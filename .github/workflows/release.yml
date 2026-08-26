@@ -30,7 +30,7 @@ jobs:
           - runner: ubuntu-22.04
             asset: dispatch-linux-x86_64.tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ env.RELEASE_TAG }}
       - name: Install Rust
@@ -63,7 +63,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@v4
