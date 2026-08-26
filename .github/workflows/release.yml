@@ -76,12 +76,18 @@ jobs:
         run: |
           sha256sum dispatch-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE_TAG" \
-            dist/dispatch-*.tar.gz dist/SHA256SUMS \
-            --verify-tag \
-            --title "Dispatch $RELEASE_TAG" \
-            --notes-file .github/release-notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/dispatch-*.tar.gz dist/SHA256SUMS \
+              --verify-tag \
+              --title "Dispatch $RELEASE_TAG" \
+              --notes-file .github/release-notes.md
+          fi
