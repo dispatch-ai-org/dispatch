@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            asset: dispatch-macos-arm64.tar.gz
+          - runner: ubuntu-22.04
+            asset: dispatch-linux-x86_64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Verify tag matches crate version
+        run: |
+          crate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test "$GITHUB_REF_NAME" = "v$crate_version"
+      - run: cargo build --release --locked
+      - name: Package and smoke test
+        run: |
+          mkdir package smoke
+          cp target/release/dispatch package/dispatch
+          chmod 0755 package/dispatch
+          tar -czf "${{ matrix.asset }}" -C package dispatch
+          test "$(tar -tzf "${{ matrix.asset }}")" = "dispatch"
+          tar -xzf "${{ matrix.asset }}" -C smoke
+          "./smoke/dispatch" version | grep -Fx "dispatch ${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dispatch-*.tar.gz
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum dispatch-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/dispatch-*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --title "Dispatch $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md

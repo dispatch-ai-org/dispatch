@@ -1,0 +1,4 @@
+/target/
+/research/
+*.tmp
+.DS_Store

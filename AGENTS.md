@@ -1,0 +1,137 @@
+# Dispatch contributor instructions
+
+These instructions apply to the entire repository.
+
+## Product thesis
+
+Dispatch is a neutral execution and evaluation layer for software work:
+
+```text
+task
+→ equivalent source states
+→ N harnesses
+→ execution evidence
+→ human evaluation
+→ durable data
+```
+
+Learned routing is a possible long-term result of that data. It is not a current feature. Do not present Dispatch as a router or let future routing concerns distort the local execution core.
+
+## Architectural ownership
+
+**Rust owns execution.** Rust owns the CLI, task/run orchestration, process supervision, harness adapters, source state, Git/worktrees/internal snapshots, execution backends, limits and timeouts, verification, diff and artifact capture, events, evaluation, SQLite/local persistence, and the explicit opt-in sync contract/outbox/client.
+
+If explicitly requested later, **Go may own networked coordination and learning**: authentication, teams, server-side ingestion, aggregate statistics, training-data processing, and routing services. Do not implement Go or cloud services in this repository.
+
+Cloud must never be required to execute a normal local Dispatch run.
+
+Evaluation upload is off by default and requires explicit user opt-in. A Cloud ingestion token is a separate submission permission: storing or possessing it never implies consent, and it must remain outside the envelope and preview. Source code, snapshots, full diffs, logs, local paths, environment data, and credentials are outside the v0.1.0 sync scope. Task text and human explanations are shared only after their inclusion has been clearly disclosed, and preview must serialize the exact payload used for upload.
+
+## Keep Dispatch small
+
+The “1K LOC” idea is a discipline, not a hard numeric constraint. Optimize for minimal conceptual surface, not code golf.
+
+1. Code is expensive.
+2. Do not add an abstraction until the current code demonstrates the need.
+3. Prefer the standard library and existing operating-system, Git, Docker, and SQLite primitives.
+4. Prefer a thin adapter over an internal framework.
+5. Prefer one supported path over multiple half-supported paths.
+6. Delete code replaced by a new path.
+7. Do not retain obsolete architecture merely for compatibility during early development.
+8. Avoid dependencies that save only trivial code.
+9. Treat growing production LOC as a reason to re-evaluate the design.
+10. Never sacrifice correctness or clarity to reach a numeric LOC target.
+
+Use explicit control flow and simple, inspectable data structures. A strong engineer should be able to follow the important execution path without navigating an internal platform.
+
+## Threshold for product changes
+
+Production changes should normally address an observed product defect, correctness problem, reliability problem, performance limitation, security issue, meaningful user friction, or data-integrity problem.
+
+Synthetic experiments can motivate more research; they do not automatically justify features.
+
+- Observed process leak → fix it.
+- Misleading candidate state → fix it.
+- An LLM suggests AST scoring → do not build it.
+- A six-way tournament sounds useful → require evidence and explicit direction first.
+
+Do not introduce speculative abstractions, duplicate execution paths, or infrastructure for hypothetical scale.
+
+## Human evaluation is the quality signal
+
+Do not substitute an LLM's code-quality opinion for human preference data.
+
+Agents may mechanically analyze test/build/lint outcomes, runtime, tokens, diffs, changed files, artifacts, and process behavior. Do not encode subjective agent opinions into rankings, training labels, routing decisions, or product behavior.
+
+Automated verification means the configured checks passed. It does not establish universal code quality. Human evaluation remains the quality/reward signal unless explicit product direction changes this policy.
+
+## Measurement discipline
+
+- Preserve raw observations and artifacts.
+- Preserve reported token semantics; do not imply cross-harness equivalence.
+- Keep unknown values unknown.
+- Do not fabricate or silently estimate transaction cost.
+- Retain Dispatch, harness, and model versions where available.
+- Preserve failures, timeouts, and partial artifacts as data.
+- Keep sync consent explicit and separate from ingestion permission, preserve stable evaluation IDs, and retain failed uploads locally.
+- Do not conflate automated checks with overall quality.
+- Do not create composite quality scores without explicit product direction.
+
+## Harness adapter discipline
+
+Harness adapters stay thin. An adapter owns only harness-specific executable discovery, command construction, stdin behavior, environment needs, output parsing, usage extraction, and harness-specific failure semantics.
+
+The generic execution core owns spawning, cancellation, timeout enforcement, stdout/stderr capture, lifecycle, process cleanup, and event emission. Keep harness-specific workarounds inside the adapter rather than scattering them through orchestration or execution.
+
+Do not introduce an internal plugin framework without multiple demonstrated integrations that cannot remain simple adapters.
+
+## Local-first and source safety
+
+Ordinary local directories, non-Git projects, existing Git repositories, and linked worktrees are first-class inputs. GitHub, a remote repository, an account, cloud services, and evaluation sync must remain optional.
+
+During evaluation, harnesses work in independent candidate states rather than directly in the user's original source. Preserve snapshot fidelity, candidate isolation, source-drift checks, and explicit apply semantics. Never weaken the unsafe-local acknowledgement or imply that local execution is sandboxed.
+
+## Scope guard
+
+Unless explicitly requested, do not add:
+
+- web UI or dashboards;
+- cloud services, authentication, billing, or team features;
+- Kubernetes, queues, Redis, or premature APIs/services;
+- generic plugin frameworks;
+- embeddings, ML, LLM judges, or automatic routing;
+- synthetic or composite quality scores;
+- new execution backends or benchmark infrastructure.
+
+Do not broaden the versioned evaluation envelope to upload source, patches, logs, or additional telemetry without a separate explicit product and consent decision. Do not put server-side cloud, routing, or learning implementation in the public core.
+
+Do not opportunistically broaden a focused task.
+
+## Working method
+
+When changing Dispatch:
+
+1. Inspect the implementation and current tests.
+2. Reproduce the issue when applicable.
+3. Make the smallest coherent change.
+4. Add a focused regression test.
+5. Run the relevant suite.
+6. Inspect the final diff and production LOC change.
+7. Delete unnecessary or replaced code.
+8. Report what changed, why, and what was deliberately not built.
+
+Do not refactor unrelated modules. Preserve user changes in a dirty workspace.
+
+Standard validation is:
+
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+## Definition of a good change
+
+A good Dispatch patch makes the system more correct, reliable, understandable, efficient, or smaller without needlessly increasing conceptual surface.
+
+If a patch adds substantial machinery, its burden of justification is high. Prefer the smallest design that fully preserves correctness, safety, and clarity.

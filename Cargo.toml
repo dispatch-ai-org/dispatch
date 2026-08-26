@@ -1,0 +1,39 @@
+[package]
+name = "dispatch"
+version = "0.1.0"
+edition = "2024"
+description = "Local-first execution and evaluation for coding-agent harnesses"
+license = "MIT"
+repository = "https://github.com/dispatch-ai-org/dispatch"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6.0"
+futures = "0.3"
+hex = "0.4"
+libc = "0.2"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+shell-words = "1.1"
+tempfile = "3.20"
+tokio = { version = "1.47", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = { version = "1.2", features = ["serde"] }
+walkdir = "2.5"
+which = "8.0"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+strip = true
+lto = "thin"
