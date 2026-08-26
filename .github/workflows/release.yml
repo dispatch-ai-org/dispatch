@@ -3,9 +3,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -22,6 +31,8 @@ jobs:
             asset: dispatch-linux-x86_64.tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
@@ -29,7 +40,7 @@ jobs:
       - name: Verify tag matches crate version
         run: |
           crate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
-          test "$GITHUB_REF_NAME" = "v$crate_version"
+          test "$RELEASE_TAG" = "v$crate_version"
       - run: cargo build --release --locked
       - name: Package and smoke test
         run: |
@@ -39,7 +50,7 @@ jobs:
           tar -czf "${{ matrix.asset }}" -C package dispatch
           test "$(tar -tzf "${{ matrix.asset }}")" = "dispatch"
           tar -xzf "${{ matrix.asset }}" -C smoke
-          "./smoke/dispatch" version | grep -Fx "dispatch ${GITHUB_REF_NAME#v}"
+          "./smoke/dispatch" version | grep -Fx "dispatch ${RELEASE_TAG#v}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -53,6 +64,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@v4
         with:
           pattern: dispatch-*.tar.gz
@@ -67,8 +80,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             dist/dispatch-*.tar.gz dist/SHA256SUMS \
             --verify-tag \
-            --title "Dispatch $GITHUB_REF_NAME" \
+            --title "Dispatch $RELEASE_TAG" \
             --notes-file .github/release-notes.md
