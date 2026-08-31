@@ -1643,6 +1643,22 @@ mod tests {
     }
 
     #[test]
+    fn init_generates_valid_config_with_verification_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let state = State {
+            root: temp.path().join("state"),
+        };
+
+        init(&state, &project, false).unwrap();
+        let contents = fs::read_to_string(project.join("dispatch.yml")).unwrap();
+        assert!(contents.contains("Replace [] with your project's verification commands"));
+        let config: Config = serde_yaml::from_str(&contents).unwrap();
+        config.validate().unwrap();
+        assert!(config.checks.verify.is_empty());
+    }
+
+    #[test]
     fn init_rejects_state_nested_in_project_before_writing() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");

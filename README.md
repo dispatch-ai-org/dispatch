@@ -1,12 +1,12 @@
 # Dispatch
 
-**Dispatch v0.1.0 — Experimental Developer Preview**
+**Dispatch v0.1.1 — Experimental Developer Preview**
 
 Dispatch runs the same software task through multiple coding-agent harnesses against equivalent source states, captures comparable execution evidence, and lets the developer inspect and choose the result they prefer.
 
-Dispatch v0.1.0 does not route work automatically or decide which agent is best. It provides the local execution and evaluation layer that could make learned routing possible later.
+Dispatch v0.1.1 does not route work automatically or decide which agent is best. It provides the local execution and evaluation layer that could make learned routing possible later.
 
-Runs and evaluations are stored locally. Nothing is uploaded to Dispatch Cloud unless the user explicitly enables evaluation sync.
+Runs and evaluations are stored locally. Nothing is uploaded to Dispatch Cloud unless the user enables evaluation sync and then explicitly runs `dispatch sync`.
 
 ## Why Dispatch exists
 
@@ -26,14 +26,14 @@ human evaluation
 durable evidence
 ```
 
-Dispatch treats automated checks and operational measurements as evidence. It does not combine them into a universal quality score; human preference remains the v0.1.0 quality signal.
+Dispatch treats automated checks and operational measurements as evidence. It does not combine them into a universal quality score; human preference remains the v0.1.1 quality signal.
 
-## What v0.1.0 does
+## What v0.1.1 does
 
 - Runs locally against ordinary directories, Git repositories, and linked worktrees; GitHub, a remote repository, an account, and Dispatch cloud are not required.
 - Freezes the source into an internal Git baseline and gives every harness its own candidate workspace.
 - Runs heterogeneous candidates concurrently with per-candidate timeout supervision.
-- Supports Codex CLI and Cursor Agent as the v0.1.0 real harnesses, plus deterministic offline fakes for workflow testing.
+- Supports Codex CLI and Cursor Agent as the v0.1.1 real harnesses, plus deterministic offline fakes for workflow testing.
 - Runs command-level verification against the frozen baseline and every completed candidate.
 - Preserves stdout, stderr, structured harness output, checks, workspaces, and patches.
 - Records runtime, reported usage, cost when directly available, changed files, and diff statistics.
@@ -97,28 +97,30 @@ Real agents and project checks run on the host only when each command includes `
 
 Dispatch clears most child environment variables. Additional names are forwarded only when they appear in `execution.forwarded_env` and the run also includes `--allow-forwarded-env`; forwarded values are redacted from persisted logs. This reduces accidental exposure but does not make local execution a sandbox.
 
-The local backend is the supported v0.1.0 real-harness backend. Docker execution is experimental: container lifecycle, candidate isolation, resource limits, timeout handling, verification, and cleanup have been validated with test harnesses, but v0.1.0 does not provide turnkey container images or container-compatible authentication for Cursor or Codex. The image must already contain the harnesses and project toolchain; the default `ubuntu:24.04` value is only a placeholder.
+The local backend is the supported v0.1.1 real-harness backend. Docker execution is experimental: container lifecycle, candidate isolation, resource limits, timeout handling, verification, and cleanup have been validated with test harnesses, but v0.1.1 does not provide turnkey container images or container-compatible authentication for Cursor or Codex. The image must already contain the harnesses and project toolchain; the default `ubuntu:24.04` value is only a placeholder.
 
 ## Quick start with Codex and Cursor
 
-Create or review project configuration, then check the environment:
+Install and authenticate the Codex and Cursor harness CLIs, then create the project configuration:
 
 ```bash
 dispatch init ./my-project
-dispatch doctor ./my-project
 ```
 
-At minimum, configure relevant verification in `my-project/dispatch.yml`, for example:
+Before the first run, replace the empty `checks.verify` list in `my-project/dispatch.yml` with the project's real verification command. For a Rust project:
 
 ```yaml
-execution:
-  backend: local
-  timeout_secs: 300
-  max_parallel: 2
-
 checks:
   verify:
     - cargo test
+```
+
+Use the command that actually verifies the project, such as `pytest`, `npm test`, or `go test ./...`. Dispatch is most useful when every candidate is checked against the same project verification command. Tests, builds, and lint are evidence—not Dispatch's automatic judgment of code quality—and a passing check does not select a winner. The human evaluation remains the outcome.
+
+Check the environment and review the reported verification state before running:
+
+```bash
+dispatch doctor ./my-project
 ```
 
 Run both harnesses against fresh copies of the same baseline:
@@ -153,10 +155,18 @@ dispatch compare <run-id> \
   --explanation "B fits the existing design better."
 ```
 
-Interactive evaluation is available with `dispatch compare <run-id> --evaluate`. Valid outcomes are a candidate label, `tie`, or `neither`. Applying a result is a separate explicit action:
+Interactive evaluation is available with `dispatch compare <run-id> --evaluate`. Valid outcomes are a candidate label, `tie`, or `neither`. Applying a result is a separate optional action:
 
 ```bash
 dispatch apply <run-id> B
+```
+
+Optional Cloud contribution is also separate. After configuring the developer-preview ingestion token described below, the reviewed flow is:
+
+```bash
+dispatch sync enable
+dispatch sync preview <run-id>
+dispatch sync
 ```
 
 For an offline workflow check, reuse the run command but omit `--harnesses`; the default `fake-good,fake-bad` pair exercises snapshotting, execution, comparison, persistence, and apply without harness credentials or network access. Keep `--allow-unsafe-local` when configured project checks run on the host.
@@ -169,7 +179,9 @@ A local backend still permits a harness to reach other host paths, which is why 
 
 If `checks.baseline` is empty, Dispatch runs `checks.verify` against the frozen baseline as evidence. A failing baseline is recorded and displayed but does not stop candidate execution: repair tasks commonly begin with failing tests. Dispatch then runs the verification commands independently against every completed candidate and retains per-command stdout and stderr.
 
-New files that remain ignored by a candidate's final `.gitignore` stay in its inspectable workspace but are omitted from `diff.patch` and `apply`. This prevents common test/build caches from entering an applied change in v0.1.0.
+Verification is mechanical evidence, not an automatic quality decision: `PASS` does not mean winner. Human preference remains the evaluation outcome.
+
+New files that remain ignored by a candidate's final `.gitignore` stay in its inspectable workspace but are omitted from `diff.patch` and `apply`. This prevents common test/build caches from entering an applied change in v0.1.1.
 
 ## Commands
 
@@ -203,27 +215,31 @@ Structured evaluation reasons are optional. Current canonical values are `correc
 
 ## Optional evaluation sync
 
-Evaluation upload is off by default. Enabling it is an explicit local choice:
+Evaluation upload is off by default. Normal local startup, `doctor`, runs, comparison, evaluation, history, and apply do not contact Dispatch Cloud.
+
+Early developer-preview ingestion requires a server-issued token. Configure that separate submission permission locally with `dispatch sync token set <server-issued-token>`; storing a token does not enable sharing.
+
+The consent, review, and transmission sequence is exactly:
 
 ```bash
-dispatch sync token set <server-issued-token>
-dispatch sync token status
 dispatch sync enable
-dispatch sync status
 dispatch sync preview <run-id>
-dispatch sync                 # flush pending and failed records
-dispatch sync disable
+dispatch sync
 ```
 
-Early developer-preview ingestion requires a server-issued token. The token is a lightweight submission permission, not an account, identity, or proof that an evaluation is genuine. It is stored in the local SQLite state, is never printed after storage, and is not encrypted beyond filesystem protections on the Dispatch state directory. `sync disable` does not clear it; use `dispatch sync token clear` explicitly.
+`dispatch sync enable` records consent locally, creates or preserves the contributor identity, and prepares eligible historical evaluations in the local outbox. It does not upload data. `dispatch sync preview <run-id>` requires consent and prints the exact eligible HTTP body without transmitting it. Bare `dispatch sync` is the explicit transmission step for pending and failed records.
+
+The contributor identity is a random local ULID that is not derived from an account, machine, path, or hardware data.
+
+The token is a lightweight submission permission, not an account, identity, or proof that an evaluation is genuine. It is stored in the local SQLite state, is never printed after storage, and is not encrypted beyond filesystem protections on the Dispatch state directory. `dispatch sync disable` stops uploads but does not clear it; use `dispatch sync token clear` explicitly. `dispatch sync status` and `dispatch sync token status` inspect local state without contacting Cloud.
 
 Token possession and sharing consent are independent. Configuring a token never enables uploads, and enabling sync without a token cannot upload. Local execution and evaluation never require either one.
 
 Opt-in sync shares the exact task description; Dispatch, OS, architecture, and backend metadata; harness/version/model identity; execution, usage, diff-count, and verification results; and the human outcome, structured reasons, and freeform explanation. This is contributed evaluation data, not generic or anonymous telemetry. Task text and explanations may contain proprietary context, so inspect the exact versioned HTTP body with `sync preview` before uploading. The ingestion token is an HTTP header and never appears in that body.
 
-The v1 payload excludes source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Richer source or diff sharing is not a v0.1.0 consent scope. The public contract is [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json).
+The v1 payload excludes source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Richer source or diff sharing is not a v0.1.1 consent scope. The public contract is [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json).
 
-Enabling sync creates a random local contributor ULID that is not derived from account, machine, path, or hardware data. Existing evaluated runs are queued as well as future ones. The SQLite outbox retains failed uploads for explicit retry; local evaluation never depends on network success. `DISPATCH_CLOUD_URL` overrides the default cloud base URL for development, and plain HTTP is accepted only for loopback testing.
+The default Cloud base URL is `https://api.rundispatch.sh`. `DISPATCH_CLOUD_URL` preserves the development/testing override, and plain HTTP is accepted only for loopback testing. The SQLite outbox retains failed uploads for explicit retry; local evaluation never depends on network success.
 
 The client uses the system `curl` with bounded timeouts to `POST /v1/evaluations`, sending `Authorization: Bearer <token>` and the stable evaluation ID as `Idempotency-Key`. Only HTTP 2xx responses mark an outbox record synced. Missing or rejected tokens leave the local evaluation unchanged and the outbox retryable.
 
@@ -243,6 +259,7 @@ execution:
 
 checks:
   baseline: []
+  # Use your project's verification commands.
   verify:
     - cargo test
 
@@ -293,7 +310,7 @@ Stdout and stderr are capped at a marked 16 MiB head-and-tail capture per stream
 ## Current boundaries
 
 - Experimental developer preview, not a stable 1.0 or hosted service.
-- The local backend is the supported real-harness backend in v0.1.0. Docker real-harness execution remains experimental and requires a suitable image and container-compatible authentication.
+- The local backend is the supported real-harness backend in v0.1.1. Docker real-harness execution remains experimental and requires a suitable image and container-compatible authentication.
 - Real-harness release testing currently covers Codex CLI and Cursor Agent; installation and authentication are external prerequisites.
 - Local real-harness execution requires explicit unsafe acknowledgement.
 - Verification is only as meaningful as the project's configured commands.

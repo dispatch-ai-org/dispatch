@@ -110,7 +110,7 @@ impl Config {
     }
 
     pub fn example_yaml() -> &'static str {
-        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  max_parallel: 3\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  verify: []\nharnesses:\n  claude:\n    model: null\n    extra_args: []\n  codex:\n    model: null\n    extra_args: []\n  cursor:\n    model: null\n    extra_args: []\n"
+        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  max_parallel: 3\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    extra_args: []\n  codex:\n    model: null\n    extra_args: []\n  cursor:\n    model: null\n    extra_args: []\n"
     }
 }
 

@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub const EVALUATION_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_CLOUD_URL: &str = "https://api.dispatch.dev";
+pub const DEFAULT_CLOUD_URL: &str = "https://api.rundispatch.sh";
 const EVALUATION_PATH: &str = "/v1/evaluations";
 const MAX_TOKEN_LENGTH: usize = 4096;
 
@@ -133,18 +133,17 @@ pub fn enable(state: &State) -> Result<()> {
     let queued = queue_all(state, &database, &settings)?;
     let available = database.evaluation_count()?;
 
-    println!("Evaluation sync enabled.");
+    println!("Evaluation sync consent enabled locally. No data was uploaded.");
+    println!("Eligible evaluations are prepared in the local outbox for explicit upload.");
     println!(
-        "Share evaluation records with Dispatch to improve harness statistics and future routing."
-    );
-    println!(
-        "Shared fields include task descriptions, harness/version/model metadata, execution and verification results, and your evaluation and reasoning."
+        "Shared fields include task descriptions, harness/version/model metadata, execution and verification results, and your human outcome, structured reasons, and freeform explanation."
     );
     println!(
         "Source code, full diffs, logs, local paths, environment values, and credentials are not uploaded."
     );
     println!("{available} completed evaluation(s) are available; {queued} newly queued.");
-    println!("Review one with: dispatch sync preview <run-id>");
+    println!("Inspect the exact body with: dispatch sync preview <run-id>");
+    println!("Transmit pending records only when ready with: dispatch sync");
     Ok(())
 }
 
@@ -713,6 +712,13 @@ mod tests {
     }
 
     #[test]
+    fn production_cloud_endpoint_is_the_default() -> Result<()> {
+        assert_eq!(DEFAULT_CLOUD_URL, "https://api.rundispatch.sh");
+        assert_eq!(validate_cloud_url(DEFAULT_CLOUD_URL)?, DEFAULT_CLOUD_URL);
+        Ok(())
+    }
+
+    #[test]
     fn envelope_preserves_semantics_unknowns_and_privacy_boundary() -> Result<()> {
         let run = evaluated_run("run-envelope");
         let settings = SyncSettings {
@@ -795,6 +801,45 @@ mod tests {
         let second = database.enable_sync("replacement", at(7))?;
         assert_eq!(first.contributor_id, second.contributor_id);
         assert_eq!(first.enabled_at, second.enabled_at);
+        Ok(())
+    }
+
+    #[test]
+    fn enable_records_consent_and_queues_without_uploading() -> Result<()> {
+        let (_temp, state, run) = persisted_run()?;
+        set_token_for_test(&state, "configured-before-consent")?;
+
+        enable(&state)?;
+
+        let database = Database::open(state.db_path())?;
+        let settings = database.sync_settings()?;
+        assert!(settings.enabled);
+        assert!(settings.contributor_id.is_some());
+        assert!(settings.enabled_at.is_some());
+        assert_eq!(database.sync_outbox_counts()?.pending, 1);
+        let connection = rusqlite::Connection::open(state.db_path())?;
+        let (status, last_attempt, synced_at): (String, Option<String>, Option<String>) =
+            connection.query_row(
+                "SELECT status, last_attempt, synced_at FROM sync_outbox WHERE run_id = ?1",
+                [&run.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(status, "pending");
+        assert!(last_attempt.is_none());
+        assert!(synced_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn preview_requires_consent() -> Result<()> {
+        let (_temp, state, run) = persisted_run()?;
+        let error = preview_payload(&state, &run.id).unwrap_err().to_string();
+        assert!(error.contains("dispatch sync enable"));
+        assert!(
+            Database::open(state.db_path())?
+                .pending_sync_records()?
+                .is_empty()
+        );
         Ok(())
     }
 

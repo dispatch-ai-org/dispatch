@@ -73,7 +73,7 @@ enum Command {
     Compare(CompareArgs),
     /// Safely apply one candidate to the original source.
     Apply { run_id: String, candidate: String },
-    /// Manage explicit opt-in evaluation sync.
+    /// Review opt-in records; bare `dispatch sync` explicitly transmits queued data.
     Sync(SyncArgs),
     /// Print the Dispatch version.
     Version,
@@ -87,13 +87,13 @@ struct SyncArgs {
 
 #[derive(Debug, Subcommand)]
 enum SyncCommand {
-    /// Enable evaluation sharing and queue completed evaluations.
+    /// Record consent and queue eligible evaluations locally; does not upload.
     Enable,
     /// Disable all evaluation uploads.
     Disable,
     /// Show consent and outbox state without contacting the cloud.
     Status,
-    /// Print the exact JSON payload for one evaluated run.
+    /// Print the exact eligible upload body without transmitting; requires consent.
     Preview { run_id: String },
     /// Manage the developer-preview Dispatch Cloud ingestion token.
     Token(SyncTokenArgs),

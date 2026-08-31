@@ -1,6 +1,12 @@
 ## Experimental Developer Preview
 
-Dispatch v0.1.0 is an early local-first release for developers who want to run the same software task through multiple coding-agent harnesses and evaluate the resulting evidence.
+Dispatch v0.1.1 is a local-first patch release that points optional evaluation sync at the production Dispatch Cloud endpoint and makes the verified first-run path explicit.
+
+### Fixed
+
+- Use `https://api.rundispatch.sh` as the default Cloud base URL while preserving development and loopback overrides.
+- Clarify that `dispatch sync enable` records consent and prepares data locally but does not upload it.
+- Prompt new projects to configure a real verification command before their first evaluation.
 
 ### Supported
 

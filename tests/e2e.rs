@@ -1,5 +1,7 @@
 use std::{
     fs,
+    io::ErrorKind,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -9,6 +11,51 @@ use std::{
 use assert_cmd::cargo_bin_cmd;
 use rusqlite::Connection;
 use serde_json::Value;
+
+#[test]
+fn normal_local_commands_do_not_contact_cloud() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let cloud_url = format!("http://{}", listener.local_addr().unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let state = temp.path().join("state");
+
+    dispatch_command(&state, &cloud_url)
+        .arg("init")
+        .arg(&source)
+        .assert()
+        .success();
+    dispatch_command(&state, &cloud_url)
+        .arg("doctor")
+        .arg(&source)
+        .assert()
+        .success();
+    let run = dispatch_command(&state, &cloud_url)
+        .arg("run")
+        .arg(&source)
+        .args(["--task", "Exercise the local workflow."])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let run_id = String::from_utf8(run.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("RUN "))
+        .unwrap()
+        .to_owned();
+    dispatch_command(&state, &cloud_url)
+        .args(["compare", &run_id, "--winner", "tie"])
+        .assert()
+        .success();
+    dispatch_command(&state, &cloud_url)
+        .arg("history")
+        .assert()
+        .success();
+
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
 
 #[test]
 fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
@@ -335,6 +382,15 @@ fn candidate_for<'a>(candidates: &'a [Value], harness: &str) -> &'a Value {
         .iter()
         .find(|candidate| candidate["harness_id"] == harness)
         .unwrap_or_else(|| panic!("missing {harness} candidate"))
+}
+
+fn dispatch_command(state: &Path, cloud_url: &str) -> assert_cmd::Command {
+    let mut command = cargo_bin_cmd!("dispatch");
+    command
+        .args(["--state-dir"])
+        .arg(state)
+        .env("DISPATCH_CLOUD_URL", cloud_url);
+    command
 }
 
 #[cfg(unix)]
