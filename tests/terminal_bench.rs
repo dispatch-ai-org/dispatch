@@ -53,6 +53,20 @@ fn edit_json(
     Ok(())
 }
 
+fn make_cursor_fixture(destination: &std::path::Path) -> anyhow::Result<()> {
+    copy_fixture(destination)?;
+    edit_json(&destination.join("config.json"), |value| {
+        value["agents"][0]["name"] = "cursor-cli".into();
+    })?;
+    for trial in ["fix-permissions__attempt-1", "git-recovery__attempt-1"] {
+        edit_json(&destination.join(trial).join("result.json"), |value| {
+            value["agent_info"]["name"] = "cursor-cli".into();
+            value["agent_info"]["version"] = "2026.08".into();
+        })?;
+    }
+    Ok(())
+}
+
 #[test]
 fn parses_minimal_real_shaped_terminal_bench_job() -> anyhow::Result<()> {
     let snapshot = read_terminal_bench_snapshot(&fixture())?;
@@ -170,16 +184,7 @@ fn maps_only_explicitly_equivalent_harbor_agents() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
 
     let cursor = temp.path().join("cursor");
-    copy_fixture(&cursor)?;
-    edit_json(&cursor.join("config.json"), |value| {
-        value["agents"][0]["name"] = "cursor-cli".into();
-    })?;
-    for trial in ["fix-permissions__attempt-1", "git-recovery__attempt-1"] {
-        edit_json(&cursor.join(trial).join("result.json"), |value| {
-            value["agent_info"]["name"] = "cursor-cli".into();
-            value["agent_info"]["version"] = "2026.08".into();
-        })?;
-    }
+    make_cursor_fixture(&cursor)?;
     let cursor_snapshot = read_terminal_bench_snapshot(&cursor)?;
     assert_eq!(cursor_snapshot.agent, "cursor-cli");
     assert_eq!(cursor_snapshot.harness, "cursor");
@@ -202,30 +207,33 @@ fn maps_only_explicitly_equivalent_harbor_agents() -> anyhow::Result<()> {
 }
 
 #[test]
-fn router_consumes_terminal_bench_only_for_exact_unknown_morphology() -> anyhow::Result<()> {
+fn router_consumes_harbor_codex_and_cursor_as_generic_fallback() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let state = state(&temp);
     import_terminal_bench(&state, &fixture())?;
+    let cursor = temp.path().join("cursor");
+    make_cursor_fixture(&cursor)?;
+    import_terminal_bench(&state, &cursor)?;
     let database = Database::open(state.db_path())?;
     let available = vec!["cursor".to_owned(), "codex".to_owned()];
-
-    let ranked = rank_harnesses(&database, &unknown_features(), &available)?;
-    assert_eq!(ranked[0].harness, "codex");
-    assert_eq!(ranked[0].score, Some(0.5));
-    assert_eq!(ranked[1].harness, "cursor");
-    assert_eq!(ranked[1].score, None);
 
     let known = TaskFeatures {
         language: Some("rust".to_owned()),
         task_kind: TaskKind::BugFix,
         scope: TaskScope::Localized,
     };
-    let known_ranked = rank_harnesses(&database, &known, &available)?;
-    assert!(
-        known_ranked
-            .iter()
-            .all(|prediction| prediction.score.is_none())
+    let ranked = rank_harnesses(&database, &known, &available)?;
+
+    assert_eq!(ranked[0].harness, "codex");
+    assert_eq!(ranked[0].score, Some(0.5));
+    assert_eq!(ranked[0].evidence.as_ref().unwrap().specificity, 0);
+    assert_eq!(
+        ranked[0].evidence.as_ref().unwrap().prior.source,
+        "harbor-framework/harbor"
     );
+    assert_eq!(ranked[1].harness, "cursor");
+    assert_eq!(ranked[1].score, Some(0.5));
+    assert_eq!(ranked[1].evidence.as_ref().unwrap().specificity, 0);
     Ok(())
 }
 

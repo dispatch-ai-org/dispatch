@@ -16,15 +16,40 @@ fn features() -> TaskFeatures {
 }
 
 fn prior(harness: &str, model: Option<&str>, successes: u64, attempts: u64) -> BenchmarkPrior {
+    evidence_prior(
+        "public-benchmark",
+        "swe-bench",
+        harness,
+        model,
+        Some("rust"),
+        TaskKind::BugFix,
+        TaskScope::Localized,
+        successes,
+        attempts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evidence_prior(
+    source: &str,
+    dataset: &str,
+    harness: &str,
+    model: Option<&str>,
+    language: Option<&str>,
+    task_kind: TaskKind,
+    scope: TaskScope,
+    successes: u64,
+    attempts: u64,
+) -> BenchmarkPrior {
     BenchmarkPrior {
-        source: "public-benchmark".to_owned(),
-        dataset: "swe-bench".to_owned(),
+        source: source.to_owned(),
+        dataset: dataset.to_owned(),
         dataset_version: "verified-2026-08".to_owned(),
         harness: harness.to_owned(),
         model: model.map(str::to_owned),
-        language: Some("rust".to_owned()),
-        task_kind: TaskKind::BugFix,
-        scope: TaskScope::Localized,
+        language: language.map(str::to_owned),
+        task_kind,
+        scope,
         successes,
         attempts,
         updated_at: at(1),
@@ -137,6 +162,268 @@ fn router_ranks_higher_observed_success_ratio_first() -> anyhow::Result<()> {
 }
 
 #[test]
+fn router_prefers_exact_evidence_over_better_supported_generic_evidence() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "generic-source",
+        "terminal-bench",
+        "codex",
+        None,
+        None,
+        TaskKind::Unknown,
+        TaskScope::Unknown,
+        90,
+        100,
+    ))?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "exact-source",
+        "rust-bugs",
+        "codex",
+        None,
+        Some("rust"),
+        TaskKind::BugFix,
+        TaskScope::Localized,
+        1,
+        2,
+    ))?;
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+
+    assert_eq!((ranked[0].successes, ranked[0].attempts), (1, 2));
+    assert_eq!(ranked[0].score, Some(0.5));
+    let evidence = ranked[0].evidence.as_ref().unwrap();
+    assert_eq!(evidence.specificity, 3);
+    assert_eq!(evidence.prior.source, "exact-source");
+    Ok(())
+}
+
+#[test]
+fn known_task_falls_back_to_generic_evidence_with_explicit_specificity() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "harbor-framework/harbor",
+        "terminal-bench/terminal-bench-2",
+        "codex",
+        Some("openai/gpt-5"),
+        None,
+        TaskKind::Unknown,
+        TaskScope::Unknown,
+        74,
+        89,
+    ))?;
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+
+    assert_eq!((ranked[0].successes, ranked[0].attempts), (74, 89));
+    assert_eq!(ranked[0].score, Some(74.0 / 89.0));
+    let evidence = ranked[0].evidence.as_ref().unwrap();
+    assert_eq!(evidence.specificity, 0);
+    assert_eq!(evidence.prior.source, "harbor-framework/harbor");
+    Ok(())
+}
+
+#[test]
+fn conflicting_known_dimensions_are_incompatible() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    for prior in [
+        evidence_prior(
+            "language-conflict",
+            "benchmark",
+            "codex",
+            None,
+            Some("python"),
+            TaskKind::BugFix,
+            TaskScope::Localized,
+            1,
+            1,
+        ),
+        evidence_prior(
+            "kind-conflict",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::Feature,
+            TaskScope::Localized,
+            1,
+            1,
+        ),
+        evidence_prior(
+            "scope-conflict",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::BugFix,
+            TaskScope::Broad,
+            1,
+            1,
+        ),
+    ] {
+        database.upsert_benchmark_prior(&prior)?;
+    }
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+
+    assert_eq!(ranked[0].score, None);
+    assert!(ranked[0].evidence.is_none());
+    Ok(())
+}
+
+#[test]
+fn unknown_task_dimension_does_not_consume_known_prior_value() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    database.upsert_benchmark_prior(&prior("codex", None, 1, 1))?;
+    let task = TaskFeatures {
+        language: None,
+        ..features()
+    };
+
+    let ranked = rank_harnesses(&database, &task, &["codex".to_owned()])?;
+
+    assert_eq!(ranked[0].score, None);
+    assert!(ranked[0].evidence.is_none());
+    Ok(())
+}
+
+#[test]
+fn unknown_task_and_unknown_prior_dimensions_remain_compatible() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "generic-source",
+        "terminal-bench",
+        "codex",
+        None,
+        None,
+        TaskKind::Unknown,
+        TaskScope::Unknown,
+        1,
+        2,
+    ))?;
+    let task = TaskFeatures {
+        language: None,
+        task_kind: TaskKind::Unknown,
+        scope: TaskScope::Unknown,
+    };
+
+    let ranked = rank_harnesses(&database, &task, &["codex".to_owned()])?;
+
+    assert_eq!(ranked[0].score, Some(0.5));
+    assert_eq!(ranked[0].evidence.as_ref().unwrap().specificity, 0);
+    Ok(())
+}
+
+#[test]
+fn more_specifically_matched_dimensions_win_within_fallback_evidence() -> anyhow::Result<()> {
+    let database = Database::open_in_memory()?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "one-dimension",
+        "benchmark",
+        "codex",
+        None,
+        Some("rust"),
+        TaskKind::Unknown,
+        TaskScope::Unknown,
+        99,
+        100,
+    ))?;
+    database.upsert_benchmark_prior(&evidence_prior(
+        "two-dimensions",
+        "benchmark",
+        "codex",
+        None,
+        Some("rust"),
+        TaskKind::BugFix,
+        TaskScope::Unknown,
+        1,
+        2,
+    ))?;
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+
+    let evidence = ranked[0].evidence.as_ref().unwrap();
+    assert_eq!(evidence.specificity, 2);
+    assert_eq!(evidence.prior.source, "two-dimensions");
+    assert_eq!((ranked[0].successes, ranked[0].attempts), (1, 2));
+    Ok(())
+}
+
+#[test]
+fn evidence_selection_prefers_attempts_then_stable_provenance_without_summing() -> anyhow::Result<()>
+{
+    let database = Database::open_in_memory()?;
+    for prior in [
+        evidence_prior(
+            "fewer-attempts",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::BugFix,
+            TaskScope::Unknown,
+            4,
+            4,
+        ),
+        evidence_prior(
+            "more-attempts",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::BugFix,
+            TaskScope::Unknown,
+            1,
+            10,
+        ),
+    ] {
+        database.upsert_benchmark_prior(&prior)?;
+    }
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+    assert_eq!((ranked[0].successes, ranked[0].attempts), (1, 10));
+    assert_eq!(
+        ranked[0].evidence.as_ref().unwrap().prior.source,
+        "more-attempts"
+    );
+
+    let database = Database::open_in_memory()?;
+    for prior in [
+        evidence_prior(
+            "beta-source",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::BugFix,
+            TaskScope::Unknown,
+            4,
+            4,
+        ),
+        evidence_prior(
+            "alpha-source",
+            "benchmark",
+            "codex",
+            None,
+            Some("rust"),
+            TaskKind::BugFix,
+            TaskScope::Unknown,
+            1,
+            4,
+        ),
+    ] {
+        database.upsert_benchmark_prior(&prior)?;
+    }
+
+    let ranked = rank_harnesses(&database, &features(), &["codex".to_owned()])?;
+    assert_eq!((ranked[0].successes, ranked[0].attempts), (1, 4));
+    assert_eq!(
+        ranked[0].evidence.as_ref().unwrap().prior.source,
+        "alpha-source"
+    );
+    Ok(())
+}
+
+#[test]
 fn router_reports_no_score_for_missing_or_zero_attempt_evidence() -> anyhow::Result<()> {
     let database = Database::open_in_memory()?;
     database.upsert_benchmark_prior(&prior("codex", None, 0, 0))?;
@@ -147,9 +434,11 @@ fn router_reports_no_score_for_missing_or_zero_attempt_evidence() -> anyhow::Res
     assert_eq!(ranked[0].harness, "codex");
     assert_eq!(ranked[0].attempts, 0);
     assert_eq!(ranked[0].score, None);
+    assert!(ranked[0].evidence.is_none());
     assert_eq!(ranked[1].harness, "cursor");
     assert_eq!(ranked[1].attempts, 0);
     assert_eq!(ranked[1].score, None);
+    assert!(ranked[1].evidence.is_none());
     Ok(())
 }
 

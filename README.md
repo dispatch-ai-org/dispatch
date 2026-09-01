@@ -220,9 +220,11 @@ Structured evaluation reasons are optional. Current canonical values are `correc
 
 `dispatch datasets import swe-bench <path>` explicitly imports a local SWE-bench Verified snapshot. The directory must contain `metadata.yaml`, `instances.jsonl`, and `results/results.json`. Dispatch preserves those exact files in its local dataset cache and stores only normalized aggregate evidence in SQLite for the experimental Router. Import and routing perform no benchmark network requests, and routing is not connected to `dispatch run`.
 
-`dispatch datasets import terminal-bench <path>` imports a completed Harbor job directory containing `config.json` and per-trial `<trial>/result.json` files. Dispatch caches those exact normalization inputs, keeps Harbor agent and model identities separate, and records Terminal-Bench morphology as unknown. With exact matching, this evidence applies only to an all-unknown task-feature query. No normal Dispatch command contacts Harbor or Terminal-Bench.
+`dispatch datasets import terminal-bench <path>` imports a completed Harbor job directory containing `config.json` and per-trial `<trial>/result.json` files. Dispatch caches those exact normalization inputs, keeps Harbor agent and model identities separate, and records Terminal-Bench morphology as unknown. No normal Dispatch command contacts Harbor or Terminal-Bench.
 
-The importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions. It does not translate an upstream agent into a Dispatch harness name. A prior is usable only when the upstream agent identity exactly matches an available harness.
+The Router treats an unknown prior dimension as compatible fallback evidence for a known task, never as an exact wildcard. Conflicting known values are rejected, and an unknown task dimension cannot consume a known prior value. Specificity is the number of dimensions the prior establishes and matches. If several priors are compatible with one harness, Dispatch selects one by greater specificity, then attempts, then stable provenance identity; it does not sum unrelated benchmark sources.
+
+The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 
 ## Optional evaluation sync
 

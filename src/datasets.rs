@@ -124,13 +124,7 @@ pub fn import_swe_bench(state: &State, path: &Path) -> Result<DatasetImportRepor
         attempts,
         updated_at: Utc::now(),
     };
-    let mut database = Database::open(state.db_path())?;
-    database.replace_benchmark_prior(&prior)?;
-
-    Ok(DatasetImportReport {
-        prior,
-        raw_snapshot_path,
-    })
+    finish_import(state, prior, raw_snapshot_path)
 }
 
 fn parse_bundle(path: &Path) -> Result<ParsedBundle> {
@@ -252,12 +246,29 @@ fn is_single_attempt(value: &serde_yaml::Value) -> bool {
 fn digest(parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
-        hasher.update(part.len().to_be_bytes());
-        hasher.update(part);
+        update_digest(&mut hasher, part);
     }
     hex::encode(hasher.finalize())
 }
 
 fn read(path: PathBuf) -> Result<Vec<u8>> {
     fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn finish_import(
+    state: &State,
+    prior: BenchmarkPrior,
+    raw_snapshot_path: PathBuf,
+) -> Result<DatasetImportReport> {
+    let mut database = Database::open(state.db_path())?;
+    database.replace_benchmark_prior(&prior)?;
+    Ok(DatasetImportReport {
+        prior,
+        raw_snapshot_path,
+    })
+}
+
+fn update_digest(hasher: &mut Sha256, part: &[u8]) {
+    hasher.update(part.len().to_be_bytes());
+    hasher.update(part);
 }

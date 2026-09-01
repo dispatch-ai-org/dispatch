@@ -203,6 +203,7 @@ fn imported_prior_is_immediately_consumed_only_by_matching_harness() -> anyhow::
     assert_eq!(ranked[0].score, Some(0.5));
     assert_eq!(ranked[1].harness, "codex");
     assert_eq!(ranked[1].score, None);
+    assert!(ranked[1].evidence.is_none());
     Ok(())
 }
 

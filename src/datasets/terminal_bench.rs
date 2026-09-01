@@ -1,17 +1,13 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{BenchmarkPrior, TaskKind, TaskScope, db::Database, state::State};
+use crate::{BenchmarkPrior, TaskKind, TaskScope, state::State};
 
-use super::DatasetImportReport;
+use super::{DatasetImportReport, finish_import, read, update_digest};
 
 const SOURCE: &str = "harbor-framework/harbor";
 
@@ -138,13 +134,7 @@ pub fn import_terminal_bench(state: &State, path: &Path) -> Result<DatasetImport
         attempts,
         updated_at: Utc::now(),
     };
-    let mut database = Database::open(state.db_path())?;
-    database.replace_benchmark_prior(&prior)?;
-
-    Ok(DatasetImportReport {
-        prior,
-        raw_snapshot_path,
-    })
+    finish_import(state, prior, raw_snapshot_path)
 }
 
 fn parse_job(path: &Path) -> Result<ParsedJob> {
@@ -356,20 +346,11 @@ fn checked_text(value: &str, label: &str) -> Result<String> {
 
 fn digest(config: &[u8], trials: &[TrialFile]) -> String {
     let mut hasher = Sha256::new();
-    update_digest(&mut hasher, b"config.json", config);
+    update_digest(&mut hasher, b"config.json");
+    update_digest(&mut hasher, config);
     for trial in trials {
-        update_digest(&mut hasher, trial.directory.as_bytes(), &trial.contents);
+        update_digest(&mut hasher, trial.directory.as_bytes());
+        update_digest(&mut hasher, &trial.contents);
     }
     hex::encode(hasher.finalize())
-}
-
-fn update_digest(hasher: &mut Sha256, name: &[u8], contents: &[u8]) {
-    hasher.update(name.len().to_be_bytes());
-    hasher.update(name);
-    hasher.update(contents.len().to_be_bytes());
-    hasher.update(contents);
-}
-
-fn read(path: PathBuf) -> Result<Vec<u8>> {
-    fs::read(&path).with_context(|| format!("failed to read {}", path.display()))
 }
