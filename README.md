@@ -40,7 +40,7 @@ Dispatch treats automated checks and operational measurements as evidence. It do
 - Supports blind Candidate A/B comparison, candidate inspection, and A/B/Tie/Neither evaluation.
 - Stores optional structured reasons and unrestricted human explanations verbatim.
 - Persists normalized records in SQLite and large artifacts on the filesystem.
-- Explicitly imports local SWE-bench snapshots as cached experimental routing priors.
+- Explicitly imports local SWE-bench and Terminal-Bench/Harbor snapshots as cached experimental routing priors.
 - Leaves the original source unchanged through the evaluation flow; `dispatch apply` is explicit and rejects source drift.
 
 ## Install
@@ -203,6 +203,7 @@ dispatch compare <run-id> [--evaluate]
   [--explanation text | --explanation-file path|-]
 dispatch apply <run-id> <candidate>
 dispatch datasets import swe-bench <path>
+dispatch datasets import terminal-bench <path>
 dispatch sync enable|disable|status
 dispatch sync preview <run-id>
 dispatch sync token set <token>
@@ -218,6 +219,8 @@ Structured evaluation reasons are optional. Current canonical values are `correc
 ## Local benchmark priors
 
 `dispatch datasets import swe-bench <path>` explicitly imports a local SWE-bench Verified snapshot. The directory must contain `metadata.yaml`, `instances.jsonl`, and `results/results.json`. Dispatch preserves those exact files in its local dataset cache and stores only normalized aggregate evidence in SQLite for the experimental Router. Import and routing perform no benchmark network requests, and routing is not connected to `dispatch run`.
+
+`dispatch datasets import terminal-bench <path>` imports a completed Harbor job directory containing `config.json` and per-trial `<trial>/result.json` files. Dispatch caches those exact normalization inputs, keeps Harbor agent and model identities separate, and records Terminal-Bench morphology as unknown. With exact matching, this evidence applies only to an all-unknown task-feature query. No normal Dispatch command contacts Harbor or Terminal-Bench.
 
 The importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions. It does not translate an upstream agent into a Dispatch harness name. A prior is usable only when the upstream agent identity exactly matches an available harness.
 

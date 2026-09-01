@@ -89,9 +89,9 @@ struct DatasetsArgs {
 
 #[derive(Debug, Subcommand)]
 enum DatasetCommand {
-    /// Import a local SWE-bench snapshot without network access.
+    /// Import a local benchmark snapshot without network access.
     Import {
-        #[arg(value_parser = ["swe-bench"])]
+        #[arg(value_parser = ["swe-bench", "terminal-bench"])]
         dataset: String,
         path: PathBuf,
     },
@@ -273,8 +273,12 @@ async fn run() -> Result<()> {
         }
         Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
         Command::Datasets(args) => match args.command {
-            DatasetCommand::Import { dataset: _, path } => {
-                let report = dispatch::datasets::import_swe_bench(&state, &path)?;
+            DatasetCommand::Import { dataset, path } => {
+                let report = match dataset.as_str() {
+                    "swe-bench" => dispatch::datasets::import_swe_bench(&state, &path)?,
+                    "terminal-bench" => dispatch::datasets::import_terminal_bench(&state, &path)?,
+                    _ => unreachable!("clap validates dataset names"),
+                };
                 println!(
                     "Imported {} {} for harness {} (model {})",
                     report.prior.dataset,
@@ -283,7 +287,7 @@ async fn run() -> Result<()> {
                     report.prior.model.as_deref().unwrap_or("unknown")
                 );
                 println!(
-                    "Observed {}/{} resolved tasks; cached raw snapshot at {}",
+                    "Observed {}/{} successful attempts; cached raw snapshot at {}",
                     report.prior.successes,
                     report.prior.attempts,
                     report.raw_snapshot_path.display()

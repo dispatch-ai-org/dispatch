@@ -1,0 +1,41 @@
+{
+  "id": "11111111-1111-4111-8111-111111111111",
+  "task_name": "fix-permissions",
+  "trial_name": "fix-permissions__attempt-1",
+  "trial_uri": "file:///tmp/jobs/terminal-bench-codex/fix-permissions__attempt-1",
+  "task_id": {
+    "org": "terminal-bench",
+    "name": "fix-permissions",
+    "ref": "sha256:task-one"
+  },
+  "source": "terminal-bench/terminal-bench-2",
+  "task_checksum": "sha256:checksum-one",
+  "config": {
+    "trial_name": "fix-permissions__attempt-1",
+    "agent": {
+      "name": "codex",
+      "model_name": "openai/gpt-5"
+    }
+  },
+  "agent_info": {
+    "name": "codex",
+    "version": "0.42.0",
+    "model_info": {
+      "name": "gpt-5",
+      "provider": "openai"
+    }
+  },
+  "agent_result": {
+    "n_input_tokens": 1200,
+    "n_output_tokens": 300,
+    "cost_usd": 0.12
+  },
+  "verifier_result": {
+    "rewards": {
+      "reward": 1
+    }
+  },
+  "exception_info": null,
+  "started_at": "2026-08-30T12:00:00Z",
+  "finished_at": "2026-08-30T12:02:00Z"
+}

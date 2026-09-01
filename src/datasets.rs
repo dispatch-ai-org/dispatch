@@ -11,6 +11,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{BenchmarkPrior, TaskKind, TaskScope, db::Database, state::State};
 
+mod terminal_bench;
+
+pub use terminal_bench::{
+    HarborTrialObservation, TerminalBenchSnapshot, import_terminal_bench,
+    read_terminal_bench_snapshot,
+};
+
 const SOURCE: &str = "swe-bench/experiments";
 const DATASET: &str = "SWE-bench_Verified";
 
