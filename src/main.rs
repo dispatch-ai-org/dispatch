@@ -43,6 +43,8 @@ enum Command {
     },
     /// Freeze a source tree and execute independent candidates.
     Run(RunArgs),
+    /// Inspect locally cached evidence for supported real harnesses.
+    Recommend(RecommendArgs),
     /// Show the state of one run (or the latest run).
     Status { run_id: Option<String> },
     /// List recent runs.
@@ -138,15 +140,8 @@ struct RunArgs {
     #[arg(default_value = ".")]
     source: PathBuf,
 
-    #[arg(
-        long,
-        required_unless_present = "task_file",
-        conflicts_with = "task_file"
-    )]
-    task: Option<String>,
-
-    #[arg(long, required_unless_present = "task", conflicts_with = "task")]
-    task_file: Option<PathBuf>,
+    #[command(flatten)]
+    task_input: TaskInput,
 
     /// Comma-separated adapter IDs. Fakes make the complete workflow testable offline.
     #[arg(long, value_delimiter = ',', default_value = "fake-good,fake-bad")]
@@ -171,6 +166,28 @@ struct RunArgs {
     /// Forward only the environment variable names allowlisted in dispatch.yml.
     #[arg(long)]
     allow_forwarded_env: bool,
+}
+
+#[derive(Debug, Args)]
+struct RecommendArgs {
+    #[arg(default_value = ".")]
+    source: PathBuf,
+
+    #[command(flatten)]
+    task_input: TaskInput,
+}
+
+#[derive(Debug, Args)]
+struct TaskInput {
+    #[arg(
+        long,
+        required_unless_present = "task_file",
+        conflicts_with = "task_file"
+    )]
+    task: Option<String>,
+
+    #[arg(long, required_unless_present = "task", conflicts_with = "task")]
+    task_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -225,12 +242,7 @@ async fn run() -> Result<()> {
             orchestrator::doctor(&state, &source, config.as_deref()).await
         }
         Command::Run(args) => {
-            let task = match (args.task, args.task_file) {
-                (Some(task), None) => task,
-                (None, Some(path)) => std::fs::read_to_string(&path)
-                    .with_context(|| format!("failed to read task file {}", path.display()))?,
-                _ => unreachable!("clap enforces one task source"),
-            };
+            let task = read_task(args.task_input)?;
             let request = orchestrator::RunRequest {
                 source: args.source,
                 task,
@@ -245,6 +257,10 @@ async fn run() -> Result<()> {
             orchestrator::run_dispatch(&state, request)
                 .await
                 .map(|_| ())
+        }
+        Command::Recommend(args) => {
+            let task = read_task(args.task_input)?;
+            orchestrator::recommend(&state, &args.source, &task)
         }
         Command::Status { run_id } => orchestrator::status(&state, run_id.as_deref()),
         Command::History { limit } => orchestrator::history(&state, limit),
@@ -311,5 +327,14 @@ async fn run() -> Result<()> {
             println!("dispatch {}", dispatch::VERSION);
             Ok(())
         }
+    }
+}
+
+fn read_task(input: TaskInput) -> Result<String> {
+    match (input.task, input.task_file) {
+        (Some(task), None) => Ok(task),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read task file {}", path.display())),
+        _ => unreachable!("clap enforces one task source"),
     }
 }

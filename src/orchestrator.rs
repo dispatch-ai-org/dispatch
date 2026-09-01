@@ -21,12 +21,17 @@ use crate::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
     EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RunRecord, RunStatus,
     VERSION,
+    classifier::classify_task,
     db::Database,
     executor::{
         CancellationToken, ExecutionStatus, Executor, run_checks_with_config_and_cancel,
         trusted_host_executable,
     },
-    harness::{HarnessRunRequest, adapter_for, build_prompt, probe_version, run_harness},
+    harness::{
+        HarnessRunRequest, SUPPORTED_HARNESSES, adapter_for, build_prompt, probe_version,
+        run_harness,
+    },
+    router::rank_harnesses,
     source,
     state::{State, write_text},
 };
@@ -244,6 +249,75 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     } else {
         println!(
             "Docker isolation is selected. Docker daemon access, image contents, harness versions, and authentication are not validated by doctor; run with a harness-enabled image. Deterministic fakes are ready."
+        );
+    }
+    Ok(())
+}
+
+pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
+    anyhow::ensure!(!task.trim().is_empty(), "task must not be empty");
+    let source_path = source::resolve_source(Some(source_path))?;
+    let projected_state_root = canonicalize_allow_missing(&state.root)?;
+    anyhow::ensure!(
+        !projected_state_root.starts_with(&source_path),
+        "Dispatch state directory must be outside the source tree: {}",
+        state.root.display()
+    );
+    let features = classify_task(&source_path, task)?;
+    state.initialize()?;
+    let database = Database::open(state.db_path())?;
+    let supported_real_harnesses = SUPPORTED_HARNESSES
+        .iter()
+        .filter(|harness| !harness.starts_with("fake-"))
+        .map(|harness| (*harness).to_owned())
+        .collect::<Vec<_>>();
+    let ranked = rank_harnesses(&database, &features, &supported_real_harnesses)?;
+
+    println!("Task");
+    println!(
+        "  language: {}",
+        features.language.as_deref().unwrap_or("unknown")
+    );
+    println!("  kind: {}", features.task_kind.as_str());
+    println!("  scope: {}", features.scope.as_str());
+
+    let recommendations = ranked
+        .iter()
+        .filter(|prediction| prediction.evidence.is_some())
+        .collect::<Vec<_>>();
+    if recommendations.is_empty() {
+        println!("\nNo compatible routing evidence is available.");
+        return Ok(());
+    }
+
+    println!("\nRecommendations");
+    for (index, prediction) in recommendations.into_iter().enumerate() {
+        let evidence = prediction
+            .evidence
+            .as_ref()
+            .expect("recommendations contain evidence");
+        let specificity = match evidence.specificity {
+            0 => "generic",
+            3 => "exact",
+            _ => "partial",
+        };
+        println!("\n{}. {}", index + 1, prediction.harness);
+        println!(
+            "   benchmark success: {}/{} ({:.1}%)",
+            prediction.successes,
+            prediction.attempts,
+            prediction.score.expect("evidence has a score") * 100.0
+        );
+        println!(
+            "   evidence specificity: {}/3 ({specificity})",
+            evidence.specificity
+        );
+        println!("   source: {}", evidence.prior.source);
+        println!("   dataset: {}", evidence.prior.dataset);
+        println!("   dataset version: {}", evidence.prior.dataset_version);
+        println!(
+            "   model: {}",
+            evidence.prior.model.as_deref().unwrap_or("<unknown>")
         );
     }
     Ok(())

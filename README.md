@@ -189,6 +189,7 @@ New files that remain ignored by a candidate's final `.gitignore` stay in its in
 ```text
 dispatch init [path] [--force]
 dispatch doctor [source] [--config path]
+dispatch recommend [source] (--task text | --task-file path)
 dispatch run [source] (--task text | --task-file path)
   [--harnesses codex,cursor] [--config path]
   [--backend local|docker] [--timeout seconds] [--max-parallel count]
@@ -223,6 +224,8 @@ Structured evaluation reasons are optional. Current canonical values are `correc
 `dispatch datasets import terminal-bench <path>` imports a completed Harbor job directory containing `config.json` and per-trial `<trial>/result.json` files. Dispatch caches those exact normalization inputs, keeps Harbor agent and model identities separate, and records Terminal-Bench morphology as unknown. No normal Dispatch command contacts Harbor or Terminal-Bench.
 
 The Router treats an unknown prior dimension as compatible fallback evidence for a known task, never as an exact wildcard. Conflicting known values are rejected, and an unknown task dimension cannot consume a known prior value. Specificity is the number of dimensions the prior establishes and matches. If several priors are compatible with one harness, Dispatch selects one by greater specificity, then attempts, then stable provenance identity; it does not sum unrelated benchmark sources.
+
+`dispatch recommend <source> --task <text>` classifies the local source and task, then displays compatible cached evidence without executing or detecting a harness. It considers the supported real adapters (`claude`, `codex`, and `cursor`) regardless of whether they are installed or customized in configuration; fake adapters are excluded. The command performs no network requests, leaves the source unchanged, and exits successfully with an explicit message when no compatible evidence exists.
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 
