@@ -827,7 +827,7 @@ fn dispatch_exclusion_pathspecs() -> [&'static str; 2] {
     ]
 }
 
-fn include_entry(entry: &DirEntry) -> bool {
+pub(crate) fn include_entry(entry: &DirEntry) -> bool {
     entry.depth() == 0 || !is_excluded_name(entry.file_name())
 }
 
