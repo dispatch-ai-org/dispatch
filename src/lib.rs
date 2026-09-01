@@ -1,4 +1,5 @@
 pub mod config;
+pub mod datasets;
 pub mod db;
 pub mod executor;
 pub mod harness;

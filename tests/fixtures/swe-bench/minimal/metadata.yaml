@@ -1,0 +1,9 @@
+info:
+  name: mini-SWE-agent + Claude 3.7 Sonnet
+tags:
+  agent: mini-SWE-agent
+  agent_org: SWE-agent
+  model:
+    - claude-3-7-sonnet-20250219
+  system:
+    attempts: 1

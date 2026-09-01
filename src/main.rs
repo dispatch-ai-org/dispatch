@@ -73,10 +73,28 @@ enum Command {
     Compare(CompareArgs),
     /// Safely apply one candidate to the original source.
     Apply { run_id: String, candidate: String },
+    /// Import public benchmark snapshots into the local evidence cache.
+    Datasets(DatasetsArgs),
     /// Review opt-in records; bare `dispatch sync` explicitly transmits queued data.
     Sync(SyncArgs),
     /// Print the Dispatch version.
     Version,
+}
+
+#[derive(Debug, Args)]
+struct DatasetsArgs {
+    #[command(subcommand)]
+    command: DatasetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DatasetCommand {
+    /// Import a local SWE-bench snapshot without network access.
+    Import {
+        #[arg(value_parser = ["swe-bench"])]
+        dataset: String,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -254,6 +272,25 @@ async fn run() -> Result<()> {
             orchestrator::compare(&state, &args.run_id, evaluation, args.evaluate)
         }
         Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
+        Command::Datasets(args) => match args.command {
+            DatasetCommand::Import { dataset: _, path } => {
+                let report = dispatch::datasets::import_swe_bench(&state, &path)?;
+                println!(
+                    "Imported {} {} for harness {} (model {})",
+                    report.prior.dataset,
+                    report.prior.dataset_version,
+                    report.prior.harness,
+                    report.prior.model.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "Observed {}/{} resolved tasks; cached raw snapshot at {}",
+                    report.prior.successes,
+                    report.prior.attempts,
+                    report.raw_snapshot_path.display()
+                );
+                Ok(())
+            }
+        },
         Command::Sync(args) => match args.command {
             Some(SyncCommand::Enable) => dispatch::sync::enable(&state),
             Some(SyncCommand::Disable) => dispatch::sync::disable(&state),

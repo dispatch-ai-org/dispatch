@@ -347,34 +347,34 @@ impl Database {
     }
 
     pub fn upsert_benchmark_prior(&self, prior: &BenchmarkPrior) -> Result<()> {
-        anyhow::ensure!(
-            prior.successes <= prior.attempts,
-            "benchmark prior successes cannot exceed attempts"
-        );
-        self.connection.execute(
-            r#"INSERT INTO benchmark_priors(
-                    source, dataset, dataset_version, harness, model, language,
-                    task_kind, scope, successes, attempts, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                ON CONFLICT DO UPDATE SET
-                    successes = excluded.successes,
-                    attempts = excluded.attempts,
-                    updated_at = excluded.updated_at"#,
+        insert_benchmark_prior(&self.connection, prior)
+    }
+
+    pub fn replace_benchmark_prior(&mut self, prior: &BenchmarkPrior) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            r#"DELETE FROM benchmark_priors
+               WHERE source = ?1
+                 AND dataset = ?2
+                 AND harness = ?3
+                 AND model IS ?4
+                 AND language IS ?5
+                 AND task_kind = ?6
+                 AND scope = ?7"#,
             params![
                 prior.source,
                 prior.dataset,
-                prior.dataset_version,
                 prior.harness,
                 prior.model,
                 prior.language,
                 prior.task_kind.as_str(),
                 prior.scope.as_str(),
-                unsigned(prior.successes, "benchmark prior successes")?,
-                unsigned(prior.attempts, "benchmark prior attempts")?,
-                timestamp(prior.updated_at),
             ],
         )?;
-        Ok(())
+        insert_benchmark_prior(&transaction, prior)?;
+        transaction
+            .commit()
+            .context("failed to replace benchmark prior")
     }
 
     pub fn matching_benchmark_priors(
@@ -1047,6 +1047,37 @@ fn path_text(path: &Path) -> String {
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn insert_benchmark_prior(connection: &Connection, prior: &BenchmarkPrior) -> Result<()> {
+    anyhow::ensure!(
+        prior.successes <= prior.attempts,
+        "benchmark prior successes cannot exceed attempts"
+    );
+    connection.execute(
+        r#"INSERT INTO benchmark_priors(
+                source, dataset, dataset_version, harness, model, language,
+                task_kind, scope, successes, attempts, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT DO UPDATE SET
+                successes = excluded.successes,
+                attempts = excluded.attempts,
+                updated_at = excluded.updated_at"#,
+        params![
+            prior.source,
+            prior.dataset,
+            prior.dataset_version,
+            prior.harness,
+            prior.model,
+            prior.language,
+            prior.task_kind.as_str(),
+            prior.scope.as_str(),
+            unsigned(prior.successes, "benchmark prior successes")?,
+            unsigned(prior.attempts, "benchmark prior attempts")?,
+            timestamp(prior.updated_at),
+        ],
+    )?;
+    Ok(())
 }
 
 fn timestamp_from_sql(column: usize, value: String) -> rusqlite::Result<DateTime<Utc>> {

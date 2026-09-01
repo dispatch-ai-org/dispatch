@@ -40,6 +40,7 @@ Dispatch treats automated checks and operational measurements as evidence. It do
 - Supports blind Candidate A/B comparison, candidate inspection, and A/B/Tie/Neither evaluation.
 - Stores optional structured reasons and unrestricted human explanations verbatim.
 - Persists normalized records in SQLite and large artifacts on the filesystem.
+- Explicitly imports local SWE-bench snapshots as cached experimental routing priors.
 - Leaves the original source unchanged through the evaluation flow; `dispatch apply` is explicit and rejects source drift.
 
 ## Install
@@ -201,6 +202,7 @@ dispatch compare <run-id> [--evaluate]
   [--winner A|B|tie|neither] [--reason value]...
   [--explanation text | --explanation-file path|-]
 dispatch apply <run-id> <candidate>
+dispatch datasets import swe-bench <path>
 dispatch sync enable|disable|status
 dispatch sync preview <run-id>
 dispatch sync token set <token>
@@ -212,6 +214,12 @@ dispatch version
 Run IDs may be abbreviated when the prefix is unique. `--state-dir` is global and `DISPATCH_HOME` provides the same override; the default state root is `~/.dispatch`.
 
 Structured evaluation reasons are optional. Current canonical values are `correctness`, `completeness`, `architecture`, `maintainability`, `readability`, `tests`, `edge-cases`, `cleaner-change`, `performance`, `cost`, `latency`, and `other`. Freeform explanations are unrestricted and stored verbatim.
+
+## Local benchmark priors
+
+`dispatch datasets import swe-bench <path>` explicitly imports a local SWE-bench Verified snapshot. The directory must contain `metadata.yaml`, `instances.jsonl`, and `results/results.json`. Dispatch preserves those exact files in its local dataset cache and stores only normalized aggregate evidence in SQLite for the experimental Router. Import and routing perform no benchmark network requests, and routing is not connected to `dispatch run`.
+
+The importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions. It does not translate an upstream agent into a Dispatch harness name. A prior is usable only when the upstream agent identity exactly matches an available harness.
 
 ## Optional evaluation sync
 
@@ -316,7 +324,7 @@ Stdout and stderr are capped at a marked 16 MiB head-and-tail capture per stream
 - Verification is only as meaningful as the project's configured commands.
 - Token accounting is harness-specific; no normalized cross-harness cost model exists.
 - Optional Cloud contribution is off by default and requires separate explicit consent plus a developer-preview ingestion token.
-- No intelligent router, automatic winner, bundled cloud service, web UI, or universal quality score exists.
+- Experimental success-ratio ranking is not connected to execution; no automatic routing, automatic winner, bundled cloud service, web UI, or universal quality score exists.
 - No cloud service is required for local use.
 
 ## Architecture and development

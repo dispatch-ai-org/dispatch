@@ -61,6 +61,9 @@ impl State {
     pub fn runs_dir(&self) -> PathBuf {
         self.root.join("runs")
     }
+    pub fn datasets_dir(&self) -> PathBuf {
+        self.root.join("datasets")
+    }
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(run_id)
     }
