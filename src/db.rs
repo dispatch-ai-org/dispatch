@@ -9,7 +9,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::models::{
-    CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord, RunRecord,
+    BenchmarkPrior, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
+    RunRecord, TaskFeatures,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -187,6 +188,39 @@ CREATE INDEX sync_outbox_status_idx ON sync_outbox(status);
         "cloud_ingestion_token",
         "ALTER TABLE sync_settings ADD COLUMN ingestion_token TEXT;",
     ),
+    (
+        6,
+        "benchmark_priors",
+        r#"
+CREATE TABLE benchmark_priors (
+    id                  INTEGER PRIMARY KEY,
+    source              TEXT NOT NULL,
+    dataset             TEXT NOT NULL,
+    dataset_version     TEXT NOT NULL,
+    harness             TEXT NOT NULL,
+    model               TEXT,
+    language            TEXT,
+    task_kind           TEXT NOT NULL CHECK (task_kind IN ('bug_fix', 'feature', 'refactor', 'tests', 'unknown')),
+    scope               TEXT NOT NULL CHECK (scope IN ('localized', 'multi_file', 'broad', 'unknown')),
+    successes           INTEGER NOT NULL CHECK (successes >= 0),
+    attempts            INTEGER NOT NULL CHECK (attempts >= 0 AND successes <= attempts),
+    updated_at          TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX benchmark_priors_identity_idx ON benchmark_priors(
+    source,
+    dataset,
+    dataset_version,
+    harness,
+    COALESCE(model, X''),
+    COALESCE(language, X''),
+    task_kind,
+    scope
+);
+CREATE INDEX benchmark_priors_lookup_idx
+    ON benchmark_priors(harness, language, task_kind, scope);
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -310,6 +344,80 @@ impl Database {
             transaction.commit()?;
         }
         Ok(())
+    }
+
+    pub fn upsert_benchmark_prior(&self, prior: &BenchmarkPrior) -> Result<()> {
+        anyhow::ensure!(
+            prior.successes <= prior.attempts,
+            "benchmark prior successes cannot exceed attempts"
+        );
+        self.connection.execute(
+            r#"INSERT INTO benchmark_priors(
+                    source, dataset, dataset_version, harness, model, language,
+                    task_kind, scope, successes, attempts, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT DO UPDATE SET
+                    successes = excluded.successes,
+                    attempts = excluded.attempts,
+                    updated_at = excluded.updated_at"#,
+            params![
+                prior.source,
+                prior.dataset,
+                prior.dataset_version,
+                prior.harness,
+                prior.model,
+                prior.language,
+                prior.task_kind.as_str(),
+                prior.scope.as_str(),
+                unsigned(prior.successes, "benchmark prior successes")?,
+                unsigned(prior.attempts, "benchmark prior attempts")?,
+                timestamp(prior.updated_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn matching_benchmark_priors(
+        &self,
+        features: &TaskFeatures,
+        harness: &str,
+    ) -> Result<Vec<BenchmarkPrior>> {
+        let mut statement = self.connection.prepare(
+            r#"SELECT source, dataset, dataset_version, harness, model, language,
+                      successes, attempts, updated_at
+               FROM benchmark_priors
+               WHERE harness = ?1
+                 AND language IS ?2
+                 AND task_kind = ?3
+                 AND scope = ?4
+               ORDER BY source, dataset, dataset_version, model"#,
+        )?;
+        let rows = statement.query_map(
+            params![
+                harness,
+                features.language,
+                features.task_kind.as_str(),
+                features.scope.as_str(),
+            ],
+            |row| {
+                let updated_at = timestamp_from_sql(8, row.get(8)?)?;
+                Ok(BenchmarkPrior {
+                    source: row.get(0)?,
+                    dataset: row.get(1)?,
+                    dataset_version: row.get(2)?,
+                    harness: row.get(3)?,
+                    model: row.get(4)?,
+                    language: row.get(5)?,
+                    task_kind: features.task_kind.clone(),
+                    scope: features.scope.clone(),
+                    successes: row.get(6)?,
+                    attempts: row.get(7)?,
+                    updated_at,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<_>>()
+            .context("failed to read matching benchmark priors")
     }
 
     /// Replace all structured state for a run in one transaction. Events are an
@@ -941,6 +1049,16 @@ fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+fn timestamp_from_sql(column: usize, value: String) -> rusqlite::Result<DateTime<Utc>> {
+    value.parse().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn unsigned(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} is too large for SQLite"))
 }
@@ -1052,7 +1170,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 5);
+        assert_eq!(database.schema_version()?, 6);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1071,6 +1189,7 @@ mod tests {
             "evaluation_reasons",
             "sync_settings",
             "sync_outbox",
+            "benchmark_priors",
         ] {
             let exists: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -1088,11 +1207,11 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 5);
+        assert_eq!(database.schema_version()?, 6);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 5);
+        assert_eq!(Database::open(&path)?.schema_version()?, 6);
         Ok(())
     }
 

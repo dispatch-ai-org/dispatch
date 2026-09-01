@@ -15,15 +15,17 @@ task
 → durable data
 ```
 
-Learned routing is a possible long-term result of that data. It is not a current feature. Do not present Dispatch as a router or let future routing concerns distort the local execution core.
+Learned and predictive routing are explicitly approved experimental feature areas. Keep early routing work local, evidence-based, and separate from execution; do not present public priors or experimental predictions as ground truth or let routing concerns distort the local execution core.
 
 ## Architectural ownership
 
-**Rust owns execution.** Rust owns the CLI, task/run orchestration, process supervision, harness adapters, source state, Git/worktrees/internal snapshots, execution backends, limits and timeouts, verification, diff and artifact capture, events, evaluation, SQLite/local persistence, and the explicit opt-in sync contract/outbox/client.
+**Rust owns execution.** Rust owns the CLI, task/run orchestration, process supervision, harness adapters, source state, Git/worktrees/internal snapshots, execution backends, limits and timeouts, verification, diff and artifact capture, events, evaluation, task features, locally cached priors and prediction, SQLite/local persistence, and the explicit opt-in sync contract/outbox/client.
 
-If explicitly requested later, **Go may own networked coordination and learning**: authentication, teams, server-side ingestion, aggregate statistics, training-data processing, and routing services. Do not implement Go or cloud services in this repository.
+If explicitly requested later, **Go may own networked coordination and learning**: authentication, teams, server-side ingestion, aggregate statistics, training-data processing, and server-side routing services. Do not implement Go or cloud services in this repository.
 
 Cloud must never be required to execute a normal local Dispatch run.
+
+Public benchmark evidence must be periodically ingested, normalized, and cached locally rather than fetched from a live service during normal runs. Preserve its provenance and treat it as an initial prior, not a quality label or ground truth.
 
 Evaluation upload is off by default and requires explicit user opt-in. A Cloud ingestion token is a separate submission permission: storing or possessing it never implies consent, and it must remain outside the envelope and preview. Source code, snapshots, full diffs, logs, local paths, environment data, and credentials are outside the v0.1.0 sync scope. Task text and human explanations are shared only after their inclusion has been clearly disclosed, and preview must serialize the exact payload used for upload.
 
@@ -99,7 +101,8 @@ Unless explicitly requested, do not add:
 - cloud services, authentication, billing, or team features;
 - Kubernetes, queues, Redis, or premature APIs/services;
 - generic plugin frameworks;
-- embeddings, ML, LLM judges, or automatic routing;
+- embeddings, ML frameworks, subjective LLM judges, or routing-driven execution beyond explicitly approved experiments;
+- automatic retries or speculative subtask orchestration;
 - synthetic or composite quality scores;
 - new execution backends or benchmark infrastructure.
 

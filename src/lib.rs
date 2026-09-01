@@ -4,6 +4,7 @@ pub mod executor;
 pub mod harness;
 pub mod models;
 pub mod orchestrator;
+pub mod router;
 pub mod source;
 pub mod state;
 pub mod sync;
