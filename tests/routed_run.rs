@@ -5,7 +5,10 @@ use std::{
 
 use assert_cmd::cargo_bin_cmd;
 use chrono::{TimeZone, Utc};
-use dispatch::{BenchmarkPrior, TaskKind, TaskScope, db::Database, source::fingerprint_tree};
+use dispatch::{
+    BenchmarkPrior, CandidateStatus, CheckStatus, TaskKind, TaskScope, db::Database,
+    source::fingerprint_tree,
+};
 use rusqlite::Connection;
 use serde_json::Value;
 
@@ -77,16 +80,33 @@ fn executable(path: &Path, marker: &Path) -> anyhow::Result<()> {
 }
 
 fn configure(source: &Path, cursor: &Path, codex: &Path, claude: &Path) -> anyhow::Result<()> {
+    configure_with_check(
+        source,
+        cursor,
+        codex,
+        claude,
+        Some("test -f cursor-routed.txt"),
+    )
+}
+
+fn configure_with_check(
+    source: &Path,
+    cursor: &Path,
+    codex: &Path,
+    claude: &Path,
+    check: Option<&str>,
+) -> anyhow::Result<()> {
+    let checks = check.map_or_else(
+        || "checks:\n  verify: []\n".to_owned(),
+        |check| format!("checks:\n  verify:\n    - {check}\n"),
+    );
     fs::write(
         source.join("dispatch.yml"),
         format!(
             r#"execution:
   timeout_secs: 2
   max_parallel: 3
-checks:
-  verify:
-    - test -f cursor-routed.txt
-harnesses:
+{checks}harnesses:
   claude:
     executable: "{}"
   codex:
@@ -244,8 +264,39 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
         serde_json::from_str::<Value>(&routing_json)?,
         metadata["routing"]
     );
+    drop(connection);
 
     let run_id = metadata["id"].as_str().unwrap();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let observation = database
+        .routing_observation_for_run(run_id)?
+        .expect("routed run records one observation");
+    assert_eq!(observation.run_id, run_id);
+    assert_eq!(observation.candidate_id, metadata["candidates"][0]["id"]);
+    assert_eq!(observation.prediction.selected_harness, "cursor");
+    assert_eq!(
+        observation.prediction.task_features.language.as_deref(),
+        Some("rust")
+    );
+    assert_eq!(observation.prediction.successes, 1);
+    assert_eq!(observation.prediction.attempts, 2);
+    assert_eq!(
+        observation.harness_version.as_deref(),
+        Some("cursor fixture 1.0")
+    );
+    assert_eq!(observation.model.as_deref(), Some("fixture-cursor"));
+    assert_eq!(observation.candidate_status, CandidateStatus::Completed);
+    assert_eq!(
+        observation.verification.as_ref().unwrap()[0],
+        CheckStatus::Passed
+    );
+    assert!(observation.human_evaluation.is_none());
+    let observation_json = serde_json::to_string(&observation)?;
+    assert!(!observation_json.contains(&source.display().to_string()));
+    assert!(!observation_json.contains("Fix the retry race in the worker."));
+    let observation_id = observation.id.clone();
+    drop(database);
+
     let shown = cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
@@ -258,7 +309,187 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
     let shown = String::from_utf8(shown)?;
     assert!(shown.contains("Routing\n"));
     assert!(shown.contains("selected: cursor"));
+    assert!(shown.contains("Routing observation"));
+    assert!(shown.contains("Process         completed"));
+    assert!(shown.contains("Verification    PASS"));
+    assert!(shown.contains("Human evaluation not recorded"));
     assert!(shown.contains("Candidate A"));
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["compare", run_id, "--winner", "A"])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let evaluated = database
+        .routing_observation_for_run(run_id)?
+        .expect("existing evaluation does not replace the observation");
+    assert_eq!(evaluated.id, observation_id);
+    assert!(evaluated.human_evaluation.is_none());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = source(temp.path());
+    let state = temp.path().join("state");
+    let marker = temp.path().join("cursor-invocations");
+    let cursor = temp.path().join("cursor-fixture");
+    let missing = temp.path().join("not-installed");
+    executable(&cursor, &marker)?;
+    configure_with_check(
+        &source,
+        &cursor,
+        &missing,
+        &missing,
+        Some("test -f deliberately-absent.txt"),
+    )?;
+    cache(
+        &state,
+        &[prior(
+            "harbor-framework/harbor",
+            "terminal-bench",
+            "2.0",
+            "cursor",
+            None,
+            None,
+            TaskKind::Unknown,
+            3,
+            4,
+        )],
+    )?;
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env(
+            "DISPATCH_CLOUD_URL",
+            "http://routing-must-not-contact.invalid",
+        )
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Fix the retry race.",
+            "--route",
+            "--allow-unsafe-local",
+        ])
+        .assert()
+        .success();
+
+    let (_, metadata) = only_metadata(&state)?;
+    let run_id = metadata["id"].as_str().unwrap();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let observation = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(observation.candidate_status, CandidateStatus::Completed);
+    assert_eq!(
+        observation.verification.as_ref().unwrap()[0],
+        CheckStatus::Failed
+    );
+    assert!(observation.human_evaluation.is_none());
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["show", run_id])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Verification    FAIL"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn routed_run_without_configured_verification_records_unknown() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = source(temp.path());
+    let state = temp.path().join("state");
+    let marker = temp.path().join("cursor-invocations");
+    let cursor = temp.path().join("cursor-fixture");
+    let missing = temp.path().join("not-installed");
+    executable(&cursor, &marker)?;
+    configure_with_check(&source, &cursor, &missing, &missing, None)?;
+    cache(
+        &state,
+        &[prior(
+            "harbor-framework/harbor",
+            "terminal-bench",
+            "2.0",
+            "cursor",
+            None,
+            None,
+            TaskKind::Unknown,
+            3,
+            4,
+        )],
+    )?;
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env(
+            "DISPATCH_CLOUD_URL",
+            "http://routing-must-not-contact.invalid",
+        )
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Fix the retry race.",
+            "--route",
+            "--allow-unsafe-local",
+        ])
+        .assert()
+        .success();
+
+    let (_, metadata) = only_metadata(&state)?;
+    let run_id = metadata["id"].as_str().unwrap();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let observation = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(observation.candidate_status, CandidateStatus::Completed);
+    assert!(observation.verification.is_none());
+    assert!(observation.human_evaluation.is_none());
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["show", run_id])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Verification    unknown"));
+    Ok(())
+}
+
+#[test]
+fn explicit_non_routed_run_creates_no_routing_observation() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source = source(temp.path());
+    let state = temp.path().join("state");
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Exercise the explicit workflow.",
+            "--harnesses",
+            "fake-good",
+        ])
+        .assert()
+        .success();
+
+    let (_, metadata) = only_metadata(&state)?;
+    let database = Database::open(state.join("dispatch.db"))?;
+    assert!(
+        database
+            .routing_observation_for_run(metadata["id"].as_str().unwrap())?
+            .is_none()
+    );
     Ok(())
 }
 

@@ -67,6 +67,23 @@ pub struct RoutingDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingObservation {
+    pub id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub prediction: RoutingDecision,
+    pub harness_version: Option<String>,
+    pub model: Option<String>,
+    pub candidate_status: CandidateStatus,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub verification: Option<Vec<CheckStatus>>,
+    pub human_evaluation: Option<EvaluationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchmarkPrior {
     pub source: String,
     pub dataset: String,
@@ -272,7 +289,7 @@ pub enum EvaluationOutcome {
     Neither,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvaluationRecord {
     pub outcome: EvaluationOutcome,
     #[serde(default)]

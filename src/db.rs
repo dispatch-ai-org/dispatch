@@ -9,8 +9,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::models::{
-    BenchmarkPrior, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
-    RunRecord, TaskFeatures,
+    BenchmarkPrior, CandidateRecord, CandidateStatus, CheckResult, EvaluationOutcome,
+    EvaluationRecord, EventRecord, RoutingObservation, RunRecord, TaskFeatures,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -225,6 +225,20 @@ CREATE INDEX benchmark_priors_lookup_idx
         7,
         "run_routing_decision",
         "ALTER TABLE runs ADD COLUMN routing_decision_json TEXT;",
+    ),
+    (
+        8,
+        "routing_observations",
+        r#"
+CREATE TABLE routing_observations (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    candidate_id        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    observation_json    TEXT NOT NULL
+);
+"#,
     ),
 ];
 
@@ -578,6 +592,7 @@ impl Database {
         if let Some(evaluation) = &run.evaluation {
             insert_evaluation(&transaction, &run.id, evaluation, false)?;
         }
+        sync_routing_observation(&transaction, run)?;
 
         transaction.commit().context("failed to commit run sync")
     }
@@ -605,6 +620,32 @@ impl Database {
         let transaction = self.connection.transaction()?;
         insert_evaluation(&transaction, run_id, evaluation, true)?;
         transaction.commit().context("failed to commit evaluation")
+    }
+
+    pub fn routing_observation(&self, id: &str) -> Result<Option<RoutingObservation>> {
+        self.read_routing_observation(
+            "SELECT observation_json FROM routing_observations WHERE id = ?1",
+            id,
+        )
+    }
+
+    pub fn routing_observation_for_run(&self, run_id: &str) -> Result<Option<RoutingObservation>> {
+        self.read_routing_observation(
+            "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
+            run_id,
+        )
+    }
+
+    fn read_routing_observation(
+        &self,
+        query: &str,
+        identity: &str,
+    ) -> Result<Option<RoutingObservation>> {
+        self.connection
+            .query_row(query, [identity], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(deserialize_routing_observation)
+            .transpose()
     }
 
     pub fn sync_settings(&self) -> Result<SyncSettings> {
@@ -984,6 +1025,90 @@ fn insert_artifact(
     Ok(())
 }
 
+fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> Result<()> {
+    let Some(prediction) = &run.routing else {
+        return Ok(());
+    };
+    let [candidate] = run.candidates.as_slice() else {
+        return Ok(());
+    };
+    if matches!(
+        candidate.status,
+        CandidateStatus::Preparing | CandidateStatus::Running | CandidateStatus::Verifying
+    ) {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        candidate.harness_id == prediction.selected_harness,
+        "routed run {} selected {} but recorded candidate {}",
+        run.id,
+        prediction.selected_harness,
+        candidate.harness_id
+    );
+
+    let id = format!("routing-observation-{}", run.id);
+    let now = Utc::now();
+    let created_at = transaction
+        .query_row(
+            "SELECT created_at FROM routing_observations WHERE run_id = ?1",
+            [&run.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| {
+            value
+                .parse()
+                .context("invalid routing observation timestamp")
+        })
+        .transpose()?
+        .unwrap_or(now);
+    let observation = RoutingObservation {
+        id: id.clone(),
+        run_id: run.id.clone(),
+        candidate_id: candidate.id.clone(),
+        created_at,
+        updated_at: now,
+        prediction: prediction.clone(),
+        harness_version: candidate.harness_version.clone(),
+        model: candidate.model.clone(),
+        candidate_status: candidate.status.clone(),
+        exit_code: candidate.exit_code,
+        timed_out: candidate.timed_out,
+        verification: (!candidate.checks.is_empty()).then(|| {
+            candidate
+                .checks
+                .iter()
+                .map(|check| check.status.clone())
+                .collect()
+        }),
+        human_evaluation: None,
+    };
+    let json =
+        serde_json::to_string(&observation).context("failed to serialize routing observation")?;
+    transaction.execute(
+        r#"INSERT INTO routing_observations(
+                id, run_id, candidate_id, created_at, updated_at, observation_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(run_id) DO UPDATE SET
+                candidate_id = excluded.candidate_id,
+                updated_at = excluded.updated_at,
+                observation_json = excluded.observation_json"#,
+        params![
+            id,
+            run.id,
+            candidate.id,
+            timestamp(observation.created_at),
+            timestamp(observation.updated_at),
+            json,
+        ],
+    )?;
+    Ok(())
+}
+
+fn deserialize_routing_observation(json: String) -> Result<RoutingObservation> {
+    serde_json::from_str(&json).context("failed to deserialize routing observation")
+}
+
 fn insert_evaluation(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1215,7 +1340,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 7);
+        assert_eq!(database.schema_version()?, 8);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1235,6 +1360,7 @@ mod tests {
             "sync_settings",
             "sync_outbox",
             "benchmark_priors",
+            "routing_observations",
         ] {
             let exists: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -1252,11 +1378,11 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 7);
+        assert_eq!(database.schema_version()?, 8);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 7);
+        assert_eq!(Database::open(&path)?.schema_version()?, 8);
         Ok(())
     }
 

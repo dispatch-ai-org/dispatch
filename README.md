@@ -42,6 +42,7 @@ Dispatch treats automated checks and operational measurements as evidence. It do
 - Persists normalized records in SQLite and large artifacts on the filesystem.
 - Explicitly imports local SWE-bench and Terminal-Bench/Harbor snapshots as cached experimental routing priors.
 - Can explicitly route one run to one locally runnable real harness while preserving the normal execution and verification path.
+- Records routed-run predictions, mechanical outcomes, and any later existing evaluation as separate durable local observations.
 - Leaves the original source unchanged through the evaluation flow; `dispatch apply` is explicit and rejects source drift.
 
 ## Install
@@ -240,6 +241,8 @@ The Router treats an unknown prior dimension as compatible fallback evidence for
 `dispatch recommend <source> --task <text>` classifies the local source and task, then displays compatible cached evidence without executing or detecting a harness. It considers the supported real adapters (`claude`, `codex`, and `cursor`) regardless of whether they are installed or customized in configuration; fake adapters are excluded. The command performs no network requests, leaves the source unchanged, and exits successfully with an explicit message when no compatible evidence exists.
 
 `dispatch run <source> --task <text> --route --allow-unsafe-local` uses the same classification and Router semantics, skips predicted adapters that are not locally executable under the effective configuration, and selects exactly one scored real adapter. The selected adapter then enters the same candidate, executor, verification, artifact, and cleanup path as an explicit one-harness run. No evidence, or no runnable predicted adapter, is a pre-execution error; Dispatch never substitutes an unscored harness. The task features and selected prior are stored separately from the resulting mechanical execution and any later human evaluation.
+
+Once a routed candidate reaches a terminal state, Dispatch records one local routing observation keyed to that run. It snapshots the prediction provenance, actual harness/model identity, process state, and configured verification statuses without turning any of them into a quality label. Missing verification and missing human evaluation remain unknown, and `dispatch show <run-id>` displays the observation. The existing blind Candidate/Tie/Neither comparison model is retained separately because it does not faithfully represent acceptance of a disclosed single routed candidate. These observations are not Router priors and are not included in Cloud sync.
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 

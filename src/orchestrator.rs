@@ -20,7 +20,7 @@ use ulid::Ulid;
 use crate::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
     EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingDecision,
-    RunRecord, RunStatus, VERSION,
+    RoutingObservation, RunRecord, RunStatus, VERSION,
     classifier::classify_task,
     db::Database,
     executor::{
@@ -1232,6 +1232,10 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
     let run = state.load_run(&resolved_run_id)?;
     let reveal = run.evaluation.is_some();
     print_run_header(&run, reveal);
+    let database = Database::open(state.db_path())?;
+    if let Some(observation) = database.routing_observation_for_run(&run.id)? {
+        print_routing_observation(&observation);
+    }
     println!("\nTask\n{}", run.task);
     println!("\nBaseline checks");
     print_checks(&run.baseline_checks);
@@ -1641,11 +1645,7 @@ fn print_diff_stats(candidate: &CandidateRecord) {
 }
 
 fn print_evaluation(evaluation: &EvaluationRecord) {
-    let outcome = match &evaluation.outcome {
-        EvaluationOutcome::Candidate(label) => format!("Candidate {label}"),
-        EvaluationOutcome::Tie => "Tie".into(),
-        EvaluationOutcome::Neither => "Neither".into(),
-    };
+    let outcome = evaluation_outcome(&evaluation.outcome);
     println!("\nEvaluation");
     println!("  Outcome         {outcome}");
     if !evaluation.reasons.is_empty() {
@@ -1653,6 +1653,48 @@ fn print_evaluation(evaluation: &EvaluationRecord) {
     }
     if let Some(explanation) = &evaluation.explanation {
         println!("  Explanation:\n{}", indent(explanation, "    "));
+    }
+}
+
+fn print_routing_observation(observation: &RoutingObservation) {
+    let verification = match observation.verification.as_deref() {
+        None => "unknown",
+        Some(checks) if checks.iter().all(|status| *status == CheckStatus::Passed) => "PASS",
+        Some(checks) if checks.contains(&CheckStatus::Failed) => "FAIL",
+        Some(checks) if checks.contains(&CheckStatus::TimedOut) => "TIMED_OUT",
+        Some(_) => "NOT_RUN",
+    };
+    let human = observation.human_evaluation.as_ref().map_or_else(
+        || "not recorded".into(),
+        |evaluation| evaluation_outcome(&evaluation.outcome),
+    );
+    println!("Routing observation");
+    println!("  ID              {}", observation.id);
+    println!(
+        "  Harness         {}",
+        observation.prediction.selected_harness
+    );
+    println!(
+        "  Harness version {}",
+        observation.harness_version.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  Model           {}",
+        observation.model.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  Process         {}",
+        observation.candidate_status.as_str()
+    );
+    println!("  Verification    {verification}");
+    println!("  Human evaluation {human}");
+}
+
+fn evaluation_outcome(outcome: &EvaluationOutcome) -> String {
+    match outcome {
+        EvaluationOutcome::Candidate(label) => format!("Candidate {label}"),
+        EvaluationOutcome::Tie => "Tie".into(),
+        EvaluationOutcome::Neither => "Neither".into(),
     }
 }
 
