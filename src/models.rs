@@ -67,6 +67,31 @@ pub struct RoutingDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingHumanOutcome {
+    Accepted,
+    Rejected,
+}
+
+impl RoutingHumanOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingHumanEvaluation {
+    pub outcome: RoutingHumanOutcome,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub explanation: Option<String>,
+    pub evaluated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingObservation {
     pub id: String,
     pub run_id: String,
@@ -80,7 +105,7 @@ pub struct RoutingObservation {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub verification: Option<Vec<CheckStatus>>,
-    pub human_evaluation: Option<EvaluationRecord>,
+    pub human_evaluation: Option<RoutingHumanEvaluation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

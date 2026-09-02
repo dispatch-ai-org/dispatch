@@ -6,8 +6,8 @@ use std::{
 use assert_cmd::cargo_bin_cmd;
 use chrono::{TimeZone, Utc};
 use dispatch::{
-    BenchmarkPrior, CandidateStatus, CheckStatus, TaskKind, TaskScope, db::Database,
-    source::fingerprint_tree,
+    BenchmarkPrior, CandidateStatus, CheckStatus, RoutingHumanOutcome, TaskKind, TaskScope,
+    db::Database, source::fingerprint_tree,
 };
 use rusqlite::Connection;
 use serde_json::Value;
@@ -327,6 +327,98 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
         .expect("existing evaluation does not replace the observation");
     assert_eq!(evaluated.id, observation_id);
     assert!(evaluated.human_evaluation.is_none());
+    let original_prediction = evaluated.prediction.clone();
+    let original_verification = evaluated.verification.clone();
+    drop(database);
+
+    let explanation_path = temp.path().join("routed-evaluation.txt");
+    let explanation = "Accepted after local review.\nKeep this verbatim.  \n";
+    fs::write(&explanation_path, explanation)?;
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env(
+            "DISPATCH_CLOUD_URL",
+            "http://routing-must-not-contact.invalid",
+        )
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .args(["--reason", "Correctness", "--reason", "tests"])
+        .arg("--explanation-file")
+        .arg(&explanation_path)
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let accepted = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(accepted.id, observation_id);
+    assert_eq!(accepted.prediction, original_prediction);
+    assert_eq!(accepted.verification, original_verification);
+    let human = accepted.human_evaluation.as_ref().unwrap();
+    assert_eq!(human.outcome, RoutingHumanOutcome::Accepted);
+    assert_eq!(human.reasons, ["correctness", "tests"]);
+    assert_eq!(human.explanation.as_deref(), Some(explanation));
+    let accepted_updated_at = accepted.updated_at;
+    let accepted_evaluated_at = human.evaluated_at;
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .args(["--reason", "correctness", "--reason", "tests"])
+        .arg("--explanation-file")
+        .arg(&explanation_path)
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let repeated = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(repeated.updated_at, accepted_updated_at);
+    assert_eq!(
+        repeated.human_evaluation.as_ref().unwrap().evaluated_at,
+        accepted_evaluated_at
+    );
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .args(["--reason", "cleaner-change"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "only valid for candidate comparison",
+        ));
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "reject"])
+        .args(["--reason", "correctness"])
+        .args(["--explanation", "Needs another revision."])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let rejected = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(rejected.id, observation_id);
+    assert_eq!(rejected.prediction, original_prediction);
+    assert_eq!(rejected.verification, original_verification);
+    assert_ne!(rejected.updated_at, accepted_updated_at);
+    let human = rejected.human_evaluation.unwrap();
+    assert_eq!(human.outcome, RoutingHumanOutcome::Rejected);
+    assert_eq!(human.reasons, ["correctness"]);
+    assert_eq!(
+        human.explanation.as_deref(),
+        Some("Needs another revision.")
+    );
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["show", run_id])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Human evaluation rejected"))
+        .stdout(predicates::str::contains("Reasons         correctness"));
     Ok(())
 }
 
@@ -390,6 +482,52 @@ fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Re
         CheckStatus::Failed
     );
     assert!(observation.human_evaluation.is_none());
+    let original_prediction = observation.prediction.clone();
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env(
+            "DISPATCH_CLOUD_URL",
+            "http://routing-must-not-contact.invalid",
+        )
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .args(["--reason", "tests"])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let accepted = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(accepted.prediction, original_prediction);
+    assert_eq!(accepted.candidate_status, CandidateStatus::Completed);
+    assert_eq!(
+        accepted.verification.as_ref().unwrap()[0],
+        CheckStatus::Failed
+    );
+    assert_eq!(
+        accepted.human_evaluation.unwrap().outcome,
+        RoutingHumanOutcome::Accepted
+    );
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "reject"])
+        .args(["--reason", "tests"])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let rejected = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(rejected.prediction, original_prediction);
+    assert_eq!(
+        rejected.verification.as_ref().unwrap()[0],
+        CheckStatus::Failed
+    );
+    assert_eq!(
+        rejected.human_evaluation.unwrap().outcome,
+        RoutingHumanOutcome::Rejected
+    );
 
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
@@ -452,6 +590,46 @@ fn routed_run_without_configured_verification_records_unknown() -> anyhow::Resul
     assert_eq!(observation.candidate_status, CandidateStatus::Completed);
     assert!(observation.verification.is_none());
     assert!(observation.human_evaluation.is_none());
+    let observation_id = observation.id;
+    let original_prediction = observation.prediction;
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env(
+            "DISPATCH_CLOUD_URL",
+            "http://routing-must-not-contact.invalid",
+        )
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let accepted = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(accepted.prediction, original_prediction);
+    assert!(accepted.verification.is_none());
+    assert_eq!(
+        accepted.human_evaluation.unwrap().outcome,
+        RoutingHumanOutcome::Accepted
+    );
+    drop(database);
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "reject"])
+        .assert()
+        .success();
+    let database = Database::open(state.join("dispatch.db"))?;
+    let rejected = database.routing_observation_for_run(run_id)?.unwrap();
+    assert_eq!(rejected.id, observation_id);
+    assert_eq!(rejected.prediction, original_prediction);
+    assert!(rejected.verification.is_none());
+    assert_eq!(
+        rejected.human_evaluation.unwrap().outcome,
+        RoutingHumanOutcome::Rejected
+    );
+    drop(database);
 
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
@@ -490,6 +668,16 @@ fn explicit_non_routed_run_creates_no_routing_observation() -> anyhow::Result<()
             .routing_observation_for_run(metadata["id"].as_str().unwrap())?
             .is_none()
     );
+    let run_id = metadata["id"].as_str().unwrap();
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["evaluate", run_id, "--outcome", "accept"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "This run was not predictively routed.\nUse `dispatch compare",
+        ));
     Ok(())
 }
 

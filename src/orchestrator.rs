@@ -20,7 +20,7 @@ use ulid::Ulid;
 use crate::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
     EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingDecision,
-    RoutingObservation, RunRecord, RunStatus, VERSION,
+    RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunRecord, RunStatus, VERSION,
     classifier::classify_task,
     db::Database,
     executor::{
@@ -67,6 +67,12 @@ pub struct RunRequest {
 #[derive(Default)]
 pub struct EvaluationInput {
     pub winner: Option<String>,
+    pub reasons: Vec<String>,
+    pub explanation: Option<String>,
+}
+
+pub struct RoutingEvaluationInput {
+    pub outcome: String,
     pub reasons: Vec<String>,
     pub explanation: Option<String>,
 }
@@ -1395,6 +1401,48 @@ pub fn compare(
     Ok(())
 }
 
+pub fn evaluate_routed(state: &State, run_id: &str, input: RoutingEvaluationInput) -> Result<()> {
+    let resolved_run_id = state.resolve_run_id(run_id)?;
+    let _run_lock = OperationLock::acquire(
+        &state.run_dir(&resolved_run_id).join(".operation.lock"),
+        "another compare/apply/evaluate operation is already using this run",
+    )?;
+    let run = state.load_run(&resolved_run_id)?;
+    if run.routing.is_none() || run.candidates.len() != 1 {
+        bail!(
+            "This run was not predictively routed.\nUse `dispatch compare <run-id> --evaluate` for candidate comparison."
+        );
+    }
+
+    let outcome = match input.outcome.as_str() {
+        "accept" => RoutingHumanOutcome::Accepted,
+        "reject" => RoutingHumanOutcome::Rejected,
+        _ => bail!("routed evaluation outcome must be accept or reject"),
+    };
+    let reasons = normalize_reasons(input.reasons)?;
+    anyhow::ensure!(
+        !reasons.iter().any(|reason| reason == "cleaner-change"),
+        "structured reason \"cleaner-change\" is only valid for candidate comparison"
+    );
+    let evaluation = RoutingHumanEvaluation {
+        outcome,
+        reasons,
+        explanation: input.explanation,
+        evaluated_at: Utc::now(),
+    };
+    let mut database = Database::open(state.db_path())?;
+    anyhow::ensure!(
+        database.routing_observation_for_run(&run.id)?.is_some(),
+        "routed run {} has no completed routing observation",
+        run.id
+    );
+    let observation = database.save_routing_human_evaluation(&run.id, &evaluation)?;
+
+    println!("Routing evaluation recorded.\n");
+    print_routing_observation(&observation);
+    Ok(())
+}
+
 pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     let _run_lock = OperationLock::acquire(
@@ -1664,10 +1712,10 @@ fn print_routing_observation(observation: &RoutingObservation) {
         Some(checks) if checks.contains(&CheckStatus::TimedOut) => "TIMED_OUT",
         Some(_) => "NOT_RUN",
     };
-    let human = observation.human_evaluation.as_ref().map_or_else(
-        || "not recorded".into(),
-        |evaluation| evaluation_outcome(&evaluation.outcome),
-    );
+    let human = observation
+        .human_evaluation
+        .as_ref()
+        .map_or("not recorded", |evaluation| evaluation.outcome.as_str());
     println!("Routing observation");
     println!("  ID              {}", observation.id);
     println!(
@@ -1688,6 +1736,14 @@ fn print_routing_observation(observation: &RoutingObservation) {
     );
     println!("  Verification    {verification}");
     println!("  Human evaluation {human}");
+    if let Some(evaluation) = &observation.human_evaluation {
+        if !evaluation.reasons.is_empty() {
+            println!("  Reasons         {}", evaluation.reasons.join(", "));
+        }
+        if let Some(explanation) = &evaluation.explanation {
+            println!("  Explanation:\n{}", indent(explanation, "    "));
+        }
+    }
 }
 
 fn evaluation_outcome(outcome: &EvaluationOutcome) -> String {

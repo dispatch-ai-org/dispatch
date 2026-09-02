@@ -10,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::models::{
     BenchmarkPrior, CandidateRecord, CandidateStatus, CheckResult, EvaluationOutcome,
-    EvaluationRecord, EventRecord, RoutingObservation, RunRecord, TaskFeatures,
+    EvaluationRecord, EventRecord, RoutingHumanEvaluation, RoutingObservation, RunRecord,
+    TaskFeatures,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -636,6 +637,45 @@ impl Database {
         )
     }
 
+    pub fn save_routing_human_evaluation(
+        &mut self,
+        run_id: &str,
+        evaluation: &RoutingHumanEvaluation,
+    ) -> Result<RoutingObservation> {
+        let transaction = self.connection.transaction()?;
+        let json = transaction
+            .query_row(
+                "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .with_context(|| format!("run {run_id} has no routing observation"))?;
+        let mut observation = deserialize_routing_observation(json)?;
+        if observation
+            .human_evaluation
+            .as_ref()
+            .is_some_and(|existing| same_routing_human_evaluation(existing, evaluation))
+        {
+            transaction.commit()?;
+            return Ok(observation);
+        }
+
+        observation.updated_at = evaluation.evaluated_at;
+        observation.human_evaluation = Some(evaluation.clone());
+        let json = serde_json::to_string(&observation)
+            .context("failed to serialize routing observation")?;
+        transaction.execute(
+            "UPDATE routing_observations SET updated_at = ?1, observation_json = ?2 \
+             WHERE run_id = ?3",
+            params![timestamp(observation.updated_at), json, run_id],
+        )?;
+        transaction
+            .commit()
+            .context("failed to commit routing evaluation")?;
+        Ok(observation)
+    }
+
     fn read_routing_observation(
         &self,
         query: &str,
@@ -1048,20 +1088,19 @@ fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> R
 
     let id = format!("routing-observation-{}", run.id);
     let now = Utc::now();
-    let created_at = transaction
+    let existing = transaction
         .query_row(
-            "SELECT created_at FROM routing_observations WHERE run_id = ?1",
+            "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
             [&run.id],
             |row| row.get::<_, String>(0),
         )
         .optional()?
-        .map(|value| {
-            value
-                .parse()
-                .context("invalid routing observation timestamp")
-        })
-        .transpose()?
-        .unwrap_or(now);
+        .map(deserialize_routing_observation)
+        .transpose()?;
+    let created_at = existing
+        .as_ref()
+        .map_or(now, |observation| observation.created_at);
+    let human_evaluation = existing.and_then(|observation| observation.human_evaluation);
     let observation = RoutingObservation {
         id: id.clone(),
         run_id: run.id.clone(),
@@ -1081,7 +1120,7 @@ fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> R
                 .map(|check| check.status.clone())
                 .collect()
         }),
-        human_evaluation: None,
+        human_evaluation,
     };
     let json =
         serde_json::to_string(&observation).context("failed to serialize routing observation")?;
@@ -1107,6 +1146,15 @@ fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> R
 
 fn deserialize_routing_observation(json: String) -> Result<RoutingObservation> {
     serde_json::from_str(&json).context("failed to deserialize routing observation")
+}
+
+fn same_routing_human_evaluation(
+    left: &RoutingHumanEvaluation,
+    right: &RoutingHumanEvaluation,
+) -> bool {
+    left.outcome == right.outcome
+        && left.reasons == right.reasons
+        && left.explanation == right.explanation
 }
 
 fn insert_evaluation(

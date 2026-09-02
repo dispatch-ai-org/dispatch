@@ -175,6 +175,17 @@ Interactive evaluation is available with `dispatch compare <run-id> --evaluate`.
 dispatch apply <run-id> B
 ```
 
+A predictively routed single-candidate result uses explicit acceptance feedback instead of blind comparison:
+
+```bash
+dispatch evaluate <run-id> \
+  --outcome accept \
+  --reason correctness \
+  --explanation "The routed result is ready to use."
+```
+
+Use `--outcome reject` when the disclosed result is not acceptable for the task. Repeating identical feedback is a no-op; submitting changed feedback replaces the routed human signal on the same observation. This does not alter the routing prediction or mechanical verification result.
+
 Optional Cloud contribution is also separate. After configuring the developer-preview ingestion token described below, the reviewed flow is:
 
 ```bash
@@ -215,6 +226,8 @@ dispatch inspect <run-id> <candidate> [--shell]
 dispatch compare <run-id> [--evaluate]
   [--winner A|B|tie|neither] [--reason value]...
   [--explanation text | --explanation-file path|-]
+dispatch evaluate <run-id> --outcome accept|reject [--reason value]...
+  [--explanation text | --explanation-file path|-]
 dispatch apply <run-id> <candidate>
 dispatch datasets import swe-bench <path>
 dispatch datasets import terminal-bench <path>
@@ -228,7 +241,7 @@ dispatch version
 
 Run IDs may be abbreviated when the prefix is unique. `--state-dir` is global and `DISPATCH_HOME` provides the same override; the default state root is `~/.dispatch`.
 
-Structured evaluation reasons are optional. Current canonical values are `correctness`, `completeness`, `architecture`, `maintainability`, `readability`, `tests`, `edge-cases`, `cleaner-change`, `performance`, `cost`, `latency`, and `other`. Freeform explanations are unrestricted and stored verbatim.
+Structured evaluation reasons are optional. Current canonical values are `correctness`, `completeness`, `architecture`, `maintainability`, `readability`, `tests`, `edge-cases`, `cleaner-change`, `performance`, `cost`, `latency`, and `other`. `cleaner-change` remains specific to candidate comparison and is not valid for routed acceptance feedback. Freeform explanations are unrestricted and stored verbatim.
 
 ## Local benchmark priors
 
@@ -242,7 +255,7 @@ The Router treats an unknown prior dimension as compatible fallback evidence for
 
 `dispatch run <source> --task <text> --route --allow-unsafe-local` uses the same classification and Router semantics, skips predicted adapters that are not locally executable under the effective configuration, and selects exactly one scored real adapter. The selected adapter then enters the same candidate, executor, verification, artifact, and cleanup path as an explicit one-harness run. No evidence, or no runnable predicted adapter, is a pre-execution error; Dispatch never substitutes an unscored harness. The task features and selected prior are stored separately from the resulting mechanical execution and any later human evaluation.
 
-Once a routed candidate reaches a terminal state, Dispatch records one local routing observation keyed to that run. It snapshots the prediction provenance, actual harness/model identity, process state, and configured verification statuses without turning any of them into a quality label. Missing verification and missing human evaluation remain unknown, and `dispatch show <run-id>` displays the observation. The existing blind Candidate/Tie/Neither comparison model is retained separately because it does not faithfully represent acceptance of a disclosed single routed candidate. These observations are not Router priors and are not included in Cloud sync.
+Once a routed candidate reaches a terminal state, Dispatch records one local routing observation keyed to that run. It snapshots the prediction provenance, actual harness/model identity, process state, and configured verification statuses without turning any of them into a quality label. Missing verification and missing human evaluation remain unknown, and `dispatch show <run-id>` displays the observation. `dispatch evaluate <run-id> --outcome accept|reject` records a separate human acceptance signal on that same observation; acceptance is never inferred from verification, and rejection never changes verification. The existing blind Candidate/Tie/Neither comparison model is retained separately because it does not faithfully represent acceptance of a disclosed single routed candidate. These observations and their human signals are not Router priors and are not included in Cloud sync.
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, TimeZone, Utc};
 use dispatch::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckResult, CheckStatus, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, RoutingDecision, RunRecord, RunStatus,
-    SourceKind, TaskFeatures, TaskKind, TaskScope, db::Database,
+    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, RoutingDecision,
+    RoutingHumanEvaluation, RoutingHumanOutcome, RunRecord, RunStatus, SourceKind, TaskFeatures,
+    TaskKind, TaskScope, db::Database,
 };
 
 fn at(second: u32) -> DateTime<Utc> {
@@ -143,6 +144,58 @@ fn routed_run_creates_one_idempotent_prediction_and_outcome_snapshot() -> anyhow
     assert_eq!(second.id, first.id);
     assert_eq!(second.created_at, first.created_at);
     assert_eq!(second.run_id, first.run_id);
+    Ok(())
+}
+
+#[test]
+fn routed_human_evaluation_updates_only_the_existing_observation() -> anyhow::Result<()> {
+    let mut database = Database::open_in_memory()?;
+    let run = run(
+        "run-human",
+        Some(decision()),
+        candidate(CandidateStatus::Completed, vec![check(CheckStatus::Passed)]),
+    );
+    database.sync_run(&run)?;
+    let before = database.routing_observation_for_run(&run.id)?.unwrap();
+
+    let accepted = RoutingHumanEvaluation {
+        outcome: RoutingHumanOutcome::Accepted,
+        reasons: vec!["correctness".into(), "tests".into()],
+        explanation: Some("The result is ready to use.".into()),
+        evaluated_at: at(5),
+    };
+    let first = database.save_routing_human_evaluation(&run.id, &accepted)?;
+    assert_eq!(first.id, before.id);
+    assert_eq!(first.created_at, before.created_at);
+    assert_eq!(first.updated_at, at(5));
+    assert_eq!(first.prediction, before.prediction);
+    assert_eq!(first.candidate_status, before.candidate_status);
+    assert_eq!(first.verification, before.verification);
+    assert_eq!(first.human_evaluation.as_ref(), Some(&accepted));
+
+    let repeated = database.save_routing_human_evaluation(
+        &run.id,
+        &RoutingHumanEvaluation {
+            evaluated_at: at(6),
+            ..accepted.clone()
+        },
+    )?;
+    assert_eq!(repeated, first);
+
+    let rejected = RoutingHumanEvaluation {
+        outcome: RoutingHumanOutcome::Rejected,
+        reasons: vec!["correctness".into()],
+        explanation: Some("The result needs more work.".into()),
+        evaluated_at: at(7),
+    };
+    let revised = database.save_routing_human_evaluation(&run.id, &rejected)?;
+    assert_eq!(revised.id, first.id);
+    assert_eq!(revised.created_at, first.created_at);
+    assert_eq!(revised.updated_at, at(7));
+    assert_eq!(revised.prediction, first.prediction);
+    assert_eq!(revised.candidate_status, first.candidate_status);
+    assert_eq!(revised.verification, first.verification);
+    assert_eq!(revised.human_evaluation.as_ref(), Some(&rejected));
     Ok(())
 }
 

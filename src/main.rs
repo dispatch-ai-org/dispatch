@@ -73,6 +73,8 @@ enum Command {
     },
     /// Compare blind candidates and optionally persist an evaluation.
     Compare(CompareArgs),
+    /// Record accept/reject feedback for one predictively routed result.
+    Evaluate(EvaluateArgs),
     /// Safely apply one candidate to the original source.
     Apply { run_id: String, candidate: String },
     /// Import public benchmark snapshots into the local evidence cache.
@@ -219,6 +221,27 @@ struct CompareArgs {
     evaluate: bool,
 }
 
+#[derive(Debug, Args)]
+struct EvaluateArgs {
+    run_id: String,
+
+    /// Whether the routed result was acceptable for the task.
+    #[arg(long, value_parser = ["accept", "reject"])]
+    outcome: String,
+
+    /// Optional structured reason; repeat the flag for multiple labels.
+    #[arg(long = "reason")]
+    reasons: Vec<String>,
+
+    /// Optional unrestricted explanation, stored verbatim.
+    #[arg(long, conflicts_with = "explanation_file")]
+    explanation: Option<String>,
+
+    /// Read unrestricted explanation verbatim from this path, or '-' for stdin.
+    #[arg(long, conflicts_with = "explanation")]
+    explanation_file: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -297,6 +320,17 @@ async fn run() -> Result<()> {
                 evaluation.explanation = Some(orchestrator::read_verbatim(&path)?);
             }
             orchestrator::compare(&state, &args.run_id, evaluation, args.evaluate)
+        }
+        Command::Evaluate(args) => {
+            let mut evaluation = orchestrator::RoutingEvaluationInput {
+                outcome: args.outcome,
+                reasons: args.reasons,
+                explanation: args.explanation,
+            };
+            if let Some(path) = args.explanation_file {
+                evaluation.explanation = Some(orchestrator::read_verbatim(&path)?);
+            }
+            orchestrator::evaluate_routed(&state, &args.run_id, evaluation)
         }
         Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
         Command::Datasets(args) => match args.command {
