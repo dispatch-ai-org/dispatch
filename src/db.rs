@@ -221,6 +221,11 @@ CREATE INDEX benchmark_priors_lookup_idx
     ON benchmark_priors(harness, language, task_kind, scope);
 "#,
     ),
+    (
+        7,
+        "run_routing_decision",
+        "ALTER TABLE runs ADD COLUMN routing_decision_json TEXT;",
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -423,6 +428,12 @@ impl Database {
     /// Replace all structured state for a run in one transaction. Events are an
     /// append-only log and are deliberately not replaced by this operation.
     pub fn sync_run(&mut self, run: &RunRecord) -> Result<()> {
+        let routing_decision_json = run
+            .routing
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed to serialize routing decision")?;
         let transaction = self.connection.transaction()?;
 
         let existing_source_id = transaction
@@ -469,10 +480,10 @@ impl Database {
                     created_at, completed_at, dispatch_version, os, architecture,
                     execution_backend, timeout_secs, cpus, memory, max_parallel,
                     docker_image, resource_limits_enforced, unsafe_local,
-                    forwarded_env_json, applied_candidate
+                    forwarded_env_json, applied_candidate, routing_decision_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     source_id = excluded.source_id,
@@ -495,7 +506,8 @@ impl Database {
                     resource_limits_enforced = excluded.resource_limits_enforced,
                     unsafe_local = excluded.unsafe_local,
                     forwarded_env_json = excluded.forwarded_env_json,
-                    applied_candidate = excluded.applied_candidate"#,
+                    applied_candidate = excluded.applied_candidate,
+                    routing_decision_json = excluded.routing_decision_json"#,
             params![
                 run.id,
                 source_id,
@@ -520,6 +532,7 @@ impl Database {
                 serde_json::to_string(&run.environment.forwarded_env)
                     .context("failed to serialize forwarded environment names")?,
                 run.applied_candidate,
+                routing_decision_json,
             ],
         )?;
 
@@ -1193,6 +1206,7 @@ mod tests {
                 candidate("cand-a", "A", "codex"),
                 candidate("cand-b", "B", "claude"),
             ],
+            routing: None,
             evaluation: None,
             applied_candidate: None,
         }
@@ -1201,7 +1215,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 6);
+        assert_eq!(database.schema_version()?, 7);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1238,11 +1252,11 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 6);
+        assert_eq!(database.schema_version()?, 7);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 6);
+        assert_eq!(Database::open(&path)?.schema_version()?, 7);
         Ok(())
     }
 

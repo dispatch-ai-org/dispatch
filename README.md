@@ -4,7 +4,7 @@
 
 Dispatch runs the same software task through multiple coding-agent harnesses against equivalent source states, captures comparable execution evidence, and lets the developer inspect and choose the result they prefer.
 
-Dispatch v0.1.1 does not route work automatically or decide which agent is best. It provides the local execution and evaluation layer that could make learned routing possible later.
+Dispatch v0.1.1 does not route work by default or decide which agent is best. An explicit experimental `--route` mode can select one locally runnable harness from cached benchmark evidence; ordinary runs still use the harnesses the developer names.
 
 Runs and evaluations are stored locally. Nothing is uploaded to Dispatch Cloud unless the user enables evaluation sync and then explicitly runs `dispatch sync`.
 
@@ -41,6 +41,7 @@ Dispatch treats automated checks and operational measurements as evidence. It do
 - Stores optional structured reasons and unrestricted human explanations verbatim.
 - Persists normalized records in SQLite and large artifacts on the filesystem.
 - Explicitly imports local SWE-bench and Terminal-Bench/Harbor snapshots as cached experimental routing priors.
+- Can explicitly route one run to one locally runnable real harness while preserving the normal execution and verification path.
 - Leaves the original source unchanged through the evaluation flow; `dispatch apply` is explicit and rejects source drift.
 
 ## Install
@@ -136,6 +137,17 @@ dispatch run ./my-project \
   --allow-unsafe-local
 ```
 
+To opt into a single-harness routed run using only locally cached evidence:
+
+```bash
+dispatch run ./my-project \
+  --task "Fix the retry race in the worker." \
+  --route \
+  --allow-unsafe-local
+```
+
+`--route` and `--harnesses` are mutually exclusive. Routed execution is local-only in v0.1.1 because Dispatch must establish executable availability before selecting a harness.
+
 Review the resulting run without submitting an evaluation:
 
 ```bash
@@ -191,7 +203,7 @@ dispatch init [path] [--force]
 dispatch doctor [source] [--config path]
 dispatch recommend [source] (--task text | --task-file path)
 dispatch run [source] (--task text | --task-file path)
-  [--harnesses codex,cursor] [--config path]
+  [--harnesses codex,cursor | --route] [--config path]
   [--backend local|docker] [--timeout seconds] [--max-parallel count]
   [--allow-unsafe-local] [--allow-forwarded-env]
 dispatch status [run-id]
@@ -219,13 +231,15 @@ Structured evaluation reasons are optional. Current canonical values are `correc
 
 ## Local benchmark priors
 
-`dispatch datasets import swe-bench <path>` explicitly imports a local SWE-bench Verified snapshot. The directory must contain `metadata.yaml`, `instances.jsonl`, and `results/results.json`. Dispatch preserves those exact files in its local dataset cache and stores only normalized aggregate evidence in SQLite for the experimental Router. Import and routing perform no benchmark network requests, and routing is not connected to `dispatch run`.
+`dispatch datasets import swe-bench <path>` explicitly imports a local SWE-bench Verified snapshot. The directory must contain `metadata.yaml`, `instances.jsonl`, and `results/results.json`. Dispatch preserves those exact files in its local dataset cache and stores only normalized aggregate evidence in SQLite for the experimental Router. Import and routing perform no benchmark network requests.
 
 `dispatch datasets import terminal-bench <path>` imports a completed Harbor job directory containing `config.json` and per-trial `<trial>/result.json` files. Dispatch caches those exact normalization inputs, keeps Harbor agent and model identities separate, and records Terminal-Bench morphology as unknown. No normal Dispatch command contacts Harbor or Terminal-Bench.
 
 The Router treats an unknown prior dimension as compatible fallback evidence for a known task, never as an exact wildcard. Conflicting known values are rejected, and an unknown task dimension cannot consume a known prior value. Specificity is the number of dimensions the prior establishes and matches. If several priors are compatible with one harness, Dispatch selects one by greater specificity, then attempts, then stable provenance identity; it does not sum unrelated benchmark sources.
 
 `dispatch recommend <source> --task <text>` classifies the local source and task, then displays compatible cached evidence without executing or detecting a harness. It considers the supported real adapters (`claude`, `codex`, and `cursor`) regardless of whether they are installed or customized in configuration; fake adapters are excluded. The command performs no network requests, leaves the source unchanged, and exits successfully with an explicit message when no compatible evidence exists.
+
+`dispatch run <source> --task <text> --route --allow-unsafe-local` uses the same classification and Router semantics, skips predicted adapters that are not locally executable under the effective configuration, and selects exactly one scored real adapter. The selected adapter then enters the same candidate, executor, verification, artifact, and cleanup path as an explicit one-harness run. No evidence, or no runnable predicted adapter, is a pre-execution error; Dispatch never substitutes an unscored harness. The task features and selected prior are stored separately from the resulting mechanical execution and any later human evaluation.
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 
@@ -332,7 +346,7 @@ Stdout and stderr are capped at a marked 16 MiB head-and-tail capture per stream
 - Verification is only as meaningful as the project's configured commands.
 - Token accounting is harness-specific; no normalized cross-harness cost model exists.
 - Optional Cloud contribution is off by default and requires separate explicit consent plus a developer-preview ingestion token.
-- Experimental success-ratio ranking is not connected to execution; no automatic routing, automatic winner, bundled cloud service, web UI, or universal quality score exists.
+- Experimental success-ratio ranking affects execution only when a developer explicitly supplies `--route`; no default routing, retry/escalation, automatic winner, bundled cloud service, web UI, or universal quality score exists.
 - No cloud service is required for local use.
 
 ## Architecture and development

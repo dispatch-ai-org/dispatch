@@ -144,8 +144,12 @@ struct RunArgs {
     task_input: TaskInput,
 
     /// Comma-separated adapter IDs. Fakes make the complete workflow testable offline.
-    #[arg(long, value_delimiter = ',', default_value = "fake-good,fake-bad")]
-    harnesses: Vec<String>,
+    #[arg(long, value_delimiter = ',', conflicts_with = "route")]
+    harnesses: Option<Vec<String>>,
+
+    /// Select one locally runnable real harness using cached routing evidence.
+    #[arg(long, conflicts_with = "harnesses")]
+    route: bool,
 
     #[arg(long)]
     config: Option<PathBuf>,
@@ -246,7 +250,14 @@ async fn run() -> Result<()> {
             let request = orchestrator::RunRequest {
                 source: args.source,
                 task,
-                harnesses: args.harnesses,
+                harnesses: args.harnesses.unwrap_or_else(|| {
+                    if args.route {
+                        Vec::new()
+                    } else {
+                        vec!["fake-good".into(), "fake-bad".into()]
+                    }
+                }),
+                route: args.route,
                 config_path: args.config,
                 backend: args.backend,
                 timeout_secs: args.timeout,

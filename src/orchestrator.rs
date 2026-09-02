@@ -19,8 +19,8 @@ use ulid::Ulid;
 
 use crate::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RunRecord, RunStatus,
-    VERSION,
+    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingDecision,
+    RunRecord, RunStatus, VERSION,
     classifier::classify_task,
     db::Database,
     executor::{
@@ -55,6 +55,7 @@ pub struct RunRequest {
     pub source: PathBuf,
     pub task: String,
     pub harnesses: Vec<String>,
+    pub route: bool,
     pub config_path: Option<PathBuf>,
     pub backend: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -266,11 +267,7 @@ pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
     let features = classify_task(&source_path, task)?;
     state.initialize()?;
     let database = Database::open(state.db_path())?;
-    let supported_real_harnesses = SUPPORTED_HARNESSES
-        .iter()
-        .filter(|harness| !harness.starts_with("fake-"))
-        .map(|harness| (*harness).to_owned())
-        .collect::<Vec<_>>();
+    let supported_real_harnesses = supported_real_harnesses();
     let ranked = rank_harnesses(&database, &features, &supported_real_harnesses)?;
 
     println!("Task");
@@ -296,11 +293,7 @@ pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
             .evidence
             .as_ref()
             .expect("recommendations contain evidence");
-        let specificity = match evidence.specificity {
-            0 => "generic",
-            3 => "exact",
-            _ => "partial",
-        };
+        let specificity = specificity_label(evidence.specificity);
         println!("\n{}. {}", index + 1, prediction.harness);
         println!(
             "   benchmark success: {}/{} ({:.1}%)",
@@ -321,6 +314,95 @@ pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn supported_real_harnesses() -> Vec<String> {
+    SUPPORTED_HARNESSES
+        .iter()
+        .filter(|harness| !harness.starts_with("fake-"))
+        .map(|harness| (*harness).to_owned())
+        .collect()
+}
+
+async fn select_routed_harness(
+    state: &State,
+    source_path: &Path,
+    task: &str,
+    config: &Config,
+) -> Result<RoutingDecision> {
+    anyhow::ensure!(
+        config.execution.backend == "local",
+        "--route requires the local backend so harness execution eligibility can be established; use --harnesses for Docker execution"
+    );
+    let features = classify_task(source_path, task)?;
+    state.initialize()?;
+    let database = Database::open(state.db_path())?;
+    let ranked = rank_harnesses(&database, &features, &supported_real_harnesses())?;
+    let mut has_compatible_evidence = false;
+
+    for prediction in ranked {
+        let Some(evidence) = prediction.evidence else {
+            continue;
+        };
+        has_compatible_evidence = true;
+        let adapter = adapter_for(&prediction.harness, &config.harnesses)?;
+        if !adapter.detect().await.available {
+            continue;
+        }
+        return Ok(RoutingDecision {
+            version: 1,
+            task_features: features,
+            selected_harness: prediction.harness,
+            successes: prediction.successes,
+            attempts: prediction.attempts,
+            specificity: evidence.specificity,
+            source: evidence.prior.source,
+            dataset: evidence.prior.dataset,
+            dataset_version: evidence.prior.dataset_version,
+            model: evidence.prior.model,
+        });
+    }
+
+    if !has_compatible_evidence {
+        bail!(
+            "No compatible routing evidence is available.\nUse --harnesses to select harnesses explicitly."
+        );
+    }
+    bail!(
+        "Compatible routing evidence is available, but no predicted harness is execution-eligible locally.\nUse --harnesses to select harnesses explicitly."
+    )
+}
+
+fn specificity_label(specificity: u8) -> &'static str {
+    match specificity {
+        0 => "generic",
+        3 => "exact",
+        _ => "partial",
+    }
+}
+
+fn print_routing_decision(decision: &RoutingDecision) {
+    println!("Routing");
+    println!("  selected: {}", decision.selected_harness);
+    println!(
+        "  benchmark success: {}/{} ({:.1}%)",
+        decision.successes,
+        decision.attempts,
+        decision.successes as f64 / decision.attempts as f64 * 100.0
+    );
+    println!(
+        "  evidence specificity: {}/3 ({})",
+        decision.specificity,
+        specificity_label(decision.specificity)
+    );
+    println!("  source: {}", decision.source);
+    println!("  dataset: {}", decision.dataset);
+    println!("  dataset version: {}", decision.dataset_version);
+    println!(
+        "  model: {}",
+        decision.model.as_deref().unwrap_or("<unknown>")
+    );
+    println!();
 }
 
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
@@ -349,12 +431,20 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         names = config.execution.forwarded_env.join(", ")
     );
 
-    let mut harnesses = request
-        .harnesses
-        .into_iter()
-        .map(|id| id.trim().to_lowercase())
-        .filter(|id| !id.is_empty())
-        .collect::<Vec<_>>();
+    let (mut harnesses, routing) = if request.route {
+        let decision = select_routed_harness(state, &source_path, &request.task, &config).await?;
+        (vec![decision.selected_harness.clone()], Some(decision))
+    } else {
+        (
+            request
+                .harnesses
+                .into_iter()
+                .map(|id| id.trim().to_lowercase())
+                .filter(|id| !id.is_empty())
+                .collect::<Vec<_>>(),
+            None,
+        )
+    };
     anyhow::ensure!(!harnesses.is_empty(), "at least one harness is required");
     let mut seen = HashSet::new();
     for harness_id in &harnesses {
@@ -378,6 +468,10 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         harnesses.len() <= 702,
         "at most 702 candidates are supported in v0"
     );
+
+    if let Some(decision) = &routing {
+        print_routing_decision(decision);
+    }
 
     state.initialize()?;
     let mut db = Database::open(state.db_path())?;
@@ -441,6 +535,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         },
         baseline_checks: Vec::new(),
         candidates: Vec::new(),
+        routing,
         evaluation: None,
         applied_candidate: None,
     };
@@ -1466,6 +1561,10 @@ fn print_run_header(run: &RunRecord, reveal: bool) {
         println!("Harness mapping  revealed");
     } else {
         println!("Harness mapping  blind");
+    }
+    if let Some(decision) = &run.routing {
+        println!();
+        print_routing_decision(decision);
     }
 }
 

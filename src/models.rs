@@ -53,6 +53,20 @@ pub struct TaskFeatures {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingDecision {
+    pub version: u32,
+    pub task_features: TaskFeatures,
+    pub selected_harness: String,
+    pub successes: u64,
+    pub attempts: u64,
+    pub specificity: u8,
+    pub source: String,
+    pub dataset: String,
+    pub dataset_version: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchmarkPrior {
     pub source: String,
     pub dataset: String,
@@ -244,6 +258,8 @@ pub struct RunRecord {
     pub baseline_checks: Vec<CheckResult>,
     #[serde(default)]
     pub candidates: Vec<CandidateRecord>,
+    #[serde(default)]
+    pub routing: Option<RoutingDecision>,
     pub evaluation: Option<EvaluationRecord>,
     pub applied_candidate: Option<String>,
 }

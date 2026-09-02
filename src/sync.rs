@@ -678,6 +678,7 @@ mod tests {
                 candidate("candidate-a", "A", "cursor", Some(20_892)),
                 candidate("candidate-b", "B", "codex", None),
             ],
+            routing: None,
             evaluation: Some(EvaluationRecord {
                 outcome: EvaluationOutcome::Candidate("B".into()),
                 reasons: vec!["correctness".into(), "cleaner-change".into()],

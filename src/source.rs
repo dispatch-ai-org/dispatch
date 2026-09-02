@@ -1202,6 +1202,7 @@ mod tests {
             },
             baseline_checks: Vec::new(),
             candidates: vec![candidate],
+            routing: None,
             evaluation: None,
             applied_candidate: None,
         }
