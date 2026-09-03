@@ -109,14 +109,19 @@ struct SyncArgs {
 
 #[derive(Debug, Subcommand)]
 enum SyncCommand {
-    /// Record consent and queue eligible evaluations locally; does not upload.
+    /// Record current contribution consent and queue eligible records; does not upload.
     Enable,
-    /// Disable all evaluation uploads.
+    /// Disable all contribution uploads.
     Disable,
     /// Show consent and outbox state without contacting the cloud.
     Status,
     /// Print the exact eligible upload body without transmitting; requires consent.
-    Preview { run_id: String },
+    Preview {
+        run_id: String,
+        /// Select a record when the run has both evaluation and routing data.
+        #[arg(long = "type", value_parser = ["evaluation", "routing-observation"])]
+        record_type: Option<String>,
+    },
     /// Manage the developer-preview Dispatch Cloud ingestion token.
     Token(SyncTokenArgs),
 }
@@ -360,7 +365,10 @@ async fn run() -> Result<()> {
             Some(SyncCommand::Enable) => dispatch::sync::enable(&state),
             Some(SyncCommand::Disable) => dispatch::sync::disable(&state),
             Some(SyncCommand::Status) => dispatch::sync::status(&state),
-            Some(SyncCommand::Preview { run_id }) => dispatch::sync::preview(&state, &run_id),
+            Some(SyncCommand::Preview {
+                run_id,
+                record_type,
+            }) => dispatch::sync::preview(&state, &run_id, record_type.as_deref()),
             Some(SyncCommand::Token(args)) => match args.command {
                 SyncTokenCommand::Set { token } => dispatch::sync::token_set(&state, &token),
                 SyncTokenCommand::Status => dispatch::sync::token_status(&state),

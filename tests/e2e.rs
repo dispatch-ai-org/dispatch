@@ -259,10 +259,10 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
         .assert()
         .success()
         .get_output()
-        .stdout
         .clone();
-    assert!(!String::from_utf8_lossy(&preview).contains(token));
-    let preview: Value = serde_json::from_slice(&preview).unwrap();
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("Record type: evaluation-v1"));
+    assert!(!String::from_utf8_lossy(&preview.stdout).contains(token));
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(preview["schema_version"], 1);
     assert_eq!(preview["run"]["run_id"], run_id);
     cargo_bin_cmd!("dispatch")

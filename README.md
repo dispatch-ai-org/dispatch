@@ -6,7 +6,7 @@ Dispatch runs the same software task through multiple coding-agent harnesses aga
 
 Dispatch v0.1.1 does not route work by default or decide which agent is best. An explicit experimental `--route` mode can select one locally runnable harness from cached benchmark evidence; ordinary runs still use the harnesses the developer names.
 
-Runs and evaluations are stored locally. Nothing is uploaded to Dispatch Cloud unless the user enables evaluation sync and then explicitly runs `dispatch sync`.
+Runs, evaluations, and routing observations are stored locally. Nothing is uploaded to Dispatch Cloud unless the user accepts the applicable contribution scope and then explicitly runs `dispatch sync`.
 
 ## Why Dispatch exists
 
@@ -190,7 +190,7 @@ Optional Cloud contribution is also separate. After configuring the developer-pr
 
 ```bash
 dispatch sync enable
-dispatch sync preview <run-id>
+dispatch sync preview <run-id> [--type evaluation|routing-observation]
 dispatch sync
 ```
 
@@ -232,7 +232,7 @@ dispatch apply <run-id> <candidate>
 dispatch datasets import swe-bench <path>
 dispatch datasets import terminal-bench <path>
 dispatch sync enable|disable|status
-dispatch sync preview <run-id>
+dispatch sync preview <run-id> [--type evaluation|routing-observation]
 dispatch sync token set <token>
 dispatch sync token status|clear
 dispatch sync
@@ -259,9 +259,9 @@ Once a routed candidate reaches a terminal state, Dispatch records one local rou
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 
-## Optional evaluation sync
+## Optional contribution sync
 
-Evaluation upload is off by default. Normal local startup, `doctor`, runs, comparison, evaluation, history, and apply do not contact Dispatch Cloud.
+Uploads are off by default. Normal local startup, `doctor`, runs, recommendation, comparison, routed evaluation, history, and apply do not contact Dispatch Cloud.
 
 Early developer-preview ingestion requires a server-issued token. Configure that separate submission permission locally with `dispatch sync token set <server-issued-token>`; storing a token does not enable sharing.
 
@@ -269,11 +269,13 @@ The consent, review, and transmission sequence is exactly:
 
 ```bash
 dispatch sync enable
-dispatch sync preview <run-id>
+dispatch sync preview <run-id> [--type evaluation|routing-observation]
 dispatch sync
 ```
 
-`dispatch sync enable` records consent locally, creates or preserves the contributor identity, and prepares eligible historical evaluations in the local outbox. It does not upload data. `dispatch sync preview <run-id>` requires consent and prints the exact eligible HTTP body without transmitting it. Bare `dispatch sync` is the explicit transmission step for pending and failed records.
+`dispatch sync enable` records the current versioned consent locally, creates or preserves the contributor identity, and prepares eligible historical evaluations and routing observations in the same local outbox. It does not upload data. Consent version 1 authorizes only `evaluation-v1`; existing version-1 users retain evaluation sync but routing observations remain ineligible until they explicitly run `sync enable` again to accept version 2 and `routing-observation-v1`.
+
+`dispatch sync preview <run-id>` requires the applicable consent and prints the exact eligible HTTP body to stdout without transmitting it; the record type is identified separately. If a routed run also has a blind evaluation, select the body explicitly with `--type evaluation` or `--type routing-observation`. Bare `dispatch sync` is the only transmission step for pending and retryable failed records.
 
 The contributor identity is a random local ULID that is not derived from an account, machine, path, or hardware data.
 
@@ -281,13 +283,15 @@ The token is a lightweight submission permission, not an account, identity, or p
 
 Token possession and sharing consent are independent. Configuring a token never enables uploads, and enabling sync without a token cannot upload. Local execution and evaluation never require either one.
 
-Opt-in sync shares the exact task description; Dispatch, OS, architecture, and backend metadata; harness/version/model identity; execution, usage, diff-count, and verification results; and the human outcome, structured reasons, and freeform explanation. This is contributed evaluation data, not generic or anonymous telemetry. Task text and explanations may contain proprietary context, so inspect the exact versioned HTTP body with `sync preview` before uploading. The ingestion token is an HTTP header and never appears in that body.
+`evaluation-v1` shares the exact task description; Dispatch, OS, architecture, and backend metadata; harness/version/model identity; execution, usage, diff-count, and verification results; and the blind human outcome, structured reasons, and freeform explanation. `routing-observation-v1` separately shares task morphology, the prediction snapshot and benchmark provenance, actual harness/model identity, mechanical outcome, and optional routed accept/reject feedback. Routed human explanations are uploaded verbatim when present. This is contributed data, not anonymous telemetry; task text and explanations may contain proprietary context. The ingestion token is an HTTP header and never appears in either body.
 
-The v1 payload excludes source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Richer source or diff sharing is not a v0.1.1 consent scope. The public contract is [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json).
+Both V1 payloads exclude source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Routing observations additionally exclude task text. Richer source or diff sharing is not a v0.1.1 consent scope. The public contracts are [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json) and [`schemas/routing-observation-v1.json`](schemas/routing-observation-v1.json).
 
 The default Cloud base URL is `https://api.rundispatch.sh`. `DISPATCH_CLOUD_URL` preserves the development/testing override, and plain HTTP is accepted only for loopback testing. The SQLite outbox retains failed uploads for explicit retry; local evaluation never depends on network success.
 
-The client uses the system `curl` with bounded timeouts to `POST /v1/evaluations`, sending `Authorization: Bearer <token>` and the stable evaluation ID as `Idempotency-Key`. Only HTTP 2xx responses mark an outbox record synced. Missing or rejected tokens leave the local evaluation unchanged and the outbox retryable.
+The client uses the system `curl` with bounded timeouts. Evaluation records go to `POST /v1/evaluations`; routing records go to `POST /v1/routing-observations`. Both send `Authorization: Bearer <token>` and the stable record ID as `Idempotency-Key`. HTTP 201 and idempotent HTTP 200 responses mark a record synced. Transient failures remain retryable; `422 idempotency_conflict` remains locally visible as a durable conflict and is not treated as synced.
+
+Before its first successful upload, a pending or failed routing payload is refreshed from the current local observation during explicit preview or sync preparation, so newly added human feedback is not silently omitted. A local human-evaluation change invalidates an earlier preview, so preview again after changing it. After a routing observation is synced, later local feedback remains local: Dispatch refuses to mutate or resend the immutable Cloud record under the same observation ID.
 
 ## Configuration
 
@@ -361,7 +365,7 @@ Stdout and stderr are capped at a marked 16 MiB head-and-tail capture per stream
 - Local real-harness execution requires explicit unsafe acknowledgement.
 - Verification is only as meaningful as the project's configured commands.
 - Token accounting is harness-specific; no normalized cross-harness cost model exists.
-- Optional Cloud contribution is off by default and requires separate explicit consent plus a developer-preview ingestion token.
+- Optional Cloud contribution is off by default and requires explicit versioned scope consent plus a developer-preview ingestion token; only bare `dispatch sync` transmits.
 - Experimental success-ratio ranking affects execution only when a developer explicitly supplies `--route`; no default routing, retry/escalation, automatic winner, bundled cloud service, web UI, or universal quality score exists.
 - No cloud service is required for local use.
 

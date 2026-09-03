@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dispatch.dev/schemas/routing-observation-v1.json",
+  "title": "Dispatch RoutingObservationV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "observation_id",
+    "run_id",
+    "contributor_id",
+    "consent",
+    "created_at",
+    "updated_at",
+    "prediction",
+    "actual_harness",
+    "mechanical_outcome",
+    "human_evaluation"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "observation_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "contributor_id": { "type": "string" },
+    "consent": { "$ref": "#/$defs/consent" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "prediction": { "$ref": "#/$defs/prediction" },
+    "actual_harness": { "$ref": "#/$defs/actual_harness" },
+    "mechanical_outcome": { "$ref": "#/$defs/mechanical_outcome" },
+    "human_evaluation": {
+      "anyOf": [
+        { "$ref": "#/$defs/human_evaluation" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "$defs": {
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "enabled_at"],
+      "properties": {
+        "scope": { "const": "routing-observation-v1" },
+        "enabled_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "prediction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "task_features",
+        "selected_harness",
+        "successes",
+        "attempts",
+        "specificity",
+        "source",
+        "dataset",
+        "dataset_version",
+        "model"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "task_features": { "$ref": "#/$defs/task_features" },
+        "selected_harness": { "type": "string" },
+        "successes": { "type": "integer", "minimum": 0 },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "specificity": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "source": { "type": "string" },
+        "dataset": { "type": "string" },
+        "dataset_version": { "type": "string" },
+        "model": { "type": ["string", "null"] }
+      }
+    },
+    "task_features": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["language", "task_kind", "scope"],
+      "properties": {
+        "language": { "type": ["string", "null"] },
+        "task_kind": { "enum": ["bug_fix", "feature", "refactor", "tests", "unknown"] },
+        "scope": { "enum": ["localized", "multi_file", "broad", "unknown"] }
+      }
+    },
+    "actual_harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["harness", "harness_version", "model"],
+      "properties": {
+        "harness": { "type": "string" },
+        "harness_version": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] }
+      }
+    },
+    "mechanical_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_status", "exit_code", "timed_out", "verification"],
+      "properties": {
+        "candidate_status": {
+          "enum": ["completed", "failed", "timed_out", "cancelled", "missing_harness", "unknown"]
+        },
+        "exit_code": { "type": ["integer", "null"] },
+        "timed_out": { "type": ["boolean", "null"] },
+        "verification": {
+          "anyOf": [
+            {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": { "enum": ["passed", "failed", "timed_out", "not_run"] }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "human_evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "reasons", "explanation", "evaluated_at"],
+      "properties": {
+        "outcome": { "enum": ["accepted", "rejected"] },
+        "reasons": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string" }
+        },
+        "explanation": { "type": ["string", "null"] },
+        "evaluated_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

@@ -419,6 +419,48 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
         .success()
         .stdout(predicates::str::contains("Human evaluation rejected"))
         .stdout(predicates::str::contains("Reasons         correctness"));
+
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "enable"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("routed accept/reject feedback"));
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Consent version: 2"))
+        .stdout(predicates::str::contains(
+            "routing-observation-v1 (enabled)",
+        ));
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "preview", run_id])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("multiple eligible sync records"));
+    let preview = cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "preview", run_id, "--type", "routing-observation"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&preview.stderr).contains("Record type: routing-observation-v1")
+    );
+    let preview: Value = serde_json::from_slice(&preview.stdout)?;
+    assert_eq!(preview["observation_id"], observation_id);
+    assert_eq!(preview["human_evaluation"]["outcome"], "rejected");
+    let preview = serde_json::to_string(&preview)?;
+    assert!(!preview.contains("Fix the retry race in the worker."));
+    assert!(!preview.contains(&source.display().to_string()));
     Ok(())
 }
 
@@ -453,6 +495,12 @@ fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Re
             4,
         )],
     )?;
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "enable"])
+        .assert()
+        .success();
 
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
@@ -482,6 +530,7 @@ fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Re
         CheckStatus::Failed
     );
     assert!(observation.human_evaluation.is_none());
+    assert!(database.pending_sync_records()?.is_empty());
     let original_prediction = observation.prediction.clone();
     drop(database);
 
@@ -508,6 +557,7 @@ fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Re
         accepted.human_evaluation.unwrap().outcome,
         RoutingHumanOutcome::Accepted
     );
+    assert!(database.pending_sync_records()?.is_empty());
     drop(database);
 
     cargo_bin_cmd!("dispatch")
@@ -590,6 +640,7 @@ fn routed_run_without_configured_verification_records_unknown() -> anyhow::Resul
     assert_eq!(observation.candidate_status, CandidateStatus::Completed);
     assert!(observation.verification.is_none());
     assert!(observation.human_evaluation.is_none());
+    assert!(database.pending_sync_records()?.is_empty());
     let observation_id = observation.id;
     let original_prediction = observation.prediction;
     drop(database);
@@ -612,6 +663,7 @@ fn routed_run_without_configured_verification_records_unknown() -> anyhow::Resul
         accepted.human_evaluation.unwrap().outcome,
         RoutingHumanOutcome::Accepted
     );
+    assert!(database.pending_sync_records()?.is_empty());
     drop(database);
 
     cargo_bin_cmd!("dispatch")

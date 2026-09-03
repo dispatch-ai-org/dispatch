@@ -241,6 +241,35 @@ CREATE TABLE routing_observations (
 );
 "#,
     ),
+    (
+        9,
+        "routing_observation_sync",
+        r#"
+ALTER TABLE sync_settings ADD COLUMN consent_version INTEGER NOT NULL DEFAULT 1
+    CHECK (consent_version >= 1);
+ALTER TABLE sync_settings ADD COLUMN routing_observation_enabled_at TEXT;
+
+CREATE TABLE sync_outbox_v2 (
+    record_id           TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    record_type         TEXT NOT NULL CHECK (record_type IN ('evaluation-v1', 'routing-observation-v1')),
+    payload_json        TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('pending', 'failed', 'conflict', 'synced')),
+    last_attempt        TEXT,
+    last_error          TEXT,
+    synced_at           TEXT
+);
+INSERT INTO sync_outbox_v2(
+    record_id, run_id, record_type, payload_json, status, last_attempt, last_error, synced_at
+)
+SELECT evaluation_id, run_id, 'evaluation-v1', payload_json, status, last_attempt, last_error, synced_at
+FROM sync_outbox;
+DROP TABLE sync_outbox;
+ALTER TABLE sync_outbox_v2 RENAME TO sync_outbox;
+CREATE INDEX sync_outbox_status_idx ON sync_outbox(status);
+CREATE INDEX sync_outbox_type_status_idx ON sync_outbox(record_type, status);
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -260,12 +289,48 @@ pub struct SyncSettings {
     pub enabled: bool,
     pub contributor_id: Option<String>,
     pub enabled_at: Option<String>,
+    pub consent_version: u32,
+    pub routing_observation_enabled_at: Option<String>,
+}
+
+impl SyncSettings {
+    pub fn routing_observations_enabled(&self) -> bool {
+        self.enabled
+            && self.consent_version >= ROUTING_OBSERVATION_CONSENT_VERSION
+            && self.routing_observation_enabled_at.is_some()
+    }
+}
+
+pub const ROUTING_OBSERVATION_CONSENT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncRecordType {
+    EvaluationV1,
+    RoutingObservationV1,
+}
+
+impl SyncRecordType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EvaluationV1 => "evaluation-v1",
+            Self::RoutingObservationV1 => "routing-observation-v1",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "evaluation-v1" => Ok(Self::EvaluationV1),
+            "routing-observation-v1" => Ok(Self::RoutingObservationV1),
+            _ => anyhow::bail!("unknown sync record type {value:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutboxRecord {
-    pub evaluation_id: String,
+    pub record_id: String,
     pub run_id: String,
+    pub record_type: SyncRecordType,
     pub payload_json: String,
 }
 
@@ -273,6 +338,7 @@ pub struct SyncOutboxRecord {
 pub struct SyncOutboxCounts {
     pub pending: usize,
     pub failed: usize,
+    pub conflict: usize,
     pub synced: usize,
 }
 
@@ -637,6 +703,15 @@ impl Database {
         )
     }
 
+    pub fn routing_observations(&self) -> Result<Vec<RoutingObservation>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT observation_json FROM routing_observations ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| deserialize_routing_observation(row?))
+            .collect()
+    }
+
     pub fn save_routing_human_evaluation(
         &mut self,
         run_id: &str,
@@ -689,19 +764,31 @@ impl Database {
     }
 
     pub fn sync_settings(&self) -> Result<SyncSettings> {
-        self.connection
+        let (enabled, contributor_id, enabled_at, consent_version, routing_enabled_at) = self
+            .connection
             .query_row(
-                "SELECT enabled, contributor_id, enabled_at FROM sync_settings WHERE id = 1",
+                "SELECT enabled, contributor_id, enabled_at, consent_version, \
+                 routing_observation_enabled_at FROM sync_settings WHERE id = 1",
                 [],
                 |row| {
-                    Ok(SyncSettings {
-                        enabled: row.get(0)?,
-                        contributor_id: row.get(1)?,
-                        enabled_at: row.get(2)?,
-                    })
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get(4)?,
+                    ))
                 },
             )
-            .context("failed to read sync settings")
+            .context("failed to read sync settings")?;
+        Ok(SyncSettings {
+            enabled,
+            contributor_id,
+            enabled_at,
+            consent_version: u32::try_from(consent_version)
+                .context("sync consent version is invalid")?,
+            routing_observation_enabled_at: routing_enabled_at,
+        })
     }
 
     pub fn enable_sync(
@@ -712,8 +799,15 @@ impl Database {
         self.connection.execute(
             "UPDATE sync_settings SET enabled = 1, \
              contributor_id = COALESCE(contributor_id, ?1), \
-             enabled_at = COALESCE(enabled_at, ?2) WHERE id = 1",
-            params![contributor_id, timestamp(enabled_at)],
+             enabled_at = COALESCE(enabled_at, ?2), \
+             consent_version = MAX(consent_version, ?3), \
+             routing_observation_enabled_at = COALESCE(routing_observation_enabled_at, ?2) \
+             WHERE id = 1",
+            params![
+                contributor_id,
+                timestamp(enabled_at),
+                ROUTING_OBSERVATION_CONSENT_VERSION
+            ],
         )?;
         self.sync_settings()
     }
@@ -770,29 +864,89 @@ impl Database {
 
     pub fn enqueue_sync(
         &self,
-        evaluation_id: &str,
+        record_type: SyncRecordType,
+        record_id: &str,
         run_id: &str,
         payload_json: &str,
     ) -> Result<bool> {
-        let exists = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM evaluations WHERE public_id = ?1 AND run_id = ?2)",
-            params![evaluation_id, run_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        anyhow::ensure!(exists, "run {run_id} has no persisted evaluation");
-        Ok(self.connection.execute(
-            "INSERT OR IGNORE INTO sync_outbox(\
-                 evaluation_id, run_id, payload_json, status\
-             ) VALUES (?1, ?2, ?3, 'pending')",
-            params![evaluation_id, run_id, payload_json],
-        )? > 0)
+        let source_exists = match record_type {
+            SyncRecordType::EvaluationV1 => self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM evaluations WHERE public_id = ?1 AND run_id = ?2)",
+                params![record_id, run_id],
+                |row| row.get::<_, bool>(0),
+            )?,
+            SyncRecordType::RoutingObservationV1 => self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM routing_observations WHERE id = ?1 AND run_id = ?2)",
+                params![record_id, run_id],
+                |row| row.get::<_, bool>(0),
+            )?,
+        };
+        anyhow::ensure!(
+            source_exists,
+            "run {run_id} has no persisted {} record {record_id}",
+            record_type.as_str()
+        );
+
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT record_type, payload_json, status FROM sync_outbox WHERE record_id = ?1",
+                [record_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let changed = if let Some((stored_type, stored_payload, status)) = existing {
+            anyhow::ensure!(
+                stored_type == record_type.as_str(),
+                "sync record {record_id} already has type {stored_type}"
+            );
+            if stored_payload == payload_json {
+                false
+            } else if record_type == SyncRecordType::EvaluationV1 {
+                // Preserve the original evaluation outbox's first-snapshot behavior.
+                false
+            } else {
+                anyhow::ensure!(
+                    !matches!(status.as_str(), "synced" | "conflict"),
+                    "{} {record_id} is already {status}; its Cloud payload is immutable",
+                    record_type.as_str()
+                );
+                transaction.execute(
+                    "UPDATE sync_outbox SET payload_json = ?2, status = 'pending', \
+                     last_attempt = NULL, last_error = NULL, synced_at = NULL \
+                     WHERE record_id = ?1",
+                    params![record_id, payload_json],
+                )?;
+                true
+            }
+        } else {
+            transaction.execute(
+                "INSERT INTO sync_outbox(\
+                     record_id, run_id, record_type, payload_json, status\
+                 ) VALUES (?1, ?2, ?3, ?4, 'pending')",
+                params![record_id, run_id, record_type.as_str(), payload_json],
+            )?;
+            true
+        };
+        transaction.commit()?;
+        Ok(changed)
     }
 
-    pub fn sync_payload_for_run(&self, run_id: &str) -> Result<Option<String>> {
+    pub fn sync_payload_for_run(
+        &self,
+        run_id: &str,
+        record_type: SyncRecordType,
+    ) -> Result<Option<String>> {
         self.connection
             .query_row(
-                "SELECT payload_json FROM sync_outbox WHERE run_id = ?1",
-                [run_id],
+                "SELECT payload_json FROM sync_outbox WHERE run_id = ?1 AND record_type = ?2",
+                params![run_id, record_type.as_str()],
                 |row| row.get(0),
             )
             .optional()
@@ -801,54 +955,92 @@ impl Database {
 
     pub fn pending_sync_records(&self) -> Result<Vec<SyncOutboxRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT evaluation_id, run_id, payload_json FROM sync_outbox \
-             WHERE status IN ('pending', 'failed') ORDER BY evaluation_id",
+            "SELECT record_id, run_id, record_type, payload_json FROM sync_outbox \
+             WHERE status IN ('pending', 'failed') ORDER BY record_id",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok(SyncOutboxRecord {
-                evaluation_id: row.get(0)?,
-                run_id: row.get(1)?,
-                payload_json: row.get(2)?,
-            })
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
-        rows.collect::<rusqlite::Result<_>>()
-            .context("failed to read sync outbox")
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read sync outbox")?;
+        rows.into_iter()
+            .map(|(record_id, run_id, record_type, payload_json)| {
+                Ok(SyncOutboxRecord {
+                    record_id,
+                    run_id,
+                    record_type: SyncRecordType::parse(&record_type)?,
+                    payload_json,
+                })
+            })
+            .collect()
     }
 
     pub fn mark_sync_failed(
         &self,
-        evaluation_id: &str,
+        record_id: &str,
         attempted_at: DateTime<Utc>,
         error: &str,
     ) -> Result<()> {
         self.connection.execute(
             "UPDATE sync_outbox SET status = 'failed', last_attempt = ?2, \
-             last_error = ?3, synced_at = NULL WHERE evaluation_id = ?1",
-            params![evaluation_id, timestamp(attempted_at), error],
+             last_error = ?3, synced_at = NULL WHERE record_id = ?1",
+            params![record_id, timestamp(attempted_at), error],
         )?;
         Ok(())
     }
 
-    pub fn mark_sync_succeeded(
+    pub fn mark_sync_conflict(
         &self,
-        evaluation_id: &str,
+        record_id: &str,
         attempted_at: DateTime<Utc>,
+        error: &str,
     ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sync_outbox SET status = 'conflict', last_attempt = ?2, \
+             last_error = ?3, synced_at = NULL WHERE record_id = ?1",
+            params![record_id, timestamp(attempted_at), error],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_sync_succeeded(&self, record_id: &str, attempted_at: DateTime<Utc>) -> Result<()> {
         let at = timestamp(attempted_at);
         self.connection.execute(
             "UPDATE sync_outbox SET status = 'synced', last_attempt = ?2, \
-             last_error = NULL, synced_at = ?2 WHERE evaluation_id = ?1",
-            params![evaluation_id, at],
+             last_error = NULL, synced_at = ?2 WHERE record_id = ?1",
+            params![record_id, at],
         )?;
         Ok(())
     }
 
     pub fn sync_outbox_counts(&self) -> Result<SyncOutboxCounts> {
+        self.read_sync_outbox_counts(None)
+    }
+
+    pub fn sync_outbox_counts_for_type(
+        &self,
+        record_type: SyncRecordType,
+    ) -> Result<SyncOutboxCounts> {
+        self.read_sync_outbox_counts(Some(record_type))
+    }
+
+    fn read_sync_outbox_counts(
+        &self,
+        record_type: Option<SyncRecordType>,
+    ) -> Result<SyncOutboxCounts> {
         let mut counts = SyncOutboxCounts::default();
-        let mut statement = self
-            .connection
-            .prepare("SELECT status, COUNT(*) FROM sync_outbox GROUP BY status")?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = self.connection.prepare(
+            "SELECT status, COUNT(*) FROM sync_outbox \
+             WHERE ?1 IS NULL OR record_type = ?1 GROUP BY status",
+        )?;
+        let record_type = record_type.map(SyncRecordType::as_str);
+        let rows = statement.query_map([record_type], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         for row in rows {
@@ -857,6 +1049,7 @@ impl Database {
             match status.as_str() {
                 "pending" => counts.pending = count,
                 "failed" => counts.failed = count,
+                "conflict" => counts.conflict = count,
                 "synced" => counts.synced = count,
                 _ => {}
             }
@@ -1388,7 +1581,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 8);
+        assert_eq!(database.schema_version()?, 9);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1426,11 +1619,71 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 8);
+        assert_eq!(database.schema_version()?, 9);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 8);
+        assert_eq!(Database::open(&path)?.schema_version()?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_preserves_legacy_evaluation_consent_and_outbox_without_expanding_scope()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;\
+             CREATE TABLE schema_migrations (\
+                 version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL\
+             );",
+        )?;
+        for (version, name, sql) in MIGRATIONS.iter().take(8) {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+        }
+        let mut legacy = Database { connection };
+        legacy.sync_run(&run("run-legacy-sync"))?;
+        legacy.save_evaluation(
+            "run-legacy-sync",
+            &EvaluationRecord {
+                outcome: EvaluationOutcome::Tie,
+                reasons: vec![],
+                explanation: None,
+                created_at: at(5),
+                blind: true,
+            },
+        )?;
+        legacy.connection.execute(
+            "UPDATE sync_settings SET enabled = 1, contributor_id = ?1, enabled_at = ?2",
+            params!["legacy-contributor", timestamp(at(6))],
+        )?;
+        legacy.connection.execute(
+            "INSERT INTO sync_outbox(evaluation_id, run_id, payload_json, status) \
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![
+                "evaluation-run-legacy-sync",
+                "run-legacy-sync",
+                "{\"schema_version\":1}"
+            ],
+        )?;
+        drop(legacy);
+
+        let database = Database::open(&path)?;
+        let settings = database.sync_settings()?;
+        assert!(settings.enabled);
+        assert_eq!(settings.consent_version, 1);
+        assert!(!settings.routing_observations_enabled());
+        assert!(settings.routing_observation_enabled_at.is_none());
+        let records = database.pending_sync_records()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_id, "evaluation-run-legacy-sync");
+        assert_eq!(records[0].record_type, SyncRecordType::EvaluationV1);
+        assert_eq!(records[0].payload_json, "{\"schema_version\":1}");
         Ok(())
     }
 
@@ -1551,16 +1804,23 @@ mod tests {
                 enabled: false,
                 contributor_id: None,
                 enabled_at: None,
+                consent_version: 1,
+                routing_observation_enabled_at: None,
             }
         );
         let first = database.enable_sync("install-first", at(1))?;
         assert!(first.enabled);
+        assert!(first.routing_observations_enabled());
         assert_eq!(first.contributor_id.as_deref(), Some("install-first"));
         database.disable_sync()?;
         assert!(!database.sync_settings()?.enabled);
         let second = database.enable_sync("install-replacement", at(2))?;
         assert_eq!(second.contributor_id, first.contributor_id);
         assert_eq!(second.enabled_at, first.enabled_at);
+        assert_eq!(
+            second.routing_observation_enabled_at,
+            first.routing_observation_enabled_at
+        );
 
         database.sync_run(&run("run-sync"))?;
         database.save_evaluation(
@@ -1574,8 +1834,24 @@ mod tests {
             },
         )?;
         let evaluation_id = database.evaluation_id("run-sync")?.unwrap();
-        assert!(database.enqueue_sync(&evaluation_id, "run-sync", "{\"v\":1}")?);
-        assert!(!database.enqueue_sync(&evaluation_id, "run-sync", "different")?);
+        assert!(database.enqueue_sync(
+            SyncRecordType::EvaluationV1,
+            &evaluation_id,
+            "run-sync",
+            "{\"v\":1}"
+        )?);
+        assert!(!database.enqueue_sync(
+            SyncRecordType::EvaluationV1,
+            &evaluation_id,
+            "run-sync",
+            "{\"v\":1}"
+        )?);
+        assert!(!database.enqueue_sync(
+            SyncRecordType::EvaluationV1,
+            &evaluation_id,
+            "run-sync",
+            "different"
+        )?);
         assert_eq!(
             database.pending_sync_records()?[0].payload_json,
             "{\"v\":1}"
@@ -1584,6 +1860,12 @@ mod tests {
         assert_eq!(database.sync_outbox_counts()?.failed, 1);
         database.mark_sync_succeeded(&evaluation_id, at(7))?;
         assert_eq!(database.sync_outbox_counts()?.synced, 1);
+        assert!(!database.enqueue_sync(
+            SyncRecordType::EvaluationV1,
+            &evaluation_id,
+            "run-sync",
+            "changed-after-sync"
+        )?);
         Ok(())
     }
 
