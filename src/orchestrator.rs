@@ -1085,14 +1085,14 @@ fn finish_failed(
     )
 }
 
-struct OperationLock {
+pub(crate) struct OperationLock {
     file: fs::File,
     #[cfg(not(unix))]
     path: PathBuf,
 }
 
 impl OperationLock {
-    fn acquire(path: &Path, busy_message: &str) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path, busy_message: &str) -> Result<Self> {
         if let Some(parent) = path.parent() {
             let parent_is_new = !parent.exists();
             fs::create_dir_all(parent)?;

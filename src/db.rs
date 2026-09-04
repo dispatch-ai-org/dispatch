@@ -13,6 +13,7 @@ use crate::models::{
     EvaluationRecord, EventRecord, RoutingHumanEvaluation, RoutingObservation, RunRecord,
     TaskFeatures,
 };
+use crate::sync::{RoutingFeedbackV1, RoutingObservationV1};
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -270,6 +271,36 @@ CREATE INDEX sync_outbox_status_idx ON sync_outbox(status);
 CREATE INDEX sync_outbox_type_status_idx ON sync_outbox(record_type, status);
 "#,
     ),
+    (
+        10,
+        "routing_feedback_events",
+        r#"
+CREATE TABLE routing_feedback_events (
+    id              TEXT PRIMARY KEY,
+    observation_id  TEXT NOT NULL REFERENCES routing_observations(id),
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    revision        INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 4294967295),
+    created_at      TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    UNIQUE (observation_id, revision)
+);
+CREATE TABLE sync_outbox_v3 (
+    record_id       TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    record_type     TEXT NOT NULL CHECK (record_type IN ('evaluation-v1', 'routing-observation-v1', 'routing-feedback-v1')),
+    payload_json    TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('pending', 'failed', 'conflict', 'synced')),
+    last_attempt    TEXT,
+    last_error      TEXT,
+    synced_at       TEXT
+);
+INSERT INTO sync_outbox_v3 SELECT * FROM sync_outbox;
+DROP TABLE sync_outbox;
+ALTER TABLE sync_outbox_v3 RENAME TO sync_outbox;
+CREATE INDEX sync_outbox_status_idx ON sync_outbox(status);
+CREATE INDEX sync_outbox_type_status_idx ON sync_outbox(record_type, status);
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -307,6 +338,7 @@ pub const ROUTING_OBSERVATION_CONSENT_VERSION: u32 = 2;
 pub enum SyncRecordType {
     EvaluationV1,
     RoutingObservationV1,
+    RoutingFeedbackV1,
 }
 
 impl SyncRecordType {
@@ -314,6 +346,7 @@ impl SyncRecordType {
         match self {
             Self::EvaluationV1 => "evaluation-v1",
             Self::RoutingObservationV1 => "routing-observation-v1",
+            Self::RoutingFeedbackV1 => "routing-feedback-v1",
         }
     }
 
@@ -321,6 +354,7 @@ impl SyncRecordType {
         match value {
             "evaluation-v1" => Ok(Self::EvaluationV1),
             "routing-observation-v1" => Ok(Self::RoutingObservationV1),
+            "routing-feedback-v1" => Ok(Self::RoutingFeedbackV1),
             _ => anyhow::bail!("unknown sync record type {value:?}"),
         }
     }
@@ -717,7 +751,9 @@ impl Database {
         run_id: &str,
         evaluation: &RoutingHumanEvaluation,
     ) -> Result<RoutingObservation> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let json = transaction
             .query_row(
                 "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
@@ -727,6 +763,8 @@ impl Database {
             .optional()?
             .with_context(|| format!("run {run_id} has no routing observation"))?;
         let mut observation = deserialize_routing_observation(json)?;
+        // Recover a known state left by an older binary before applying a new revision.
+        record_routing_feedback(&transaction, &observation)?;
         if observation
             .human_evaluation
             .as_ref()
@@ -745,10 +783,73 @@ impl Database {
              WHERE run_id = ?3",
             params![timestamp(observation.updated_at), json, run_id],
         )?;
+        record_routing_feedback(&transaction, &observation)?;
         transaction
             .commit()
             .context("failed to commit routing evaluation")?;
         Ok(observation)
+    }
+
+    pub fn synced_routing_payload(&self, run_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox WHERE run_id = ?1 \
+             AND record_type = 'routing-observation-v1' AND status = 'synced'",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read synced routing parent")
+    }
+
+    pub fn routing_feedback_for_run(&self, run_id: &str) -> Result<Vec<RoutingFeedbackV1>> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload_json FROM routing_feedback_events WHERE run_id = ?1 ORDER BY revision",
+        )?;
+        let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
+        rows.map(|row| serde_json::from_str(&row?).context("invalid routing feedback event"))
+            .collect()
+    }
+
+    pub fn reconcile_routing_feedback(&self, run_id: Option<&str>) -> Result<usize> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut statement = transaction.prepare(
+            "SELECT o.observation_json FROM routing_observations o JOIN sync_outbox s \
+             ON s.record_id = o.id WHERE s.record_type = 'routing-observation-v1' AND s.status = 'synced' \
+             AND (?1 IS NULL OR o.run_id = ?1)",
+        )?;
+        let observations = statement
+            .query_map([run_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut created = 0;
+        for json in observations {
+            created += usize::from(record_routing_feedback(
+                &transaction,
+                &deserialize_routing_observation(json)?,
+            )?);
+        }
+        // The semantic event survives independently of outbox retention.
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_outbox(record_id, run_id, record_type, payload_json, status) \
+             SELECT f.id, f.run_id, 'routing-feedback-v1', f.payload_json, 'pending' \
+             FROM routing_feedback_events f JOIN sync_outbox p ON p.record_id = f.observation_id \
+             WHERE p.record_type = 'routing-observation-v1' AND p.status = 'synced' \
+             AND (?1 IS NULL OR f.run_id = ?1)", [run_id],
+        )?;
+        transaction.commit()?;
+        Ok(created)
+    }
+
+    pub(crate) fn sync_payload_for_record(&self, record_id: &str) -> Result<String> {
+        self.connection
+            .query_row(
+                "SELECT payload_json FROM sync_outbox WHERE record_id = ?1",
+                [record_id],
+                |row| row.get(0),
+            )
+            .context("sync payload is missing")
     }
 
     fn read_routing_observation(
@@ -880,6 +981,10 @@ impl Database {
                 params![record_id, run_id],
                 |row| row.get::<_, bool>(0),
             )?,
+            SyncRecordType::RoutingFeedbackV1 => self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM routing_feedback_events WHERE id = ?1 AND run_id = ?2 AND payload_json = ?3)",
+                params![record_id, run_id, payload_json], |row| row.get::<_, bool>(0),
+            )?,
         };
         anyhow::ensure!(
             source_exists,
@@ -913,7 +1018,8 @@ impl Database {
                 false
             } else {
                 anyhow::ensure!(
-                    !matches!(status.as_str(), "synced" | "conflict"),
+                    record_type != SyncRecordType::RoutingFeedbackV1
+                        && !matches!(status.as_str(), "synced" | "conflict"),
                     "{} {record_id} is already {status}; its Cloud payload is immutable",
                     record_type.as_str()
                 );
@@ -943,6 +1049,10 @@ impl Database {
         run_id: &str,
         record_type: SyncRecordType,
     ) -> Result<Option<String>> {
+        anyhow::ensure!(
+            record_type != SyncRecordType::RoutingFeedbackV1,
+            "routing feedback requires a revision selector"
+        );
         self.connection
             .query_row(
                 "SELECT payload_json FROM sync_outbox WHERE run_id = ?1 AND record_type = ?2",
@@ -955,8 +1065,9 @@ impl Database {
 
     pub fn pending_sync_records(&self) -> Result<Vec<SyncOutboxRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT record_id, run_id, record_type, payload_json FROM sync_outbox \
-             WHERE status IN ('pending', 'failed') ORDER BY record_id",
+            "SELECT s.record_id, s.run_id, s.record_type, s.payload_json FROM sync_outbox s \
+             LEFT JOIN routing_feedback_events f ON f.id = s.record_id \
+             WHERE s.status IN ('pending', 'failed') ORDER BY s.run_id, COALESCE(f.revision, 0), s.record_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1350,6 +1461,100 @@ fn same_routing_human_evaluation(
         && left.explanation == right.explanation
 }
 
+/// Called only inside an immediate transaction: state change, revision and outbox
+/// become durable together. The wire snapshot is also the local semantic event.
+fn record_routing_feedback(
+    transaction: &Transaction<'_>,
+    observation: &RoutingObservation,
+) -> Result<bool> {
+    let Some(human) = &observation.human_evaluation else {
+        return Ok(false);
+    };
+    let parent = transaction
+        .query_row(
+            "SELECT payload_json FROM sync_outbox WHERE record_id = ?1 \
+         AND record_type = 'routing-observation-v1' AND status = 'synced'",
+            [&observation.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(parent) = parent else {
+        return Ok(false);
+    };
+    let parent: RoutingObservationV1 =
+        serde_json::from_str(&parent).context("invalid synced routing parent")?;
+    anyhow::ensure!(
+        parent.schema_version == 1
+            && parent.observation_id == observation.id
+            && parent.run_id == observation.run_id
+            && parent.consent.scope == "routing-observation-v1",
+        "synced routing parent identity or version mismatch"
+    );
+    let latest = transaction.query_row(
+        "SELECT payload_json FROM routing_feedback_events WHERE observation_id = ?1 ORDER BY revision DESC LIMIT 1",
+        [&observation.id], |row| row.get::<_, String>(0),
+    ).optional()?;
+    let (previous_revision, previous_state) = if let Some(latest) = latest {
+        let latest: RoutingFeedbackV1 = serde_json::from_str(&latest)?;
+        (
+            latest.revision,
+            Some((latest.outcome, latest.reasons, latest.explanation)),
+        )
+    } else {
+        let previous = parent
+            .human_evaluation
+            .map(|old| -> Result<_> {
+                let outcome = match old.outcome.as_str() {
+                    "accepted" => "accept",
+                    "rejected" => "reject",
+                    _ => anyhow::bail!("invalid human outcome in synced routing parent"),
+                };
+                Ok((outcome.to_owned(), old.reasons, old.explanation))
+            })
+            .transpose()?;
+        (0, previous)
+    };
+    let outcome = match human.outcome {
+        crate::RoutingHumanOutcome::Accepted => "accept",
+        crate::RoutingHumanOutcome::Rejected => "reject",
+    };
+    if previous_state
+        .as_ref()
+        .is_some_and(|(old_outcome, reasons, explanation)| {
+            old_outcome == outcome && reasons == &human.reasons && explanation == &human.explanation
+        })
+    {
+        return Ok(false);
+    }
+    let revision = previous_revision
+        .checked_add(1)
+        .context("routing feedback revision exhausted")?;
+    let event = RoutingFeedbackV1 {
+        schema_version: 1,
+        feedback_event_id: format!("routing-feedback-{}-{revision}", observation.run_id),
+        observation_id: observation.id.clone(),
+        contributor_id: parent.contributor_id,
+        revision,
+        consent: parent.consent,
+        outcome: outcome.into(),
+        reasons: human.reasons.clone(),
+        explanation: human.explanation.clone(),
+        evaluated_at: human.evaluated_at,
+    };
+    let payload = serde_json::to_string_pretty(&event)?;
+    transaction.execute(
+        "INSERT INTO routing_feedback_events(id, observation_id, run_id, revision, created_at, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![event.feedback_event_id, observation.id, observation.run_id, revision, timestamp(Utc::now()), payload],
+    )?;
+    transaction.execute(
+        "INSERT INTO sync_outbox(record_id, run_id, record_type, payload_json, status) \
+         VALUES (?1, ?2, 'routing-feedback-v1', ?3, 'pending')",
+        params![event.feedback_event_id, observation.run_id, payload],
+    )?;
+    Ok(true)
+}
+
 fn insert_evaluation(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1581,7 +1786,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 9);
+        assert_eq!(database.schema_version()?, 10);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1602,6 +1807,7 @@ mod tests {
             "sync_outbox",
             "benchmark_priors",
             "routing_observations",
+            "routing_feedback_events",
         ] {
             let exists: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -1619,11 +1825,11 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 9);
+        assert_eq!(database.schema_version()?, 10);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 9);
+        assert_eq!(Database::open(&path)?.schema_version()?, 10);
         Ok(())
     }
 
@@ -1684,6 +1890,56 @@ mod tests {
         assert_eq!(records[0].record_id, "evaluation-run-legacy-sync");
         assert_eq!(records[0].record_type, SyncRecordType::EvaluationV1);
         assert_eq!(records[0].payload_json, "{\"schema_version\":1}");
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_migration_preserves_typed_outbox_bytes_status_and_retry_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v9.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().take(9) {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, ?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+        }
+        let mut previous = Database { connection };
+        previous.sync_run(&run("migration-run"))?;
+        previous.enable_sync("migration-contributor", at(6))?;
+        for status in ["pending", "failed", "conflict", "synced"] {
+            for record_type in ["evaluation-v1", "routing-observation-v1"] {
+                previous.connection.execute(
+                    "INSERT INTO sync_outbox VALUES (?1, 'migration-run', ?2, ?3, ?4, 'attempt', 'error', 'synced-at')",
+                    params![format!("{record_type}-{status}"), record_type, format!("{{\n  \"state\": \"{status}\"\n}}"), status],
+                )?;
+            }
+        }
+        let settings = previous.sync_settings()?;
+        drop(previous);
+        let migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 10);
+        assert_eq!(migrated.sync_settings()?, settings);
+        for status in ["pending", "failed", "conflict", "synced"] {
+            for record_type in ["evaluation-v1", "routing-observation-v1"] {
+                let row: (String, String, String, String, String) = migrated.connection.query_row(
+                    "SELECT payload_json, status, last_attempt, last_error, synced_at FROM sync_outbox WHERE record_id = ?1",
+                    [format!("{record_type}-{status}")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+                )?;
+                assert_eq!(
+                    row,
+                    (
+                        format!("{{\n  \"state\": \"{status}\"\n}}"),
+                        status.into(),
+                        "attempt".into(),
+                        "error".into(),
+                        "synced-at".into()
+                    )
+                );
+            }
+        }
         Ok(())
     }
 

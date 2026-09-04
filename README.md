@@ -190,7 +190,7 @@ Optional Cloud contribution is also separate. After configuring the developer-pr
 
 ```bash
 dispatch sync enable
-dispatch sync preview <run-id> [--type evaluation|routing-observation]
+dispatch sync preview <run-id> [--type evaluation|routing-observation|routing-feedback] [--revision <n>]
 dispatch sync
 ```
 
@@ -232,7 +232,7 @@ dispatch apply <run-id> <candidate>
 dispatch datasets import swe-bench <path>
 dispatch datasets import terminal-bench <path>
 dispatch sync enable|disable|status
-dispatch sync preview <run-id> [--type evaluation|routing-observation]
+dispatch sync preview <run-id> [--type evaluation|routing-observation|routing-feedback] [--revision <n>]
 dispatch sync token set <token>
 dispatch sync token status|clear
 dispatch sync
@@ -255,7 +255,7 @@ The Router treats an unknown prior dimension as compatible fallback evidence for
 
 `dispatch run <source> --task <text> --route --allow-unsafe-local` uses the same classification and Router semantics, skips predicted adapters that are not locally executable under the effective configuration, and selects exactly one scored real adapter. The selected adapter then enters the same candidate, executor, verification, artifact, and cleanup path as an explicit one-harness run. No evidence, or no runnable predicted adapter, is a pre-execution error; Dispatch never substitutes an unscored harness. The task features and selected prior are stored separately from the resulting mechanical execution and any later human evaluation.
 
-Once a routed candidate reaches a terminal state, Dispatch records one local routing observation keyed to that run. It snapshots the prediction provenance, actual harness/model identity, process state, and configured verification statuses without turning any of them into a quality label. Missing verification and missing human evaluation remain unknown, and `dispatch show <run-id>` displays the observation. `dispatch evaluate <run-id> --outcome accept|reject` records a separate human acceptance signal on that same observation; acceptance is never inferred from verification, and rejection never changes verification. The existing blind Candidate/Tie/Neither comparison model is retained separately because it does not faithfully represent acceptance of a disclosed single routed candidate. These observations and their human signals are not Router priors and are not included in Cloud sync.
+Once a routed candidate reaches a terminal state, Dispatch records one local routing observation keyed to that run. It snapshots the prediction provenance, actual harness/model identity, process state, and configured verification statuses without turning any of them into a quality label. Missing verification and missing human evaluation remain unknown, and `dispatch show <run-id>` displays the observation. `dispatch evaluate <run-id> --outcome accept|reject` records a separate human acceptance signal on that same observation; acceptance is never inferred from verification, and rejection never changes verification. The existing blind Candidate/Tie/Neither comparison model is retained separately because it does not faithfully represent acceptance of a disclosed single routed candidate. These observations and their human signals are not Router priors; sharing requires the explicit contribution consent and sync flow below.
 
 The SWE-bench importer preserves the upstream `tags.agent` and single `tags.model` identities separately and accepts only pass@1 submissions without translating agent identity. Harbor maps only its verified `codex` and `cursor-cli` integrations to Dispatch `codex` and `cursor`; other Harbor agent names remain unchanged. A prior is usable only for its stored harness identity.
 
@@ -269,13 +269,13 @@ The consent, review, and transmission sequence is exactly:
 
 ```bash
 dispatch sync enable
-dispatch sync preview <run-id> [--type evaluation|routing-observation]
+dispatch sync preview <run-id> [--type evaluation|routing-observation|routing-feedback] [--revision <n>]
 dispatch sync
 ```
 
 `dispatch sync enable` records the current versioned consent locally, creates or preserves the contributor identity, and prepares eligible historical evaluations and routing observations in the same local outbox. It does not upload data. Consent version 1 authorizes only `evaluation-v1`; existing version-1 users retain evaluation sync but routing observations remain ineligible until they explicitly run `sync enable` again to accept version 2 and `routing-observation-v1`.
 
-`dispatch sync preview <run-id>` requires the applicable consent and prints the exact eligible HTTP body to stdout without transmitting it; the record type is identified separately. If a routed run also has a blind evaluation, select the body explicitly with `--type evaluation` or `--type routing-observation`. Bare `dispatch sync` is the only transmission step for pending and retryable failed records.
+`dispatch sync preview <run-id>` requires the applicable consent and prints the exact eligible HTTP body to stdout without transmitting it; the record type is identified on stderr. Select ambiguous record types with `--type evaluation`, `--type routing-observation`, or `--type routing-feedback`. Feedback preview shows the sole event directly; multiple revisions require `--revision <n>`. A parent preview always shows the immutable uploaded body after it has synced. Bare `dispatch sync` is the only transmission step for pending and retryable failed records.
 
 The contributor identity is a random local ULID that is not derived from an account, machine, path, or hardware data.
 
@@ -285,13 +285,17 @@ Token possession and sharing consent are independent. Configuring a token never 
 
 `evaluation-v1` shares the exact task description; Dispatch, OS, architecture, and backend metadata; harness/version/model identity; execution, usage, diff-count, and verification results; and the blind human outcome, structured reasons, and freeform explanation. `routing-observation-v1` separately shares task morphology, the prediction snapshot and benchmark provenance, actual harness/model identity, mechanical outcome, and optional routed accept/reject feedback. Routed human explanations are uploaded verbatim when present. This is contributed data, not anonymous telemetry; task text and explanations may contain proprietary context. The ingestion token is an HTTP header and never appears in either body.
 
-Both V1 payloads exclude source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Routing observations additionally exclude task text. Richer source or diff sharing is not a v0.1.1 consent scope. The public contracts are [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json) and [`schemas/routing-observation-v1.json`](schemas/routing-observation-v1.json).
+All V1 payloads exclude source files, snapshots, patches, logs, environment names and values, credentials, Git identity/remotes and fingerprints, verification command text, exact harness prompts, changed-file names, candidate errors, and absolute local paths. Routing observations additionally exclude task text. Feedback events contain only event/parent/contributor identity, revision, consent metadata, accept/reject, reasons, explanation, and evaluation time—not the parent's task, prediction, or mechanical data. Richer source or diff sharing is not a v0.1.1 consent scope. The public contracts are [`schemas/evaluation-v1.json`](schemas/evaluation-v1.json), [`schemas/routing-observation-v1.json`](schemas/routing-observation-v1.json), and [`schemas/routing-feedback-v1.json`](schemas/routing-feedback-v1.json).
 
 The default Cloud base URL is `https://api.rundispatch.sh`. `DISPATCH_CLOUD_URL` preserves the development/testing override, and plain HTTP is accepted only for loopback testing. The SQLite outbox retains failed uploads for explicit retry; local evaluation never depends on network success.
 
-The client uses the system `curl` with bounded timeouts. Evaluation records go to `POST /v1/evaluations`; routing records go to `POST /v1/routing-observations`. Both send `Authorization: Bearer <token>` and the stable record ID as `Idempotency-Key`. HTTP 201 and idempotent HTTP 200 responses mark a record synced. Transient failures remain retryable; `422 idempotency_conflict` remains locally visible as a durable conflict and is not treated as synced.
+The client uses the system `curl` with bounded timeouts. Evaluations go to `POST /v1/evaluations`, routing observations to `POST /v1/routing-observations`, and feedback events to `POST /v1/routing-feedback`. Each sends `Authorization: Bearer <token>` and its stable record ID as `Idempotency-Key`. HTTP 201 and idempotent HTTP 200 responses mark a record synced. Transient failures remain retryable; `422 idempotency_conflict`, and feedback `422 revision_conflict` or `422 invalid_parent`, remain durable conflicts without automatic retry. Generic HTTP 401/403 errors indicate an authentication/authorization failure, which may originate from deployment protection rather than the ingestion API.
 
-Before its first successful upload, a pending or failed routing payload is refreshed from the current local observation during explicit preview or sync preparation, so newly added human feedback is not silently omitted. A local human-evaluation change invalidates an earlier preview, so preview again after changing it. After a routing observation is synced, later local feedback remains local: Dispatch refuses to mutate or resend the immutable Cloud record under the same observation ID.
+Before its first successful upload, a pending or failed routing payload is refreshed from the current local observation during explicit preview or sync preparation; no separate feedback event is created. A local human-evaluation change invalidates an earlier parent preview, so preview again after changing it.
+
+After the parent syncs, a genuine change to outcome, ordered reasons, or explanation atomically updates the local human signal, appends an immutable feedback event, and queues its exact payload. Repeating the same state creates nothing, even if invoked later. Revisions start at 1 and increase per observation under a SQLite immediate transaction; IDs are `routing-feedback-<run-id>-<revision>`. Events upload in numeric revision order and retry independently. The parent and earlier event payloads never change.
+
+Feedback uses the existing version-2 `routing-observation-v1` consent scope and the parent's contributor/consent identity; it does not introduce consent version 3. Disabled or legacy consent prevents feedback transmission even when events are queued. Evaluation itself remains local-only. Sync preparation and preview also reconcile an older installation's current human state against its synced parent/latest event: only a known current difference is appended, never invented intermediate history. Evaluation performs the same reconciliation before applying a new change.
 
 ## Configuration
 

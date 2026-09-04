@@ -119,8 +119,11 @@ enum SyncCommand {
     Preview {
         run_id: String,
         /// Select a record when the run has both evaluation and routing data.
-        #[arg(long = "type", value_parser = ["evaluation", "routing-observation"])]
+        #[arg(long = "type", value_parser = ["evaluation", "routing-observation", "routing-feedback"])]
         record_type: Option<String>,
+        /// Select one immutable routed-feedback revision.
+        #[arg(long, requires = "record_type", value_parser = clap::value_parser!(u32).range(1..))]
+        revision: Option<u32>,
     },
     /// Manage the developer-preview Dispatch Cloud ingestion token.
     Token(SyncTokenArgs),
@@ -368,7 +371,8 @@ async fn run() -> Result<()> {
             Some(SyncCommand::Preview {
                 run_id,
                 record_type,
-            }) => dispatch::sync::preview(&state, &run_id, record_type.as_deref()),
+                revision,
+            }) => dispatch::sync::preview(&state, &run_id, record_type.as_deref(), revision),
             Some(SyncCommand::Token(args)) => match args.command {
                 SyncTokenCommand::Set { token } => dispatch::sync::token_set(&state, &token),
                 SyncTokenCommand::Status => dispatch::sync::token_status(&state),

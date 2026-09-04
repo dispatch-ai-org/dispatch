@@ -15,6 +15,7 @@ use crate::{
     RoutingObservation, RunRecord, VERSION,
     db::{Database, SyncRecordType, SyncSettings},
     executor::{trusted_host_executable, trusted_host_path},
+    orchestrator::OperationLock,
     state::State,
 };
 
@@ -181,6 +182,21 @@ pub struct RoutingHumanEvaluationV1 {
     pub evaluated_at: DateTime<Utc>,
 }
 
+/// Also stored as the immutable local event: no prediction or execution data is copied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingFeedbackV1 {
+    pub schema_version: u32,
+    pub feedback_event_id: String,
+    pub observation_id: String,
+    pub contributor_id: String,
+    pub revision: u32,
+    pub consent: ConsentMetadataV1,
+    pub outcome: String,
+    pub reasons: Vec<String>,
+    pub explanation: Option<String>,
+    pub evaluated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncReport {
     pub synced: usize,
@@ -189,6 +205,7 @@ pub struct SyncReport {
 
 pub fn enable(state: &State) -> Result<()> {
     state.initialize()?;
+    let _sync_lock = lock_sync(state)?;
     let mut database = Database::open(state.db_path())?;
     let settings = database.enable_sync(&Ulid::new().to_string(), Utc::now())?;
     let queued = queue_all(state, &database, &settings)?;
@@ -226,6 +243,7 @@ pub fn status(state: &State) -> Result<()> {
     let settings = database.sync_settings()?;
     let evaluations = database.sync_outbox_counts_for_type(SyncRecordType::EvaluationV1)?;
     let routing = database.sync_outbox_counts_for_type(SyncRecordType::RoutingObservationV1)?;
+    let feedback = database.sync_outbox_counts_for_type(SyncRecordType::RoutingFeedbackV1)?;
     println!(
         "Evaluation sync: {}",
         if settings.enabled {
@@ -268,6 +286,10 @@ pub fn status(state: &State) -> Result<()> {
         "Outbox routing-observation-v1: {} pending, {} failed, {} conflict, {} synced",
         routing.pending, routing.failed, routing.conflict, routing.synced
     );
+    println!(
+        "Outbox routing-feedback-v1: {} pending, {} failed, {} conflict, {} synced",
+        feedback.pending, feedback.failed, feedback.conflict, feedback.synced
+    );
     println!("Cloud URL: {}", configured_cloud_url()?);
     Ok(())
 }
@@ -301,9 +323,15 @@ pub fn token_clear(state: &State) -> Result<()> {
     Ok(())
 }
 
-pub fn preview(state: &State, run_id: &str, requested_type: Option<&str>) -> Result<()> {
+pub fn preview(
+    state: &State,
+    run_id: &str,
+    requested_type: Option<&str>,
+    revision: Option<u32>,
+) -> Result<()> {
     let requested_type = requested_type.map(parse_record_type).transpose()?;
-    let (record_type, payload) = preview_payload_for_type(state, run_id, requested_type)?;
+    let (record_type, payload) =
+        preview_payload_for_revision(state, run_id, requested_type, revision)?;
     eprintln!("Record type: {}", record_type.as_str());
     println!("{payload}");
     Ok(())
@@ -332,17 +360,38 @@ pub fn preview_payload_for_type(
     run_id: &str,
     requested_type: Option<SyncRecordType>,
 ) -> Result<(SyncRecordType, String)> {
+    preview_payload_for_revision(state, run_id, requested_type, None)
+}
+
+pub fn preview_payload_for_revision(
+    state: &State,
+    run_id: &str,
+    requested_type: Option<SyncRecordType>,
+    revision: Option<u32>,
+) -> Result<(SyncRecordType, String)> {
     state.initialize()?;
+    let _sync_lock = lock_sync(state)?;
     let database = Database::open(state.db_path())?;
     let settings = require_enabled(&database)?;
     let run = state.load_run(run_id)?;
+    let _run_lock = OperationLock::acquire(
+        &state.run_dir(&run.id).join(".operation.lock"),
+        "another operation is using this run",
+    )?;
+    if settings.routing_observations_enabled() {
+        database.reconcile_routing_feedback(Some(&run.id))?;
+    }
     let observation = database.routing_observation_for_run(&run.id)?;
+    let feedback = database.routing_feedback_for_run(&run.id)?;
     let mut eligible = Vec::new();
     if run.evaluation.is_some() {
         eligible.push(SyncRecordType::EvaluationV1);
     }
     if settings.routing_observations_enabled() && observation.is_some() {
         eligible.push(SyncRecordType::RoutingObservationV1);
+    }
+    if settings.routing_observations_enabled() && !feedback.is_empty() {
+        eligible.push(SyncRecordType::RoutingFeedbackV1);
     }
 
     let record_type = if let Some(requested) = requested_type {
@@ -361,11 +410,15 @@ pub fn preview_payload_for_type(
             ),
             [] => bail!("run {} has no eligible sync record", run.id),
             _ => bail!(
-                "run {} has multiple eligible sync records; use --type evaluation or --type routing-observation",
+                "run {} has multiple eligible sync records; use --type evaluation, --type routing-observation, or --type routing-feedback",
                 run.id
             ),
         }
     };
+    anyhow::ensure!(
+        revision.is_none() || record_type == SyncRecordType::RoutingFeedbackV1,
+        "--revision requires --type routing-feedback"
+    );
     match record_type {
         SyncRecordType::EvaluationV1 => {
             queue_evaluation(&database, &settings, &run)?;
@@ -379,6 +432,22 @@ pub fn preview_payload_for_type(
                     .context("routing observation disappeared during preview")?,
             )?;
         }
+        SyncRecordType::RoutingFeedbackV1 => {
+            let event = match revision {
+                Some(revision) => feedback
+                    .iter()
+                    .find(|event| event.revision == revision)
+                    .with_context(|| {
+                        format!("run {} has no feedback revision {revision}", run.id)
+                    })?,
+                None if feedback.len() == 1 => &feedback[0],
+                None => bail!("multiple feedback revisions exist; use --revision <n>"),
+            };
+            return Ok((
+                record_type,
+                database.sync_payload_for_record(&event.feedback_event_id)?,
+            ));
+        }
     }
     let payload = database
         .sync_payload_for_run(&run.id, record_type)?
@@ -388,6 +457,9 @@ pub fn preview_payload_for_type(
 
 fn queue_all(state: &State, database: &Database, settings: &SyncSettings) -> Result<usize> {
     let mut queued = 0;
+    if settings.routing_observations_enabled() {
+        queued += database.reconcile_routing_feedback(None)?;
+    }
     for path in state.list_metadata_paths()? {
         let run: RunRecord = serde_json::from_slice(
             &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
@@ -428,6 +500,12 @@ fn queue_routing_observation(
     settings: &SyncSettings,
     observation: &RoutingObservation,
 ) -> Result<bool> {
+    if database
+        .synced_routing_payload(&observation.run_id)?
+        .is_some()
+    {
+        return Ok(false);
+    }
     let envelope = routing_observation_envelope_for(observation, settings)?;
     let payload = serialize_routing_observation(&envelope)?;
     database.enqueue_sync(
@@ -451,7 +529,10 @@ fn parse_record_type(value: &str) -> Result<SyncRecordType> {
     match value {
         "evaluation" => Ok(SyncRecordType::EvaluationV1),
         "routing-observation" => Ok(SyncRecordType::RoutingObservationV1),
-        _ => bail!("sync preview type must be evaluation or routing-observation"),
+        "routing-feedback" => Ok(SyncRecordType::RoutingFeedbackV1),
+        _ => {
+            bail!("sync preview type must be evaluation, routing-observation, or routing-feedback")
+        }
     }
 }
 
@@ -764,6 +845,7 @@ fn validate_ingestion_token(token: &str) -> Result<()> {
 
 pub(crate) fn flush_to(state: &State, base_url: &str) -> Result<SyncReport> {
     state.initialize()?;
+    let _sync_lock = lock_sync(state)?;
     let database = Database::open(state.db_path())?;
     let settings = require_enabled(&database)?;
     queue_all(state, &database, &settings)?;
@@ -773,7 +855,23 @@ pub(crate) fn flush_to(state: &State, base_url: &str) -> Result<SyncReport> {
     validate_ingestion_token(&token)?;
     let base_url = validate_cloud_url(base_url)?;
     let mut report = SyncReport::default();
-    for record in database.pending_sync_records()? {
+    for mut record in database.pending_sync_records()? {
+        if record.record_type != SyncRecordType::EvaluationV1
+            && !settings.routing_observations_enabled()
+        {
+            continue;
+        }
+        let _run_lock = OperationLock::acquire(
+            &state.run_dir(&record.run_id).join(".operation.lock"),
+            "another operation is using this run",
+        )?;
+        if record.record_type == SyncRecordType::RoutingObservationV1 {
+            let observation = database
+                .routing_observation_for_run(&record.run_id)?
+                .context("routing observation is missing")?;
+            queue_routing_observation(&database, &settings, &observation)?;
+            record.payload_json = database.sync_payload_for_record(&record.record_id)?;
+        }
         let attempted_at = Utc::now();
         let endpoint = format!("{}{}", base_url, record_endpoint(record.record_type));
         match post_record(
@@ -787,12 +885,12 @@ pub(crate) fn flush_to(state: &State, base_url: &str) -> Result<SyncReport> {
                 database.mark_sync_succeeded(&record.record_id, attempted_at)?;
                 report.synced += 1;
             }
-            Ok(UploadResult::IdempotencyConflict) => {
+            Ok(UploadResult::Conflict(code)) => {
                 database.mark_sync_conflict(
                     &record.record_id,
                     attempted_at,
                     &format!(
-                        "{} idempotency_conflict (HTTP 422); the local record and Cloud record differ",
+                        "{} {code} (HTTP 422); record retained locally without automatic retry",
                         record.record_type.as_str()
                     ),
                 )?;
@@ -815,7 +913,14 @@ pub(crate) fn flush_to(state: &State, base_url: &str) -> Result<SyncReport> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadResult {
     Synced,
-    IdempotencyConflict,
+    Conflict(&'static str),
+}
+
+fn lock_sync(state: &State) -> Result<OperationLock> {
+    OperationLock::acquire(
+        &state.root.join(".sync.lock"),
+        "another sync preparation or upload is in progress",
+    )
 }
 
 #[derive(Deserialize)]
@@ -827,6 +932,7 @@ fn record_endpoint(record_type: SyncRecordType) -> &'static str {
     match record_type {
         SyncRecordType::EvaluationV1 => EVALUATION_PATH,
         SyncRecordType::RoutingObservationV1 => ROUTING_OBSERVATION_PATH,
+        SyncRecordType::RoutingFeedbackV1 => "/v1/routing-feedback",
     }
 }
 
@@ -905,13 +1011,25 @@ fn post_record(
     }
     let response = fs::read_to_string(response_file.path()).unwrap_or_default();
     if status_code == 422
-        && serde_json::from_str::<CloudErrorResponse>(&response)
-            .is_ok_and(|error| error.error == "idempotency_conflict")
+        && let Ok(error) = serde_json::from_str::<CloudErrorResponse>(&response)
     {
-        return Ok(UploadResult::IdempotencyConflict);
+        match error.error.as_str() {
+            "idempotency_conflict" => {
+                return Ok(UploadResult::Conflict("idempotency_conflict"));
+            }
+            "revision_conflict" if record_type == SyncRecordType::RoutingFeedbackV1 => {
+                return Ok(UploadResult::Conflict("revision_conflict"));
+            }
+            "invalid_parent" if record_type == SyncRecordType::RoutingFeedbackV1 => {
+                return Ok(UploadResult::Conflict("invalid_parent"));
+            }
+            _ => {}
+        }
     }
     if matches!(status_code, 401 | 403) {
-        bail!("Dispatch Cloud ingestion token was rejected (HTTP {status_code})");
+        bail!(
+            "HTTP authentication/authorization failure (HTTP {status_code}); check API credentials and deployment access protection"
+        );
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     bail!(
@@ -1170,6 +1288,466 @@ mod tests {
         Ok(())
     }
 
+    fn feedback(outcome: RoutingHumanOutcome, second: u32) -> RoutingHumanEvaluation {
+        RoutingHumanEvaluation {
+            outcome,
+            reasons: vec!["correctness".into(), "tests".into()],
+            explanation: Some("  Reviewed locally.\nKeep this verbatim.  \n".into()),
+            evaluated_at: at(second),
+        }
+    }
+
+    fn sync_parent_for_test(state: &State, run_id: &str) -> Result<String> {
+        enable_for_test(state)?;
+        let (_, payload) =
+            preview_payload_for_type(state, run_id, Some(SyncRecordType::RoutingObservationV1))?;
+        Database::open(state.db_path())?
+            .mark_sync_succeeded(&format!("routing-observation-{run_id}"), at(7))?;
+        Ok(payload)
+    }
+
+    #[test]
+    fn feedback_revisions_are_durable_immutable_and_only_follow_synced_parents() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        enable_for_test(&state)?;
+        let mut database = Database::open(state.db_path())?;
+        let accepted = feedback(RoutingHumanOutcome::Accepted, 8);
+        database.save_routing_human_evaluation(&run.id, &accepted)?;
+        assert!(database.routing_feedback_for_run(&run.id)?.is_empty());
+        let parent = sync_parent_for_test(&state, &run.id)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parent)?["human_evaluation"]["outcome"],
+            "accepted"
+        );
+        database
+            .save_routing_human_evaluation(&run.id, &feedback(RoutingHumanOutcome::Accepted, 9))?;
+        assert!(database.routing_feedback_for_run(&run.id)?.is_empty());
+
+        for (index, outcome) in [
+            RoutingHumanOutcome::Rejected,
+            RoutingHumanOutcome::Accepted,
+            RoutingHumanOutcome::Rejected,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let human = feedback(outcome, 10 + index as u32);
+            database.save_routing_human_evaluation(&run.id, &human)?;
+            database.save_routing_human_evaluation(&run.id, &human)?;
+            let events = database.routing_feedback_for_run(&run.id)?;
+            assert_eq!(events.len(), index + 1);
+            assert_eq!(events[index].revision, index as u32 + 1);
+            assert_eq!(
+                events[index].feedback_event_id,
+                format!("routing-feedback-{}-{}", run.id, index + 1)
+            );
+            assert_eq!(events[index].reasons, human.reasons);
+            assert_eq!(events[index].explanation, human.explanation);
+            assert_eq!(events[index].evaluated_at, human.evaluated_at);
+        }
+        let events = database.routing_feedback_for_run(&run.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.outcome.as_str())
+                .collect::<Vec<_>>(),
+            ["reject", "accept", "reject"]
+        );
+        assert_eq!(events[0].evaluated_at, at(10));
+        assert_eq!(database.pending_sync_records()?.len(), 3);
+        drop(database);
+        assert_eq!(
+            Database::open(state.db_path())?.routing_feedback_for_run(&run.id)?,
+            events
+        );
+        assert_eq!(
+            preview_payload_for_type(&state, &run.id, Some(SyncRecordType::RoutingObservationV1))?
+                .1,
+            parent
+        );
+        assert!(
+            preview_payload_for_revision(
+                &state,
+                &run.id,
+                Some(SyncRecordType::RoutingFeedbackV1),
+                None
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("--revision")
+        );
+        for revision in 1..=3 {
+            let (_, payload) = preview_payload_for_revision(
+                &state,
+                &run.id,
+                Some(SyncRecordType::RoutingFeedbackV1),
+                Some(revision),
+            )?;
+            let event: RoutingFeedbackV1 = serde_json::from_str(&payload)?;
+            assert_eq!(event, events[revision as usize - 1]);
+        }
+        assert!(
+            preview_payload_for_revision(
+                &state,
+                &run.id,
+                Some(SyncRecordType::RoutingFeedbackV1),
+                Some(4)
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_wire_schema_is_narrow_and_preserves_parent_consent_identity() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        let parent = sync_parent_for_test(&state, &run.id)?;
+        let parent: RoutingObservationV1 = serde_json::from_str(&parent)?;
+        let mut database = Database::open(state.db_path())?;
+        database
+            .save_routing_human_evaluation(&run.id, &feedback(RoutingHumanOutcome::Accepted, 8))?;
+        let event = database.routing_feedback_for_run(&run.id)?.remove(0);
+        assert_eq!(event.schema_version, 1);
+        assert_eq!(event.revision, 1);
+        assert_eq!(event.observation_id, parent.observation_id);
+        assert_eq!(event.contributor_id, parent.contributor_id);
+        assert_eq!(event.consent, parent.consent);
+        assert_eq!(event.consent.scope, "routing-observation-v1");
+        assert_eq!(event.outcome, "accept");
+        let value = serde_json::to_value(&event)?;
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/routing-feedback-v1.json"))?;
+        assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+        for key in value.as_object().unwrap().keys() {
+            assert!(
+                schema["properties"].get(key).is_some(),
+                "unexpected wire field {key}"
+            );
+        }
+        for key in schema["required"].as_array().unwrap() {
+            assert!(value.get(key.as_str().unwrap()).is_some());
+        }
+        for excluded in [
+            "task",
+            "task_features",
+            "prediction",
+            "actual_harness",
+            "mechanical_outcome",
+            "verification",
+            "source",
+            "logs",
+            "paths",
+            "run_id",
+        ] {
+            assert!(value.get(excluded).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn historical_feedback_reconciliation_recovers_only_current_known_state() -> Result<()> {
+        for (parent_human, current_human, expected) in [
+            (None, feedback(RoutingHumanOutcome::Accepted, 9), 1),
+            (
+                Some(feedback(RoutingHumanOutcome::Accepted, 8)),
+                feedback(RoutingHumanOutcome::Rejected, 9),
+                1,
+            ),
+            (
+                Some(feedback(RoutingHumanOutcome::Accepted, 8)),
+                feedback(RoutingHumanOutcome::Accepted, 9),
+                0,
+            ),
+        ] {
+            let (_temp, state, run) = persisted_routed_run(false)?;
+            let mut database = Database::open(state.db_path())?;
+            if let Some(human) = parent_human {
+                database.save_routing_human_evaluation(&run.id, &human)?;
+            }
+            let parent = sync_parent_for_test(&state, &run.id)?;
+            // Simulate the previous binary's post-sync replacement, with no event history.
+            let mut observation = database.routing_observation_for_run(&run.id)?.unwrap();
+            observation.human_evaluation = Some(current_human.clone());
+            observation.updated_at = current_human.evaluated_at;
+            rusqlite::Connection::open(state.db_path())?.execute(
+                "UPDATE routing_observations SET observation_json = ?1 WHERE run_id = ?2",
+                rusqlite::params![serde_json::to_string(&observation)?, run.id],
+            )?;
+            assert_eq!(database.reconcile_routing_feedback(None)?, expected);
+            assert_eq!(database.reconcile_routing_feedback(None)?, 0);
+            let events = database.routing_feedback_for_run(&run.id)?;
+            assert_eq!(events.len(), expected);
+            if let Some(event) = events.first() {
+                assert_eq!(event.revision, 1);
+                assert_eq!(event.evaluated_at, current_human.evaluated_at);
+            }
+            assert_eq!(
+                database
+                    .sync_payload_for_run(&run.id, SyncRecordType::RoutingObservationV1)?
+                    .unwrap(),
+                parent
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsynced_parent_states_never_create_feedback_events() -> Result<()> {
+        for status in ["not_queued", "pending", "failed", "conflict"] {
+            let (_temp, state, run) = persisted_routed_run(false)?;
+            enable_for_test(&state)?;
+            let mut database = Database::open(state.db_path())?;
+            if status != "not_queued" {
+                preview_payload(&state, &run.id)?;
+                rusqlite::Connection::open(state.db_path())?
+                    .execute("UPDATE sync_outbox SET status = ?1", [status])?;
+            }
+            database.save_routing_human_evaluation(
+                &run.id,
+                &feedback(RoutingHumanOutcome::Accepted, 8),
+            )?;
+            assert_eq!(database.reconcile_routing_feedback(None)?, 0);
+            assert!(database.routing_feedback_for_run(&run.id)?.is_empty());
+            if status != "conflict" {
+                let parent: RoutingObservationV1 =
+                    serde_json::from_str(&preview_payload(&state, &run.id)?)?;
+                assert_eq!(parent.human_evaluation.unwrap().outcome, "accepted");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_upload_uses_existing_outbox_and_preserves_retries_and_conflicts() -> Result<()> {
+        for (status, error) in [
+            (201, ""),
+            (200, ""),
+            (500, ""),
+            (422, "idempotency_conflict"),
+            (422, "revision_conflict"),
+            (422, "invalid_parent"),
+        ] {
+            let (_temp, state, run) = persisted_routed_run(false)?;
+            let parent = sync_parent_for_test(&state, &run.id)?;
+            let mut database = Database::open(state.db_path())?;
+            database.save_routing_human_evaluation(
+                &run.id,
+                &feedback(RoutingHumanOutcome::Accepted, 8),
+            )?;
+            set_token_for_test(&state, "feedback-test-token")?;
+            let (_, preview) = preview_payload_for_revision(
+                &state,
+                &run.id,
+                Some(SyncRecordType::RoutingFeedbackV1),
+                None,
+            )?;
+            let (url, received, server) =
+                mock_server_with_body(status, &format!(r#"{{"error":"{error}"}}"#))?;
+            let report = flush_to(&state, &url)?;
+            let request = received.recv()?;
+            server.join().unwrap()?;
+            let (headers, body) = split_request(&request)?;
+            assert!(headers.starts_with("POST /v1/routing-feedback "));
+            assert!(headers.contains(&format!("Idempotency-Key: routing-feedback-{}-1", run.id)));
+            assert_eq!(body, preview.as_bytes());
+            assert_eq!(report.synced, usize::from(status < 300));
+            assert_eq!(
+                database
+                    .sync_payload_for_run(&run.id, SyncRecordType::RoutingObservationV1)?
+                    .unwrap(),
+                parent
+            );
+            assert_eq!(database.routing_feedback_for_run(&run.id)?.len(), 1);
+            if status == 500 {
+                assert_eq!(database.pending_sync_records()?[0].payload_json, preview);
+                let (url, received, server) = mock_server(201)?;
+                assert_eq!(flush_to(&state, &url)?.synced, 1);
+                assert_eq!(split_request(&received.recv()?)?.1, preview.as_bytes());
+                server.join().unwrap()?;
+            } else if status == 422 {
+                assert_eq!(database.sync_outbox_counts()?.conflict, 1);
+                let stored: String = rusqlite::Connection::open(state.db_path())?.query_row(
+                    "SELECT last_error FROM sync_outbox WHERE record_type = 'routing-feedback-v1'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(stored.contains(error));
+            }
+            assert!(database.pending_sync_records()?.is_empty());
+            assert_eq!(
+                flush_to(&state, "https://must-not-contact.invalid")?.synced,
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn queued_feedback_requires_current_consent_and_token_at_transmission() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        sync_parent_for_test(&state, &run.id)?;
+        let mut database = Database::open(state.db_path())?;
+        database
+            .save_routing_human_evaluation(&run.id, &feedback(RoutingHumanOutcome::Accepted, 8))?;
+        assert!(
+            flush_to(&state, "https://must-not-contact.invalid")
+                .unwrap_err()
+                .to_string()
+                .contains("token not configured")
+        );
+        set_token_for_test(&state, "test-token")?;
+        database.disable_sync()?;
+        assert!(flush_to(&state, "https://must-not-contact.invalid").is_err());
+        enable_legacy_for_test(&state)?;
+        assert_eq!(
+            flush_to(&state, "https://must-not-contact.invalid")?,
+            SyncReport::default()
+        );
+        assert_eq!(database.pending_sync_records()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_feedback_changes_allocate_unique_contiguous_revisions() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        sync_parent_for_test(&state, &run.id)?;
+        let threads: Vec<_> = (0..6)
+            .map(|index| {
+                let path = state.db_path();
+                let run_id = run.id.clone();
+                thread::spawn(move || -> Result<()> {
+                    let mut human = feedback(RoutingHumanOutcome::Accepted, 8);
+                    human.explanation = Some(format!("Review {index}"));
+                    Database::open(path)?.save_routing_human_evaluation(&run_id, &human)?;
+                    Ok(())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap()?;
+        }
+        let events = Database::open(state.db_path())?.routing_feedback_for_run(&run.id)?;
+        assert_eq!(
+            events.iter().map(|e| e.revision).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn feedback_uploads_in_numeric_revision_order_without_reposting_parent() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        let parent = sync_parent_for_test(&state, &run.id)?;
+        let mut database = Database::open(state.db_path())?;
+        for revision in 1..=12 {
+            let mut human = feedback(RoutingHumanOutcome::Accepted, 8);
+            human.explanation = Some(format!("Revision {revision}"));
+            database.save_routing_human_evaluation(&run.id, &human)?;
+        }
+        set_token_for_test(&state, "ordering-test-token")?;
+        let (url, requests, server) = mock_server_responses(&vec![(201, ""); 12])?;
+        assert_eq!(flush_to(&state, &url)?.synced, 12);
+        for revision in 1..=12 {
+            let request = requests.recv()?;
+            let (headers, body) = split_request(&request)?;
+            assert!(headers.starts_with("POST /v1/routing-feedback "));
+            assert_eq!(
+                serde_json::from_slice::<RoutingFeedbackV1>(body)?.revision,
+                revision
+            );
+            assert_eq!(
+                body,
+                preview_payload_for_revision(
+                    &state,
+                    &run.id,
+                    Some(SyncRecordType::RoutingFeedbackV1),
+                    Some(revision)
+                )?
+                .1
+                .as_bytes()
+            );
+        }
+        server.join().unwrap()?;
+        assert_eq!(
+            database
+                .sync_payload_for_run(&run.id, SyncRecordType::RoutingObservationV1)?
+                .unwrap(),
+            parent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_feedback_event_survives_outbox_reconstruction() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        sync_parent_for_test(&state, &run.id)?;
+        let mut database = Database::open(state.db_path())?;
+        database
+            .save_routing_human_evaluation(&run.id, &feedback(RoutingHumanOutcome::Accepted, 8))?;
+        let event = database.routing_feedback_for_run(&run.id)?.remove(0);
+        let payload = database.sync_payload_for_record(&event.feedback_event_id)?;
+        assert!(
+            database
+                .enqueue_sync(
+                    SyncRecordType::RoutingFeedbackV1,
+                    &event.feedback_event_id,
+                    &run.id,
+                    "changed payload"
+                )
+                .is_err()
+        );
+        rusqlite::Connection::open(state.db_path())?.execute(
+            "DELETE FROM sync_outbox WHERE record_id = ?1",
+            [&event.feedback_event_id],
+        )?;
+        assert_eq!(
+            database.routing_feedback_for_run(&run.id)?.as_slice(),
+            std::slice::from_ref(&event)
+        );
+        assert_eq!(database.reconcile_routing_feedback(Some(&run.id))?, 0);
+        assert_eq!(
+            database.sync_payload_for_record(&event.feedback_event_id)?,
+            payload
+        );
+        assert_eq!(database.routing_feedback_for_run(&run.id)?, [event]);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_reuses_locks_to_prevent_pending_payload_and_evaluation_races() -> Result<()> {
+        let (_temp, state, run) = persisted_routed_run(false)?;
+        enable_for_test(&state)?;
+        set_token_for_test(&state, "lock-test-token")?;
+        let lock = OperationLock::acquire(&state.run_dir(&run.id).join(".operation.lock"), "busy")?;
+        assert!(
+            preview_payload(&state, &run.id)
+                .unwrap_err()
+                .to_string()
+                .contains("another operation")
+        );
+        assert!(
+            flush_to(&state, "https://must-not-contact.invalid")
+                .unwrap_err()
+                .to_string()
+                .contains("another operation")
+        );
+        drop(lock);
+        let _lock = lock_sync(&state)?;
+        assert!(
+            preview_payload(&state, &run.id)
+                .unwrap_err()
+                .to_string()
+                .contains("another sync")
+        );
+        assert!(
+            flush_to(&state, "https://must-not-contact.invalid")
+                .unwrap_err()
+                .to_string()
+                .contains("another sync")
+        );
+        Ok(())
+    }
+
     #[test]
     fn routing_observation_v1_preserves_independent_signals_and_privacy() -> Result<()> {
         let human = RoutingHumanEvaluation {
@@ -1414,11 +1992,14 @@ mod tests {
             },
         )?;
         drop(database);
-        let error =
-            preview_payload_for_type(&state, &run.id, Some(SyncRecordType::RoutingObservationV1))
-                .unwrap_err()
-                .to_string();
-        assert!(error.contains("already synced") && error.contains("immutable"));
+        assert_eq!(
+            preview_payload_for_type(&state, &run.id, Some(SyncRecordType::RoutingObservationV1))?
+                .1,
+            preview
+        );
+        let events = Database::open(state.db_path())?.routing_feedback_for_run(&run.id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, "reject");
         assert_eq!(
             Database::open(state.db_path())?
                 .sync_outbox_counts()?
@@ -1807,7 +2388,8 @@ mod tests {
                 .len(),
             1
         );
-        assert!(error.contains("token was rejected (HTTP 401)"));
+        assert!(error.contains("authentication/authorization failure (HTTP 401)"));
+        assert!(!error.contains("token was rejected"));
         assert!(!error.contains(token));
         assert_eq!(
             state.load_run(&run.id)?.evaluation.unwrap().explanation,
@@ -1827,53 +2409,62 @@ mod tests {
     }
 
     fn mock_server_with_body(status: u16, response_body: &str) -> Result<MockServer> {
+        mock_server_responses(&[(status, response_body)])
+    }
+
+    fn mock_server_responses(responses: &[(u16, &str)]) -> Result<MockServer> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let (sender, receiver) = mpsc::channel();
-        let response_body = response_body.to_owned();
+        let responses: Vec<_> = responses
+            .iter()
+            .map(|(status, body)| (*status, body.to_string()))
+            .collect();
         let handle = thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let mut expected = None;
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
+            for (status, response_body) in responses {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let mut expected = None;
+                loop {
+                    let read = stream.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if expected.is_none()
+                        && let Some(split) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..split]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        expected = Some(split + 4 + length);
+                    }
+                    if expected.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&buffer[..read]);
-                if expected.is_none()
-                    && let Some(split) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                {
-                    let headers = String::from_utf8_lossy(&request[..split]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .and_then(|value| value.parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    expected = Some(split + 4 + length);
-                }
-                if expected.is_some_and(|length| request.len() >= length) {
-                    break;
-                }
+                sender.send(request)?;
+                let reason = match status {
+                    200 => "OK",
+                    201 => "Created",
+                    422 => "Unprocessable Entity",
+                    401 => "Unauthorized",
+                    _ => "Server Error",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )?;
             }
-            sender.send(request)?;
-            let reason = match status {
-                200 => "OK",
-                201 => "Created",
-                422 => "Unprocessable Entity",
-                401 => "Unauthorized",
-                _ => "Server Error",
-            };
-            write!(
-                stream,
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            )?;
             Ok(())
         });
         Ok((format!("http://{address}"), receiver, handle))

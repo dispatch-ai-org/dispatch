@@ -461,6 +461,76 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
     let preview = serde_json::to_string(&preview)?;
     assert!(!preview.contains("Fix the retry race in the worker."));
     assert!(!preview.contains(&source.display().to_string()));
+
+    // Simulate the successful parent upload, then exercise the actual CLI path.
+    database.mark_sync_succeeded(&observation_id, Utc::now())?;
+    let parent = database
+        .sync_payload_for_run(run_id, dispatch::db::SyncRecordType::RoutingObservationV1)?
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let cloud_url = format!("http://{}", listener.local_addr()?);
+    for (outcome, expected) in [("accept", 1), ("accept", 1), ("reject", 2)] {
+        cargo_bin_cmd!("dispatch")
+            .args(["--state-dir"])
+            .arg(&state)
+            .env("DISPATCH_CLOUD_URL", &cloud_url)
+            .args([
+                "evaluate",
+                run_id,
+                "--outcome",
+                outcome,
+                "--reason",
+                "tests",
+                "--explanation",
+                "  Smoke review.\n",
+            ])
+            .assert()
+            .success();
+        assert_eq!(database.routing_feedback_for_run(run_id)?.len(), expected);
+    }
+    cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .args(["sync", "preview", run_id, "--type", "routing-feedback"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--revision"));
+    let feedback_preview = cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .env("DISPATCH_CLOUD_URL", &cloud_url)
+        .args([
+            "sync",
+            "preview",
+            run_id,
+            "--type",
+            "routing-feedback",
+            "--revision",
+            "1",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&feedback_preview.stderr)
+            .contains("Record type: routing-feedback-v1")
+    );
+    let body: Value = serde_json::from_slice(&feedback_preview.stdout)?;
+    assert_eq!(body["revision"], 1);
+    assert_eq!(body["outcome"], "accept");
+    assert_eq!(body["explanation"], "  Smoke review.\n");
+    assert_eq!(
+        database
+            .sync_payload_for_run(run_id, dispatch::db::SyncRecordType::RoutingObservationV1)?
+            .unwrap(),
+        parent
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     Ok(())
 }
 
