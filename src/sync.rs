@@ -241,9 +241,6 @@ pub fn status(state: &State) -> Result<()> {
     state.initialize()?;
     let database = Database::open(state.db_path())?;
     let settings = database.sync_settings()?;
-    let evaluations = database.sync_outbox_counts_for_type(SyncRecordType::EvaluationV1)?;
-    let routing = database.sync_outbox_counts_for_type(SyncRecordType::RoutingObservationV1)?;
-    let feedback = database.sync_outbox_counts_for_type(SyncRecordType::RoutingFeedbackV1)?;
     println!(
         "Evaluation sync: {}",
         if settings.enabled {
@@ -278,18 +275,21 @@ pub fn status(state: &State) -> Result<()> {
         "Routing observations: {}",
         database.routing_observations()?.len()
     );
-    println!(
-        "Outbox evaluation-v1: {} pending, {} failed, {} conflict, {} synced",
-        evaluations.pending, evaluations.failed, evaluations.conflict, evaluations.synced
-    );
-    println!(
-        "Outbox routing-observation-v1: {} pending, {} failed, {} conflict, {} synced",
-        routing.pending, routing.failed, routing.conflict, routing.synced
-    );
-    println!(
-        "Outbox routing-feedback-v1: {} pending, {} failed, {} conflict, {} synced",
-        feedback.pending, feedback.failed, feedback.conflict, feedback.synced
-    );
+    for record_type in [
+        SyncRecordType::EvaluationV1,
+        SyncRecordType::RoutingObservationV1,
+        SyncRecordType::RoutingFeedbackV1,
+    ] {
+        let counts = database.sync_outbox_counts_for_type(record_type)?;
+        println!(
+            "Outbox {}: {} pending, {} failed, {} conflict, {} synced",
+            record_type.as_str(),
+            counts.pending,
+            counts.failed,
+            counts.conflict,
+            counts.synced
+        );
+    }
     println!("Cloud URL: {}", configured_cloud_url()?);
     Ok(())
 }
@@ -351,11 +351,13 @@ pub fn flush(state: &State) -> Result<()> {
     Ok(())
 }
 
-pub fn preview_payload(state: &State, run_id: &str) -> Result<String> {
+#[cfg(test)]
+fn preview_payload(state: &State, run_id: &str) -> Result<String> {
     preview_payload_for_type(state, run_id, None).map(|(_, payload)| payload)
 }
 
-pub fn preview_payload_for_type(
+#[cfg(test)]
+fn preview_payload_for_type(
     state: &State,
     run_id: &str,
     requested_type: Option<SyncRecordType>,
@@ -500,6 +502,9 @@ fn queue_routing_observation(
     settings: &SyncSettings,
     observation: &RoutingObservation,
 ) -> Result<bool> {
+    if observation.prediction.selection_basis != crate::SelectionBasis::Evidence {
+        return Ok(false);
+    }
     if database
         .synced_routing_payload(&observation.run_id)?
         .is_some()
@@ -613,6 +618,10 @@ pub fn routing_observation_envelope_for(
     settings: &SyncSettings,
 ) -> Result<RoutingObservationV1> {
     anyhow::ensure!(
+        observation.prediction.selection_basis == crate::SelectionBasis::Evidence,
+        "only evidence-based routing observations are eligible for Cloud contribution"
+    );
+    anyhow::ensure!(
         settings.routing_observations_enabled(),
         "routing-observation sync consent is not enabled; run `dispatch sync enable` to accept the current scope"
     );
@@ -638,14 +647,7 @@ pub fn routing_observation_envelope_for(
         "routing evidence specificity exceeds 3"
     );
     anyhow::ensure!(
-        matches!(
-            observation.candidate_status,
-            CandidateStatus::Completed
-                | CandidateStatus::Failed
-                | CandidateStatus::TimedOut
-                | CandidateStatus::Cancelled
-                | CandidateStatus::MissingHarness
-        ),
+        observation.candidate_status.is_terminal(),
         "routing observation {} is not terminal",
         observation.id
     );
@@ -805,7 +807,7 @@ pub fn serialize_routing_observation(observation: &RoutingObservationV1) -> Resu
         .context("failed to serialize routing-observation envelope")
 }
 
-fn configured_cloud_url() -> Result<String> {
+pub(crate) fn configured_cloud_url() -> Result<String> {
     let value = env::var("DISPATCH_CLOUD_URL").unwrap_or_else(|_| DEFAULT_CLOUD_URL.into());
     validate_cloud_url(&value)
 }
@@ -1179,6 +1181,8 @@ mod tests {
                 dataset: "terminal-bench".into(),
                 dataset_version: "2.0".into(),
                 model: Some("benchmark/model".into()),
+                selection_basis: crate::SelectionBasis::Evidence,
+                alternatives: Vec::new(),
             },
             harness_version: Some("cursor-1.2.3".into()),
             model: Some("execution/model".into()),
@@ -1219,6 +1223,8 @@ mod tests {
             dataset: "terminal-bench".into(),
             dataset_version: "2.0".into(),
             model: Some("benchmark/model".into()),
+            selection_basis: crate::SelectionBasis::Evidence,
+            alternatives: Vec::new(),
         });
         if blind_evaluation {
             run.evaluation = Some(EvaluationRecord {

@@ -142,12 +142,25 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
     let marker = temp.path().join("cursor-invocations");
     let cursor = temp.path().join("cursor-fixture");
     let missing_codex = temp.path().join("missing-codex");
-    let missing_claude = temp.path().join("missing-claude");
+    let claude = temp.path().join("claude-fixture");
+    let claude_marker = temp.path().join("claude-invocations");
     executable(&cursor, &marker)?;
-    configure(&source, &cursor, &missing_codex, &missing_claude)?;
+    executable(&claude, &claude_marker)?;
+    configure(&source, &cursor, &missing_codex, &claude)?;
     cache(
         &state,
         &[
+            prior(
+                "harbor-framework/harbor",
+                "terminal-bench",
+                "2.0",
+                "claude",
+                None,
+                None,
+                TaskKind::Unknown,
+                1,
+                10,
+            ),
             prior(
                 "unsupported-source",
                 "unsupported-dataset",
@@ -218,13 +231,15 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
         .clone();
     let stdout = String::from_utf8(output)?;
 
-    assert!(stdout.contains("Routing\n"));
-    assert!(stdout.contains("selected: cursor"));
+    assert!(stdout.contains("Agent\n  Cursor"));
+    assert!(stdout.contains("Selection\n  Evidence-based"));
+    assert!(stdout.contains("Cursor: 1/2"));
     assert!(stdout.contains("benchmark success: 1/2 (50.0%)"));
     assert!(stdout.contains("evidence specificity: 2/3 (partial)"));
     assert!(stdout.contains("source: specific-public-evidence"));
     assert!(stdout.contains("Preparing 1 candidate(s)..."));
     assert_eq!(fs::read_to_string(&marker)?, "run\n");
+    assert!(!claude_marker.exists());
     assert_eq!(fingerprint_tree(&source)?, source_fingerprint);
     assert!(!source.join("cursor-routed.txt").exists());
     let (_, metadata) = only_metadata(&state)?;
@@ -307,8 +322,8 @@ fn routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path(
         .stdout
         .clone();
     let shown = String::from_utf8(shown)?;
-    assert!(shown.contains("Routing\n"));
-    assert!(shown.contains("selected: cursor"));
+    assert!(shown.contains("Agent\n  Cursor"));
+    assert!(shown.contains("Selection\n  Evidence-based"));
     assert!(shown.contains("Routing observation"));
     assert!(shown.contains("Process         completed"));
     assert!(shown.contains("Verification    PASS"));
@@ -829,12 +844,17 @@ fn route_and_explicit_harnesses_are_mutually_exclusive() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
-fn routed_run_without_compatible_evidence_fails_before_creating_a_candidate() -> anyhow::Result<()>
-{
+fn routed_run_without_compatible_evidence_uses_the_stable_default() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let source = source(temp.path());
     let state = temp.path().join("state");
+    let marker = temp.path().join("cursor-invocations");
+    let cursor = temp.path().join("cursor-fixture");
+    let missing = temp.path().join("not-installed");
+    executable(&cursor, &marker)?;
+    configure(&source, &cursor, &missing, &missing)?;
     cache(
         &state,
         &[prior(
@@ -850,7 +870,7 @@ fn routed_run_without_compatible_evidence_fails_before_creating_a_candidate() ->
         )],
     )?;
 
-    cargo_bin_cmd!("dispatch")
+    let output = cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
         .arg("run")
@@ -862,12 +882,18 @@ fn routed_run_without_compatible_evidence_fails_before_creating_a_candidate() ->
             "--allow-unsafe-local",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "No compatible routing evidence is available.\nUse --harnesses to select harnesses explicitly.",
-        ));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
 
-    assert_eq!(fs::read_dir(state.join("runs"))?.count(), 0);
+    let stdout = String::from_utf8(output)?;
+    assert!(stdout.contains("Agent\n  Cursor"));
+    assert!(stdout.contains("Selection\n  Only available agent"));
+    assert_eq!(fs::read_to_string(marker)?, "run\n");
+    let (_, metadata) = only_metadata(&state)?;
+    assert_eq!(metadata["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["candidates"][0]["harness_id"], "cursor");
     Ok(())
 }
 
@@ -907,7 +933,7 @@ fn routed_run_with_evidence_but_no_eligible_adapter_fails_before_execution() -> 
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "Compatible routing evidence is available, but no predicted harness is execution-eligible locally.",
+            "No supported coding agent is available.",
         ));
 
     assert_eq!(fs::read_dir(state.join("runs"))?.count(), 0);

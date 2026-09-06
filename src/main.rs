@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "dispatch",
     version,
-    about = "Compare coding-agent harnesses on local software tasks"
+    about = "Dispatch — give a software task to the best available coding agent"
 )]
 struct Cli {
     /// Override ~/.dispatch (also available as DISPATCH_HOME).
@@ -27,6 +27,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create a small project-local Dispatch configuration.
+    #[command(hide = true)]
     Init {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -35,16 +36,24 @@ enum Command {
         force: bool,
     },
     /// Check local dependencies and harness availability.
+    #[command(hide = true)]
     Doctor {
         #[arg(default_value = ".")]
         source: PathBuf,
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Freeze a source tree and execute independent candidates.
+    /// Work on a software task with the best available coding agent.
     Run(RunArgs),
     /// Inspect locally cached evidence for supported real harnesses.
+    #[command(hide = true)]
     Recommend(RecommendArgs),
+    /// Inspect observed local outcomes without changing routing.
+    #[command(hide = true)]
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
     /// Show the state of one run (or the latest run).
     Status { run_id: Option<String> },
     /// List recent runs.
@@ -52,18 +61,26 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
+    /// Explain why Dispatch chose the agent for the latest task.
+    Explain { run_id: Option<String> },
     /// Show a run and its persisted signals.
+    #[command(hide = true)]
     Show { run_id: String },
     /// Print a candidate's patch.
     Diff {
-        run_id: String,
-        candidate: String,
+        run_id: Option<String>,
+        candidate: Option<String>,
         #[arg(long, conflicts_with = "name_only")]
         stat: bool,
         #[arg(long, conflicts_with = "stat")]
         name_only: bool,
     },
+    /// Accept and safely apply the latest single result.
+    Accept(ReviewArgs),
+    /// Reject the latest single result without changing the source tree.
+    Reject(ReviewArgs),
     /// Print the path to a candidate's complete workspace.
+    #[command(hide = true)]
     Inspect {
         run_id: String,
         candidate: String,
@@ -72,23 +89,34 @@ enum Command {
         shell: bool,
     },
     /// Compare blind candidates and optionally persist an evaluation.
+    #[command(hide = true)]
     Compare(CompareArgs),
     /// Record accept/reject feedback for one predictively routed result.
+    #[command(hide = true)]
     Evaluate(EvaluateArgs),
     /// Safely apply one candidate to the original source.
+    #[command(hide = true)]
     Apply { run_id: String, candidate: String },
     /// Import public benchmark snapshots into the local evidence cache.
-    Datasets(DatasetsArgs),
+    #[command(hide = true)]
+    Datasets {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+    /// Refresh the compact public routing data cache.
+    #[command(hide = true)]
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
+    },
     /// Review opt-in records; bare `dispatch sync` explicitly transmits queued data.
-    Sync(SyncArgs),
+    #[command(hide = true)]
+    Sync {
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+    },
     /// Print the Dispatch version.
     Version,
-}
-
-#[derive(Debug, Args)]
-struct DatasetsArgs {
-    #[command(subcommand)]
-    command: DatasetCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -99,12 +127,20 @@ enum DatasetCommand {
         dataset: String,
         path: PathBuf,
     },
+    /// Export imported normalized priors as a versioned maintainer snapshot.
+    ExportPublicPriors { output: PathBuf },
 }
 
-#[derive(Debug, Args)]
-struct SyncArgs {
-    #[command(subcommand)]
-    command: Option<SyncCommand>,
+#[derive(Debug, Subcommand)]
+enum DataCommand {
+    /// Fetch the latest compact public routing data; existing data remains on failure.
+    Refresh,
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    /// Count routed outcomes for this source location, without ranking harnesses.
+    Local { source: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,13 +162,10 @@ enum SyncCommand {
         revision: Option<u32>,
     },
     /// Manage the developer-preview Dispatch Cloud ingestion token.
-    Token(SyncTokenArgs),
-}
-
-#[derive(Debug, Args)]
-struct SyncTokenArgs {
-    #[command(subcommand)]
-    command: SyncTokenCommand,
+    Token {
+        #[command(subcommand)]
+        command: SyncTokenCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,38 +180,51 @@ enum SyncTokenCommand {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    #[arg(default_value = ".")]
-    source: PathBuf,
+    /// Desired software change. The source defaults to the current directory.
+    task_or_legacy_source: Option<String>,
 
-    #[command(flatten)]
-    task_input: TaskInput,
+    /// Work on a source tree other than the current directory.
+    #[arg(long)]
+    source: Option<PathBuf>,
+
+    /// Legacy task form retained for scripts using `run <source> --task ...`.
+    #[arg(long, conflicts_with = "task_file", hide = true)]
+    task: Option<String>,
+
+    /// Read the task verbatim from a file, or '-' for stdin.
+    #[arg(long, conflicts_with = "task")]
+    task_file: Option<PathBuf>,
 
     /// Comma-separated adapter IDs. Fakes make the complete workflow testable offline.
-    #[arg(long, value_delimiter = ',', conflicts_with = "route")]
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["route", "agent"], hide = true)]
     harnesses: Option<Vec<String>>,
 
+    /// Deliberately choose one supported coding agent.
+    #[arg(long, value_parser = ["claude", "codex", "cursor"], conflicts_with_all = ["route", "harnesses"])]
+    agent: Option<String>,
+
     /// Select one locally runnable real harness using cached routing evidence.
-    #[arg(long, conflicts_with = "harnesses")]
+    #[arg(long, conflicts_with_all = ["harnesses", "agent"], hide = true)]
     route: bool,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     config: Option<PathBuf>,
 
-    #[arg(long, value_parser = ["local", "docker"])]
+    #[arg(long, value_parser = ["local", "docker"], hide = true)]
     backend: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     timeout: Option<u64>,
 
-    #[arg(long)]
+    #[arg(long, hide = true)]
     max_parallel: Option<usize>,
 
     /// Explicitly allow real agents or project checks to execute on the host.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     allow_unsafe_local: bool,
 
     /// Forward only the environment variable names allowlisted in dispatch.yml.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     allow_forwarded_env: bool,
 }
 
@@ -212,6 +258,16 @@ struct CompareArgs {
     #[arg(long)]
     winner: Option<String>,
 
+    #[command(flatten)]
+    feedback: FeedbackArgs,
+
+    /// Prompt for outcome, labels, and multiline freeform text.
+    #[arg(long)]
+    evaluate: bool,
+}
+
+#[derive(Debug, Args)]
+struct FeedbackArgs {
     /// Optional structured reason; repeat the flag for multiple labels.
     #[arg(long = "reason")]
     reasons: Vec<String>,
@@ -223,10 +279,15 @@ struct CompareArgs {
     /// Read unrestricted explanation verbatim from this path, or '-' for stdin.
     #[arg(long, conflicts_with = "explanation")]
     explanation_file: Option<PathBuf>,
+}
 
-    /// Prompt for outcome, labels, and multiline freeform text.
-    #[arg(long)]
-    evaluate: bool,
+impl FeedbackArgs {
+    fn read_explanation(&self) -> Result<Option<String>> {
+        match &self.explanation_file {
+            Some(path) => orchestrator::read_verbatim(path).map(Some),
+            None => Ok(self.explanation.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -237,17 +298,16 @@ struct EvaluateArgs {
     #[arg(long, value_parser = ["accept", "reject"])]
     outcome: String,
 
-    /// Optional structured reason; repeat the flag for multiple labels.
-    #[arg(long = "reason")]
-    reasons: Vec<String>,
+    #[command(flatten)]
+    feedback: FeedbackArgs,
+}
 
-    /// Optional unrestricted explanation, stored verbatim.
-    #[arg(long, conflicts_with = "explanation_file")]
-    explanation: Option<String>,
+#[derive(Debug, Args)]
+struct ReviewArgs {
+    run_id: Option<String>,
 
-    /// Read unrestricted explanation verbatim from this path, or '-' for stdin.
-    #[arg(long, conflicts_with = "explanation")]
-    explanation_file: Option<PathBuf>,
+    #[command(flatten)]
+    feedback: FeedbackArgs,
 }
 
 #[tokio::main]
@@ -277,18 +337,13 @@ async fn run() -> Result<()> {
             orchestrator::doctor(&state, &source, config.as_deref()).await
         }
         Command::Run(args) => {
-            let task = read_task(args.task_input)?;
+            let (source, task) = read_run_input(&args)?;
             let request = orchestrator::RunRequest {
-                source: args.source,
+                source,
                 task,
-                harnesses: args.harnesses.unwrap_or_else(|| {
-                    if args.route {
-                        Vec::new()
-                    } else {
-                        vec!["fake-good".into(), "fake-bad".into()]
-                    }
-                }),
+                harnesses: args.harnesses.unwrap_or_default(),
                 route: args.route,
+                agent: args.agent,
                 config_path: args.config,
                 backend: args.backend,
                 timeout_secs: args.timeout,
@@ -304,44 +359,75 @@ async fn run() -> Result<()> {
             let task = read_task(args.task_input)?;
             orchestrator::recommend(&state, &args.source, &task)
         }
-        Command::Status { run_id } => orchestrator::status(&state, run_id.as_deref()),
+        Command::Evidence {
+            command: EvidenceCommand::Local { source },
+        } => dispatch::evidence::inspect_local(&state, &source),
+        Command::Status { run_id } => {
+            orchestrator::status(&state, run_id.as_deref(), &std::env::current_dir()?)
+        }
         Command::History { limit } => orchestrator::history(&state, limit),
+        Command::Explain { run_id } => {
+            orchestrator::explain(&state, run_id.as_deref(), &std::env::current_dir()?)
+        }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
             run_id,
             candidate,
             stat,
             name_only,
-        } => orchestrator::diff(&state, &run_id, &candidate, stat, name_only),
+        } => orchestrator::diff(
+            &state,
+            run_id.as_deref(),
+            candidate.as_deref(),
+            &std::env::current_dir()?,
+            stat,
+            name_only,
+        ),
+        Command::Accept(args) => {
+            let explanation = args.feedback.read_explanation()?;
+            orchestrator::accept_or_reject_latest(
+                &state,
+                args.run_id.as_deref(),
+                &std::env::current_dir()?,
+                true,
+                args.feedback.reasons,
+                explanation,
+            )
+        }
+        Command::Reject(args) => {
+            let explanation = args.feedback.read_explanation()?;
+            orchestrator::accept_or_reject_latest(
+                &state,
+                args.run_id.as_deref(),
+                &std::env::current_dir()?,
+                false,
+                args.feedback.reasons,
+                explanation,
+            )
+        }
         Command::Inspect {
             run_id,
             candidate,
             shell,
         } => orchestrator::inspect(&state, &run_id, &candidate, shell),
         Command::Compare(args) => {
-            let mut evaluation = orchestrator::EvaluationInput {
+            let evaluation = orchestrator::EvaluationInput {
                 winner: args.winner,
-                reasons: args.reasons,
-                explanation: args.explanation,
+                explanation: args.feedback.read_explanation()?,
+                reasons: args.feedback.reasons,
             };
-            if let Some(path) = args.explanation_file {
-                evaluation.explanation = Some(orchestrator::read_verbatim(&path)?);
-            }
             orchestrator::compare(&state, &args.run_id, evaluation, args.evaluate)
         }
         Command::Evaluate(args) => {
-            let mut evaluation = orchestrator::RoutingEvaluationInput {
+            let evaluation = orchestrator::RoutingEvaluationInput {
                 outcome: args.outcome,
-                reasons: args.reasons,
-                explanation: args.explanation,
+                explanation: args.feedback.read_explanation()?,
+                reasons: args.feedback.reasons,
             };
-            if let Some(path) = args.explanation_file {
-                evaluation.explanation = Some(orchestrator::read_verbatim(&path)?);
-            }
             orchestrator::evaluate_routed(&state, &args.run_id, evaluation)
         }
         Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
-        Command::Datasets(args) => match args.command {
+        Command::Datasets { command } => match command {
             DatasetCommand::Import { dataset, path } => {
                 let report = match dataset.as_str() {
                     "swe-bench" => dispatch::datasets::import_swe_bench(&state, &path)?,
@@ -363,8 +449,45 @@ async fn run() -> Result<()> {
                 );
                 Ok(())
             }
+            DatasetCommand::ExportPublicPriors { output } => {
+                let snapshot = dispatch::public_priors::export_public_priors(&state, &output)?;
+                println!(
+                    "Exported {} public prior entries to {}\nSnapshot: {}",
+                    snapshot.entries.len(),
+                    output.display(),
+                    snapshot.snapshot_id
+                );
+                Ok(())
+            }
         },
-        Command::Sync(args) => match args.command {
+        Command::Data {
+            command: DataCommand::Refresh,
+        } => {
+            match dispatch::public_priors::refresh(&state) {
+                Ok((dispatch::public_priors::RefreshResult::Updated, snapshot)) => {
+                    let agents = snapshot
+                        .entries
+                        .iter()
+                        .map(|entry| entry.harness.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len();
+                    println!("Public routing data updated.");
+                    println!("Snapshot: {}", snapshot.snapshot_id);
+                    println!("Agents: {agents}");
+                    println!("Evidence groups: {}", snapshot.entries.len());
+                }
+                Ok((dispatch::public_priors::RefreshResult::Current, snapshot)) => {
+                    println!("Public routing data is up to date.");
+                    println!("Snapshot: {}", snapshot.snapshot_id);
+                }
+                Err(_) => {
+                    println!("Could not refresh public routing data.");
+                    println!("Existing local data remains available.");
+                }
+            }
+            Ok(())
+        }
+        Command::Sync { command } => match command {
             Some(SyncCommand::Enable) => dispatch::sync::enable(&state),
             Some(SyncCommand::Disable) => dispatch::sync::disable(&state),
             Some(SyncCommand::Status) => dispatch::sync::status(&state),
@@ -373,7 +496,7 @@ async fn run() -> Result<()> {
                 record_type,
                 revision,
             }) => dispatch::sync::preview(&state, &run_id, record_type.as_deref(), revision),
-            Some(SyncCommand::Token(args)) => match args.command {
+            Some(SyncCommand::Token { command }) => match command {
                 SyncTokenCommand::Set { token } => dispatch::sync::token_set(&state, &token),
                 SyncTokenCommand::Status => dispatch::sync::token_status(&state),
                 SyncTokenCommand::Clear => dispatch::sync::token_clear(&state),
@@ -393,5 +516,31 @@ fn read_task(input: TaskInput) -> Result<String> {
         (None, Some(path)) => std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read task file {}", path.display())),
         _ => unreachable!("clap enforces one task source"),
+    }
+}
+
+fn read_run_input(args: &RunArgs) -> Result<(PathBuf, String)> {
+    let legacy_task = match (&args.task, &args.task_file) {
+        (Some(task), None) => Some(task.clone()),
+        (None, Some(path)) => Some(orchestrator::read_verbatim(path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects multiple task inputs"),
+    };
+    match legacy_task {
+        Some(task) => Ok((
+            args.source.clone().unwrap_or_else(|| {
+                args.task_or_legacy_source
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }),
+            task,
+        )),
+        None => Ok((
+            args.source.clone().unwrap_or_else(|| PathBuf::from(".")),
+            args.task_or_legacy_source
+                .clone()
+                .context("a task is required; use `dispatch run \"<task>\"`")?,
+        )),
     }
 }

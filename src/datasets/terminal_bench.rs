@@ -3,11 +3,10 @@ use std::{collections::BTreeSet, fs, path::Path};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::{BenchmarkPrior, TaskKind, TaskScope, state::State};
 
-use super::{DatasetImportReport, finish_import, read, update_digest};
+use super::{DatasetImportReport, cache_snapshot, digest, finish_import, read};
 
 const SOURCE: &str = "harbor-framework/harbor";
 
@@ -99,19 +98,19 @@ pub fn read_terminal_bench_snapshot(path: &Path) -> Result<TerminalBenchSnapshot
 
 pub fn import_terminal_bench(state: &State, path: &Path) -> Result<DatasetImportReport> {
     let job = parse_job(path)?;
-    state.initialize()?;
-
-    let raw_snapshot_path = state
-        .datasets_dir()
-        .join("terminal-bench")
-        .join(&job.snapshot_id);
-    fs::create_dir_all(&raw_snapshot_path)?;
-    fs::write(raw_snapshot_path.join("config.json"), &job.config)?;
-    for trial in &job.trials {
-        let directory = raw_snapshot_path.join(&trial.directory);
-        fs::create_dir_all(&directory)?;
-        fs::write(directory.join("result.json"), &trial.contents)?;
-    }
+    let raw_snapshot_path = cache_snapshot(
+        state,
+        "terminal-bench",
+        &job.snapshot_id,
+        std::iter::once(("config.json".into(), job.config)).chain(job.trials.into_iter().map(
+            |trial| {
+                (
+                    Path::new(&trial.directory).join("result.json"),
+                    trial.contents,
+                )
+            },
+        )),
+    )?;
 
     let successes = u64::try_from(
         job.snapshot
@@ -232,7 +231,16 @@ fn parse_job(path: &Path) -> Result<ParsedJob> {
 
     let (agent, agent_version, model, upstream_source) =
         common_identity.context("Harbor job has no trial results")?;
-    let snapshot_id = digest(&config, &trials);
+    // Keep Harbor's existing filename/content hash order, distinct from SWE-bench.
+    let snapshot_id = digest(
+        [b"config.json".as_slice(), config.as_slice()]
+            .into_iter()
+            .chain(
+                trials
+                    .iter()
+                    .flat_map(|trial| [trial.directory.as_bytes(), trial.contents.as_slice()]),
+            ),
+    );
     let dataset_version = format!("{upstream_version}+sha256:{snapshot_id}");
     Ok(ParsedJob {
         snapshot: TerminalBenchSnapshot {
@@ -342,15 +350,4 @@ fn checked_text(value: &str, label: &str) -> Result<String> {
     let value = value.trim();
     anyhow::ensure!(!value.is_empty(), "{label} must not be empty");
     Ok(value.to_owned())
-}
-
-fn digest(config: &[u8], trials: &[TrialFile]) -> String {
-    let mut hasher = Sha256::new();
-    update_digest(&mut hasher, b"config.json");
-    update_digest(&mut hasher, config);
-    for trial in trials {
-        update_digest(&mut hasher, trial.directory.as_bytes());
-        update_digest(&mut hasher, &trial.contents);
-    }
-    hex::encode(hasher.finalize())
 }

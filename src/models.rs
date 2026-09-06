@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     BugFix,
     Feature,
     Refactor,
     Tests,
+    #[default]
     Unknown,
 }
 
@@ -25,12 +26,13 @@ impl TaskKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskScope {
     Localized,
     MultiFile,
     Broad,
+    #[default]
     Unknown,
 }
 
@@ -45,7 +47,7 @@ impl TaskScope {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskFeatures {
     pub language: Option<String>,
     pub task_kind: TaskKind,
@@ -63,6 +65,41 @@ pub struct RoutingDecision {
     pub source: String,
     pub dataset: String,
     pub dataset_version: String,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub selection_basis: SelectionBasis,
+    #[serde(default)]
+    pub alternatives: Vec<RoutingAlternative>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionBasis {
+    #[default]
+    Evidence,
+    Default,
+    Override,
+}
+
+impl SelectionBasis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Evidence => "Evidence-based",
+            Self::Default => "Dispatch default",
+            Self::Override => "Agent override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingAlternative {
+    pub harness: String,
+    pub successes: u64,
+    pub attempts: u64,
+    pub specificity: Option<u8>,
+    pub source: Option<String>,
+    pub dataset: Option<String>,
+    pub dataset_version: Option<String>,
     pub model: Option<String>,
 }
 
@@ -181,6 +218,10 @@ pub enum CandidateStatus {
 }
 
 impl CandidateStatus {
+    pub(crate) fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Preparing | Self::Running | Self::Verifying)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Preparing => "preparing",

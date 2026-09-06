@@ -4,18 +4,24 @@ These instructions apply to the entire repository.
 
 ## Product thesis
 
-Dispatch is a neutral execution and evaluation layer for software work:
+Dispatch gives a software task to the best available coding agent using observed
+performance evidence, runs that agent through the existing isolated execution
+path, and explains the choice:
 
 ```text
 task
-→ equivalent source states
-→ N harnesses
-→ execution evidence
-→ human evaluation
+→ deterministic task features
+→ eligible local harnesses + cached public evidence
+→ one selected harness
+→ isolated execution and verification
+→ human review
 → durable data
 ```
 
-Learned and predictive routing are explicitly approved experimental feature areas. Keep early routing work local, evidence-based, and separate from execution; do not present public priors or experimental predictions as ground truth or let routing concerns distort the local execution core.
+Predictive routing is the normal product path. Keep selection local and
+evidence-based, do not present public priors as ground truth, and feed the
+selected harness into the same execution core used by deliberate overrides.
+Multi-harness comparison remains an advanced evaluation workflow.
 
 ## Architectural ownership
 
@@ -25,7 +31,11 @@ If explicitly requested later, **Go may own networked coordination and learning*
 
 Cloud must never be required to execute a normal local Dispatch run.
 
-Public benchmark evidence must be periodically ingested, normalized, and cached locally rather than fetched from a live service during normal runs. Preserve its provenance and treat it as an initial prior, not a quality label or ground truth.
+Public benchmark evidence must be normalized offline and distributed as a
+compact versioned snapshot. Bundle a fallback with the CLI and cache only
+normalized entries locally; normal runs must never fetch live benchmark data.
+Preserve provenance and treat public evidence as an observation, not a quality
+label or ground truth.
 
 Evaluation upload is off by default and requires explicit user opt-in. A Cloud ingestion token is a separate submission permission: storing or possessing it never implies consent, and it must remain outside the envelope and preview. Source code, snapshots, full diffs, logs, local paths, environment data, and credentials are outside the v0.1.0 sync scope. Task text and human explanations are shared only after their inclusion has been clearly disclosed, and preview must serialize the exact payload used for upload.
 

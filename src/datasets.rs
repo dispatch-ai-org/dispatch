@@ -88,18 +88,15 @@ pub fn read_swe_bench_snapshot(path: &Path) -> Result<SweBenchSnapshot> {
 
 pub fn import_swe_bench(state: &State, path: &Path) -> Result<DatasetImportReport> {
     let bundle = parse_bundle(path)?;
-    state.initialize()?;
-
-    let raw_snapshot_path = state
-        .datasets_dir()
-        .join("swe-bench")
-        .join(&bundle.snapshot_id);
-    fs::create_dir_all(raw_snapshot_path.join("results"))?;
-    fs::write(raw_snapshot_path.join("metadata.yaml"), &bundle.metadata)?;
-    fs::write(raw_snapshot_path.join("instances.jsonl"), &bundle.instances)?;
-    fs::write(
-        raw_snapshot_path.join("results/results.json"),
-        &bundle.results,
+    let raw_snapshot_path = cache_snapshot(
+        state,
+        "swe-bench",
+        &bundle.snapshot_id,
+        [
+            ("metadata.yaml".into(), bundle.metadata),
+            ("instances.jsonl".into(), bundle.instances),
+            ("results/results.json".into(), bundle.results),
+        ],
     )?;
 
     let successes = u64::try_from(
@@ -198,7 +195,11 @@ fn parse_bundle(path: &Path) -> Result<ParsedBundle> {
             task_id,
         })
         .collect();
-    let snapshot_id = digest(&[&metadata, &instances, &results]);
+    let snapshot_id = digest([
+        metadata.as_slice(),
+        instances.as_slice(),
+        results.as_slice(),
+    ]);
     let dataset_version = format!("sha256:{snapshot_id}");
     Ok(ParsedBundle {
         snapshot: SweBenchSnapshot {
@@ -243,12 +244,30 @@ fn is_single_attempt(value: &serde_yaml::Value) -> bool {
     }
 }
 
-fn digest(parts: &[&[u8]]) -> String {
+fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
-        update_digest(&mut hasher, part);
+        hasher.update(part.len().to_be_bytes());
+        hasher.update(part);
     }
     hex::encode(hasher.finalize())
+}
+
+// Both parsers supply only their already-validated relative snapshot filenames.
+fn cache_snapshot(
+    state: &State,
+    benchmark: &str,
+    snapshot_id: &str,
+    files: impl IntoIterator<Item = (PathBuf, Vec<u8>)>,
+) -> Result<PathBuf> {
+    state.initialize()?;
+    let root = state.datasets_dir().join(benchmark).join(snapshot_id);
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("snapshot file has a parent"))?;
+        fs::write(path, contents)?;
+    }
+    Ok(root)
 }
 
 fn read(path: PathBuf) -> Result<Vec<u8>> {
@@ -266,9 +285,4 @@ fn finish_import(
         prior,
         raw_snapshot_path,
     })
-}
-
-fn update_digest(hasher: &mut Sha256, part: &[u8]) {
-    hasher.update(part.len().to_be_bytes());
-    hasher.update(part);
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -9,11 +10,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::models::{
-    BenchmarkPrior, CandidateRecord, CandidateStatus, CheckResult, EvaluationOutcome,
-    EvaluationRecord, EventRecord, RoutingHumanEvaluation, RoutingObservation, RunRecord,
-    TaskFeatures,
+    BenchmarkPrior, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
+    RoutingHumanEvaluation, RoutingObservation, RunRecord, TaskFeatures,
 };
+use crate::public_priors::PublicPriorSnapshotV1;
 use crate::sync::{RoutingFeedbackV1, RoutingObservationV1};
+use crate::{RoutingHumanOutcome, evidence::LocalRoutingEvidence};
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -301,7 +303,42 @@ CREATE INDEX sync_outbox_status_idx ON sync_outbox(status);
 CREATE INDEX sync_outbox_type_status_idx ON sync_outbox(record_type, status);
 "#,
     ),
+    (
+        11,
+        "distributed_public_priors",
+        r#"
+ALTER TABLE benchmark_priors ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'
+    CHECK (origin IN ('manual', 'distributed'));
+DROP INDEX benchmark_priors_identity_idx;
+CREATE UNIQUE INDEX benchmark_priors_identity_idx ON benchmark_priors(
+    source,
+    dataset,
+    dataset_version,
+    harness,
+    COALESCE(model, X''),
+    COALESCE(language, X''),
+    task_kind,
+    scope,
+    origin
+);
+CREATE TABLE distributed_public_prior_snapshot (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    snapshot_id     TEXT NOT NULL,
+    generated_at    TEXT NOT NULL,
+    installed_at    TEXT NOT NULL,
+    installed_from  TEXT NOT NULL CHECK (installed_from IN ('bundled', 'downloaded'))
+);
+"#,
+    ),
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistributedPublicPriorSnapshot {
+    pub snapshot_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub installed_at: DateTime<Utc>,
+    pub installed_from: String,
+}
 
 /// The compact row used by `dispatch history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,7 +504,7 @@ impl Database {
     }
 
     pub fn upsert_benchmark_prior(&self, prior: &BenchmarkPrior) -> Result<()> {
-        insert_benchmark_prior(&self.connection, prior)
+        insert_benchmark_prior(&self.connection, prior, "manual")
     }
 
     pub fn replace_benchmark_prior(&mut self, prior: &BenchmarkPrior) -> Result<()> {
@@ -480,7 +517,8 @@ impl Database {
                  AND model IS ?4
                  AND language IS ?5
                  AND task_kind = ?6
-                 AND scope = ?7"#,
+                 AND scope = ?7
+                 AND origin = 'manual'"#,
             params![
                 prior.source,
                 prior.dataset,
@@ -491,7 +529,7 @@ impl Database {
                 prior.scope.as_str(),
             ],
         )?;
-        insert_benchmark_prior(&transaction, prior)?;
+        insert_benchmark_prior(&transaction, prior, "manual")?;
         transaction
             .commit()
             .context("failed to replace benchmark prior")
@@ -538,6 +576,99 @@ impl Database {
         )?;
         rows.collect::<rusqlite::Result<_>>()
             .context("failed to read matching benchmark priors")
+    }
+
+    pub fn replace_distributed_public_priors(
+        &mut self,
+        snapshot: &PublicPriorSnapshotV1,
+        installed_from: &str,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        anyhow::ensure!(
+            matches!(installed_from, "bundled" | "downloaded"),
+            "invalid public prior installation source"
+        );
+        if self
+            .distributed_public_prior_snapshot()?
+            .is_some_and(|current| current.snapshot_id == snapshot.snapshot_id)
+        {
+            return Ok(());
+        }
+
+        let installed_at = Utc::now();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM benchmark_priors WHERE origin = 'distributed'",
+            [],
+        )?;
+        for entry in &snapshot.entries {
+            insert_benchmark_prior(
+                &transaction,
+                &entry.to_prior(snapshot.generated_at),
+                "distributed",
+            )?;
+        }
+        transaction.execute(
+            r#"INSERT INTO distributed_public_prior_snapshot(
+                    id, snapshot_id, generated_at, installed_at, installed_from
+                ) VALUES (1, ?1, ?2, ?3, ?4)
+                ON CONFLICT(id) DO UPDATE SET
+                    snapshot_id = excluded.snapshot_id,
+                    generated_at = excluded.generated_at,
+                    installed_at = excluded.installed_at,
+                    installed_from = excluded.installed_from"#,
+            params![
+                snapshot.snapshot_id,
+                timestamp(snapshot.generated_at),
+                timestamp(installed_at),
+                installed_from,
+            ],
+        )?;
+        transaction
+            .commit()
+            .context("failed to replace distributed public priors")
+    }
+
+    pub fn distributed_public_prior_snapshot(
+        &self,
+    ) -> Result<Option<DistributedPublicPriorSnapshot>> {
+        self.connection
+            .query_row(
+                "SELECT snapshot_id, generated_at, installed_at, installed_from \
+                 FROM distributed_public_prior_snapshot WHERE id = 1",
+                [],
+                |row| {
+                    Ok(DistributedPublicPriorSnapshot {
+                        snapshot_id: row.get(0)?,
+                        generated_at: timestamp_from_sql(1, row.get(1)?)?,
+                        installed_at: timestamp_from_sql(2, row.get(2)?)?,
+                        installed_from: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read distributed public prior snapshot")
+    }
+
+    pub fn distributed_public_prior_count(&self) -> Result<usize> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM benchmark_priors WHERE origin = 'distributed'",
+            [],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).context("distributed public prior count is invalid")
+    }
+
+    pub fn manual_benchmark_priors(&self) -> Result<Vec<BenchmarkPrior>> {
+        let mut statement = self.connection.prepare(
+            "SELECT source, dataset, dataset_version, harness, model, language, \
+                    task_kind, scope, successes, attempts, updated_at \
+             FROM benchmark_priors WHERE origin = 'manual' \
+             ORDER BY source, dataset, dataset_version, harness, model, language, task_kind, scope",
+        )?;
+        let rows = statement.query_map([], prior_from_row)?;
+        rows.collect::<rusqlite::Result<_>>()
+            .context("failed to read public benchmark priors")
     }
 
     /// Replace all structured state for a run in one transaction. Events are an
@@ -744,6 +875,70 @@ impl Database {
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| deserialize_routing_observation(row?))
             .collect()
+    }
+
+    /// Derive source-local counts in one SQLite read snapshot. `source` is the
+    /// canonical location already stored by run preparation, not a repository ID.
+    /// No sync preparation, outbox writes, public priors or Cloud queries occur.
+    pub fn local_routing_evidence(&self, source: &Path) -> Result<Vec<LocalRoutingEvidence>> {
+        let mut statement = self.connection.prepare(
+            "SELECT o.observation_json, f.id, f.run_id, f.revision, f.payload_json \
+             FROM routing_observations o JOIN runs r ON r.id = o.run_id \
+             JOIN sources s ON s.id = r.source_id \
+             LEFT JOIN routing_feedback_events f ON f.id = (\
+                 SELECT id FROM routing_feedback_events WHERE observation_id = o.id \
+                 ORDER BY revision DESC LIMIT 1) \
+             WHERE s.path = ?1 ORDER BY o.id",
+        )?;
+        let mut rows = statement.query([path_text(source)])?;
+        let mut groups = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let observation = deserialize_routing_observation(row.get(0)?)?;
+            if !observation.candidate_status.is_terminal() {
+                continue;
+            }
+            let latest = row.get::<_, Option<String>>(4)?;
+            let human = if let Some(json) = latest {
+                let event: RoutingFeedbackV1 =
+                    serde_json::from_str(&json).context("invalid local routing feedback event")?;
+                anyhow::ensure!(
+                    event.schema_version == 1
+                        && event.revision > 0
+                        && event.consent.scope == "routing-observation-v1"
+                        && event.feedback_event_id == row.get::<_, String>(1)?
+                        && event.observation_id == observation.id
+                        && row.get::<_, String>(2)? == observation.run_id
+                        && i64::from(event.revision) == row.get::<_, i64>(3)?,
+                    "local routing feedback identity or version mismatch"
+                );
+                Some(match event.outcome.as_str() {
+                    "accept" => RoutingHumanOutcome::Accepted,
+                    "reject" => RoutingHumanOutcome::Rejected,
+                    _ => anyhow::bail!("invalid local routing feedback outcome"),
+                })
+            } else {
+                observation
+                    .human_evaluation
+                    .as_ref()
+                    .map(|human| human.outcome.clone())
+            };
+            let features = &observation.prediction.task_features;
+            let key = (
+                features.language.clone(),
+                features.task_kind.as_str(),
+                features.scope.as_str(),
+                observation.prediction.selected_harness.clone(),
+            );
+            groups
+                .entry(key)
+                .or_insert_with(|| LocalRoutingEvidence {
+                    task_features: features.clone(),
+                    harness: observation.prediction.selected_harness.clone(),
+                    ..Default::default()
+                })
+                .count(&observation, human.as_ref());
+        }
+        Ok(groups.into_values().collect())
     }
 
     pub fn save_routing_human_evaluation(
@@ -1376,10 +1571,7 @@ fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> R
     let [candidate] = run.candidates.as_slice() else {
         return Ok(());
     };
-    if matches!(
-        candidate.status,
-        CandidateStatus::Preparing | CandidateStatus::Running | CandidateStatus::Verifying
-    ) {
+    if !candidate.status.is_terminal() {
         return Ok(());
     }
     anyhow::ensure!(
@@ -1633,7 +1825,11 @@ fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-fn insert_benchmark_prior(connection: &Connection, prior: &BenchmarkPrior) -> Result<()> {
+fn insert_benchmark_prior(
+    connection: &Connection,
+    prior: &BenchmarkPrior,
+    origin: &str,
+) -> Result<()> {
     anyhow::ensure!(
         prior.successes <= prior.attempts,
         "benchmark prior successes cannot exceed attempts"
@@ -1641,8 +1837,8 @@ fn insert_benchmark_prior(connection: &Connection, prior: &BenchmarkPrior) -> Re
     connection.execute(
         r#"INSERT INTO benchmark_priors(
                 source, dataset, dataset_version, harness, model, language,
-                task_kind, scope, successes, attempts, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                task_kind, scope, successes, attempts, updated_at, origin
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT DO UPDATE SET
                 successes = excluded.successes,
                 attempts = excluded.attempts,
@@ -1659,9 +1855,47 @@ fn insert_benchmark_prior(connection: &Connection, prior: &BenchmarkPrior) -> Re
             unsigned(prior.successes, "benchmark prior successes")?,
             unsigned(prior.attempts, "benchmark prior attempts")?,
             timestamp(prior.updated_at),
+            origin,
         ],
     )?;
     Ok(())
+}
+
+fn prior_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkPrior> {
+    Ok(BenchmarkPrior {
+        source: row.get(0)?,
+        dataset: row.get(1)?,
+        dataset_version: row.get(2)?,
+        harness: row.get(3)?,
+        model: row.get(4)?,
+        language: row.get(5)?,
+        task_kind: parse_task_kind(row.get(6)?)?,
+        scope: parse_task_scope(row.get(7)?)?,
+        successes: row.get(8)?,
+        attempts: row.get(9)?,
+        updated_at: timestamp_from_sql(10, row.get(10)?)?,
+    })
+}
+
+fn parse_task_kind(value: String) -> rusqlite::Result<crate::TaskKind> {
+    match value.as_str() {
+        "bug_fix" => Ok(crate::TaskKind::BugFix),
+        "feature" => Ok(crate::TaskKind::Feature),
+        "refactor" => Ok(crate::TaskKind::Refactor),
+        "tests" => Ok(crate::TaskKind::Tests),
+        "unknown" => Ok(crate::TaskKind::Unknown),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn parse_task_scope(value: String) -> rusqlite::Result<crate::TaskScope> {
+    match value.as_str() {
+        "localized" => Ok(crate::TaskScope::Localized),
+        "multi_file" => Ok(crate::TaskScope::MultiFile),
+        "broad" => Ok(crate::TaskScope::Broad),
+        "unknown" => Ok(crate::TaskScope::Unknown),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn timestamp_from_sql(column: usize, value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -1786,7 +2020,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 10);
+        assert_eq!(database.schema_version()?, 11);
         let foreign_keys: i64 =
             database
                 .connection
@@ -1825,11 +2059,11 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 10);
+        assert_eq!(database.schema_version()?, 11);
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 10);
+        assert_eq!(Database::open(&path)?.schema_version()?, 11);
         Ok(())
     }
 
@@ -1920,7 +2154,7 @@ mod tests {
         let settings = previous.sync_settings()?;
         drop(previous);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 10);
+        assert_eq!(migrated.schema_version()?, 11);
         assert_eq!(migrated.sync_settings()?, settings);
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {

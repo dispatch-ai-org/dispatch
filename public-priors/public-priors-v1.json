@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "sha256:b2b85e912a6f925f2cf8be5c343c32b974777b8b039bc835e1c5f9f44b118b6a",
+  "generated_at": "2026-06-26T00:00:00Z",
+  "entries": [
+    {
+      "source": "harbor-framework/harbor",
+      "dataset": "terminal-bench/terminal-bench",
+      "dataset_version": "4.0.0",
+      "harness": "codex",
+      "model": "openai/gpt-5.6-sol",
+      "language": null,
+      "task_kind": "unknown",
+      "scope": "unknown",
+      "successes": 123,
+      "attempts": 330
+    }
+  ]
+}

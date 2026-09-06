@@ -81,15 +81,10 @@ fn include_entry(entry: &DirEntry) -> bool {
 }
 
 fn portable_path(path: &Path) -> Option<String> {
-    let mut result = String::new();
-    for component in path.components() {
-        let component = component.as_os_str().to_str()?;
-        if !result.is_empty() {
-            result.push('/');
-        }
-        result.push_str(component);
-    }
-    Some(result)
+    path.components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("/"))
 }
 
 fn primary_language(evidence: &SourceEvidence) -> Option<String> {
@@ -114,12 +109,12 @@ fn primary_language(evidence: &SourceEvidence) -> Option<String> {
 }
 
 fn classify_task_kind(task: &str) -> TaskKind {
+    let task = task.to_ascii_lowercase();
     let words = task
         .split(|character: char| !character.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    let words = if words.first().is_some_and(|word| word == "please") {
+    let words = if words.first().is_some_and(|word| *word == "please") {
         &words[1..]
     } else {
         &words
@@ -160,14 +155,8 @@ fn classify_task_kind(task: &str) -> TaskKind {
     }
 }
 
-fn starts_with_any(words: &[String], phrases: &[&[&str]]) -> bool {
-    phrases.iter().any(|phrase| {
-        words
-            .iter()
-            .map(String::as_str)
-            .take(phrase.len())
-            .eq(phrase.iter().copied())
-    })
+fn starts_with_any(words: &[&str], phrases: &[&[&str]]) -> bool {
+    phrases.iter().any(|phrase| words.starts_with(phrase))
 }
 
 fn classify_scope(files: &BTreeSet<String>, task: &str) -> TaskScope {

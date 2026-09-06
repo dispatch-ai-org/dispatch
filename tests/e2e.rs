@@ -34,7 +34,12 @@ fn normal_local_commands_do_not_contact_cloud() {
     let run = dispatch_command(&state, &cloud_url)
         .arg("run")
         .arg(&source)
-        .args(["--task", "Exercise the local workflow."])
+        .args([
+            "--task",
+            "Exercise the local workflow.",
+            "--harnesses",
+            "fake-good,fake-bad",
+        ])
         .assert()
         .success()
         .get_output()

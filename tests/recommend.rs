@@ -7,7 +7,10 @@ use std::{
 
 use assert_cmd::cargo_bin_cmd;
 use chrono::{TimeZone, Utc};
-use dispatch::{BenchmarkPrior, TaskKind, TaskScope, db::Database, source::fingerprint_tree};
+use dispatch::{
+    BenchmarkPrior, TaskKind, TaskScope, db::Database, public_priors::PublicPriorSnapshotV1,
+    source::fingerprint_tree,
+};
 
 fn source(root: &Path) -> PathBuf {
     let source = root.join("source");
@@ -46,7 +49,21 @@ fn prior(
 }
 
 fn cache(state: &Path, priors: &[BenchmarkPrior]) -> anyhow::Result<()> {
-    let database = Database::open(state.join("dispatch.db"))?;
+    let mut database = Database::open(state.join("dispatch.db"))?;
+    let unsupported = prior(
+        "fixture-public-source",
+        "fixture-public-dataset",
+        "unsupported-public-agent",
+        None,
+        None,
+        TaskKind::Unknown,
+        1,
+        1,
+    );
+    database.replace_distributed_public_priors(
+        &PublicPriorSnapshotV1::from_priors(vec![unsupported])?,
+        "downloaded",
+    )?;
     for prior in priors {
         database.upsert_benchmark_prior(prior)?;
     }
@@ -240,6 +257,7 @@ fn no_or_zero_attempt_evidence_is_a_successful_explicit_no_recommendation() -> a
     let state = temp.path().join("state");
     let task_file = temp.path().join("task.md");
     fs::write(&task_file, "Introduce structured logging")?;
+    cache(&state, &[])?;
 
     let no_evidence = cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])

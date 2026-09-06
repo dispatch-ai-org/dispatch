@@ -4,8 +4,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use dispatch::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckResult, CheckStatus, DiffStats,
     EnvironmentRecord, EvaluationOutcome, EvaluationRecord, RoutingDecision,
-    RoutingHumanEvaluation, RoutingHumanOutcome, RunRecord, RunStatus, SourceKind, TaskFeatures,
-    TaskKind, TaskScope, db::Database,
+    RoutingHumanEvaluation, RoutingHumanOutcome, RunRecord, RunStatus, SelectionBasis, SourceKind,
+    TaskFeatures, TaskKind, TaskScope, db::Database,
 };
 
 fn at(second: u32) -> DateTime<Utc> {
@@ -28,6 +28,8 @@ fn decision() -> RoutingDecision {
         dataset: "terminal-bench".into(),
         dataset_version: "2.0".into(),
         model: Some("benchmark/model".into()),
+        selection_basis: SelectionBasis::Evidence,
+        alternatives: Vec::new(),
     }
 }
 

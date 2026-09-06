@@ -19,8 +19,9 @@ use ulid::Ulid;
 
 use crate::{
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingDecision,
-    RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunRecord, RunStatus, VERSION,
+    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingAlternative,
+    RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunRecord,
+    RunStatus, SelectionBasis, VERSION,
     classifier::classify_task,
     db::Database,
     executor::{
@@ -56,6 +57,7 @@ pub struct RunRequest {
     pub task: String,
     pub harnesses: Vec<String>,
     pub route: bool,
+    pub agent: Option<String>,
     pub config_path: Option<PathBuf>,
     pub backend: Option<String>,
     pub timeout_secs: Option<u64>,
@@ -272,7 +274,7 @@ pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
     );
     let features = classify_task(&source_path, task)?;
     state.initialize()?;
-    let database = Database::open(state.db_path())?;
+    let database = crate::public_priors::open_database(state)?;
     let supported_real_harnesses = supported_real_harnesses();
     let ranked = rank_harnesses(&database, &features, &supported_real_harnesses)?;
 
@@ -330,7 +332,7 @@ fn supported_real_harnesses() -> Vec<String> {
         .collect()
 }
 
-async fn select_routed_harness(
+async fn select_automatic_harness(
     state: &State,
     source_path: &Path,
     task: &str,
@@ -342,41 +344,99 @@ async fn select_routed_harness(
     );
     let features = classify_task(source_path, task)?;
     state.initialize()?;
-    let database = Database::open(state.db_path())?;
-    let ranked = rank_harnesses(&database, &features, &supported_real_harnesses())?;
-    let mut has_compatible_evidence = false;
-
-    for prediction in ranked {
-        let Some(evidence) = prediction.evidence else {
-            continue;
-        };
-        has_compatible_evidence = true;
-        let adapter = adapter_for(&prediction.harness, &config.harnesses)?;
-        if !adapter.detect().await.available {
-            continue;
+    let database = crate::public_priors::open_database(state)?;
+    let mut eligible = Vec::new();
+    for harness in supported_real_harnesses() {
+        let adapter = adapter_for(&harness, &config.harnesses)?;
+        if adapter.detect().await.available {
+            eligible.push(harness);
         }
+    }
+    anyhow::ensure!(
+        !eligible.is_empty(),
+        "No supported coding agent is available. Install and authenticate Claude Code, Codex, or Cursor, then try again."
+    );
+    let ranked = rank_harnesses(&database, &features, &eligible)?;
+    let alternatives = ranked
+        .iter()
+        .map(|prediction| match &prediction.evidence {
+            Some(evidence) => RoutingAlternative {
+                harness: prediction.harness.clone(),
+                successes: prediction.successes,
+                attempts: prediction.attempts,
+                specificity: Some(evidence.specificity),
+                source: Some(evidence.prior.source.clone()),
+                dataset: Some(evidence.prior.dataset.clone()),
+                dataset_version: Some(evidence.prior.dataset_version.clone()),
+                model: evidence.prior.model.clone(),
+            },
+            None => RoutingAlternative {
+                harness: prediction.harness.clone(),
+                successes: 0,
+                attempts: 0,
+                specificity: None,
+                source: None,
+                dataset: None,
+                dataset_version: None,
+                model: None,
+            },
+        })
+        .collect::<Vec<_>>();
+
+    // One observed result is not a comparison against unknown performance.
+    let mut evidenced = ranked
+        .iter()
+        .filter(|prediction| prediction.evidence.is_some());
+    if let (Some(prediction), Some(_)) = (evidenced.next(), evidenced.next()) {
+        let evidence = prediction.evidence.as_ref().expect("checked above");
         return Ok(RoutingDecision {
             version: 1,
             task_features: features,
-            selected_harness: prediction.harness,
+            selected_harness: prediction.harness.clone(),
             successes: prediction.successes,
             attempts: prediction.attempts,
             specificity: evidence.specificity,
-            source: evidence.prior.source,
-            dataset: evidence.prior.dataset,
-            dataset_version: evidence.prior.dataset_version,
-            model: evidence.prior.model,
+            source: evidence.prior.source.clone(),
+            dataset: evidence.prior.dataset.clone(),
+            dataset_version: evidence.prior.dataset_version.clone(),
+            model: evidence.prior.model.clone(),
+            selection_basis: SelectionBasis::Evidence,
+            alternatives,
         });
     }
 
-    if !has_compatible_evidence {
-        bail!(
-            "No compatible routing evidence is available.\nUse --harnesses to select harnesses explicitly."
-        );
-    }
-    bail!(
-        "Compatible routing evidence is available, but no predicted harness is execution-eligible locally.\nUse --harnesses to select harnesses explicitly."
-    )
+    let selected_harness = eligible[0].clone();
+    Ok(RoutingDecision {
+        version: 1,
+        task_features: features,
+        selected_harness,
+        successes: 0,
+        attempts: 0,
+        specificity: 0,
+        source: String::new(),
+        dataset: String::new(),
+        dataset_version: String::new(),
+        model: None,
+        selection_basis: SelectionBasis::Default,
+        alternatives,
+    })
+}
+
+fn override_decision(source_path: &Path, task: &str, harness: String) -> Result<RoutingDecision> {
+    Ok(RoutingDecision {
+        version: 1,
+        task_features: classify_task(source_path, task)?,
+        selected_harness: harness,
+        successes: 0,
+        attempts: 0,
+        specificity: 0,
+        source: String::new(),
+        dataset: String::new(),
+        dataset_version: String::new(),
+        model: None,
+        selection_basis: SelectionBasis::Override,
+        alternatives: Vec::new(),
+    })
 }
 
 fn specificity_label(specificity: u8) -> &'static str {
@@ -387,9 +447,69 @@ fn specificity_label(specificity: u8) -> &'static str {
     }
 }
 
+fn selection_label(decision: &RoutingDecision) -> &'static str {
+    if decision.selection_basis == SelectionBasis::Default && decision.alternatives.len() == 1 {
+        "Only available agent"
+    } else {
+        decision.selection_basis.as_str()
+    }
+}
+
+fn print_selection_reason(decision: &RoutingDecision) {
+    println!("Why:");
+    match decision.selection_basis {
+        SelectionBasis::Evidence => println!(
+            "  {} had the strongest relevant observed benchmark performance\n  among eligible agents with compatible evidence.",
+            harness_name(&decision.selected_harness)
+        ),
+        SelectionBasis::Default if decision.alternatives.len() == 1 => println!(
+            "  This is the only execution-eligible agent; no performance comparison was possible."
+        ),
+        SelectionBasis::Default => println!(
+            "  Dispatch did not have enough comparable public performance data\n  to make an evidence-based choice."
+        ),
+        SelectionBasis::Override => println!("  You explicitly selected this agent."),
+    }
+    if decision.selection_basis == SelectionBasis::Evidence
+        && decision.alternatives.iter().any(|a| a.attempts == 0)
+    {
+        println!(
+            "  Agents without compatible evidence were not compared; their performance is unknown."
+        );
+    } else if decision.selection_basis == SelectionBasis::Default
+        && decision.alternatives.iter().any(|a| a.attempts > 0)
+    {
+        println!("  Available benchmark evidence did not determine the selection.");
+    }
+}
+
 fn print_routing_decision(decision: &RoutingDecision) {
-    println!("Routing");
-    println!("  selected: {}", decision.selected_harness);
+    println!("Agent\n  {}", harness_name(&decision.selected_harness));
+    println!("Selection\n  {}", selection_label(decision));
+    print_selection_reason(decision);
+    if !decision.alternatives.is_empty() {
+        println!("Available benchmark evidence:");
+    }
+    for alternative in &decision.alternatives {
+        if alternative.attempts > 0 {
+            println!(
+                "  {}: {}/{}",
+                harness_name(&alternative.harness),
+                alternative.successes,
+                alternative.attempts
+            );
+        } else {
+            println!(
+                "  {}: no compatible public evidence",
+                harness_name(&alternative.harness)
+            );
+        }
+    }
+    if decision.selection_basis != SelectionBasis::Evidence {
+        println!();
+        return;
+    }
+    println!("Advanced details:");
     println!(
         "  benchmark success: {}/{} ({:.1}%)",
         decision.successes,
@@ -409,6 +529,15 @@ fn print_routing_decision(decision: &RoutingDecision) {
         decision.model.as_deref().unwrap_or("<unknown>")
     );
     println!();
+}
+
+fn harness_name(id: &str) -> &str {
+    match id {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        _ => id,
+    }
 }
 
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
@@ -437,8 +566,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         names = config.execution.forwarded_env.join(", ")
     );
 
-    let (mut harnesses, routing) = if request.route {
-        let decision = select_routed_harness(state, &source_path, &request.task, &config).await?;
+    let automatic = request.route || (request.harnesses.is_empty() && request.agent.is_none());
+    let (mut harnesses, routing) = if automatic {
+        let decision =
+            select_automatic_harness(state, &source_path, &request.task, &config).await?;
+        (vec![decision.selected_harness.clone()], Some(decision))
+    } else if let Some(agent) = request.agent {
+        let decision = override_decision(&source_path, &request.task, agent)?;
         (vec![decision.selected_harness.clone()], Some(decision))
     } else {
         (
@@ -464,12 +598,23 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         || !config.checks.baseline.is_empty()
         || !config.checks.verify.is_empty();
     let unsafe_local = config.execution.backend == "local" && executes_untrusted_host_code;
-    anyhow::ensure!(
-        config.execution.backend != "local"
-            || !executes_untrusted_host_code
-            || request.allow_unsafe_local,
-        "local execution cannot isolate the original source from real harnesses or project checks; use --backend docker, or explicitly accept the risk with --allow-unsafe-local"
-    );
+    if unsafe_local && !request.allow_unsafe_local {
+        print!(
+            "Dispatch will run {} with your user permissions in an isolated candidate workspace. Continue? [y/N] ",
+            harnesses
+                .iter()
+                .map(|id| harness_name(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        anyhow::ensure!(
+            matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+            "local execution was not authorized; explicitly accept the risk with --allow-unsafe-local for non-interactive use, or use --backend docker"
+        );
+    }
     anyhow::ensure!(
         harnesses.len() <= 702,
         "at most 702 candidates are supported in v0"
@@ -893,15 +1038,83 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         return Err(error.context("failed to finalize run"));
     }
 
-    println!("\nRun ready for evaluation.\n");
-    println!(
-        "Baseline verification {}\n",
-        checks_summary(&run.baseline_checks)
-    );
-    print_candidates(&run, false);
-    println!("Inspect: dispatch inspect {} A", run.id);
-    println!("Compare: dispatch compare {}", run.id);
+    if run.routing.is_some() {
+        print_single_result_summary(&run, "Done", false, None);
+    } else {
+        println!("\nRun ready for evaluation.\n");
+        println!(
+            "Baseline verification {}\n",
+            checks_summary(&run.baseline_checks)
+        );
+        print_candidates(&run, false);
+        println!("Inspect: dispatch inspect {} A", run.id);
+        println!("Compare: dispatch compare {}", run.id);
+    }
     Ok(run)
+}
+
+fn result_verification(candidate: &CandidateRecord) -> &'static str {
+    if candidate.checks.is_empty() {
+        if candidate.status == CandidateStatus::TimedOut {
+            "Not run — agent timed out"
+        } else {
+            "Not configured"
+        }
+    } else if candidate
+        .checks
+        .iter()
+        .all(|check| check.status == CheckStatus::Passed)
+    {
+        "PASS"
+    } else if candidate
+        .checks
+        .iter()
+        .any(|check| check.status == CheckStatus::Failed)
+    {
+        "FAIL"
+    } else if candidate
+        .checks
+        .iter()
+        .any(|check| check.status == CheckStatus::TimedOut)
+    {
+        "TIMED_OUT"
+    } else {
+        "NOT_RUN"
+    }
+}
+
+fn print_single_result_summary(
+    run: &RunRecord,
+    heading: &str,
+    show_status: bool,
+    human_outcome: Option<&RoutingHumanOutcome>,
+) {
+    let decision = run.routing.as_ref().expect("caller checked routing");
+    let candidate = run
+        .candidates
+        .first()
+        .expect("a completed selected run has one candidate");
+    println!("\n{heading}\n");
+    println!("Task\n  {}\n", one_line(&run.task, 120));
+    println!("Agent\n  {}", harness_name(&decision.selected_harness));
+    println!("  {} selection\n", selection_label(decision));
+    println!("Verification\n  {}\n", result_verification(candidate));
+    if show_status {
+        println!("Status\n  {}\n", run.status.as_str());
+    }
+    if run.status == RunStatus::Applied {
+        println!("Result\n  Applied to the source tree");
+    } else if let Some(outcome) = human_outcome {
+        match outcome {
+            RoutingHumanOutcome::Accepted => println!("Result\n  Accepted; not applied"),
+            RoutingHumanOutcome::Rejected => {
+                println!("Result\n  Rejected; source tree unchanged")
+            }
+        }
+    } else {
+        println!("Review\n  dispatch diff\n");
+        println!("Then\n  dispatch accept\n  dispatch reject");
+    }
 }
 
 async fn execute_candidate(
@@ -1199,14 +1412,24 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-pub fn status(state: &State, id: Option<&str>) -> Result<()> {
+pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match id {
         Some(id) => state.load_run(id)?,
-        None => load_latest(state)?,
+        None => load_latest_for_source(state, source_path, false)?,
     };
+    if id.is_none() && run.routing.is_some() && run.candidates.len() == 1 {
+        let database = Database::open(state.db_path())?;
+        let observation = database.routing_observation_for_run(&run.id)?;
+        let human_outcome = observation
+            .as_ref()
+            .and_then(|observation| observation.human_evaluation.as_ref())
+            .map(|evaluation| &evaluation.outcome);
+        print_single_result_summary(&run, "Latest task", true, human_outcome);
+        return Ok(());
+    }
     let reveal = run.evaluation.is_some();
     print_run_header(&run, reveal);
-    println!();
+    println!("\nTask\n  {}\n", one_line(&run.task, 120));
     print_candidates(&run, reveal);
     Ok(())
 }
@@ -1267,13 +1490,20 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
 
 pub fn diff(
     state: &State,
-    run_id: &str,
-    candidate: &str,
+    run_id: Option<&str>,
+    candidate: Option<&str>,
+    source_path: &Path,
     stat: bool,
     name_only: bool,
 ) -> Result<()> {
-    let run = state.load_run(run_id)?;
-    let candidate = find_candidate(&run, candidate)?;
+    let run = match run_id {
+        Some(run_id) => state.load_run(run_id)?,
+        None => load_latest_for_source(state, source_path, true)?,
+    };
+    let candidate = match candidate {
+        Some(candidate) => find_candidate(&run, candidate)?,
+        None => sole_candidate(&run)?,
+    };
     if name_only {
         for path in &candidate.diff_stats.changed_files {
             println!("{path}");
@@ -1402,6 +1632,17 @@ pub fn compare(
 }
 
 pub fn evaluate_routed(state: &State, run_id: &str, input: RoutingEvaluationInput) -> Result<()> {
+    let observation = record_routing_evaluation(state, run_id, input)?;
+    println!("Routing evaluation recorded.\n");
+    print_routing_observation(&observation);
+    Ok(())
+}
+
+fn record_routing_evaluation(
+    state: &State,
+    run_id: &str,
+    input: RoutingEvaluationInput,
+) -> Result<RoutingObservation> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     let _run_lock = OperationLock::acquire(
         &state.run_dir(&resolved_run_id).join(".operation.lock"),
@@ -1436,10 +1677,118 @@ pub fn evaluate_routed(state: &State, run_id: &str, input: RoutingEvaluationInpu
         "routed run {} has no completed routing observation",
         run.id
     );
-    let observation = database.save_routing_human_evaluation(&run.id, &evaluation)?;
+    database.save_routing_human_evaluation(&run.id, &evaluation)
+}
 
-    println!("Routing evaluation recorded.\n");
-    print_routing_observation(&observation);
+pub fn accept_or_reject_latest(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+) -> Result<()> {
+    let run = match run_id {
+        Some(run_id) => state.load_run(run_id)?,
+        None => load_latest_unresolved_single(state, source_path)?,
+    };
+    let candidate = sole_candidate(&run)?.label.clone();
+    record_routing_evaluation(
+        state,
+        &run.id,
+        RoutingEvaluationInput {
+            outcome: if accept { "accept" } else { "reject" }.into(),
+            reasons,
+            explanation,
+        },
+    )?;
+    if accept {
+        apply(state, &run.id, &candidate)?;
+    } else {
+        println!("Result rejected. The source tree was not changed.");
+    }
+    Ok(())
+}
+
+pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Result<()> {
+    let run = match run_id {
+        Some(run_id) => state.load_run(run_id)?,
+        None => load_latest_for_source(state, source_path, true)?,
+    };
+    let decision = run
+        .routing
+        .as_ref()
+        .context("this run has no single-agent selection to explain")?;
+    println!("Task classification");
+    println!(
+        "  language: {}",
+        decision
+            .task_features
+            .language
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!("  kind: {}", decision.task_features.task_kind.as_str());
+    println!("  scope: {}", decision.task_features.scope.as_str());
+    println!("\nEligible agents");
+    if decision.alternatives.is_empty() {
+        println!(
+            "  {} (explicit override)",
+            harness_name(&decision.selected_harness)
+        );
+    } else {
+        for alternative in &decision.alternatives {
+            if alternative.attempts == 0 {
+                println!(
+                    "  {}: no compatible public evidence",
+                    harness_name(&alternative.harness)
+                );
+            } else {
+                println!(
+                    "  {}: {}/{} observed benchmark results, specificity {}/3",
+                    harness_name(&alternative.harness),
+                    alternative.successes,
+                    alternative.attempts,
+                    alternative.specificity.unwrap_or(0)
+                );
+                println!(
+                    "    source: {}\n    dataset: {}\n    dataset version: {}\n    model: {}",
+                    provenance_name(alternative.source.as_deref().unwrap_or("unknown")),
+                    alternative.dataset.as_deref().unwrap_or("unknown"),
+                    alternative.dataset_version.as_deref().unwrap_or("unknown"),
+                    alternative.model.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
+    }
+    println!(
+        "\nSelected agent\n  {}",
+        harness_name(&decision.selected_harness)
+    );
+    println!("Selection basis\n  {}", selection_label(decision));
+    print_selection_reason(decision);
+    // Historical decisions may predate the per-agent evidence snapshot.
+    if decision.selection_basis == SelectionBasis::Evidence && decision.alternatives.is_empty() {
+        println!("Public provenance");
+        println!("  source: {}", provenance_name(&decision.source));
+        println!("  dataset: {}", decision.dataset);
+        println!("  dataset version: {}", decision.dataset_version);
+        println!(
+            "  model: {}",
+            decision.model.as_deref().unwrap_or("unknown")
+        );
+    }
+    match decision.selection_basis {
+        SelectionBasis::Evidence => println!(
+            "\nLimitation\n  These are observed public benchmark outcomes, not confidence or a calibrated probability."
+        ),
+        SelectionBasis::Default => println!(
+            "\nLimitation\n  No compatible public evidence was used; the stable default order is not a performance claim."
+        ),
+        SelectionBasis::Override => println!(
+            "\nLimitation\n  This choice reflects your override, not a Dispatch performance comparison."
+        ),
+    }
     Ok(())
 }
 
@@ -1592,15 +1941,55 @@ fn find_candidate<'a>(run: &'a RunRecord, value: &str) -> Result<&'a CandidateRe
         .with_context(|| format!("run {} has no candidate {value}", run.id))
 }
 
-fn load_latest(state: &State) -> Result<RunRecord> {
-    let path = state
-        .list_metadata_paths()?
-        .into_iter()
-        .next()
-        .context("no Dispatch runs yet")?;
-    let bytes = fs::read(&path)?;
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid metadata at {}", path.display()))
+fn sole_candidate(run: &RunRecord) -> Result<&CandidateRecord> {
+    let [candidate] = run.candidates.as_slice() else {
+        bail!("run {} does not have exactly one result", run.id);
+    };
+    Ok(candidate)
+}
+
+fn load_latest_for_source(state: &State, source_path: &Path, single: bool) -> Result<RunRecord> {
+    let source_path = source::resolve_source(Some(source_path))?;
+    for path in state.list_metadata_paths()? {
+        let run: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid metadata at {}", path.display()))?;
+        if run.source_path == source_path && (!single || run.candidates.len() == 1) {
+            return Ok(run);
+        }
+    }
+    bail!("no Dispatch runs for {}", source_path.display())
+}
+
+fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<RunRecord> {
+    let source_path = source::resolve_source(Some(source_path))?;
+    let database = Database::open(state.db_path())?;
+    for path in state.list_metadata_paths()? {
+        let run: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid metadata at {}", path.display()))?;
+        if run.source_path != source_path || run.candidates.len() != 1 || run.routing.is_none() {
+            continue;
+        }
+        if database
+            .routing_observation_for_run(&run.id)?
+            .is_some_and(|observation| observation.human_evaluation.is_none())
+        {
+            return Ok(run);
+        }
+    }
+    bail!(
+        "no unresolved single-result Dispatch run for {}",
+        source_path.display()
+    )
+}
+
+fn provenance_name(source: &str) -> &str {
+    if source.contains("harbor") {
+        "Harbor"
+    } else if source.contains("swe-bench") {
+        "SWE-bench"
+    } else {
+        source
+    }
 }
 
 fn print_run_header(run: &RunRecord, reveal: bool) {
