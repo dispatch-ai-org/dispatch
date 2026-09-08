@@ -1,6 +1,6 @@
 # Dispatch
 
-**Dispatch v0.1.1 — Experimental Developer Preview**
+**Dispatch v0.1.2 — Experimental Developer Preview**
 
 Tell Dispatch what you want changed. Dispatch chooses an available coding agent using observed performance data, runs it in an isolated candidate workspace, verifies the result when configured, and lets you review and accept it.
 
@@ -148,7 +148,7 @@ Dispatch freezes the source into an internal Git baseline and gives the selected
 
 If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment.
 
-The local backend is the supported real-agent path in v0.1.1. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
+The local backend is the supported real-agent path in v0.1.2. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
 
 ## Core commands
 
