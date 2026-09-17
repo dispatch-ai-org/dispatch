@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -7,11 +7,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use crate::models::{
-    BenchmarkPrior, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
-    RoutingHumanEvaluation, RoutingObservation, RunRecord, TaskFeatures,
+    AdmissionState, AdmissionSummary, AttemptRecord, BenchmarkPrior, CandidateRecord,
+    CapacityObservation, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
+    GoalFeedbackRevision, RoutingHumanEvaluation, RoutingObservation, RunMode, RunRecord,
+    TaskFeatures,
 };
 use crate::public_priors::PublicPriorSnapshotV1;
 use crate::sync::{RoutingFeedbackV1, RoutingObservationV1};
@@ -330,6 +334,326 @@ CREATE TABLE distributed_public_prior_snapshot (
 );
 "#,
     ),
+    (
+        12,
+        "truthful_attempt_outcomes",
+        r#"
+ALTER TABLE runs ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'legacy'
+    CHECK (run_mode IN ('legacy', 'routed', 'comparison'));
+ALTER TABLE runs ADD COLUMN state_revision INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0);
+ALTER TABLE runs ADD COLUMN outcome_json TEXT NOT NULL DEFAULT
+    '{"version":1,"lifecycle":"finished","work_result":"pending","verification":"inconclusive","review":"not_requested","application":"not_applied","phase":"finished","waiting_on":"none"}';
+ALTER TABLE runs ADD COLUMN run_projection_json TEXT;
+
+CREATE TABLE attempts (
+    id                  TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    candidate_id        TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    ordinal             INTEGER NOT NULL CHECK (ordinal >= 1),
+    generation          INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+    harness_id          TEXT NOT NULL,
+    harness_version     TEXT,
+    requested_model     TEXT,
+    resolved_model      TEXT,
+    observed_model      TEXT,
+    requested_effort    TEXT,
+    resolved_effort     TEXT,
+    observed_effort     TEXT,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    outcome             TEXT NOT NULL,
+    raw_telemetry_path  TEXT NOT NULL,
+    identity_provenance TEXT NOT NULL DEFAULT 'observed'
+        CHECK (identity_provenance IN ('observed', 'legacy')),
+    UNIQUE (run_id, ordinal),
+    UNIQUE (run_id, candidate_id)
+);
+CREATE INDEX attempts_run_idx ON attempts(run_id, ordinal);
+
+INSERT INTO attempts(
+    id, run_id, candidate_id, role, ordinal, generation, harness_id,
+    harness_version, observed_model, started_at, completed_at, outcome,
+    raw_telemetry_path, identity_provenance
+)
+SELECT 'legacy-' || c.id, c.run_id, c.id, 'executor',
+       (SELECT COUNT(*) FROM candidates earlier
+        WHERE earlier.run_id = c.run_id AND earlier.label <= c.label),
+       1, c.harness_id, c.harness_version, c.model, r.created_at, r.completed_at,
+       c.status, '', 'legacy'
+FROM candidates c JOIN runs r ON r.id = c.run_id;
+
+ALTER TABLE events ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE events ADD COLUMN sequence INTEGER;
+ALTER TABLE events ADD COLUMN attempt_id TEXT;
+ALTER TABLE events ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE events ADD COLUMN actor TEXT NOT NULL DEFAULT 'legacy';
+UPDATE events
+SET sequence = (
+    SELECT COUNT(*) FROM events earlier
+    WHERE earlier.run_id = events.run_id AND earlier.id <= events.id
+);
+CREATE UNIQUE INDEX events_run_sequence_idx ON events(run_id, sequence);
+"#,
+    ),
+    (
+        13,
+        "resource_allocation",
+        r#"
+PRAGMA legacy_alter_table = ON;
+ALTER TABLE runs RENAME TO runs_v12;
+CREATE TABLE runs (
+    id                  TEXT PRIMARY KEY,
+    source_id           INTEGER NOT NULL REFERENCES sources(id),
+    task                TEXT NOT NULL,
+    exact_prompt        TEXT NOT NULL,
+    baseline_path       TEXT NOT NULL,
+    baseline_commit     TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    dispatch_version    TEXT NOT NULL,
+    os                  TEXT NOT NULL,
+    architecture        TEXT NOT NULL,
+    execution_backend   TEXT NOT NULL,
+    timeout_secs        INTEGER NOT NULL,
+    cpus                REAL NOT NULL,
+    memory              TEXT NOT NULL,
+    max_parallel        INTEGER NOT NULL,
+    applied_candidate   TEXT,
+    docker_image        TEXT,
+    resource_limits_enforced INTEGER NOT NULL DEFAULT 0,
+    unsafe_local        INTEGER NOT NULL DEFAULT 0,
+    forwarded_env_json  TEXT NOT NULL DEFAULT '[]',
+    routing_decision_json TEXT,
+    run_mode            TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison')),
+    state_revision      INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
+    outcome_json        TEXT NOT NULL,
+    run_projection_json TEXT
+);
+INSERT INTO runs(
+    id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+    created_at, completed_at, dispatch_version, os, architecture,
+    execution_backend, timeout_secs, cpus, memory, max_parallel,
+    applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+    forwarded_env_json, routing_decision_json, run_mode, state_revision,
+    outcome_json, run_projection_json
+)
+SELECT id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+       created_at, completed_at, dispatch_version, os, architecture,
+       execution_backend, timeout_secs, cpus, memory, max_parallel,
+       applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+       forwarded_env_json, routing_decision_json, run_mode, state_revision,
+       outcome_json, run_projection_json
+FROM runs_v12;
+DROP TABLE runs_v12;
+PRAGMA legacy_alter_table = OFF;
+
+ALTER TABLE attempts ADD COLUMN resource_snapshot_json TEXT;
+
+CREATE TABLE allocation_decisions (
+    run_id          TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    decision_json   TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE goal_feedback_revisions (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    revision        INTEGER NOT NULL CHECK (revision >= 1),
+    outcome         TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected')),
+    reasons_json    TEXT NOT NULL,
+    explanation     TEXT,
+    created_at      TEXT NOT NULL,
+    UNIQUE (run_id, revision)
+);
+CREATE INDEX goal_feedback_run_idx ON goal_feedback_revisions(run_id, revision);
+"#,
+    ),
+    (
+        14,
+        "capacity_and_admission",
+        r#"
+CREATE TABLE resource_pools (
+    id                      TEXT PRIMARY KEY,
+    provider                TEXT NOT NULL,
+    funding_source          TEXT NOT NULL,
+    provider_buckets_json   TEXT NOT NULL,
+    max_active              INTEGER NOT NULL CHECK (max_active = 1),
+    next_fence              INTEGER NOT NULL DEFAULT 0 CHECK (next_fence >= 0),
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL
+);
+
+CREATE TABLE capacity_observations (
+    id                      TEXT PRIMARY KEY,
+    pool_id                 TEXT NOT NULL REFERENCES resource_pools(id),
+    source                  TEXT NOT NULL,
+    source_version          TEXT NOT NULL,
+    provider_bucket_id      TEXT,
+    window_identity         TEXT,
+    sampled_at              TEXT NOT NULL,
+    valid_until             TEXT NOT NULL,
+    payload_json            TEXT NOT NULL
+);
+CREATE INDEX capacity_observations_pool_time_idx
+    ON capacity_observations(pool_id, sampled_at, id);
+
+CREATE TABLE admission_requests (
+    id                      TEXT PRIMARY KEY,
+    run_id                  TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    pool_id                 TEXT NOT NULL REFERENCES resource_pools(id),
+    owner_session           TEXT NOT NULL,
+    generation              INTEGER NOT NULL CHECK (generation >= 1),
+    priority                INTEGER NOT NULL,
+    enqueued_at             TEXT NOT NULL,
+    heartbeat_at            TEXT NOT NULL,
+    expires_at              TEXT NOT NULL,
+    owner_pid               INTEGER,
+    owner_start_identity    TEXT,
+    owner_boot_identity     TEXT,
+    status                  TEXT NOT NULL CHECK (status IN ('queued','admitted','reconciliation','released','abandoned','cancelled')),
+    start_intent_at         TEXT,
+    admitted_at             TEXT,
+    released_at             TEXT
+);
+CREATE UNIQUE INDEX admission_one_runnable_per_goal_idx
+    ON admission_requests(run_id) WHERE status IN ('queued','admitted','reconciliation');
+CREATE INDEX admission_queue_idx
+    ON admission_requests(pool_id, status, priority, enqueued_at, id);
+
+CREATE TABLE pool_leases (
+    pool_id                 TEXT PRIMARY KEY REFERENCES resource_pools(id),
+    request_id              TEXT NOT NULL UNIQUE REFERENCES admission_requests(id),
+    owner_session           TEXT NOT NULL,
+    generation              INTEGER NOT NULL CHECK (generation >= 1),
+    fence                   INTEGER NOT NULL CHECK (fence >= 1),
+    state                   TEXT NOT NULL CHECK (state IN ('start_intent','running','reconciliation')),
+    start_intent_at         TEXT NOT NULL,
+    heartbeat_at            TEXT NOT NULL,
+    expires_at              TEXT NOT NULL,
+    owner_pid               INTEGER,
+    owner_start_identity    TEXT,
+    owner_boot_identity     TEXT,
+    child_pid               INTEGER,
+    child_start_identity    TEXT,
+    child_boot_identity     TEXT,
+    child_process_group     INTEGER,
+    backend_identity        TEXT,
+    cleanup_confirmed_at    TEXT
+);
+"#,
+    ),
+    (
+        15,
+        "phase2_safety_correction",
+        r#"
+ALTER TABLE resource_pools ADD COLUMN canonical_identity TEXT;
+UPDATE resource_pools SET canonical_identity=id WHERE canonical_identity IS NULL;
+CREATE UNIQUE INDEX resource_pools_canonical_identity_idx
+    ON resource_pools(canonical_identity);
+
+CREATE TABLE capacity_authorizations (
+    id                      TEXT PRIMARY KEY,
+    pool_id                 TEXT NOT NULL REFERENCES resource_pools(id),
+    authorization_revision  INTEGER NOT NULL CHECK (authorization_revision >= 1),
+    observation_id          TEXT NOT NULL REFERENCES capacity_observations(id),
+    route_revision          TEXT NOT NULL,
+    evidence_json           TEXT NOT NULL,
+    status                  TEXT NOT NULL CHECK (status IN ('authorized','rejected')),
+    reason                  TEXT,
+    created_at              TEXT NOT NULL,
+    valid_until             TEXT NOT NULL
+);
+CREATE INDEX capacity_authorizations_pool_revision_idx
+    ON capacity_authorizations(pool_id,authorization_revision,created_at,id);
+
+CREATE TABLE capacity_observation_constraints (
+    observation_id          TEXT NOT NULL REFERENCES capacity_observations(id) ON DELETE CASCADE,
+    ordinal                 INTEGER NOT NULL,
+    provider_bucket_id      TEXT,
+    window_identity         TEXT,
+    constraint_json         TEXT NOT NULL,
+    PRIMARY KEY (observation_id,ordinal)
+);
+
+ALTER TABLE admission_requests ADD COLUMN attempt_id TEXT REFERENCES attempts(id);
+ALTER TABLE admission_requests ADD COLUMN route_snapshot_json TEXT;
+ALTER TABLE admission_requests ADD COLUMN configuration_revision TEXT;
+ALTER TABLE admission_requests ADD COLUMN authorization_revision INTEGER;
+ALTER TABLE admission_requests ADD COLUMN authorization_id TEXT REFERENCES capacity_authorizations(id);
+ALTER TABLE admission_requests ADD COLUMN canonical_pool_identity TEXT;
+ALTER TABLE admission_requests ADD COLUMN fence INTEGER;
+
+ALTER TABLE pool_leases ADD COLUMN attempt_id TEXT REFERENCES attempts(id);
+ALTER TABLE pool_leases ADD COLUMN route_snapshot_json TEXT;
+ALTER TABLE pool_leases ADD COLUMN configuration_revision TEXT;
+ALTER TABLE pool_leases ADD COLUMN authorization_revision INTEGER;
+ALTER TABLE pool_leases ADD COLUMN authorization_id TEXT REFERENCES capacity_authorizations(id);
+ALTER TABLE pool_leases ADD COLUMN canonical_pool_identity TEXT;
+ALTER TABLE pool_leases ADD COLUMN launch_lifecycle TEXT NOT NULL DEFAULT 'launch_intent_committed';
+ALTER TABLE pool_leases ADD COLUMN launch_observation_id TEXT REFERENCES capacity_observations(id);
+"#,
+    ),
+    (
+        16,
+        "repair_existing_lease_knowledge",
+        r#"
+-- Migration 15's default is not evidence that an existing lease never spawned.
+-- Repair already-upgraded databases too; only recorded cleanup is affirmative.
+UPDATE pool_leases
+SET launch_lifecycle=CASE WHEN cleanup_confirmed_at IS NOT NULL
+                         THEN 'cleanup_confirmed' ELSE 'cleanup_uncertain' END,
+    state='reconciliation';
+UPDATE admission_requests SET status='reconciliation'
+WHERE id IN (SELECT request_id FROM pool_leases)
+  AND status IN ('admitted','reconciliation');
+"#,
+    ),
+    (
+        17,
+        "bounded_attempts_and_clarifications",
+        r#"
+ALTER TABLE attempts ADD COLUMN details_json TEXT;
+ALTER TABLE runs ADD COLUMN delivery_attempt_id TEXT REFERENCES attempts(id);
+CREATE TABLE clarifications (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(id),
+    generation INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','answered','cancelled')),
+    question_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX clarification_one_pending ON clarifications(run_id) WHERE state='pending';
+"#,
+    ),
+    (
+        18,
+        "foreground_control_authority_and_receipts",
+        r#"
+CREATE TABLE control_grants (
+    id TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL UNIQUE,
+    scope_json TEXT NOT NULL
+);
+CREATE TABLE control_runs (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id),
+    principal TEXT NOT NULL REFERENCES control_grants(id),
+    session_id TEXT NOT NULL,
+    cancelled INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE command_receipts (
+    principal TEXT NOT NULL REFERENCES control_grants(id),
+    request_id TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    reply_json TEXT NOT NULL,
+    PRIMARY KEY(principal, request_id)
+);
+"#,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,7 +743,104 @@ pub struct Database {
     connection: Connection,
 }
 
+fn sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(details, _)
+            if matches!(details.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// A missing mapping overlaps only within the same provider/funding identity.
+/// Bucket sets need not be equal: any shared allowance implies exclusion.
+pub(crate) fn overlapping_pools(connection: &Connection, pool_id: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT p.id FROM resource_pools p JOIN resource_pools q ON q.id=?1
+         WHERE p.provider=q.provider AND p.funding_source=q.funding_source
+         AND (json_array_length(p.provider_buckets_json)=0 OR json_array_length(q.provider_buckets_json)=0
+              OR EXISTS(SELECT 1 FROM json_each(p.provider_buckets_json) a
+                        JOIN json_each(q.provider_buckets_json) b ON a.value=b.value)) ORDER BY p.id",
+    )?;
+    Ok(statement
+        .query_map([pool_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn shared_capacity_history(
+    connection: &Connection,
+    pool_id: &str,
+) -> Result<Vec<CapacityObservation>> {
+    let mut history = Vec::new();
+    for id in overlapping_pools(connection, pool_id)? {
+        let mut statement = connection
+            .prepare("SELECT payload_json FROM capacity_observations WHERE pool_id=?1")?;
+        for row in statement.query_map([id], |row| row.get::<_, String>(0))? {
+            history.push(serde_json::from_str::<CapacityObservation>(&row?)?);
+        }
+    }
+    history.sort_by(|a, b| (a.sampled_at, &a.id).cmp(&(b.sampled_at, &b.id)));
+    Ok(history)
+}
+
+fn authoritative_admission(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<AdmissionSummary>> {
+    connection
+        .query_row(
+            "SELECT r.id,r.pool_id,COALESCE(r.attempt_id,''),COALESCE(r.route_snapshot_json,''),COALESCE(r.configuration_revision,''),COALESCE(r.canonical_pool_identity,''),COALESCE(r.authorization_id,''),COALESCE(r.authorization_revision,0),r.owner_session,r.generation,r.priority,r.status,COALESCE(r.fence,l.fence),r.enqueued_at,r.released_at FROM admission_requests r LEFT JOIN pool_leases l ON l.request_id=r.id AND l.owner_session=r.owner_session AND l.generation=r.generation WHERE r.run_id=?1 ORDER BY r.enqueued_at DESC,r.id DESC LIMIT 1",
+            [run_id],
+            |row| {
+                let status: String = row.get(11)?;
+                let state = match status.as_str() {
+                    "queued" => AdmissionState::Queued,
+                    "admitted" => AdmissionState::Admitted,
+                    "reconciliation" => AdmissionState::Reconciliation,
+                    _ => AdmissionState::Released,
+                };
+                Ok(AdmissionSummary {
+                    request_id: row.get(0)?,
+                    pool_id: row.get(1)?,
+                    attempt_id: row.get(2)?,
+                    route_snapshot_json: row.get(3)?,
+                    configuration_revision: row.get(4)?,
+                    canonical_pool_identity: row.get(5)?,
+                    authorization_id: row.get(6)?,
+                    authorization_revision: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    owner_session: row.get(8)?,
+                    generation: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+                    priority: row.get(10)?,
+                    state,
+                    fence: row
+                        .get::<_, Option<i64>>(12)?
+                        .and_then(|value| u64::try_from(value).ok()),
+                    enqueued_at: timestamp_from_sql(13, row.get(13)?)?,
+                    released_at: row
+                        .get::<_, Option<String>>(14)?
+                        .map(|value| timestamp_from_sql(14, value))
+                        .transpose()?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to read authoritative admission state")
+}
+
 impl Database {
+    /// Event followers never migrate, repair projections, or acquire execution authority.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { connection })
+    }
+
+    /// Authoritative control and admission writes share the ordinary durable
+    /// connection. Model execution never owns a database write transaction.
+    pub fn open_control(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(path)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path
@@ -435,6 +856,10 @@ impl Database {
             .with_context(|| format!("failed to open database {}", path.display()))?;
         let mut database = Self { connection };
         database.configure(false)?;
+        database
+            .connection
+            .pragma_update(None, "synchronous", "FULL")
+            .context("failed to enable FULL SQLite durability")?;
         database.migrate()?;
         Ok(database)
     }
@@ -448,6 +873,14 @@ impl Database {
         Ok(database)
     }
 
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+
     fn configure(&self, in_memory: bool) -> Result<()> {
         self.connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")
@@ -457,25 +890,60 @@ impl Database {
             .context("failed to configure SQLite busy timeout")?;
         if !in_memory {
             // WAL lets read-only history/show commands coexist with an active run.
-            self.connection
-                .pragma_update(None, "journal_mode", "WAL")
-                .context("failed to enable SQLite WAL mode")?;
+            let mut last_busy = None;
+            for _ in 0..200 {
+                match self.connection.pragma_update(None, "journal_mode", "WAL") {
+                    Ok(()) => {
+                        last_busy = None;
+                        break;
+                    }
+                    Err(error) if sqlite_busy(&error) => {
+                        last_busy = Some(error);
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error).context("failed to enable SQLite WAL mode"),
+                }
+            }
+            if let Some(error) = last_busy {
+                return Err(error).context("failed to enable SQLite WAL mode after waiting");
+            }
         }
         Ok(())
     }
 
     fn migrate(&mut self) -> Result<()> {
-        self.connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (\
+        let initialized = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !initialized {
+            self.connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS schema_migrations (\
                     version INTEGER PRIMARY KEY, \
                     name TEXT NOT NULL, \
                     applied_at TEXT NOT NULL\
                 );",
-            )
-            .context("failed to initialize schema migrations")?;
+                )
+                .context("failed to initialize schema migrations")?;
+        }
+        let applied = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT version FROM schema_migrations")?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?
+        };
 
         for (version, name, sql) in MIGRATIONS {
+            if applied.contains(version) {
+                continue;
+            }
+            if *version == 13 {
+                self.connection.pragma_update(None, "foreign_keys", false)?;
+            }
             let transaction = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -488,6 +956,9 @@ impl Database {
                 .context("failed to read schema migration state")?;
             if applied {
                 transaction.commit()?;
+                if *version == 13 {
+                    self.connection.pragma_update(None, "foreign_keys", true)?;
+                }
                 continue;
             }
 
@@ -499,6 +970,9 @@ impl Database {
                 params![version, name, timestamp(Utc::now())],
             )?;
             transaction.commit()?;
+            if *version == 13 {
+                self.connection.pragma_update(None, "foreign_keys", true)?;
+            }
         }
         Ok(())
     }
@@ -508,7 +982,9 @@ impl Database {
     }
 
     pub fn replace_benchmark_prior(&mut self, prior: &BenchmarkPrior) -> Result<()> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             r#"DELETE FROM benchmark_priors
                WHERE source = ?1
@@ -659,6 +1135,52 @@ impl Database {
         usize::try_from(count).context("distributed public prior count is invalid")
     }
 
+    pub fn append_capacity_observation(&self, observation: &CapacityObservation) -> Result<()> {
+        let payload = serde_json::to_string(observation)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO capacity_observations(id,pool_id,source,source_version,provider_bucket_id,window_identity,sampled_at,valid_until,payload_json) VALUES(?1,?2,?3,?4,NULL,NULL,?5,?6,?7)",
+            params![observation.id, observation.pool_id, observation.source, observation.source_version, timestamp(observation.sampled_at), timestamp(observation.valid_until), payload],
+        )?;
+        for (ordinal, constraint) in observation.constraints.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO capacity_observation_constraints(observation_id,ordinal,provider_bucket_id,window_identity,constraint_json) VALUES(?1,?2,?3,?4,?5)",
+                params![observation.id, ordinal, constraint.provider_bucket_id, constraint.window_id, serde_json::to_string(constraint)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn latest_capacity_observation(
+        &self,
+        pool_id: &str,
+    ) -> Result<Option<CapacityObservation>> {
+        self.connection
+            .query_row(
+                "SELECT payload_json FROM capacity_observations WHERE pool_id=?1 ORDER BY sampled_at DESC,id DESC LIMIT 1",
+                [pool_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| serde_json::from_str(&payload).context("invalid capacity observation"))
+            .transpose()
+    }
+
+    pub fn questions_for_run(&self, run_id: &str) -> Result<Vec<crate::Clarification>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT question_json FROM clarifications WHERE run_id=?1 ORDER BY id")?;
+        statement
+            .query_map([run_id], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
+
+    pub fn admission_summary_for_run(&self, run_id: &str) -> Result<Option<AdmissionSummary>> {
+        authoritative_admission(&self.connection, run_id)
+    }
+
     pub fn manual_benchmark_priors(&self) -> Result<Vec<BenchmarkPrior>> {
         let mut statement = self.connection.prepare(
             "SELECT source, dataset, dataset_version, harness, model, language, \
@@ -674,13 +1196,68 @@ impl Database {
     /// Replace all structured state for a run in one transaction. Events are an
     /// append-only log and are deliberately not replaced by this operation.
     pub fn sync_run(&mut self, run: &RunRecord) -> Result<()> {
+        self.sync_run_effect(run, |_| Ok(()))
+    }
+
+    /// Initial run, acceptance event, ownership and receipt share one commit.
+    pub(crate) fn create_run(
+        &mut self,
+        run: &mut RunRecord,
+        event: EventRecord,
+    ) -> Result<EventRecord> {
+        let mut projection = run.clone();
+        let mut committed = None;
+        self.sync_run_effect(run, |transaction| {
+            committed = Some(Self::transition_on(transaction, &mut projection, event)?);
+            Ok(())
+        })?;
+        *run = projection;
+        Ok(committed.expect("created transition"))
+    }
+
+    fn sync_run_effect(
+        &mut self,
+        run: &RunRecord,
+        effect: impl FnOnce(&Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
         let routing_decision_json = run
             .routing
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
             .context("failed to serialize routing decision")?;
-        let transaction = self.connection.transaction()?;
+        let outcome_json =
+            serde_json::to_string(&run.outcome).context("failed to serialize run outcome")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Admission binds immutably to an attempt. The legacy projection
+        // writer replaces attempt rows within this same transaction, so defer
+        // that foreign-key check until the replacement is complete.
+        transaction.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+
+        let stored_revision = transaction
+            .query_row(
+                "SELECT state_revision FROM runs WHERE id=?1",
+                [&run.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(stored_revision) = stored_revision {
+            anyhow::ensure!(
+                u64::try_from(stored_revision)
+                    .ok()
+                    .is_some_and(|value| value <= run.state_revision),
+                "refusing to overwrite a newer committed run projection"
+            );
+        }
+        validate_terminal_write(&transaction, run, false)?;
+        let mut projection = run.clone();
+        if let Some(admission) = authoritative_admission(&transaction, &run.id)? {
+            projection.admission = Some(admission);
+        }
+        let run_projection_json = serde_json::to_string(&projection)
+            .context("failed to serialize authoritative run projection")?;
 
         let existing_source_id = transaction
             .query_row(
@@ -726,10 +1303,12 @@ impl Database {
                     created_at, completed_at, dispatch_version, os, architecture,
                     execution_backend, timeout_secs, cpus, memory, max_parallel,
                     docker_image, resource_limits_enforced, unsafe_local,
-                    forwarded_env_json, applied_candidate, routing_decision_json
+                    forwarded_env_json, applied_candidate, routing_decision_json,
+                    run_mode, state_revision, outcome_json, run_projection_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
+                    ?24, ?25, ?26, ?27
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     source_id = excluded.source_id,
@@ -753,7 +1332,11 @@ impl Database {
                     unsafe_local = excluded.unsafe_local,
                     forwarded_env_json = excluded.forwarded_env_json,
                     applied_candidate = excluded.applied_candidate,
-                    routing_decision_json = excluded.routing_decision_json"#,
+                    routing_decision_json = excluded.routing_decision_json,
+                    run_mode = excluded.run_mode,
+                    state_revision = excluded.state_revision,
+                    outcome_json = excluded.outcome_json,
+                    run_projection_json = excluded.run_projection_json"#,
             params![
                 run.id,
                 source_id,
@@ -779,14 +1362,41 @@ impl Database {
                     .context("failed to serialize forwarded environment names")?,
                 run.applied_candidate,
                 routing_decision_json,
+                run.mode.as_str(),
+                unsigned(run.state_revision, "run state revision")?,
+                outcome_json,
+                run_projection_json,
             ],
         )?;
+
+        if let Some(decision) = &run.allocation {
+            let decision_json = serde_json::to_string(decision)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT decision_json FROM allocation_decisions WHERE run_id = ?1",
+                    [&run.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                existing
+                    .as_ref()
+                    .is_none_or(|stored| stored == &decision_json),
+                "allocation decision for run {} is immutable",
+                run.id
+            );
+            transaction.execute(
+                "INSERT OR IGNORE INTO allocation_decisions(run_id, decision_json, created_at) VALUES (?1, ?2, ?3)",
+                params![run.id, decision_json, timestamp(run.created_at)],
+            )?;
+        }
 
         // Evaluations reference candidates, so remove the old evaluation before
         // replacing a run's candidate set. Reasons cascade from the evaluation.
         transaction.execute("DELETE FROM evaluations WHERE run_id = ?1", [&run.id])?;
         transaction.execute("DELETE FROM checks WHERE run_id = ?1", [&run.id])?;
         transaction.execute("DELETE FROM artifacts WHERE run_id = ?1", [&run.id])?;
+        transaction.execute("DELETE FROM attempts WHERE run_id = ?1 AND (details_json IS NULL OR completed_at IS NULL)", [&run.id])?;
         transaction.execute("DELETE FROM candidates WHERE run_id = ?1", [&run.id])?;
 
         for candidate in &run.candidates {
@@ -797,6 +1407,18 @@ impl Database {
                 insert_check_artifacts(&transaction, &run.id, Some(&candidate.id), check)?;
             }
         }
+        for attempt in &run.attempts {
+            insert_attempt(&transaction, attempt)?;
+        }
+        transaction.execute(
+            "UPDATE runs SET delivery_attempt_id=?2 WHERE id=?1",
+            params![
+                run.id,
+                run.phase3
+                    .as_ref()
+                    .and_then(|p| p.final_attempt_id.as_deref())
+            ],
+        )?;
 
         insert_artifact(
             &transaction,
@@ -826,7 +1448,76 @@ impl Database {
         }
         sync_routing_observation(&transaction, run)?;
 
+        effect(&transaction)?;
         transaction.commit().context("failed to commit run sync")
+    }
+
+    pub fn save_goal_feedback(
+        &mut self,
+        run_id: &str,
+        outcome: RoutingHumanOutcome,
+        reasons: Vec<String>,
+        explanation: Option<String>,
+    ) -> Result<GoalFeedbackRevision> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM goal_feedback_revisions WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let feedback = GoalFeedbackRevision {
+            id: format!("goal-feedback-{run_id}-{revision}"),
+            run_id: run_id.to_owned(),
+            revision,
+            outcome,
+            reasons,
+            explanation,
+            created_at: Utc::now(),
+        };
+        transaction.execute(
+            "INSERT INTO goal_feedback_revisions(id, run_id, revision, outcome, reasons_json, explanation, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                feedback.id,
+                feedback.run_id,
+                feedback.revision,
+                feedback.outcome.as_str(),
+                serde_json::to_string(&feedback.reasons)?,
+                feedback.explanation,
+                timestamp(feedback.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(feedback)
+    }
+
+    pub fn latest_goal_feedback(&self, run_id: &str) -> Result<Option<GoalFeedbackRevision>> {
+        self.connection
+            .query_row(
+                "SELECT id, revision, outcome, reasons_json, explanation, created_at FROM goal_feedback_revisions WHERE run_id = ?1 ORDER BY revision DESC LIMIT 1",
+                [run_id],
+                |row| {
+                    let outcome = match row.get::<_, String>(2)?.as_str() {
+                        "accepted" => RoutingHumanOutcome::Accepted,
+                        "rejected" => RoutingHumanOutcome::Rejected,
+                        value => return Err(rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("invalid goal feedback outcome {value}").into())),
+                    };
+                    let reasons_json: String = row.get(3)?;
+                    let reasons = serde_json::from_str(&reasons_json).map_err(|error| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error)))?;
+                    Ok(GoalFeedbackRevision {
+                        id: row.get(0)?,
+                        run_id: run_id.to_owned(),
+                        revision: row.get(1)?,
+                        outcome,
+                        reasons,
+                        explanation: row.get(4)?,
+                        created_at: timestamp_from_sql(5, row.get(5)?)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read goal feedback")
     }
 
     pub fn record_event(&self, event: &EventRecord) -> Result<()> {
@@ -834,18 +1525,201 @@ impl Database {
             serde_json::to_string(&event.payload).context("failed to serialize event payload")?;
         self.connection
             .execute(
-                "INSERT INTO events(run_id, candidate_label, event_type, timestamp, payload_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO events(run_id, candidate_label, event_type, timestamp, payload_json, \
+                                    protocol_version, sequence, attempt_id, generation, actor) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                         COALESCE(NULLIF(?7, 0), (SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1)),
+                         ?8, ?9, ?10)",
                 params![
                     event.run_id,
                     event.candidate_label,
                     event.event_type,
                     timestamp(event.timestamp),
                     payload,
+                    event.protocol_version,
+                    unsigned(event.sequence, "event sequence")?,
+                    event.attempt_id,
+                    event.generation,
+                    event.actor,
                 ],
             )
             .with_context(|| format!("failed to record {} event", event.event_type))?;
         Ok(())
+    }
+
+    /// Commit the semantic state revision and its event in one SQLite transaction.
+    /// Files in the run directory are projections written only after this succeeds.
+    pub fn commit_transition(
+        &self,
+        run: &mut RunRecord,
+        event: EventRecord,
+    ) -> Result<EventRecord> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let event = Self::transition_on(&transaction, run, event)?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    fn transition_on(
+        transaction: &Transaction<'_>,
+        run: &mut RunRecord,
+        mut event: EventRecord,
+    ) -> Result<EventRecord> {
+        let stored_revision: i64 = transaction.query_row(
+            "SELECT state_revision FROM runs WHERE id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            u64::try_from(stored_revision).ok() == Some(run.state_revision),
+            "run state revision changed concurrently"
+        );
+        let sequence: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )?;
+        run.state_revision = run
+            .state_revision
+            .checked_add(1)
+            .context("run state revision overflow")?;
+        event.protocol_version = 1;
+        event.sequence = u64::try_from(sequence).context("event sequence is invalid")?;
+        if let Some(actor) = crate::commands::actor() {
+            event.actor = actor;
+        }
+        if event.actor.is_empty() {
+            event.actor = "orchestrator".into();
+        }
+        if event.generation == 0 {
+            event.generation = 1;
+        }
+        // Every committed event carries its semantic outcome so cursor followers
+        // can observe even a waiting transition that has already been answered.
+        if !event.payload.is_object() {
+            event.payload = serde_json::json!({"data": event.payload});
+        }
+        event
+            .payload
+            .as_object_mut()
+            .expect("normalized event object")
+            .insert("outcome".into(), serde_json::to_value(&run.outcome)?);
+        persist_questions(transaction, run)?;
+        let outcome_json = serde_json::to_string(&run.outcome)?;
+        validate_terminal_write(transaction, run, event.event_type == "review.accepted")?;
+        let mut projection = run.clone();
+        if let Some(admission) = authoritative_admission(transaction, &run.id)? {
+            projection.admission = Some(admission);
+        }
+        let projection_json = serde_json::to_string(&projection)?;
+        transaction.execute(
+            "UPDATE runs SET state_revision = ?2, outcome_json = ?3, run_projection_json = ?4, \
+                             run_mode = ?5, status = ?6, completed_at = ?7, applied_candidate = ?8 \
+             WHERE id = ?1",
+            params![
+                run.id,
+                unsigned(run.state_revision, "run state revision")?,
+                outcome_json,
+                projection_json,
+                run.mode.as_str(),
+                run.status.as_str(),
+                run.completed_at.map(timestamp),
+                run.applied_candidate,
+            ],
+        )?;
+        let payload = serde_json::to_string(&event.payload)?;
+        transaction.execute(
+            "INSERT INTO events(run_id, candidate_label, event_type, timestamp, payload_json, \
+                                protocol_version, sequence, attempt_id, generation, actor) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.run_id,
+                event.candidate_label,
+                event.event_type,
+                timestamp(event.timestamp),
+                payload,
+                event.protocol_version,
+                sequence,
+                event.attempt_id,
+                event.generation,
+                event.actor,
+            ],
+        )?;
+        crate::commands::commit_receipt(transaction, run, &mut event)?;
+        // Keep immediate JSON/results and the file projection consistent with
+        // the same admission authority used by subsequent status reads.
+        run.admission = projection.admission;
+        Ok(event)
+    }
+
+    pub fn committed_run_projection(&self, run_id: &str) -> Result<Option<RunRecord>> {
+        let json = self
+            .connection
+            .query_row(
+                "SELECT run_projection_json FROM runs WHERE id = ?1",
+                [run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        json.map(|json| serde_json::from_str(&json).context("invalid committed run projection"))
+            .transpose()
+    }
+
+    pub fn events_for_run(&self, run_id: &str) -> Result<Vec<EventRecord>> {
+        self.events_after(run_id, 0, i64::MAX as u64)
+    }
+
+    pub fn event_page(
+        &self,
+        run_id: &str,
+        after: u64,
+        limit: u64,
+    ) -> Result<(Vec<EventRecord>, Option<RunRecord>)> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let latest: u64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(after <= latest, "cursor is ahead of the committed journal");
+        let events = self.events_after(run_id, after, limit)?;
+        let run = self.committed_run_projection(run_id)?;
+        transaction.commit()?;
+        Ok((events, run))
+    }
+
+    pub fn events_after(&self, run_id: &str, after: u64, limit: u64) -> Result<Vec<EventRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT protocol_version, sequence, attempt_id, generation, actor,
+                    candidate_label, event_type, timestamp, payload_json
+             FROM events WHERE run_id = ?1 AND sequence > ?2 ORDER BY sequence LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![run_id, after, limit], |row| {
+            let payload_json: String = row.get(8)?;
+            let payload = serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(EventRecord {
+                protocol_version: row.get(0)?,
+                run_id: run_id.to_owned(),
+                sequence: row.get::<_, u64>(1)?,
+                attempt_id: row.get(2)?,
+                generation: row.get(3)?,
+                actor: row.get(4)?,
+                candidate_label: row.get(5)?,
+                event_type: row.get(6)?,
+                timestamp: timestamp_from_sql(7, row.get(7)?)?,
+                payload,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to replay run events")
     }
 
     pub fn save_evaluation(&mut self, run_id: &str, evaluation: &EvaluationRecord) -> Result<()> {
@@ -1462,6 +2336,61 @@ fn insert_candidate(
     Ok(())
 }
 
+fn insert_attempt(transaction: &Transaction<'_>, attempt: &AttemptRecord) -> Result<()> {
+    let details = serde_json::to_string(attempt)?;
+    let old: Option<String> = transaction
+        .query_row(
+            "SELECT details_json FROM attempts WHERE id=?1 AND completed_at IS NOT NULL",
+            [&attempt.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(old) = old {
+        anyhow::ensure!(old == details, "completed attempt evidence is immutable");
+        return Ok(());
+    }
+    transaction.execute(
+        r#"INSERT INTO attempts(
+                id, run_id, candidate_id, role, ordinal, generation, harness_id,
+                harness_version, requested_model, resolved_model, observed_model,
+                requested_effort, resolved_effort, observed_effort, started_at,
+                completed_at, outcome, raw_telemetry_path, identity_provenance,
+                resource_snapshot_json, details_json
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, 'observed', ?19, ?20
+            )"#,
+        params![
+            attempt.id,
+            attempt.run_id,
+            attempt.candidate_id,
+            attempt.role,
+            attempt.ordinal,
+            attempt.generation,
+            attempt.harness_id,
+            attempt.harness_version,
+            attempt.requested_model,
+            attempt.resolved_model,
+            attempt.observed_model,
+            attempt.requested_effort,
+            attempt.resolved_effort,
+            attempt.observed_effort,
+            timestamp(attempt.started_at),
+            attempt.completed_at.map(timestamp),
+            attempt.outcome,
+            path_text(&attempt.raw_telemetry_path),
+            attempt
+                .resource
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            details,
+        ],
+    )?;
+    Ok(())
+}
+
 fn insert_check(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -1565,6 +2494,9 @@ fn insert_artifact(
 }
 
 fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> Result<()> {
+    if run.mode == RunMode::Allocation {
+        return Ok(());
+    }
     let Some(prediction) = &run.routing else {
         return Ok(());
     };
@@ -1916,6 +2848,117 @@ fn usize_integer(value: usize, field: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} is too large for SQLite"))
 }
 
+fn validate_terminal_write(
+    connection: &Connection,
+    run: &RunRecord,
+    explicit_review: bool,
+) -> Result<()> {
+    if run.phase3.is_some() {
+        let mut statement = connection.prepare("SELECT id,details_json FROM attempts WHERE run_id=?1 AND completed_at IS NOT NULL AND details_json IS NOT NULL")?;
+        for row in statement.query_map([&run.id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (id, original) = row?;
+            let attempt = run
+                .attempts
+                .iter()
+                .find(|a| a.id == id)
+                .context("completed attempt cannot be removed")?;
+            anyhow::ensure!(
+                serde_json::to_string(attempt)? == original,
+                "completed attempt evidence is immutable"
+            );
+        }
+    }
+    let old: Option<String> = connection
+        .query_row(
+            "SELECT outcome_json FROM runs WHERE id=?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(old) = old {
+        let old: crate::RunOutcome = serde_json::from_str(&old)?;
+        anyhow::ensure!(
+            old.work_result != crate::WorkResult::Cancelled
+                || (run.outcome.work_result == crate::WorkResult::Cancelled
+                    && run.outcome.lifecycle == crate::LifecycleState::Finished),
+            "cancelled work cannot reopen"
+        );
+        anyhow::ensure!(
+            old.review != crate::ReviewState::Rejected
+                || run.outcome.review == crate::ReviewState::Rejected
+                || (explicit_review && run.outcome.lifecycle == crate::LifecycleState::Finished),
+            "rejected work cannot automatically reopen"
+        );
+    }
+    Ok(())
+}
+
+fn persist_questions(connection: &Connection, run: &RunRecord) -> Result<()> {
+    let Some(policy) = &run.phase3 else {
+        return Ok(());
+    };
+    for question in &policy.questions {
+        anyhow::ensure!(question.run_id == run.id, "question belongs to another run");
+        let json = serde_json::to_string(question)?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT question_json FROM clarifications WHERE id=?1",
+                [&question.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.as_deref() == Some(&json) {
+            continue;
+        }
+        let state = match question.state {
+            crate::QuestionState::Pending => "pending",
+            crate::QuestionState::Answered => "answered",
+            crate::QuestionState::Cancelled => "cancelled",
+        };
+        if let Some(existing) = existing {
+            let old: crate::Clarification = serde_json::from_str(&existing)?;
+            anyhow::ensure!(
+                old.run_id == run.id
+                    && old.attempt_id == question.attempt_id
+                    && old.generation == question.generation
+                    && old.report == question.report
+                    && old.state == crate::QuestionState::Pending
+                    && question.state != crate::QuestionState::Pending
+                    && question.revision == old.revision + 1
+                    && question.actor_uid == Some(policy.owner_uid),
+                "stale or unauthorized question mutation"
+            );
+            let changed = connection.execute("UPDATE clarifications SET state=?2,revision=?3,question_json=?4 WHERE id=?1 AND run_id=?5 AND revision=?6 AND state='pending'",params![question.id,state,question.revision,json,run.id,old.revision])?;
+            anyhow::ensure!(changed == 1, "question changed concurrently");
+        } else {
+            anyhow::ensure!(
+                question.state == crate::QuestionState::Pending && question.revision == 1,
+                "new question must be pending"
+            );
+            let active: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM admission_requests WHERE run_id=?1 AND status IN ('queued','admitted','reconciliation'))",[&run.id],|r|r.get(0))?;
+            anyhow::ensure!(
+                !active,
+                "cannot wait on a human while admission is unresolved"
+            );
+            connection.execute(
+                "INSERT INTO clarifications VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    question.id,
+                    run.id,
+                    question.attempt_id,
+                    question.generation,
+                    question.revision,
+                    state,
+                    json
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1980,6 +3023,7 @@ mod tests {
 
     fn run(id: &str) -> RunRecord {
         RunRecord {
+            phase3: None,
             id: id.to_owned(),
             task: "Fix the retry race".to_owned(),
             exact_prompt: "Fix the retry race\n\nKeep the public API.".to_owned(),
@@ -1990,6 +3034,9 @@ mod tests {
             baseline_path: PathBuf::from(format!("/state/{id}/baseline")),
             baseline_commit: "0123456789abcdef".to_owned(),
             status: RunStatus::ReadyForEvaluation,
+            mode: crate::RunMode::Legacy,
+            state_revision: 0,
+            outcome: crate::RunOutcome::default(),
             created_at: at(1),
             completed_at: Some(at(4)),
             environment: EnvironmentRecord {
@@ -2011,16 +3058,38 @@ mod tests {
                 candidate("cand-a", "A", "codex"),
                 candidate("cand-b", "B", "claude"),
             ],
+            attempts: Vec::new(),
             routing: None,
+            allocation: None,
+            capacity: None,
+            admission: None,
             evaluation: None,
             applied_candidate: None,
         }
     }
 
+    fn insert_legacy_run(connection: &Connection, id: &str) -> Result<()> {
+        connection.execute(
+            "INSERT INTO sources(path, kind, fingerprint, created_at) VALUES ('/legacy', 'directory', 'legacy', ?1)",
+            [timestamp(at(1))],
+        )?;
+        connection.execute(
+            r#"INSERT INTO runs(
+                    id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+                    created_at, dispatch_version, os, architecture, execution_backend,
+                    timeout_secs, cpus, memory, max_parallel
+                ) VALUES (?1, 1, 'task', 'prompt', '/baseline', 'commit',
+                          'ready_for_evaluation', ?2, '0.1.0', 'test', 'test', 'local',
+                          30, 1.0, '1g', 1)"#,
+            params![id, timestamp(at(1))],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 11);
+        assert_eq!(database.schema_version()?, 18);
         let foreign_keys: i64 =
             database
                 .connection
@@ -2042,6 +3111,16 @@ mod tests {
             "benchmark_priors",
             "routing_observations",
             "routing_feedback_events",
+            "attempts",
+            "allocation_decisions",
+            "goal_feedback_revisions",
+            "resource_pools",
+            "capacity_observations",
+            "capacity_authorizations",
+            "capacity_observation_constraints",
+            "admission_requests",
+            "pool_leases",
+            "clarifications",
         ] {
             let exists: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -2054,16 +3133,294 @@ mod tests {
     }
 
     #[test]
+    fn capacity_observations_append_without_replacing_prior_samples() -> Result<()> {
+        let database = Database::open_in_memory()?;
+        database.connection.execute(
+            "INSERT INTO resource_pools(id,provider,funding_source,provider_buckets_json,max_active,next_fence,created_at,updated_at) VALUES('pool','openai','chatgpt-plus','[\"codex\"]',1,0,?1,?1)",
+            [timestamp(at(1))],
+        )?;
+        let first = crate::capacity::unknown_observation("pool", "default", at(2), 300, "first");
+        let second = crate::capacity::unknown_observation("pool", "default", at(3), 300, "second");
+        database.append_capacity_observation(&first)?;
+        database.append_capacity_observation(&second)?;
+        let rows: i64 = database.connection.query_row(
+            "SELECT COUNT(*) FROM capacity_observations WHERE pool_id='pool'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 2);
+        assert_eq!(
+            database.latest_capacity_observation("pool")?.unwrap().id,
+            second.id
+        );
+        assert!(database.append_capacity_observation(&first).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_cleanup_and_release_survive_equal_and_stale_projection_writes() -> Result<()> {
+        for uncertain in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let state = crate::state::State::discover(Some(temp.path().join("state")))?;
+            state.initialize()?;
+            let mut database = Database::open(state.db_path())?;
+            let mut current = run(&ulid::Ulid::new().to_string());
+            current.state_revision = 3;
+            database.sync_run(&current)?;
+            let coordinator = crate::admission::AdmissionCoordinator::new(
+                state.db_path(),
+                Duration::from_secs(20),
+                Duration::from_secs(1),
+            );
+            coordinator.register_pool("pool", "openai", "chatgpt-plus", &["codex".into()])?;
+            let request = coordinator.enqueue(&current.id, "pool", "owner", 1, 0)?;
+            let crate::admission::AcquireResult::Acquired(token) =
+                coordinator.try_acquire(&request)?
+            else {
+                panic!("not admitted")
+            };
+            current.admission = database.admission_summary_for_run(&current.id)?;
+            database.sync_run(&current)?;
+            let stale = current.clone();
+            let expected = if uncertain {
+                database.connection.execute("UPDATE pool_leases SET launch_lifecycle='spawn_may_have_occurred' WHERE pool_id='pool'",[])?;
+                coordinator.cleanup_after_unrecorded_spawn(
+                    &token,
+                    &crate::admission::ProcessIdentity::current(),
+                    None,
+                    false,
+                )?;
+                let states:(String,String)=database.connection.query_row("SELECT l.state,r.status FROM pool_leases l JOIN admission_requests r ON r.id=l.request_id",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                assert_eq!(states, ("reconciliation".into(), "reconciliation".into()));
+                assert!(!coordinator.release_not_launched(&token)?);
+                crate::AdmissionState::Reconciliation
+            } else {
+                assert!(coordinator.release(&token)?);
+                crate::AdmissionState::Released
+            };
+            // Real production projection writer must overlay SQL authority,
+            // even when handed an equal-revision stale in-memory snapshot.
+            database.sync_run(&stale)?;
+            assert_eq!(
+                database
+                    .committed_run_projection(&current.id)?
+                    .unwrap()
+                    .admission
+                    .unwrap()
+                    .state,
+                expected
+            );
+            database.commit_transition(
+                &mut current,
+                EventRecord {
+                    run_id: stale.id.clone(),
+                    event_type: "projection.test".into(),
+                    timestamp: Utc::now(),
+                    ..EventRecord::default()
+                },
+            )?;
+            assert_eq!(
+                crate::orchestrator::run_result(&current)
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .state,
+                expected
+            );
+            for revision in [3, 4, 5] {
+                let mut stale_file = stale.clone();
+                stale_file.state_revision = revision;
+                state.save_run(&stale_file)?;
+                let public = state.load_run(&current.id)?;
+                assert_eq!(public.admission.as_ref().unwrap().state, expected);
+                let json = serde_json::to_value(public)?;
+                assert_eq!(
+                    json["admission"]["state"],
+                    if uncertain {
+                        "reconciliation"
+                    } else {
+                        "released"
+                    }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stale_run_projection_cannot_overwrite_newer_revision() -> Result<()> {
+        let mut database = Database::open_in_memory()?;
+        let mut current = run("projection-fence");
+        database.sync_run(&current)?;
+        let stale = current.clone();
+        current.state_revision = 2;
+        current.status = RunStatus::Failed;
+        database.sync_run(&current)?;
+        assert!(database.sync_run(&stale).is_err());
+        let stored = database.committed_run_projection(&current.id)?.unwrap();
+        assert_eq!(stored.state_revision, 2);
+        assert_eq!(stored.status, RunStatus::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_preserves_live_orphans_from_schema_14_and_already_applied_15() -> Result<()> {
+        for version in [14, 15] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("old.db");
+            let connection = Connection::open(&path)?;
+            connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);")?;
+            for (number, name, sql) in MIGRATIONS.iter().take(12) {
+                connection.execute_batch(sql)?;
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
+                    params![number, name, timestamp(at(1))],
+                )?;
+            }
+            insert_legacy_run(&connection, "old-run")?;
+            for (number, name, sql) in MIGRATIONS.iter().take(version).skip(12) {
+                connection.execute_batch(sql)?;
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
+                    params![number, name, timestamp(at(1))],
+                )?;
+            }
+            connection.execute_batch("INSERT INTO resource_pools(id,provider,funding_source,provider_buckets_json,max_active,next_fence,created_at,updated_at) VALUES('pool','openai','chatgpt-plus','[\"codex\"]',1,1,'2020-01-01','2020-01-01');
+                INSERT INTO admission_requests(id,run_id,pool_id,owner_session,generation,priority,enqueued_at,heartbeat_at,expires_at,status) VALUES('request','old-run','pool','dead-owner',1,0,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','admitted');")?;
+            let child = crate::admission::ProcessIdentity::current();
+            connection.execute("INSERT INTO pool_leases(pool_id,request_id,owner_session,generation,fence,state,start_intent_at,heartbeat_at,expires_at,owner_pid,child_pid,child_start_identity,child_boot_identity,child_process_group) VALUES('pool','request','dead-owner',1,1,'running',?1,?1,?1,4294967295,?2,?3,?4,?5)",params![timestamp(at(1)),child.pid,child.start,child.boot,child.process_group])?;
+            drop(connection);
+            let migrated = Database::open(&path)?;
+            crate::admission::AdmissionCoordinator::new(
+                &path,
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+            .reconcile_expired("pool")?;
+            let lifecycle: String = migrated.connection.query_row(
+                "SELECT launch_lifecycle FROM pool_leases WHERE pool_id='pool'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(lifecycle, "cleanup_uncertain");
+            assert_eq!(
+                migrated
+                    .admission_summary_for_run("old-run")?
+                    .unwrap()
+                    .state,
+                crate::AdmissionState::Reconciliation
+            );
+            assert_eq!(Database::open(&path)?.schema_version()?, 18);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn phase_three_migration_preserves_phase_two_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("phase-two.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().take(16) {
+            if *version == 13 {
+                connection.pragma_update(None, "foreign_keys", false)?;
+            }
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1,?2,?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+            if *version == 12 {
+                insert_legacy_run(&connection, "phase-two")?;
+            }
+        }
+        connection.execute("INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,started_at,outcome,raw_telemetry_path) VALUES ('attempt','phase-two','candidate','executor',1,1,'codex',?1,'completed','telemetry')",[timestamp(at(1))])?;
+        drop(connection);
+        let migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 18);
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT outcome FROM attempts WHERE id='attempt'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "completed"
+        );
+        assert!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT details_json FROM attempts WHERE id='attempt'",
+                    [],
+                    |r| r.get::<_, Option<String>>(0)
+                )?
+                .is_none()
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("SELECT COUNT(*) FROM clarifications", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        migrated.health_check()
+    }
+
+    #[test]
+    fn allocation_migration_preserves_phase_zero_rows_and_foreign_keys() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("phase-zero.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);",
+        )?;
+        for (version, name, sql) in MIGRATIONS.iter().take(12) {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1, ?2, ?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+        }
+        insert_legacy_run(&connection, "phase-zero-run")?;
+        connection.execute(
+            "INSERT INTO events(run_id, event_type, timestamp, payload_json) VALUES ('phase-zero-run', 'legacy', ?1, '{}')",
+            [timestamp(at(2))],
+        )?;
+        drop(connection);
+
+        let migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 18);
+        let violations: i64 = migrated.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |row| row.get(0),
+        )?;
+        let event_count: i64 = migrated.connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = 'phase-zero-run'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((violations, event_count), (0, 1));
+        Ok(())
+    }
+
+    #[test]
     fn opens_file_database_and_creates_parent_directories() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 11);
+        assert_eq!(database.schema_version()?, 18);
+        assert_eq!(
+            database
+                .connection
+                .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))?,
+            2
+        );
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 11);
+        assert_eq!(Database::open(&path)?.schema_version()?, 18);
         Ok(())
     }
 
@@ -2086,8 +3443,8 @@ mod tests {
                 params![version, name, timestamp(at(1))],
             )?;
         }
+        insert_legacy_run(&connection, "run-legacy-sync")?;
         let mut legacy = Database { connection };
-        legacy.sync_run(&run("run-legacy-sync"))?;
         legacy.save_evaluation(
             "run-legacy-sync",
             &EvaluationRecord {
@@ -2140,8 +3497,8 @@ mod tests {
                 params![version, name, timestamp(at(1))],
             )?;
         }
+        insert_legacy_run(&connection, "migration-run")?;
         let mut previous = Database { connection };
-        previous.sync_run(&run("migration-run"))?;
         previous.enable_sync("migration-contributor", at(6))?;
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {
@@ -2154,7 +3511,7 @@ mod tests {
         let settings = previous.sync_settings()?;
         drop(previous);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 11);
+        assert_eq!(migrated.schema_version()?, 18);
         assert_eq!(migrated.sync_settings()?, settings);
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {
@@ -2418,6 +3775,7 @@ mod tests {
             event_type: "candidate.completed".to_owned(),
             timestamp: at(5),
             payload: json!({"exit_code": 0, "message": "done"}),
+            ..EventRecord::default()
         })?;
         database.sync_run(&record)?;
 

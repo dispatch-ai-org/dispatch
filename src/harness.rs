@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,8 +13,8 @@ use serde_json::Value;
 use crate::{
     config::{ExecutionConfig, HarnessConfig, HarnessesConfig},
     executor::{
-        CancellationToken, CommandSpec, ExecutionRequest, ExecutionResult, ExecutionStatus,
-        Executor, trusted_host_executable,
+        CancellationToken, CommandSpec, ExecutionObserver, ExecutionRequest, ExecutionResult,
+        ExecutionStatus, Executor, trusted_host_executable,
     },
 };
 
@@ -81,7 +82,9 @@ pub struct HarnessTelemetry {
     pub token_semantics: Option<String>,
     pub cost_usd: Option<f64>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub harness_version: Option<String>,
+    pub semantic_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,7 @@ pub struct HarnessRunRequest {
     pub output_dir: PathBuf,
     pub timeout: Option<Duration>,
     pub cancellation: CancellationToken,
+    pub observer: Option<Arc<dyn ExecutionObserver>>,
 }
 
 impl HarnessRunRequest {
@@ -105,6 +109,7 @@ impl HarnessRunRequest {
             output_dir: output_dir.into(),
             timeout: None,
             cancellation: CancellationToken::new(),
+            observer: None,
         }
     }
 
@@ -117,13 +122,23 @@ impl HarnessRunRequest {
         self.cancellation = cancellation;
         self
     }
+
+    pub fn with_observer(mut self, observer: Arc<dyn ExecutionObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessRunResult {
     pub harness_id: String,
     pub harness_version: Option<String>,
-    pub model: Option<String>,
+    pub requested_model: Option<String>,
+    pub resolved_model: Option<String>,
+    pub observed_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub resolved_effort: Option<String>,
+    pub observed_effort: Option<String>,
     pub execution: ExecutionResult,
     pub tokens: Option<u64>,
     pub token_semantics: Option<String>,
@@ -137,6 +152,10 @@ pub trait HarnessAdapter: Send + Sync {
     fn id(&self) -> &'static str;
 
     fn model(&self) -> Option<&str> {
+        None
+    }
+
+    fn effort(&self) -> Option<&str> {
         None
     }
 
@@ -187,6 +206,7 @@ pub async fn run_harness(
         request.output_dir.join("stderr.log"),
     );
     execution_request.timeout = request.timeout;
+    execution_request.observer = request.observer;
     let mut execution = executor
         .execute_with_cancel(execution_request, request.cancellation)
         .await?;
@@ -195,15 +215,26 @@ pub async fn run_harness(
         let stderr = execution.raw_stderr_lossy();
         adapter.parse_output(&stdout, &stderr)
     };
+    if execution.status == ExecutionStatus::Succeeded
+        && let Some(error) = &telemetry.semantic_error
+    {
+        execution.status = ExecutionStatus::Failed;
+        execution.error = Some(format!("harness reported an error: {error}"));
+    }
     execution.clear_raw_capture();
+
+    let requested_model = adapter.model().map(str::to_owned);
+    let requested_effort = adapter.effort().map(str::to_owned);
 
     Ok(HarnessRunResult {
         harness_id: adapter.id().into(),
         harness_version: harness_version.or(telemetry.harness_version.clone()),
-        model: adapter
-            .model()
-            .map(str::to_owned)
-            .or_else(|| telemetry.model.clone()),
+        requested_model: requested_model.clone(),
+        resolved_model: requested_model,
+        observed_model: telemetry.model.clone(),
+        requested_effort: requested_effort.clone(),
+        resolved_effort: requested_effort,
+        observed_effort: telemetry.effort.clone(),
         execution,
         tokens: telemetry.tokens,
         token_semantics: telemetry.token_semantics,
@@ -307,6 +338,10 @@ impl HarnessAdapter for CodexAdapter {
         self.config.model.as_deref()
     }
 
+    fn effort(&self) -> Option<&str> {
+        self.config.effort.as_deref()
+    }
+
     async fn detect(&self) -> DetectionResult {
         detect_executable(&self.executable())
     }
@@ -326,6 +361,14 @@ impl HarnessAdapter for CodexAdapter {
             ".".into(),
         ];
         push_model_and_extra_args(&mut args, &self.config);
+        if let Some(effort) = &self.config.effort {
+            args.push("-c".into());
+            args.push(format!("model_reasoning_effort=\"{effort}\""));
+        }
+        if self.config.allocation_service_mode.as_deref() == Some("standard") {
+            args.push("-c".into());
+            args.push("service_tier=\"default\"".into());
+        }
         args.push(request.prompt.clone());
         Ok(CommandSpec::new(path_string(&self.executable())).args(args))
     }
@@ -572,17 +615,38 @@ pub fn parse_jsonl_telemetry(output: &str) -> HarnessTelemetry {
         .iter()
         .rev()
         .find_map(|event| reported_text(event, &["model", "model_name", "modelName"]));
+    let effort = events
+        .iter()
+        .rev()
+        .find_map(|event| reported_text(event, &["effort", "reasoning_effort", "reasoningEffort"]));
     let harness_version = events.iter().rev().find_map(|event| {
         reported_text(event, &["harness_version", "cli_version", "agent_version"])
     });
+    let semantic_error = events.iter().find_map(reported_semantic_error);
     HarnessTelemetry {
         events,
         tokens,
         token_semantics,
         cost_usd,
         model,
+        effort,
         harness_version,
+        semantic_error,
     }
+}
+
+fn reported_semantic_error(value: &Value) -> Option<String> {
+    let object = value.as_object()?;
+    let is_error = object.get("is_error").and_then(Value::as_bool) == Some(true);
+    let error_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "error" || kind.ends_with(".failed"));
+    if !is_error && !error_type {
+        return None;
+    }
+    reported_text(value, &["error", "message", "result"])
+        .or_else(|| Some("unspecified structured harness error".into()))
 }
 
 fn reported_text(value: &Value, keys: &[&str]) -> Option<String> {
@@ -716,6 +780,58 @@ fn field_f64(value: &Value, names: &[&str]) -> Option<f64> {
         .find_map(|name| value.get(*name).and_then(Value::as_f64))
 }
 
+/// Only the last completed `agent_message` item can supply a checkpoint.
+/// Its text must be a string containing one bounded, versioned JSON envelope.
+/// A malformed final item fails closed; earlier malformed items cannot hide a
+/// valid final report, and an earlier checkpoint never substitutes for it.
+pub(crate) fn codex_checkpoint(
+    events: &[Value],
+) -> Option<std::result::Result<crate::CheckpointReport, String>> {
+    let mut messages = events.iter().filter(|event| {
+        event["type"] == "item.completed" && event["item"]["type"] == "agent_message"
+    });
+    let final_message = messages.next_back()?;
+    let Some(text) = final_message["item"]["text"].as_str() else {
+        return Some(Err(
+            "final agent message has a malformed text payload".into()
+        ));
+    };
+    if !text.contains("dispatch_checkpoint") {
+        return messages
+            .any(|event| {
+                event["item"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("dispatch_checkpoint"))
+            })
+            .then(|| Err("checkpoint was not the final agent message".into()));
+    }
+    Some(
+        (|| -> Result<crate::CheckpointReport> {
+            anyhow::ensure!(text.len() <= 16_384, "checkpoint report too large");
+            let envelope: Value = serde_json::from_str(text)?;
+            anyhow::ensure!(
+                envelope.as_object().is_some_and(|v| v.len() == 1),
+                "checkpoint must be a single structured envelope"
+            );
+            let value: crate::CheckpointReport =
+                serde_json::from_value(envelope["dispatch_checkpoint"].clone())?;
+            anyhow::ensure!(
+                value.version == 1
+                    && !value.question.trim().is_empty()
+                    && value.question.len() <= 4096
+                    && value.choices.len() <= 8
+                    && value
+                        .choices
+                        .iter()
+                        .all(|s| !s.trim().is_empty() && s.len() <= 512),
+                "invalid checkpoint payload"
+            );
+            Ok(value)
+        })()
+        .map_err(|e| format!("unsupported checkpoint: {e}")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,8 +846,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let configured = HarnessConfig {
             model: Some("test-model".into()),
+            effort: Some("high".into()),
             executable: Some(PathBuf::from("custom-agent")),
             extra_args: vec!["--extra".into()],
+            allocation_service_mode: None,
         };
 
         let codex = CodexAdapter::new(configured.clone())
@@ -752,8 +870,15 @@ mod tests {
         );
         assert!(!codex.args.iter().any(|arg| arg == "--full-auto"));
         assert_eq!(
-            &codex.args[codex.args.len() - 4..],
-            ["--model", "test-model", "--extra", "do the task"]
+            &codex.args[codex.args.len() - 6..],
+            [
+                "--model",
+                "test-model",
+                "--extra",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "do the task"
+            ]
         );
 
         let cursor = CursorAdapter::new(configured.clone())
@@ -806,6 +931,8 @@ mod tests {
 
         assert_eq!(good.execution.status, ExecutionStatus::Succeeded);
         assert_eq!(bad.execution.status, ExecutionStatus::Succeeded);
+        assert_eq!(good.observed_model, None);
+        assert_eq!(good.observed_effort, None);
         assert!(good_workspace.join("dispatch-fake-good.txt").is_file());
         assert!(!good_workspace.join("dispatch-fake-bad.txt").exists());
         assert!(bad_workspace.join("dispatch-fake-bad.txt").is_file());
@@ -919,6 +1046,19 @@ mod tests {
 
         let overflow = parse_jsonl_telemetry("{\"total_tokens\":18446744073709551615}\n");
         assert_eq!(overflow.tokens, None);
+    }
+
+    #[test]
+    fn recognizes_structured_harness_errors_and_observed_effort() {
+        let telemetry = parse_jsonl_telemetry(
+            "{\"type\":\"turn.failed\",\"message\":\"provider rejected the request\",\"model\":\"observed-model\",\"reasoning_effort\":\"high\"}\n",
+        );
+        assert_eq!(telemetry.model.as_deref(), Some("observed-model"));
+        assert_eq!(telemetry.effort.as_deref(), Some("high"));
+        assert_eq!(
+            telemetry.semantic_error.as_deref(),
+            Some("provider rejected the request")
+        );
     }
 
     #[test]

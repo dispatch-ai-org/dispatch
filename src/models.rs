@@ -187,7 +187,135 @@ pub enum RunStatus {
     Evaluated,
     Applied,
     Interrupted,
+    Deferred,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Legacy,
+    Routed,
+    Allocation,
+    Comparison,
+}
+
+impl RunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Routed => "routed",
+            Self::Allocation => "allocation",
+            Self::Comparison => "comparison",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    Preparing,
+    Working,
+    Waiting,
+    #[default]
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkResult {
+    #[default]
+    Pending,
+    Ready,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    #[default]
+    NotConfigured,
+    NotRun,
+    Passed,
+    Failed,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    NotRequested,
+    #[default]
+    Pending,
+    Accepted,
+    Rejected,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationState {
+    #[default]
+    NotApplied,
+    Applied,
+    BlockedBySourceDrift,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    Preparing,
+    Executing,
+    Verifying,
+    Reviewing,
+    Applying,
+    #[default]
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingOn {
+    #[default]
+    None,
+    Human,
+    Capacity,
+    Dependency,
+    Authorization,
+    Admission,
+    Reconciliation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub version: u32,
+    pub lifecycle: LifecycleState,
+    pub work_result: WorkResult,
+    pub verification: VerificationState,
+    pub review: ReviewState,
+    pub application: ApplicationState,
+    pub phase: RunPhase,
+    pub waiting_on: WaitingOn,
+}
+
+impl Default for RunOutcome {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            lifecycle: LifecycleState::Finished,
+            work_result: WorkResult::Pending,
+            verification: VerificationState::NotConfigured,
+            review: ReviewState::Pending,
+            application: ApplicationState::NotApplied,
+            phase: RunPhase::Finished,
+            waiting_on: WaitingOn::None,
+        }
+    }
 }
 
 impl RunStatus {
@@ -199,6 +327,7 @@ impl RunStatus {
             Self::Evaluated => "evaluated",
             Self::Applied => "applied",
             Self::Interrupted => "interrupted",
+            Self::Deferred => "deferred",
             Self::Failed => "failed",
         }
     }
@@ -324,6 +453,8 @@ pub struct EnvironmentRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
+    #[serde(default)]
+    pub phase3: Option<GoalExecution>,
     pub id: String,
     pub task: String,
     pub exact_prompt: String,
@@ -334,6 +465,12 @@ pub struct RunRecord {
     pub baseline_path: PathBuf,
     pub baseline_commit: String,
     pub status: RunStatus,
+    #[serde(default)]
+    pub mode: RunMode,
+    #[serde(default)]
+    pub state_revision: u64,
+    #[serde(default)]
+    pub outcome: RunOutcome,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub environment: EnvironmentRecord,
@@ -342,7 +479,15 @@ pub struct RunRecord {
     #[serde(default)]
     pub candidates: Vec<CandidateRecord>,
     #[serde(default)]
+    pub attempts: Vec<AttemptRecord>,
+    #[serde(default)]
     pub routing: Option<RoutingDecision>,
+    #[serde(default)]
+    pub allocation: Option<AllocationDecision>,
+    #[serde(default)]
+    pub capacity: Option<CapacityObservation>,
+    #[serde(default)]
+    pub admission: Option<AdmissionSummary>,
     pub evaluation: Option<EvaluationRecord>,
     pub applied_candidate: Option<String>,
 }
@@ -365,11 +510,356 @@ pub struct EvaluationRecord {
     pub blind: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventRecord {
+    #[serde(default = "event_protocol_version")]
+    pub protocol_version: u32,
     pub run_id: String,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub generation: u32,
+    #[serde(default = "default_event_actor")]
+    pub actor: String,
     pub candidate_label: Option<String>,
     pub event_type: String,
     pub timestamp: DateTime<Utc>,
     pub payload: serde_json::Value,
+}
+
+fn event_protocol_version() -> u32 {
+    1
+}
+
+fn default_event_actor() -> String {
+    "legacy".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    #[serde(default)]
+    pub detail: AttemptDetail,
+    pub id: String,
+    pub run_id: String,
+    pub candidate_id: String,
+    pub role: String,
+    pub ordinal: u32,
+    pub generation: u32,
+    pub harness_id: String,
+    pub harness_version: Option<String>,
+    pub requested_model: Option<String>,
+    pub resolved_model: Option<String>,
+    pub observed_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub resolved_effort: Option<String>,
+    pub observed_effort: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub outcome: String,
+    pub raw_telemetry_path: PathBuf,
+    #[serde(default)]
+    pub resource: Option<ResourceChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceTier {
+    Light,
+    Standard,
+    Strong,
+}
+
+impl ResourceTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Standard => "standard",
+            Self::Strong => "strong",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceChoice {
+    pub provider: String,
+    pub funding_source: String,
+    pub harness: String,
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub effort: Option<String>,
+    pub service_mode: String,
+    pub runtime: String,
+    pub pool: String,
+    pub tier: ResourceTier,
+    pub no_overage_verified: bool,
+    pub internal_composition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelCapability {
+    pub model: String,
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    pub included: bool,
+    pub no_overage_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitySnapshot {
+    pub version: u32,
+    pub source: String,
+    pub harness: String,
+    pub observed_at: DateTime<Utc>,
+    pub models: Vec<ModelCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllocationAlternative {
+    pub choice: ResourceChoice,
+    pub eligible: bool,
+    pub exclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllocationDecision {
+    pub version: u32,
+    pub policy_version: String,
+    pub task_features: TaskFeatures,
+    pub selected: ResourceChoice,
+    pub reason: String,
+    pub capability: CapabilitySnapshot,
+    pub alternatives: Vec<AllocationAlternative>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "knowledge", rename_all = "snake_case")]
+pub enum CapacityValue<T> {
+    Reported {
+        value: T,
+    },
+    Estimated {
+        lower: T,
+        upper: T,
+        method: String,
+        samples: u32,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+impl<T> CapacityValue<T> {
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        Self::Unknown {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityMapping {
+    Mapped,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapacityConstraint {
+    pub kind: String,
+    pub unit: String,
+    pub provider_bucket_id: Option<String>,
+    pub window_id: Option<String>,
+    pub reported_used_percent: Option<f64>,
+    pub remaining: CapacityValue<f64>,
+    pub reset_at: CapacityValue<DateTime<Utc>>,
+    pub window_duration_secs: CapacityValue<u64>,
+    pub scope: CapacityValue<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScarcityState {
+    Available,
+    Constrained,
+    Reserve,
+    Exhausted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CapacityObservation {
+    pub id: String,
+    pub pool_id: String,
+    pub source: String,
+    pub source_version: String,
+    pub sampled_at: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
+    pub mapping: CapacityMapping,
+    pub auth_mode: CapacityValue<String>,
+    #[serde(default = "unknown_funding_identity")]
+    pub funding_identity: CapacityValue<String>,
+    pub plan_type: CapacityValue<String>,
+    pub credits_available: CapacityValue<bool>,
+    pub service_tier: CapacityValue<String>,
+    pub constraints: Vec<CapacityConstraint>,
+    pub scarcity: ScarcityState,
+    pub attributable_attempt_id: Option<String>,
+    pub attribution: String,
+    pub raw_observation_ref: Option<PathBuf>,
+}
+
+fn unknown_funding_identity() -> CapacityValue<String> {
+    CapacityValue::unknown("funding identity not recorded")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    Queued,
+    Admitted,
+    Reconciliation,
+    Released,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdmissionSummary {
+    pub request_id: String,
+    pub pool_id: String,
+    #[serde(default)]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub route_snapshot_json: String,
+    #[serde(default)]
+    pub configuration_revision: String,
+    #[serde(default)]
+    pub canonical_pool_identity: String,
+    #[serde(default)]
+    pub authorization_id: String,
+    #[serde(default)]
+    pub authorization_revision: u64,
+    pub owner_session: String,
+    pub generation: u64,
+    pub priority: i32,
+    pub state: AdmissionState,
+    pub fence: Option<u64>,
+    pub enqueued_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalFeedbackRevision {
+    pub id: String,
+    pub run_id: String,
+    pub revision: u32,
+    pub outcome: RoutingHumanOutcome,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub explanation: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunResult {
+    pub phase3: Option<GoalExecution>,
+    pub elapsed_ms: i64,
+    pub schema_version: u32,
+    pub run_id: String,
+    pub mode: RunMode,
+    pub state_revision: u64,
+    pub outcome: RunOutcome,
+    pub exit_code: i32,
+    pub attempts: Vec<AttemptRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<AllocationDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<CapacityObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionSummary>,
+}
+
+/// Local execution policy and delivery lineage, never part of v1 sync envelopes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalExecution {
+    pub max_invocations: u32,
+    pub deadline_at: DateTime<Utc>,
+    pub no_retry: bool,
+    pub fixed_model: Option<String>,
+    pub fixed_effort: Option<String>,
+    pub priority: i32,
+    pub owner_uid: u32,
+    #[serde(default)]
+    pub supervisor: Option<crate::admission::ProcessIdentity>,
+    pub final_attempt_id: Option<String>,
+    pub contributing_attempts: Vec<String>,
+    pub provenance: String,
+    pub failure: Option<FailureKind>,
+    pub questions: Vec<Clarification>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttemptDetail {
+    pub parent_attempt_id: Option<String>,
+    pub reason: Option<String>,
+    pub input_baseline: Option<PathBuf>,
+    pub decision: Option<AllocationDecision>,
+    pub admission: Option<AdmissionSummary>,
+    pub capacity: Option<CapacityObservation>,
+    pub result: Option<CandidateRecord>,
+    pub failure: Option<FailureKind>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    TargetVerification,
+    VerificationInfrastructure,
+    VerificationUnknown,
+    HarnessProcess,
+    BaselineInfrastructure,
+    Cancelled,
+    Deadline,
+    CapacityAdmission,
+    Authorization,
+    UnsupportedCheckpoint,
+    InternalState,
+    SourceDrift,
+    InvocationLimit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub version: u32,
+    pub question: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionState {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Clarification {
+    pub id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub generation: u32,
+    pub revision: u64,
+    pub report: CheckpointReport,
+    pub state: QuestionState,
+    pub answer: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub actor_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }

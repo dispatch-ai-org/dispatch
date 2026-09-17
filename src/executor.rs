@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Notify};
 
 use crate::{
+    admission::ProcessIdentity,
     config::ExecutionConfig,
     models::{CheckPhase, CheckResult, CheckStatus},
 };
@@ -76,7 +77,24 @@ impl CommandSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+pub trait ExecutionObserver: std::fmt::Debug + Send + Sync {
+    fn authorize_launch(&self) -> Result<()>;
+    fn spawn_failed(&self) -> Result<()>;
+    fn child_spawned(
+        &self,
+        identity: &ProcessIdentity,
+        backend_identity: Option<&str>,
+    ) -> Result<()>;
+    fn cleanup_confirmed(&self, identity: &ProcessIdentity) -> Result<()>;
+    fn cleanup_after_unrecorded_spawn(
+        &self,
+        identity: &ProcessIdentity,
+        backend_identity: Option<&str>,
+        confirmed: bool,
+    ) -> Result<()>;
+}
+
+#[derive(Clone)]
 pub struct ExecutionRequest {
     pub command: CommandSpec,
     /// The only candidate tree made available to the command.
@@ -85,6 +103,7 @@ pub struct ExecutionRequest {
     pub stderr_path: PathBuf,
     /// Overrides the configured timeout when set.
     pub timeout: Option<Duration>,
+    pub observer: Option<Arc<dyn ExecutionObserver>>,
 }
 
 impl ExecutionRequest {
@@ -100,11 +119,17 @@ impl ExecutionRequest {
             stdout_path: stdout_path.into(),
             stderr_path: stderr_path.into(),
             timeout: None,
+            observer: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_observer(mut self, observer: Arc<dyn ExecutionObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 }
@@ -130,6 +155,7 @@ pub struct ExecutionResult {
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub error: Option<String>,
+    pub cleanup_confirmed: bool,
     #[serde(skip)]
     raw_stdout: Vec<u8>,
     #[serde(skip)]
@@ -249,9 +275,32 @@ impl Executor {
         #[cfg(unix)]
         command.process_group(0);
 
+        if let Some(observer) = &request.observer {
+            observer.authorize_launch()?;
+        }
+        // Authorization may block on SQLite. Recheck after it returns, then
+        // perform no await or external work before the synchronous OS spawn.
+        if cancellation.is_cancelled() {
+            if let Some(observer) = &request.observer {
+                // The executor knows it has not called spawn, despite the
+                // durable conservative spawn-may-have-occurred marker.
+                observer.spawn_failed()?;
+            }
+            return self
+                .finish_without_child(
+                    request,
+                    ExecutionStatus::Cancelled,
+                    started,
+                    "execution cancelled at the launch boundary".into(),
+                )
+                .await;
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                if let Some(observer) = &request.observer {
+                    observer.spawn_failed()?;
+                }
                 return self
                     .finish_without_child(
                         request,
@@ -264,6 +313,40 @@ impl Executor {
         };
 
         let mut process_group = ProcessGroupGuard::new(child.id());
+        let child_identity = child.id().map(crate::admission::process_identity);
+        if let (Some(observer), Some(identity)) = (&request.observer, &child_identity)
+            && let Err(error) = observer.child_spawned(identity, container_name.as_deref())
+        {
+            let group_cleanup_confirmed = terminate_child(&mut child, &mut process_group).await;
+            let backend_cleanup_confirmed = match &container_name {
+                Some(name) => cleanup_docker_container(name).await,
+                None => true,
+            };
+            let cleanup_confirmed = group_cleanup_confirmed && backend_cleanup_confirmed;
+            // The conservative spawn-may-have-occurred marker was committed
+            // before spawn. Resolve it explicitly even when child identity
+            // persistence failed and later artifact writing also fails.
+            if let Some(observer) = &request.observer {
+                observer.cleanup_after_unrecorded_spawn(
+                    identity,
+                    container_name.as_deref(),
+                    cleanup_confirmed,
+                )?;
+            }
+            if cleanup_confirmed && let Some(guard) = &mut docker_cleanup {
+                guard.disarm();
+            }
+            let mut result = self
+                .finish_without_child(
+                    request,
+                    ExecutionStatus::Failed,
+                    started,
+                    format!("failed to persist child start: {error:#}"),
+                )
+                .await?;
+            result.cleanup_confirmed = cleanup_confirmed;
+            return Ok(result);
+        }
         let stdout = child
             .stdout
             .take()
@@ -290,6 +373,7 @@ impl Executor {
             _ = cancellation.cancelled() => Completion::Cancelled,
         };
 
+        let mut forced_group_cleanup = None;
         let (status, exit_code, error) = match completion {
             Completion::Exited(Ok(exit)) if exit.success() => {
                 (ExecutionStatus::Succeeded, exit.code(), None)
@@ -305,7 +389,7 @@ impl Executor {
                 Some(format!("failed while waiting for process: {error}")),
             ),
             Completion::TimedOut => {
-                terminate_child(&mut child, &mut process_group).await;
+                forced_group_cleanup = Some(terminate_child(&mut child, &mut process_group).await);
                 (
                     ExecutionStatus::TimedOut,
                     None,
@@ -316,7 +400,7 @@ impl Executor {
                 )
             }
             Completion::Cancelled => {
-                terminate_child(&mut child, &mut process_group).await;
+                forced_group_cleanup = Some(terminate_child(&mut child, &mut process_group).await);
                 (
                     ExecutionStatus::Cancelled,
                     None,
@@ -327,15 +411,23 @@ impl Executor {
 
         // Kill background descendants that outlived a normally exiting parent,
         // and make sure they cannot keep captured pipe descriptors open.
-        process_group.kill();
-        let cleanup_confirmed = if status != ExecutionStatus::Succeeded {
-            match &container_name {
-                Some(name) => cleanup_docker_container(name).await,
+        let group_cleanup_confirmed = match forced_group_cleanup {
+            Some(confirmed) => confirmed,
+            None => match process_group.kill() {
+                Some(group) => confirm_process_group_gone(group).await,
                 None => true,
-            }
-        } else {
-            true
+            },
         };
+        let backend_cleanup_confirmed = match &container_name {
+            Some(name) => cleanup_docker_container(name).await,
+            None => true,
+        };
+        let cleanup_confirmed = group_cleanup_confirmed && backend_cleanup_confirmed;
+        if !cleanup_confirmed
+            && let (Some(observer), Some(identity)) = (&request.observer, &child_identity)
+        {
+            observer.cleanup_after_unrecorded_spawn(identity, container_name.as_deref(), false)?;
+        }
         let (mut stdout, mut stderr) = join_readers(stdout_task, stderr_task).await?;
         if matches!(
             status,
@@ -355,6 +447,11 @@ impl Executor {
         if cleanup_confirmed && let Some(guard) = &mut docker_cleanup {
             guard.disarm();
         }
+        if cleanup_confirmed
+            && let (Some(observer), Some(identity)) = (&request.observer, &child_identity)
+        {
+            observer.cleanup_confirmed(identity)?;
+        }
 
         Ok(ExecutionResult {
             status,
@@ -366,6 +463,7 @@ impl Executor {
             stdout_path: request.stdout_path,
             stderr_path: request.stderr_path,
             error,
+            cleanup_confirmed,
             raw_stdout,
             raw_stderr,
         })
@@ -539,6 +637,7 @@ impl Executor {
             stdout_path: request.stdout_path,
             stderr_path: request.stderr_path,
             error: Some(message),
+            cleanup_confirmed: true,
             raw_stdout: Vec::new(),
             raw_stderr: Vec::new(),
         })
@@ -657,20 +756,29 @@ async fn join_readers(
     }
 }
 
-struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     #[cfg(unix)]
     pgid: Option<i32>,
 }
 
 impl ProcessGroupGuard {
-    fn new(child_id: Option<u32>) -> Self {
+    pub(crate) fn new(child_id: Option<u32>) -> Self {
         Self {
             #[cfg(unix)]
             pgid: child_id.and_then(|id| i32::try_from(id).ok()),
         }
     }
 
-    fn kill(&mut self) {
+    /// A GUI application's lifetime can outlive its explicitly reviewed document.
+    /// Execution supervision never disarms its own cleanup guard.
+    pub(crate) fn disarm(&mut self) {
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+    }
+
+    pub(crate) fn kill(&mut self) -> Option<i32> {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid.take() {
             // SAFETY: `pgid` came directly from the successfully spawned child,
@@ -679,22 +787,38 @@ impl ProcessGroupGuard {
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
+            return Some(pgid);
         }
+        None
     }
 }
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        self.kill();
+        let _ = self.kill();
     }
 }
 
-async fn terminate_child(child: &mut tokio::process::Child, group: &mut ProcessGroupGuard) {
-    group.kill();
+async fn terminate_child(child: &mut tokio::process::Child, group: &mut ProcessGroupGuard) -> bool {
+    let killed_group = group.kill();
     // `kill` waits for the direct process on supported Tokio platforms. If it
     // races with group cleanup or natural exit there is nothing left to do.
     let _ = child.kill().await;
     let _ = child.wait().await;
+    match killed_group {
+        Some(group) => confirm_process_group_gone(group).await,
+        None => true,
+    }
+}
+
+pub(crate) async fn confirm_process_group_gone(group: i32) -> bool {
+    for _ in 0..20 {
+        if crate::admission::process_group_exists(Some(group)) == Some(false) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    crate::admission::process_group_exists(Some(group)) == Some(false)
 }
 
 async fn cleanup_docker_container(name: &str) -> bool {
@@ -861,7 +985,7 @@ fn explicitly_forwarded_value(
         .or_else(|| env::var(name).ok())
 }
 
-fn safe_local_environment() -> BTreeMap<String, String> {
+pub(crate) fn safe_local_environment() -> BTreeMap<String, String> {
     const SAFE_NAMES: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
     let mut values = BTreeMap::new();
     for name in SAFE_NAMES {
@@ -937,8 +1061,48 @@ pub async fn run_checks_with_config_and_cancel(
     commands: &[String],
     phase: CheckPhase,
     output_dir: &Path,
+    config: ExecutionConfig,
+    cancellation: CancellationToken,
+) -> Vec<CheckResult> {
+    run_checks_with_observer(
+        workspace,
+        commands,
+        phase,
+        output_dir,
+        config,
+        cancellation,
+        None,
+        None,
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+pub enum CheckLifecycleEvent {
+    Started {
+        owner_id: Option<String>,
+        ordinal: usize,
+        phase: CheckPhase,
+        name: String,
+        command: String,
+    },
+    Finished {
+        owner_id: Option<String>,
+        ordinal: usize,
+        result: CheckResult,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_checks_with_observer(
+    workspace: &Path,
+    commands: &[String],
+    phase: CheckPhase,
+    output_dir: &Path,
     mut config: ExecutionConfig,
     cancellation: CancellationToken,
+    observer: Option<tokio::sync::mpsc::UnboundedSender<CheckLifecycleEvent>>,
+    owner_id: Option<String>,
 ) -> Vec<CheckResult> {
     config.forwarded_env.clear();
     let executor = Executor::new(config);
@@ -955,6 +1119,16 @@ pub async fn run_checks_with_config_and_cancel(
             CommandSpec::new("/bin/sh").args(["-lc".to_owned(), configured_command.clone()]);
         let request =
             ExecutionRequest::new(command, workspace, stdout_path.clone(), stderr_path.clone());
+
+        if let Some(observer) = &observer {
+            let _ = observer.send(CheckLifecycleEvent::Started {
+                owner_id: owner_id.clone(),
+                ordinal,
+                phase: phase.clone(),
+                name: format!("{} {ordinal}", check_phase_name(&phase)),
+                command: configured_command.clone(),
+            });
+        }
 
         let result = match executor
             .execute_with_cancel(request, cancellation.clone())
@@ -991,6 +1165,13 @@ pub async fn run_checks_with_config_and_cancel(
                 }
             }
         };
+        if let Some(observer) = &observer {
+            let _ = observer.send(CheckLifecycleEvent::Finished {
+                owner_id: owner_id.clone(),
+                ordinal,
+                result: result.clone(),
+            });
+        }
         results.push(result);
     }
 

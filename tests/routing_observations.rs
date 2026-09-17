@@ -74,6 +74,7 @@ fn candidate(status: CandidateStatus, checks: Vec<CheckResult>) -> CandidateReco
 fn run(id: &str, routing: Option<RoutingDecision>, mut candidate: CandidateRecord) -> RunRecord {
     candidate.id = format!("candidate-{id}");
     RunRecord {
+        phase3: None,
         id: id.into(),
         task: "private task text that must not enter the observation".into(),
         exact_prompt: "private exact prompt".into(),
@@ -84,6 +85,9 @@ fn run(id: &str, routing: Option<RoutingDecision>, mut candidate: CandidateRecor
         baseline_path: PathBuf::from("/private/baseline"),
         baseline_commit: "private-commit".into(),
         status: RunStatus::ReadyForEvaluation,
+        mode: dispatch::RunMode::Legacy,
+        state_revision: 0,
+        outcome: dispatch::RunOutcome::default(),
         created_at: at(1),
         completed_at: Some(at(2)),
         environment: EnvironmentRecord {
@@ -102,7 +106,11 @@ fn run(id: &str, routing: Option<RoutingDecision>, mut candidate: CandidateRecor
         },
         baseline_checks: Vec::new(),
         candidates: vec![candidate],
+        attempts: Vec::new(),
         routing,
+        allocation: None,
+        capacity: None,
+        admission: None,
         evaluation: None,
         applied_candidate: None,
     }

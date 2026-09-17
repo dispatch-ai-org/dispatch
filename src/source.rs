@@ -884,6 +884,16 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
 }
 
 fn plain_git_command() -> Command {
+    #[cfg(target_os = "macos")]
+    let git = {
+        let command_line_tools = PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/git");
+        if command_line_tools.is_file() {
+            command_line_tools
+        } else {
+            trusted_host_executable("git").unwrap_or_else(|_| PathBuf::from("/usr/bin/git"))
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
     let git = trusted_host_executable("git").unwrap_or_else(|_| PathBuf::from("/usr/bin/git"));
     let mut command = Command::new(git);
     command.env_clear();
@@ -1097,7 +1107,7 @@ fn create_symlink(target: &Path, destination: &Path, source_link: &Path) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{fs, path::Path};
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -1113,7 +1123,7 @@ mod tests {
     }
 
     fn run_git(path: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = plain_git_command()
             .arg("-C")
             .arg(path)
             .args(args)
@@ -1174,6 +1184,7 @@ mod tests {
         candidate: CandidateRecord,
     ) -> RunRecord {
         RunRecord {
+            phase3: None,
             id: "test-run".into(),
             task: "test task".into(),
             exact_prompt: "test prompt".into(),
@@ -1184,6 +1195,9 @@ mod tests {
             baseline_path: snapshot.baseline_path.clone(),
             baseline_commit: snapshot.baseline_commit.clone(),
             status: RunStatus::Evaluated,
+            mode: crate::RunMode::Legacy,
+            state_revision: 0,
+            outcome: crate::RunOutcome::default(),
             created_at: Utc::now(),
             completed_at: None,
             environment: EnvironmentRecord {
@@ -1202,7 +1216,11 @@ mod tests {
             },
             baseline_checks: Vec::new(),
             candidates: vec![candidate],
+            attempts: Vec::new(),
             routing: None,
+            allocation: None,
+            capacity: None,
+            admission: None,
             evaluation: None,
             applied_candidate: None,
         }

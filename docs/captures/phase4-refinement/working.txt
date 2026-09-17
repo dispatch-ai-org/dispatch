@@ -1,0 +1,7 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Goal  Add tests in src/lib.rs
+
+  Working
+  ● goal ━━ ● light-model ── ○ verify ── ○ review
+  ◒ 0s elapsed · Ctrl+C cancel

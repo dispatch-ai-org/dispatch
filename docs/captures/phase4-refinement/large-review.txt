@@ -1,0 +1,30 @@
+  Changes  ·  125 entries  ·  125 matching
+  1 rename(s) combine old and new paths
+  > renamed  +0 -0        after rename.txt <- before rename.txt
+    deleted  +0 -1        deleted.txt
+    modified binary       image.bin
+    modified +1 -1        src/item000.rs
+    modified +1 -1        src/item001.rs
+    modified +1 -1        src/item002.rs
+    modified +1 -1        src/item003.rs
+    modified +1 -1        src/item004.rs
+    modified +1 -1        src/item005.rs
+    modified +1 -1        src/item006.rs
+    modified +1 -1        src/item007.rs
+    modified +1 -1        src/item008.rs
+    modified +1 -1        src/item009.rs
+    modified +1 -1        src/item010.rs
+    modified +1 -1        src/item011.rs
+    modified +1 -1        src/item012.rs
+    modified +1 -1        src/item013.rs
+    modified +1 -1        src/item014.rs
+    modified +1 -1        src/item015.rs
+    modified +1 -1        src/item016.rs
+    modified +1 -1        src/item017.rs
+    modified +1 -1        src/item018.rs
+    modified +1 -1        src/item019.rs
+    modified +1 -1        src/item020.rs
+    modified +1 -1        src/item021.rs
+
+  Filter /
+  q back  Enter open  / filter  ↑↓ choose  e editor  v pager

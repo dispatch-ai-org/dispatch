@@ -1,0 +1,15 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Goal  Add tests in src/lib.rs
+
+  Ready for review
+  Verification passed
+  1 file changed · +1 / -1 lines
+
+  Preview · src/lib.rs
+  -const RADIUS: u32 = 20;
+  +const RADIUS: u32 = 40; // delivered
+
+  [Enter/d] Review changes   [e] Open in editor
+  [a] Accept & apply   [r] Reject
+  [n] Leave pending   [i] Details

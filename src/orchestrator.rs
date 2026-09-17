@@ -1,3 +1,5 @@
+pub(crate) mod phase3;
+pub use phase3::{QuestionCommand, answer_question, cancel_question};
 use std::{
     collections::{HashSet, VecDeque},
     ffi::OsString,
@@ -7,6 +9,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,24 +24,75 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
-    CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, RoutingAlternative,
-    RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunRecord,
-    RunStatus, SelectionBasis, VERSION,
+    AdmissionState, AllocationDecision, ApplicationState, AttemptRecord, CandidateRecord,
+    CandidateStatus, CheckPhase, CheckStatus, Config, DiffStats, EnvironmentRecord,
+    EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState, ReviewState,
+    RoutingAlternative, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome,
+    RoutingObservation, RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus,
+    SelectionBasis, VERSION, VerificationState, WaitingOn, WorkResult,
+    admission::{
+        AcquireResult, AdmissionBinding, AdmissionCoordinator, AdmissionLeaseObserver, LeaseToken,
+        canonical_pool_identity,
+    },
+    capacity::{authorize_observation, needs_refresh, probe_codex, supports_codex_account_probe},
     classifier::classify_task,
     db::Database,
     executor::{
-        CancellationToken, ExecutionStatus, Executor, run_checks_with_config_and_cancel,
-        trusted_host_executable,
+        CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
+        run_checks_with_observer, trusted_host_executable,
     },
     harness::{
         HarnessRunRequest, SUPPORTED_HARNESSES, adapter_for, build_prompt, probe_version,
         run_harness,
     },
-    router::rank_harnesses,
+    router::{rank_harnesses, select_resource},
     source,
     state::{State, write_text},
 };
+
+static RUN_OUTPUT_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+tokio::task_local! { static CANCEL_AT_HANDOFF: u8; }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunOutputMode {
+    #[default]
+    Human,
+    Json,
+    Jsonl,
+    /// In-process presenter owns all terminal output.
+    Silent,
+}
+
+impl RunOutputMode {
+    fn code(self) -> u8 {
+        match self {
+            Self::Human => 0,
+            Self::Json => 1,
+            Self::Jsonl => 2,
+            Self::Silent => 3,
+        }
+    }
+}
+
+/// Scoped to one foreground operation; latest committed projection replaces the
+/// previous one instead of growing a render queue. Policy remains in the core.
+pub struct Presentation {
+    pub updates: tokio::sync::watch::Sender<Option<(EventRecord, RunRecord)>>,
+    pub cancellation: CancellationToken,
+}
+tokio::task_local! { static PRESENTATION: Presentation; }
+
+pub async fn present<F: Future>(presentation: Presentation, work: F) -> F::Output {
+    PRESENTATION.scope(presentation, work).await
+}
+
+fn operation_cancellation() -> CancellationToken {
+    PRESENTATION
+        .try_with(|p| p.cancellation.clone())
+        .unwrap_or_default()
+}
 
 const EVALUATION_REASONS: &[&str] = &[
     "correctness",
@@ -58,12 +115,17 @@ pub struct RunRequest {
     pub harnesses: Vec<String>,
     pub route: bool,
     pub agent: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub config_path: Option<PathBuf>,
     pub backend: Option<String>,
     pub timeout_secs: Option<u64>,
     pub max_parallel: Option<usize>,
+    pub priority: i32,
+    pub no_retry: bool,
     pub allow_unsafe_local: bool,
     pub allow_forwarded_env: bool,
+    pub output: RunOutputMode,
 }
 
 #[derive(Default)]
@@ -531,6 +593,17 @@ fn print_routing_decision(decision: &RoutingDecision) {
     println!();
 }
 
+fn print_allocation_decision(decision: &AllocationDecision) {
+    println!("Resource");
+    println!(
+        "  {} · {} · {} effort",
+        decision.selected.requested_model,
+        decision.selected.tier.as_str(),
+        decision.selected.effort.as_deref().unwrap_or("default")
+    );
+    println!("Why:\n  {}\n", decision.reason);
+}
+
 fn harness_name(id: &str) -> &str {
     match id {
         "claude" => "Claude Code",
@@ -541,6 +614,7 @@ fn harness_name(id: &str) -> &str {
 }
 
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
+    RUN_OUTPUT_MODE.store(request.output.code(), Ordering::Relaxed);
     anyhow::ensure!(!request.task.trim().is_empty(), "task must not be empty");
     let source_path = source::resolve_source(Some(&request.source))?;
     let projected_state_root = canonicalize_allow_missing(&state.root)?;
@@ -550,6 +624,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         state.root.display()
     );
     let (mut config, config_path) = Config::discover(&source_path, request.config_path.as_deref())?;
+    crate::commands::validate_submission(state, &request, &config)?;
     if let Some(backend) = request.backend {
         config.execution.backend = backend;
     }
@@ -560,20 +635,74 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         config.execution.max_parallel = max_parallel;
     }
     config.validate()?;
+    crate::config::validate_model(request.model.as_deref())?;
+    crate::config::validate_effort(request.effort.as_deref())?;
     anyhow::ensure!(
         config.execution.forwarded_env.is_empty() || request.allow_forwarded_env,
         "configuration requests forwarding environment variables ({names}); review them and re-run with --allow-forwarded-env",
         names = config.execution.forwarded_env.join(", ")
     );
 
-    let automatic = request.route || (request.harnesses.is_empty() && request.agent.is_none());
-    let (mut harnesses, routing) = if automatic {
+    if (request.model.is_some() || request.effort.is_some())
+        && request
+            .agent
+            .as_deref()
+            .is_some_and(|agent| agent != "codex")
+    {
+        bail!("--model and --effort are Phase 1 Codex controls; use --agent codex");
+    }
+    let resources = crate::commands::resources(state)?;
+    let trial_automatic = resources.allocation_enabled
+        && !request.route
+        && request.harnesses.is_empty()
+        && request.agent.is_none();
+    let allocation_requested =
+        trial_automatic || request.model.is_some() || request.effort.is_some();
+    let automatic = request.route
+        || (request.harnesses.is_empty() && request.agent.is_none() && !allocation_requested);
+    let fixed_model = request
+        .model
+        .clone()
+        .or(config.harnesses.codex.model.clone());
+    let fixed_effort = request
+        .effort
+        .clone()
+        .or(config.harnesses.codex.effort.clone());
+    let (mut harnesses, routing, allocation) = if allocation_requested {
+        anyhow::ensure!(
+            config.harnesses.codex.extra_args.is_empty(),
+            "allocation profiles require harnesses.codex.extra_args to be empty so model, effort, fast-mode, and internal-orchestration controls cannot be shadowed"
+        );
+        let features = classify_task(&source_path, &request.task)?;
+        let decision = select_resource(
+            &resources,
+            &features,
+            &config.execution.backend,
+            request.model.as_deref(),
+            request.effort.as_deref(),
+            config.harnesses.codex.model.as_deref(),
+            config.harnesses.codex.effort.as_deref(),
+        )?;
+        config.harnesses.codex.model = Some(decision.selected.resolved_model.clone());
+        config.harnesses.codex.effort = decision.selected.effort.clone();
+        config.harnesses.codex.allocation_service_mode =
+            Some(decision.selected.service_mode.clone());
+        (vec!["codex".into()], None, Some(decision))
+    } else if automatic {
         let decision =
             select_automatic_harness(state, &source_path, &request.task, &config).await?;
-        (vec![decision.selected_harness.clone()], Some(decision))
+        (
+            vec![decision.selected_harness.clone()],
+            Some(decision),
+            None,
+        )
     } else if let Some(agent) = request.agent {
         let decision = override_decision(&source_path, &request.task, agent)?;
-        (vec![decision.selected_harness.clone()], Some(decision))
+        (
+            vec![decision.selected_harness.clone()],
+            Some(decision),
+            None,
+        )
     } else {
         (
             request
@@ -582,6 +711,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 .map(|id| id.trim().to_lowercase())
                 .filter(|id| !id.is_empty())
                 .collect::<Vec<_>>(),
+            None,
             None,
         )
     };
@@ -598,6 +728,11 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         || !config.checks.baseline.is_empty()
         || !config.checks.verify.is_empty();
     let unsafe_local = config.execution.backend == "local" && executes_untrusted_host_code;
+    if unsafe_local && !request.allow_unsafe_local && request.output != RunOutputMode::Human {
+        bail!(
+            "machine output requires --allow-unsafe-local when local execution needs authorization"
+        );
+    }
     if unsafe_local && !request.allow_unsafe_local {
         print!(
             "Dispatch will run {} with your user permissions in an isolated candidate workspace. Continue? [y/N] ",
@@ -620,8 +755,15 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         "at most 702 candidates are supported in v0"
     );
 
-    if let Some(decision) = &routing {
+    if request.output == RunOutputMode::Human
+        && let Some(decision) = &routing
+    {
         print_routing_decision(decision);
+    }
+    if request.output == RunOutputMode::Human
+        && let Some(decision) = &allocation
+    {
+        print_allocation_decision(decision);
     }
 
     state.initialize()?;
@@ -630,6 +772,14 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let run_dir = state.run_dir(&run_id);
     fs::create_dir(&run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
+    let _run_lock = if allocation.is_some() {
+        Some(OperationLock::acquire(
+            &run_dir.join(".operation.lock"),
+            "run is already supervised",
+        )?)
+    } else {
+        None
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -640,11 +790,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &run_dir.join("config.snapshot.yml"),
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
-    let cancellation = CancellationToken::new();
+    let cancellation = operation_cancellation();
     let _signal_listener = SignalListener::install(cancellation.clone());
 
-    println!("RUN {run_id}\n");
-    println!("Creating baseline...");
+    if request.output == RunOutputMode::Human {
+        println!("RUN {run_id}\n");
+        println!("Creating baseline...");
+    }
     let snapshot = match source::create_snapshot(&source_path, &run_dir) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -652,11 +804,14 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             return Err(error.context("baseline creation failed; incomplete run state was removed"));
         }
     };
-    println!("Creating baseline... done ({})", snapshot.baseline_commit);
+    if request.output == RunOutputMode::Human {
+        println!("Creating baseline... done ({})", snapshot.baseline_commit);
+    }
 
     let exact_prompt = build_prompt(&request.task);
     let now = Utc::now();
     let mut run = RunRecord {
+        phase3: None,
         id: run_id.clone(),
         task: request.task,
         exact_prompt: exact_prompt.clone(),
@@ -667,6 +822,28 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
         status: RunStatus::Preparing,
+        mode: if allocation.is_some() {
+            RunMode::Allocation
+        } else if routing.is_some() {
+            RunMode::Routed
+        } else {
+            RunMode::Comparison
+        },
+        state_revision: 0,
+        outcome: RunOutcome {
+            lifecycle: LifecycleState::Preparing,
+            work_result: WorkResult::Pending,
+            verification: if config.checks.verify.is_empty() {
+                VerificationState::NotConfigured
+            } else {
+                VerificationState::NotRun
+            },
+            review: ReviewState::NotRequested,
+            application: ApplicationState::NotApplied,
+            phase: RunPhase::Preparing,
+            waiting_on: WaitingOn::None,
+            ..RunOutcome::default()
+        },
         created_at: now,
         completed_at: None,
         environment: EnvironmentRecord {
@@ -686,27 +863,50 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         },
         baseline_checks: Vec::new(),
         candidates: Vec::new(),
+        attempts: Vec::new(),
         routing,
+        allocation,
+        capacity: None,
+        admission: None,
         evaluation: None,
         applied_candidate: None,
     };
-    state.save_run(&run)?;
-    db.sync_run(&run)?;
-    persist_event(
-        state,
-        &db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: None,
-            event_type: "run.created".into(),
-            timestamp: now,
-            payload: serde_json::json!({
-                "source": run.source_path,
-                "source_kind": run.source_kind.as_str(),
-                "config": config_path,
-            }),
-        },
-    )?;
+    if run.mode == RunMode::Allocation {
+        run.phase3 = Some(crate::GoalExecution {
+            max_invocations: crate::commands::invocation_limit(),
+            deadline_at: run.created_at
+                + chrono::TimeDelta::seconds(
+                    i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
+                ),
+            no_retry: request.no_retry,
+            fixed_model,
+            fixed_effort,
+            priority: request.priority,
+            owner_uid: phase3::local_uid(),
+            supervisor: Some(crate::admission::ProcessIdentity::current()),
+            final_attempt_id: None,
+            contributing_attempts: Vec::new(),
+            provenance: "single_attempt".into(),
+            failure: None,
+            questions: Vec::new(),
+        });
+    }
+    let _deadline = phase3::DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
+    let created_event = EventRecord {
+        run_id: run.id.clone(),
+        candidate_label: None,
+        event_type: "run.created".into(),
+        timestamp: now,
+        payload: serde_json::json!({
+            "source": run.source_path,
+            "source_kind": run.source_kind.as_str(),
+            "config": config_path,
+        }),
+        ..EventRecord::default()
+    };
+    let created = db.create_run(&mut run, created_event)?;
+    publish_event(state, created, &run)?;
+
     persist_event(
         state,
         &db,
@@ -716,7 +916,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             event_type: "baseline.started".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"commit": run.baseline_commit}),
+            ..EventRecord::default()
         },
+        &mut run,
     )?;
 
     let mut baseline_passed = true;
@@ -726,7 +928,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &config.checks.baseline
     };
     if !baseline_commands.is_empty() {
-        println!("Running baseline checks...");
+        if request.output == RunOutputMode::Human {
+            println!("Running baseline checks...");
+        }
         let baseline_check_dir = run_dir.join("baseline-check");
         let baseline_check_workspace = match source::create_candidate_workspace(
             &run.baseline_path,
@@ -739,27 +943,53 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 bail!(message);
             }
         };
-        run.baseline_checks = run_checks_with_config_and_cancel(
+        let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
+        let check_output_dir = run_dir.join("checks/baseline");
+        let baseline_future = run_checks_with_observer(
             &baseline_check_workspace,
             baseline_commands,
             CheckPhase::Baseline,
-            &run_dir.join("checks/baseline"),
+            &check_output_dir,
             config.execution.clone(),
             cancellation.clone(),
-        )
-        .await;
+            Some(check_tx),
+            None,
+        );
+        tokio::pin!(baseline_future);
+        run.baseline_checks = loop {
+            tokio::select! {
+                results = &mut baseline_future => break results,
+                Some(event) = check_rx.recv() => persist_check_lifecycle(state, &db, &mut run, event)?,
+            }
+        };
+        while let Ok(event) = check_rx.try_recv() {
+            persist_check_lifecycle(state, &db, &mut run, event)?;
+        }
         baseline_passed = run
             .baseline_checks
             .iter()
             .all(|check| check.status == CheckStatus::Passed);
-        println!(
-            "Running baseline checks... {}",
-            if baseline_passed { "pass" } else { "FAIL" }
-        );
-        state.save_run(&run)?;
+        if request.output == RunOutputMode::Human {
+            println!(
+                "Running baseline checks... {}",
+                if baseline_passed { "pass" } else { "FAIL" }
+            );
+        }
         db.sync_run(&run)?;
     }
     if cancellation.is_cancelled() {
+        if run.phase3.is_some() {
+            let failure = phase3::interrupted(&run);
+            phase3::stop(
+                state,
+                &mut db,
+                &mut run,
+                failure,
+                "goal interrupted during baseline checks",
+            )?;
+            phase3::emit(&run, request.output)?;
+            return Ok(run);
+        }
         finish_interrupted(state, &mut db, &mut run)?;
         bail!(
             "run {} interrupted; the frozen baseline was preserved",
@@ -778,8 +1008,23 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 "commit": run.baseline_commit,
                 "checks_passed": baseline_passed,
             }),
+            ..EventRecord::default()
         },
+        &mut run,
     )?;
+
+    if run.mode == RunMode::Allocation {
+        return phase3::drive(
+            state,
+            &mut db,
+            run,
+            config,
+            resources,
+            cancellation,
+            request.output,
+        )
+        .await;
+    }
 
     // Randomize the durable label mapping independently of execution order.
     let mut labels = (0..harnesses.len())
@@ -787,7 +1032,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         .collect::<Vec<_>>();
     labels.shuffle(&mut rand::rng());
     let mut pending = VecDeque::new();
-    println!("\nPreparing {} candidate(s)...", harnesses.len());
+    if request.output == RunOutputMode::Human {
+        println!("\nPreparing {} candidate(s)...", harnesses.len());
+    }
     for (harness_id, label) in harnesses.drain(..).zip(labels) {
         let candidate_id = Ulid::new().to_string();
         let candidate_dir = run_dir.join("candidates").join(candidate_id.to_lowercase());
@@ -833,23 +1080,67 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             diff_stats: DiffStats::default(),
             checks: Vec::new(),
         };
+        let requested_model = match candidate.harness_id.as_str() {
+            "claude" => config.harnesses.claude.model.clone(),
+            "codex" => config.harnesses.codex.model.clone(),
+            "cursor" => config.harnesses.cursor.model.clone(),
+            _ => None,
+        };
+        let requested_effort = match candidate.harness_id.as_str() {
+            "claude" => config.harnesses.claude.effort.clone(),
+            "codex" => config.harnesses.codex.effort.clone(),
+            "cursor" => config.harnesses.cursor.effort.clone(),
+            _ => None,
+        };
+        run.attempts.push(AttemptRecord {
+            detail: Default::default(),
+            id: Ulid::new().to_string(),
+            run_id: run.id.clone(),
+            candidate_id: candidate.id.clone(),
+            role: "executor".into(),
+            ordinal: u32::try_from(run.attempts.len() + 1).unwrap_or(u32::MAX),
+            generation: 1,
+            harness_id: candidate.harness_id.clone(),
+            harness_version: None,
+            requested_model: requested_model.clone(),
+            resolved_model: requested_model,
+            observed_model: None,
+            requested_effort: requested_effort.clone(),
+            resolved_effort: requested_effort,
+            observed_effort: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            outcome: "preparing".into(),
+            raw_telemetry_path: candidate_dir.join("harness.jsonl"),
+            resource: run
+                .allocation
+                .as_ref()
+                .map(|decision| decision.selected.clone()),
+        });
         run.candidates.push(candidate.clone());
         pending.push_back(candidate);
     }
     run.candidates
         .sort_by(|left, right| left.label.cmp(&right.label));
     run.status = RunStatus::Running;
-    state.save_run(&run)?;
+    run.outcome.lifecycle = LifecycleState::Working;
+    run.outcome.phase = RunPhase::Executing;
     db.sync_run(&run)?;
 
-    if config.execution.backend == "local" && executes_untrusted_host_code {
+    if request.output != RunOutputMode::Silent
+        && config.execution.backend == "local"
+        && executes_untrusted_host_code
+    {
         eprintln!(
             "warning: real harnesses are running locally; use --backend docker with a harness-enabled image for a container boundary"
         );
     }
 
-    type CandidateFuture = Pin<Box<dyn Future<Output = CandidateRecord> + Send>>;
+    let mut admitted_lease: Option<crate::admission::AcquiredLeaseGuard> = None;
+
+    type CandidateFuture = Pin<Box<dyn Future<Output = CandidateExecution> + Send>>;
     let mut running: FuturesUnordered<CandidateFuture> = FuturesUnordered::new();
+    let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
     let parallelism = config
         .execution
         .max_parallel
@@ -860,17 +1151,25 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let mut orchestration_error = None;
     'candidate_loop: while !pending.is_empty() || !running.is_empty() {
         if cancellation.is_cancelled() {
+            drop(admitted_lease.take());
             interrupted = true;
             break;
+        }
+        #[cfg(test)]
+        if CANCEL_AT_HANDOFF
+            .try_with(|point| *point == 2)
+            .unwrap_or(false)
+        {
+            cancellation.cancel();
         }
         while running.len() < parallelism && !cancellation.is_cancelled() {
             let Some(mut candidate) = pending.pop_front() else {
                 break;
             };
             candidate.status = CandidateStatus::Running;
+            let attempt_id = update_attempt_started(&mut run, &candidate.id);
             replace_candidate(&mut run, candidate.clone());
             let persisted = (|| -> Result<()> {
-                state.save_run(&run)?;
                 db.sync_run(&run)?;
                 persist_event(
                     state,
@@ -878,21 +1177,32 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                     EventRecord {
                         run_id: run.id.clone(),
                         candidate_label: Some(candidate.label.clone()),
-                        event_type: "candidate.started".into(),
+                        event_type: "attempt.started".into(),
                         timestamp: Utc::now(),
                         payload: serde_json::json!({"harness": candidate.harness_id}),
+                        attempt_id: Some(attempt_id.clone()),
+                        ..EventRecord::default()
                     },
+                    &mut run,
                 )
             })();
             if let Err(error) = persisted {
                 orchestration_error = Some(error.context("failed to persist candidate start"));
                 break 'candidate_loop;
             }
-            println!("Candidate {}   running", candidate.label);
+            if request.output == RunOutputMode::Human {
+                println!("Candidate {}   running", candidate.label);
+            }
             let candidate_config = config.clone();
             let candidate_prompt = exact_prompt.clone();
             let baseline_path = run.baseline_path.clone();
             let candidate_cancellation = cancellation.clone();
+            let candidate_check_tx = check_tx.clone();
+            let heartbeat_secs = resources.capacity.heartbeat_secs;
+            let candidate_admission = admitted_lease.take().map(|guard| {
+                let (coordinator, token) = guard.handoff();
+                (coordinator, token, heartbeat_secs)
+            });
             running.push(Box::pin(async move {
                 execute_candidate(
                     candidate,
@@ -900,6 +1210,8 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                     candidate_config,
                     baseline_path,
                     candidate_cancellation,
+                    (candidate_check_tx, attempt_id),
+                    candidate_admission,
                 )
                 .await
             }));
@@ -907,6 +1219,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
 
         let next = tokio::select! {
             candidate = running.next() => candidate,
+            Some(event) = check_rx.recv() => {
+                if let Err(error) = persist_check_lifecycle(state, &db, &mut run, event) {
+                    orchestration_error = Some(error.context("failed to persist check transition"));
+                    break 'candidate_loop;
+                }
+                continue 'candidate_loop;
+            }
             _ = cancellation.cancelled() => {
                 interrupted = true;
                 None
@@ -915,23 +1234,28 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         if interrupted {
             break;
         }
-        let Some(candidate) = next else {
+        let Some(execution) = next else {
             continue;
         };
-        let event_type = match candidate.status {
-            CandidateStatus::Completed => "candidate.finished",
-            CandidateStatus::TimedOut => "candidate.timed_out",
-            _ => "candidate.failed",
-        };
-        println!(
-            "Candidate {}   {:<16} {}",
-            candidate.label,
-            candidate.status.as_str(),
-            format_duration(candidate.duration_ms)
-        );
+        let candidate = execution.candidate.clone();
+        while let Ok(event) = check_rx.try_recv() {
+            if let Err(error) = persist_check_lifecycle(state, &db, &mut run, event) {
+                orchestration_error = Some(error.context("failed to persist check transition"));
+                break 'candidate_loop;
+            }
+        }
+        let event_type = "attempt.finished";
+        if request.output == RunOutputMode::Human {
+            println!(
+                "Candidate {}   {:<16} {}",
+                candidate.label,
+                candidate.status.as_str(),
+                format_duration(candidate.duration_ms)
+            );
+        }
         replace_candidate(&mut run, candidate.clone());
+        let attempt_id = update_attempt_finished(&mut run, &candidate, &execution);
         let persisted = (|| -> Result<()> {
-            state.save_run(&run)?;
             db.sync_run(&run)?;
             persist_event(
                 state,
@@ -946,7 +1270,10 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                         "duration_ms": candidate.duration_ms,
                         "files_changed": candidate.diff_stats.files_changed,
                     }),
+                    attempt_id: Some(attempt_id),
+                    ..EventRecord::default()
                 },
+                &mut run,
             )
         })();
         if let Err(error) = persisted {
@@ -955,9 +1282,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         }
     }
 
+    // Also covers cancellation between the outer and inner loop checks.
+    drop(admitted_lease.take());
     if interrupted || orchestration_error.is_some() {
         cancellation.cancel();
-        while let Some(candidate) = running.next().await {
+        while let Some(execution) = running.next().await {
+            let candidate = execution.candidate.clone();
+            update_attempt_finished(&mut run, &candidate, &execution);
             replace_candidate(&mut run, candidate);
         }
         for mut candidate in pending {
@@ -1013,12 +1344,16 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         );
     }
 
-    run.status = RunStatus::ReadyForEvaluation;
     run.completed_at = Some(Utc::now());
+    refresh_outcome(&mut run);
+    run.status = if run.outcome.work_result == WorkResult::Ready {
+        RunStatus::ReadyForEvaluation
+    } else {
+        RunStatus::Failed
+    };
     run.candidates
         .sort_by(|left, right| left.label.cmp(&right.label));
     let finalized = (|| -> Result<()> {
-        state.save_run(&run)?;
         db.sync_run(&run)?;
         persist_event(
             state,
@@ -1026,10 +1361,15 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             EventRecord {
                 run_id: run.id.clone(),
                 candidate_label: None,
-                event_type: "run.ready_for_evaluation".into(),
+                event_type: "run.finished".into(),
                 timestamp: Utc::now(),
-                payload: serde_json::json!({"candidate_count": run.candidates.len()}),
+                payload: serde_json::json!({
+                    "candidate_count": run.candidates.len(),
+                    "outcome": run.outcome,
+                }),
+                ..EventRecord::default()
             },
+            &mut run,
         )
     })();
     if let Err(error) = finalized {
@@ -1038,10 +1378,33 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         return Err(error.context("failed to finalize run"));
     }
 
-    if run.routing.is_some() {
-        print_single_result_summary(&run, "Done", false, None);
+    if request.output == RunOutputMode::Json {
+        println!("{}", serde_json::to_string(&run_result(&run))?);
+    } else if request.output == RunOutputMode::Jsonl {
+        println!(
+            "{}",
+            serde_json::json!({"type": "result", "result": run_result(&run)})
+        );
+    } else if request.output == RunOutputMode::Silent {
+        // The in-process presenter receives committed projections.
+    } else if run.routing.is_some() || run.allocation.is_some() {
+        let heading = if run.outcome.verification == VerificationState::Failed {
+            "Verification failed"
+        } else if run.outcome.work_result == WorkResult::Ready {
+            "Ready for review"
+        } else {
+            "Attempt failed"
+        };
+        print_single_result_summary(&run, heading, false, None);
     } else {
-        println!("\nRun ready for evaluation.\n");
+        println!(
+            "\n{}.\n",
+            if run.outcome.work_result == WorkResult::Ready {
+                "Run ready for evaluation"
+            } else {
+                "Run failed"
+            }
+        );
         println!(
             "Baseline verification {}\n",
             checks_summary(&run.baseline_checks)
@@ -1053,10 +1416,449 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn admit_attempt(
+    state: &State,
+    db: &mut Database,
+    run: &mut RunRecord,
+    config: &Config,
+    resources: &crate::config::ResourceConfig,
+    cancellation: &CancellationToken,
+    output: RunOutputMode,
+    priority: i32,
+) -> Result<Option<crate::admission::AcquiredLeaseGuard>> {
+    let run_dir = state.run_dir(&run.id);
+    let mut admitted_lease: Option<crate::admission::AcquiredLeaseGuard> = None;
+    if let Some(selected) = run
+        .attempts
+        .last()
+        .and_then(|attempt| attempt.detail.decision.as_ref())
+        .or(run.allocation.as_ref())
+        .map(|value| value.selected.clone())
+    {
+        let profile = resources
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.pool == selected.pool
+                    && profile.provider == selected.provider
+                    && profile.funding_source == selected.funding_source
+                    && profile.model == selected.resolved_model
+                    && profile.effort == selected.effort
+            })
+            .context("selected resource profile disappeared before admission")?;
+        let coordinator = AdmissionCoordinator::new(
+            state.db_path(),
+            Duration::from_secs(resources.capacity.lease_secs),
+            Duration::from_secs(resources.capacity.aging_secs),
+        );
+        let canonical_identity = canonical_pool_identity(
+            &selected.provider,
+            &selected.funding_source,
+            &profile.provider_buckets,
+        );
+        let coordinated_pool = coordinator.register_pool(
+            &selected.pool,
+            &selected.provider,
+            &selected.funding_source,
+            &profile.provider_buckets,
+        )?;
+        if !resources.capacity.admission {
+            let message = "shared admission cannot be disabled for allocation execution; drain/reconcile coordinated work and disable allocation instead";
+            finish_failed(state, db, run, message)?;
+            bail!(message);
+        }
+        let executable = config
+            .harnesses
+            .codex
+            .executable
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("codex"));
+        let mut observation = observe_capacity(
+            &executable,
+            &selected,
+            &coordinated_pool,
+            profile,
+            &resources.capacity,
+            &run_dir,
+            db,
+        )
+        .await?;
+        run.capacity = Some(observation.clone());
+        db.sync_run(run)?;
+        let route_snapshot_json = serde_json::to_string(&serde_json::json!({
+            "resource": selected,
+            "provider_buckets": profile.provider_buckets,
+        }))?;
+        let configuration_revision = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(route_snapshot_json.as_bytes()))
+        );
+        let authorization = match authorize_observation(
+            db,
+            &coordinated_pool,
+            &observation,
+            &configuration_revision,
+            profile.authorization_revision,
+            &selected.funding_source,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(policy) = &mut run.phase3 {
+                    policy.failure = Some(crate::FailureKind::Authorization);
+                }
+                let message = format!(
+                    "subscription-only funding revalidation failed before launch: {error:#}"
+                );
+                finish_failed(state, db, run, &message)?;
+                bail!(message);
+            }
+        };
+        if output == RunOutputMode::Human {
+            match observation.scarcity {
+                crate::ScarcityState::Constrained | crate::ScarcityState::Reserve => {
+                    println!("Allowance appears constrained; Dispatch will serialize model work.");
+                }
+                crate::ScarcityState::Unknown => {
+                    println!("Capacity currently unknown; using conservative shared admission.");
+                }
+                _ => {}
+            }
+        }
+        let mut announced_capacity_wait = false;
+        while crate::capacity::resolved_scarcity(db.connection(), &coordinated_pool, Utc::now())?
+            == crate::ScarcityState::Exhausted
+        {
+            if cancellation.is_cancelled() {
+                finish_interrupted(state, db, run)?;
+                bail!(
+                    "run {} interrupted while waiting for subscription capacity",
+                    run.id
+                );
+            }
+            run.outcome.lifecycle = LifecycleState::Waiting;
+            run.outcome.waiting_on = WaitingOn::Capacity;
+            db.sync_run(run)?;
+            if !announced_capacity_wait && output == RunOutputMode::Human {
+                println!("Subscription allowance is exhausted; waiting to refresh capacity...");
+                announced_capacity_wait = true;
+            }
+            if needs_refresh(&observation, Utc::now()) {
+                observation = observe_capacity(
+                    &executable,
+                    &selected,
+                    &coordinated_pool,
+                    profile,
+                    &resources.capacity,
+                    &run_dir,
+                    db,
+                )
+                .await?;
+                run.capacity = Some(observation.clone());
+                db.sync_run(run)?;
+                if let Err(error) = authorize_observation(
+                    db,
+                    &coordinated_pool,
+                    &observation,
+                    &configuration_revision,
+                    profile.authorization_revision,
+                    &selected.funding_source,
+                ) {
+                    if let Some(policy) = &mut run.phase3 {
+                        policy.failure = Some(crate::FailureKind::Authorization);
+                    }
+                    let message = format!(
+                        "subscription-only funding revalidation failed before launch: {error:#}"
+                    );
+                    finish_failed(state, db, run, &message)?;
+                    bail!(message);
+                }
+                continue;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                _ = cancellation.cancelled() => {}
+            }
+        }
+        if crate::capacity::resolved_scarcity(db.connection(), &coordinated_pool, Utc::now())?
+            == crate::ScarcityState::Reserve
+            && priority < 1
+        {
+            let message = "allowance is in reserve; non-urgent work was deferred without launching a model (use --priority urgent only when the work is explicitly urgent)";
+            finish_deferred(state, db, run, message)?;
+
+            return Ok(None);
+        }
+        run.outcome.lifecycle = LifecycleState::Working;
+        run.outcome.waiting_on = WaitingOn::None;
+        if resources.capacity.admission {
+            let owner_session = Ulid::new().to_string();
+            let attempt_id = run
+                .attempts
+                .last()
+                .context("allocation attempt missing before admission")?
+                .id
+                .clone();
+            let mut summary = coordinator.enqueue_bound(
+                &run.id,
+                &coordinated_pool,
+                &owner_session,
+                1,
+                priority,
+                &AdmissionBinding {
+                    attempt_id,
+                    route_snapshot_json: route_snapshot_json.clone(),
+                    configuration_revision: configuration_revision.clone(),
+                    canonical_pool_identity: canonical_identity.clone(),
+                    authorization_id: authorization.id.clone(),
+                    authorization_revision: authorization.revision,
+                },
+            )?;
+            run.admission = Some(summary.clone());
+            run.outcome.lifecycle = LifecycleState::Waiting;
+            run.outcome.waiting_on = WaitingOn::Admission;
+            db.sync_run(run)?;
+            persist_event(
+                state,
+                db,
+                EventRecord {
+                    run_id: run.id.clone(),
+                    event_type: "admission.queued".into(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::json!({"request_id": summary.request_id, "pool": summary.pool_id, "priority": summary.priority}),
+                    generation: 1,
+                    ..EventRecord::default()
+                },
+                run,
+            )?;
+            let mut announced_wait = false;
+            loop {
+                if cancellation.is_cancelled() {
+                    coordinator.cancel_queued(&summary)?;
+                    finish_interrupted(state, db, run)?;
+                    bail!(
+                        "run {} interrupted while waiting for shared subscription capacity",
+                        run.id
+                    );
+                }
+                if let Some(shared) = db.latest_capacity_observation(&coordinated_pool)?
+                    && run.capacity.as_ref().map(|value| &value.id) != Some(&shared.id)
+                {
+                    run.capacity = Some(shared.clone());
+                    db.sync_run(run)?;
+                    match authorize_observation(
+                        db,
+                        &coordinated_pool,
+                        &shared,
+                        &configuration_revision,
+                        profile.authorization_revision,
+                        &selected.funding_source,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            coordinator.cancel_queued(&summary)?;
+                            if let Some(policy) = &mut run.phase3 {
+                                policy.failure = Some(crate::FailureKind::Authorization);
+                            }
+                            let message = format!(
+                                "subscription-only funding revalidation failed before launch: {error:#}"
+                            );
+                            finish_failed(state, db, run, &message)?;
+                            bail!(message);
+                        }
+                    }
+                    if crate::capacity::resolved_scarcity(
+                        db.connection(),
+                        &coordinated_pool,
+                        Utc::now(),
+                    )? == crate::ScarcityState::Exhausted
+                    {
+                        coordinator.cancel_queued(&summary)?;
+                        let message = "newer shared evidence reports exhausted subscription capacity; no model invocation was launched";
+                        finish_failed(state, db, run, message)?;
+                        bail!(message);
+                    }
+                    if crate::capacity::resolved_scarcity(
+                        db.connection(),
+                        &coordinated_pool,
+                        Utc::now(),
+                    )? == crate::ScarcityState::Reserve
+                        && priority < 1
+                    {
+                        coordinator.cancel_queued(&summary)?;
+                        let message = "allowance entered reserve while queued; non-urgent work was deferred without launching a model";
+                        finish_deferred(state, db, run, message)?;
+
+                        return Ok(None);
+                    }
+                }
+                if run
+                    .capacity
+                    .as_ref()
+                    .is_some_and(|value| needs_refresh(value, Utc::now()))
+                {
+                    let refreshed = observe_capacity(
+                        &executable,
+                        &selected,
+                        &coordinated_pool,
+                        profile,
+                        &resources.capacity,
+                        &run_dir,
+                        db,
+                    )
+                    .await?;
+                    run.capacity = Some(refreshed.clone());
+                    db.sync_run(run)?;
+                    match authorize_observation(
+                        db,
+                        &coordinated_pool,
+                        &refreshed,
+                        &configuration_revision,
+                        profile.authorization_revision,
+                        &selected.funding_source,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            coordinator.cancel_queued(&summary)?;
+                            if let Some(policy) = &mut run.phase3 {
+                                policy.failure = Some(crate::FailureKind::Authorization);
+                            }
+                            let message = format!(
+                                "subscription-only funding revalidation failed before launch: {error:#}"
+                            );
+                            finish_failed(state, db, run, &message)?;
+                            bail!(message);
+                        }
+                    }
+                    if crate::capacity::resolved_scarcity(
+                        db.connection(),
+                        &coordinated_pool,
+                        Utc::now(),
+                    )? == crate::ScarcityState::Exhausted
+                    {
+                        coordinator.cancel_queued(&summary)?;
+                        let message = "subscription capacity became exhausted while awaiting local admission; no model invocation was launched";
+                        finish_failed(state, db, run, message)?;
+                        bail!(message);
+                    }
+                    if crate::capacity::resolved_scarcity(
+                        db.connection(),
+                        &coordinated_pool,
+                        Utc::now(),
+                    )? == crate::ScarcityState::Reserve
+                        && priority < 1
+                    {
+                        coordinator.cancel_queued(&summary)?;
+                        let message = "allowance entered reserve while queued; non-urgent work was deferred without launching a model";
+                        finish_deferred(state, db, run, message)?;
+
+                        return Ok(None);
+                    }
+                }
+                match coordinator.try_acquire(&summary)? {
+                    AcquireResult::Acquired(token) => {
+                        let token = *token;
+                        admitted_lease = Some(crate::admission::AcquiredLeaseGuard::new(
+                            coordinator.clone(),
+                            token.clone(),
+                        ));
+                        #[cfg(test)]
+                        if CANCEL_AT_HANDOFF
+                            .try_with(|point| *point == 1)
+                            .unwrap_or(false)
+                        {
+                            cancellation.cancel();
+                        }
+                        summary.state = AdmissionState::Admitted;
+                        summary.fence = Some(token.fence);
+                        run.admission = Some(summary);
+                        run.outcome.lifecycle = LifecycleState::Working;
+                        run.outcome.waiting_on = WaitingOn::None;
+                        db.sync_run(run)?;
+                        persist_event(
+                            state,
+                            db,
+                            EventRecord {
+                                run_id: run.id.clone(),
+                                event_type: "admission.acquired".into(),
+                                timestamp: Utc::now(),
+                                payload: serde_json::json!({"pool": token.pool_id, "fence": token.fence}),
+                                generation: u32::try_from(token.generation).unwrap_or(u32::MAX),
+                                ..EventRecord::default()
+                            },
+                            run,
+                        )?;
+                        break;
+                    }
+                    AcquireResult::Waiting => {
+                        if run.outcome.waiting_on != WaitingOn::Admission {
+                            run.outcome.waiting_on = WaitingOn::Admission;
+                            persist_event(
+                                state,
+                                db,
+                                EventRecord {
+                                    run_id: run.id.clone(),
+                                    event_type: "admission.waiting".into(),
+                                    timestamp: Utc::now(),
+                                    payload: serde_json::json!({"request_id": summary.request_id}),
+                                    ..EventRecord::default()
+                                },
+                                run,
+                            )?;
+                        }
+                        if !announced_wait && output == RunOutputMode::Human {
+                            println!("Waiting for shared subscription capacity...");
+                            announced_wait = true;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                            _ = cancellation.cancelled() => {}
+                        }
+                    }
+                    AcquireResult::Reconciliation => {
+                        if run.outcome.waiting_on != WaitingOn::Reconciliation {
+                            run.outcome.waiting_on = WaitingOn::Reconciliation;
+                            if let Some(admission) = &mut run.admission {
+                                admission.state = AdmissionState::Reconciliation;
+                            }
+                            persist_event(
+                                state,
+                                db,
+                                EventRecord {
+                                    run_id: run.id.clone(),
+                                    event_type: "admission.reconciliation".into(),
+                                    timestamp: Utc::now(),
+                                    payload: serde_json::json!({"request_id": summary.request_id}),
+                                    ..EventRecord::default()
+                                },
+                                run,
+                            )?;
+                        }
+                        if !announced_wait && output == RunOutputMode::Human {
+                            println!(
+                                "Waiting for reconciliation of a possibly live model process..."
+                            );
+                            announced_wait = true;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = cancellation.cancelled() => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(admitted_lease)
+}
+
 fn result_verification(candidate: &CandidateRecord) -> &'static str {
     if candidate.checks.is_empty() {
         if candidate.status == CandidateStatus::TimedOut {
             "Not run — agent timed out"
+        } else if candidate.status != CandidateStatus::Completed {
+            "Not run — agent failed"
         } else {
             "Not configured"
         }
@@ -1089,15 +1891,37 @@ fn print_single_result_summary(
     show_status: bool,
     human_outcome: Option<&RoutingHumanOutcome>,
 ) {
-    let decision = run.routing.as_ref().expect("caller checked routing");
     let candidate = run
         .candidates
         .first()
         .expect("a completed selected run has one candidate");
     println!("\n{heading}\n");
     println!("Task\n  {}\n", one_line(&run.task, 120));
-    println!("Agent\n  {}", harness_name(&decision.selected_harness));
-    println!("  {} selection\n", selection_label(decision));
+    if let Some(decision) = run
+        .attempts
+        .last()
+        .and_then(|a| a.detail.decision.as_ref())
+        .or(run.allocation.as_ref())
+    {
+        println!("Agent\n  {}", harness_name(&decision.selected.harness));
+        println!(
+            "  Allocation trial · {} tier\n",
+            decision.selected.tier.as_str()
+        );
+    } else {
+        let decision = run.routing.as_ref().expect("caller checked selection");
+        println!("Agent\n  {}", harness_name(&decision.selected_harness));
+        println!("  {} selection\n", selection_label(decision));
+    }
+    if let Some(attempt) = run.attempts.last()
+        && (attempt.requested_model.is_some() || attempt.observed_model.is_some())
+    {
+        println!(
+            "Model\n  requested: {}\n  observed: {}\n",
+            attempt.requested_model.as_deref().unwrap_or("unknown"),
+            attempt.observed_model.as_deref().unwrap_or("unknown")
+        );
+    }
     println!("Verification\n  {}\n", result_verification(candidate));
     if show_status {
         println!("Status\n  {}\n", run.status.as_str());
@@ -1117,13 +1941,77 @@ fn print_single_result_summary(
     }
 }
 
+struct CandidateExecution {
+    checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
+    admission_released: bool,
+    failure: Option<crate::FailureKind>,
+    candidate: CandidateRecord,
+    requested_model: Option<String>,
+    resolved_model: Option<String>,
+    observed_model: Option<String>,
+    requested_effort: Option<String>,
+    resolved_effort: Option<String>,
+    observed_effort: Option<String>,
+}
+
+async fn observe_capacity(
+    executable: &Path,
+    selected: &crate::ResourceChoice,
+    coordinated_pool: &str,
+    profile: &crate::config::ResourceProfile,
+    config: &crate::config::CapacityConfig,
+    run_dir: &Path,
+    db: &Database,
+) -> Result<crate::CapacityObservation> {
+    let probe = if config.codex_probe && supports_codex_account_probe(executable) {
+        probe_codex(
+            executable,
+            coordinated_pool,
+            &profile.provider_buckets,
+            &selected.service_mode,
+            config,
+        )
+        .await
+    } else {
+        let reason = if config.codex_probe {
+            "Codex account probe unavailable for this configured executable"
+        } else {
+            "capacity probe disabled"
+        };
+        crate::capacity::CapacityProbeResult {
+            observation: crate::capacity::unknown_observation(
+                coordinated_pool,
+                &selected.service_mode,
+                Utc::now(),
+                config.freshness_secs,
+                reason,
+            ),
+            raw: serde_json::json!({"unavailable": reason}),
+        }
+    };
+    let mut observation = probe.observation;
+    let capacity_dir = run_dir.join("capacity");
+    fs::create_dir_all(&capacity_dir)?;
+    let capacity_path = capacity_dir.join(format!("{}.raw.json", observation.id));
+    write_text(&capacity_path, &serde_json::to_string_pretty(&probe.raw)?)?;
+    observation.raw_observation_ref = Some(capacity_path);
+    db.append_capacity_observation(&observation)?;
+    Ok(observation)
+}
+
 async fn execute_candidate(
     mut candidate: CandidateRecord,
     prompt: String,
     config: Config,
     baseline_path: PathBuf,
     cancellation: CancellationToken,
-) -> CandidateRecord {
+    verification: (
+        tokio::sync::mpsc::UnboundedSender<CheckLifecycleEvent>,
+        String,
+    ),
+    admission: Option<(AdmissionCoordinator, LeaseToken, u64)>,
+) -> CandidateExecution {
+    let (check_observer, attempt_id) = verification;
     let candidate_dir = candidate
         .prompt_path
         .parent()
@@ -1131,24 +2019,80 @@ async fn execute_candidate(
         .unwrap_or_else(|| candidate.workspace_path.clone());
     let timeout = Duration::from_secs(config.execution.timeout_secs);
 
+    let heartbeat_stop = CancellationToken::new();
+    let heartbeat_task = admission
+        .as_ref()
+        .map(|(coordinator, token, heartbeat_secs)| {
+            let coordinator = coordinator.clone();
+            let token = token.clone();
+            let heartbeat_secs = *heartbeat_secs;
+            let stop = heartbeat_stop.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if coordinator.heartbeat(&token).ok() == Some(false) {
+                                break;
+                            }
+                        }
+                        _ = stop.cancelled() => break,
+                    }
+                }
+            })
+        });
     let execution = async {
         let adapter = adapter_for(&candidate.harness_id, &config.harnesses)?;
         let executor = Executor::new(config.execution.clone());
-        let request = HarnessRunRequest::new(&candidate.workspace_path, prompt, &candidate_dir)
+        let mut request = HarnessRunRequest::new(&candidate.workspace_path, prompt, &candidate_dir)
             .with_timeout(timeout)
             .with_cancellation(cancellation.clone());
+        if let Some((coordinator, token, _)) = &admission {
+            request = request.with_observer(Arc::new(AdmissionLeaseObserver::new(
+                coordinator.clone(),
+                token.clone(),
+            )));
+        }
         run_harness(adapter.as_ref(), &executor, request).await
     }
     .await;
+    heartbeat_stop.cancel();
+    if let Some(task) = heartbeat_task {
+        let _ = task.await;
+    }
 
+    let admission_released = match (&admission, &execution) {
+        (Some((coordinator, token, _)), _) => coordinator.release(token).unwrap_or(false),
+        (None, _) => true,
+    };
+
+    let mut checkpoint = None;
+    let mut failure = None;
+    let mut identities = (None, None, None, None, None, None);
     match execution {
         Ok(result) => {
+            if admission.is_some()
+                && candidate.harness_id == "codex"
+                && result.execution.status == ExecutionStatus::Succeeded
+                && admission_released
+            {
+                checkpoint = crate::harness::codex_checkpoint(&result.events);
+            }
             let _ = write_text(
                 &candidate_dir.join("harness.jsonl"),
                 &result.execution.stdout,
             );
             candidate.harness_version = result.harness_version;
-            candidate.model = result.model;
+            candidate.model = result.observed_model.clone();
+            identities = (
+                result.requested_model,
+                result.resolved_model,
+                result.observed_model,
+                result.requested_effort,
+                result.resolved_effort,
+                result.observed_effort,
+            );
             candidate.duration_ms = result.execution.duration_ms;
             candidate.exit_code = result.execution.exit_code;
             candidate.timed_out = result.execution.timed_out;
@@ -1165,14 +2109,21 @@ async fn execute_candidate(
                 ExecutionStatus::Failed | ExecutionStatus::SpawnFailed => CandidateStatus::Failed,
             };
 
-            if candidate.status == CandidateStatus::Verifying {
-                candidate.checks = run_checks_with_config_and_cancel(
+            if candidate.status == CandidateStatus::Verifying
+                && admission_released
+                && checkpoint.is_some()
+            {
+                candidate.status = CandidateStatus::Completed;
+            } else if candidate.status == CandidateStatus::Verifying && admission_released {
+                candidate.checks = run_checks_with_observer(
                     &candidate.workspace_path,
                     &config.checks.verify,
                     CheckPhase::Verify,
                     &candidate_dir.join("checks"),
                     config.execution.clone(),
                     cancellation.clone(),
+                    Some(check_observer),
+                    Some(attempt_id),
                 )
                 .await;
                 candidate.status = if cancellation.is_cancelled() {
@@ -1180,9 +2131,25 @@ async fn execute_candidate(
                 } else {
                     CandidateStatus::Completed
                 };
+            } else if candidate.status == CandidateStatus::Verifying {
+                candidate.status = CandidateStatus::Failed;
+                append_candidate_error(
+                    &mut candidate,
+                    "model process cleanup could not be confirmed; pool awaits reconciliation"
+                        .into(),
+                );
             }
         }
         Err(error) => {
+            failure = Some(if error.downcast_ref::<rusqlite::Error>().is_some() {
+                crate::FailureKind::InternalState
+            } else if error.to_string().contains("funding revalidation") {
+                crate::FailureKind::Authorization
+            } else if error.to_string().contains("launch deferred:") {
+                crate::FailureKind::CapacityAdmission
+            } else {
+                crate::FailureKind::HarnessProcess
+            });
             let message = format!("{error:#}");
             candidate.status = if message.contains(" is unavailable:") {
                 CandidateStatus::MissingHarness
@@ -1203,6 +2170,7 @@ async fn execute_candidate(
     ) {
         Ok(stats) => candidate.diff_stats = stats,
         Err(error) => {
+            failure = Some(crate::FailureKind::InternalState);
             append_candidate_error(&mut candidate, format!("diff collection failed: {error:#}"));
             if candidate.status == CandidateStatus::Completed {
                 candidate.status = CandidateStatus::Failed;
@@ -1210,7 +2178,57 @@ async fn execute_candidate(
             let _ = write_text(&candidate.diff_path, "");
         }
     }
-    candidate
+    CandidateExecution {
+        checkpoint,
+        admission_released,
+        failure,
+        candidate,
+        requested_model: identities.0,
+        resolved_model: identities.1,
+        observed_model: identities.2,
+        requested_effort: identities.3,
+        resolved_effort: identities.4,
+        observed_effort: identities.5,
+    }
+}
+
+fn update_attempt_started(run: &mut RunRecord, candidate_id: &str) -> String {
+    let attempt = run
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.candidate_id == candidate_id)
+        .expect("candidate attempt exists");
+    attempt.started_at = Utc::now();
+    attempt.outcome = "running".into();
+    attempt.id.clone()
+}
+
+fn update_attempt_finished(
+    run: &mut RunRecord,
+    candidate: &CandidateRecord,
+    execution: &CandidateExecution,
+) -> String {
+    let attempt = run
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.candidate_id == candidate.id)
+        .expect("candidate attempt exists");
+    attempt.harness_version = candidate.harness_version.clone();
+    attempt.requested_model = execution
+        .requested_model
+        .clone()
+        .or_else(|| attempt.requested_model.clone());
+    attempt.resolved_model = execution
+        .resolved_model
+        .clone()
+        .or_else(|| attempt.resolved_model.clone());
+    attempt.observed_model = execution.observed_model.clone();
+    attempt.requested_effort = execution.requested_effort.clone();
+    attempt.resolved_effort = execution.resolved_effort.clone();
+    attempt.observed_effort = execution.observed_effort.clone();
+    attempt.completed_at = Some(Utc::now());
+    attempt.outcome = candidate.status.as_str().into();
+    attempt.id.clone()
 }
 
 fn candidate_label(index: usize) -> String {
@@ -1248,17 +2266,204 @@ fn append_candidate_error(candidate: &mut CandidateRecord, error: String) {
     }
 }
 
-fn persist_event(state: &State, db: &Database, event: EventRecord) -> Result<()> {
+fn refresh_outcome(run: &mut RunRecord) {
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = if run
+        .candidates
+        .iter()
+        .any(|candidate| candidate.status == CandidateStatus::Completed)
+    {
+        WorkResult::Ready
+    } else {
+        WorkResult::Failed
+    };
+    let checks = run
+        .candidates
+        .iter()
+        .flat_map(|candidate| &candidate.checks)
+        .collect::<Vec<_>>();
+    run.outcome.verification = if checks.is_empty() {
+        if run.outcome.work_result == WorkResult::Ready {
+            VerificationState::NotConfigured
+        } else {
+            VerificationState::NotRun
+        }
+    } else if checks
+        .iter()
+        .all(|check| check.status == CheckStatus::Passed)
+    {
+        VerificationState::Passed
+    } else if checks
+        .iter()
+        .any(|check| check.status == CheckStatus::Failed)
+    {
+        VerificationState::Failed
+    } else {
+        VerificationState::Inconclusive
+    };
+    run.outcome.review = if run.outcome.work_result == WorkResult::Ready {
+        run.outcome.phase = RunPhase::Reviewing;
+        ReviewState::Pending
+    } else {
+        run.outcome.phase = RunPhase::Finished;
+        ReviewState::NotRequested
+    };
+}
+
+fn persist_event(
+    state: &State,
+    db: &Database,
+    event: EventRecord,
+    run: &mut RunRecord,
+) -> Result<()> {
+    let event = db.commit_transition(run, event)?;
+    publish_event(state, event, run)
+}
+
+fn publish_event(state: &State, event: EventRecord, run: &RunRecord) -> Result<()> {
+    crate::commands::notify_commit(run, &event);
+    state.save_run(run)?;
     state.append_event(&event)?;
-    db.record_event(&event)
+    let _ = PRESENTATION.try_with(|p| {
+        p.updates.send_replace(Some((event.clone(), run.clone())));
+    });
+    if RUN_OUTPUT_MODE.load(Ordering::Relaxed) == RunOutputMode::Jsonl.code() {
+        println!("{}", serde_json::json!({"type": "event", "event": event}));
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+fn persist_check_lifecycle(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    event: CheckLifecycleEvent,
+) -> Result<()> {
+    let (attempt_id, event_type, payload) = match event {
+        CheckLifecycleEvent::Started {
+            owner_id,
+            ordinal,
+            phase,
+            name,
+            command,
+        } => {
+            if phase == CheckPhase::Verify {
+                run.outcome.phase = RunPhase::Verifying;
+            }
+            (
+                owner_id,
+                "check.started",
+                serde_json::json!({
+                    "ordinal": ordinal,
+                    "name": name,
+                    "phase": phase,
+                    "command": command,
+                }),
+            )
+        }
+        CheckLifecycleEvent::Finished {
+            owner_id,
+            ordinal,
+            result,
+        } => {
+            let checks = if let Some(owner_id) = &owner_id {
+                let candidate_id = run
+                    .attempts
+                    .iter()
+                    .find(|attempt| &attempt.id == owner_id)
+                    .map(|attempt| attempt.candidate_id.clone());
+                candidate_id.and_then(|candidate_id| {
+                    run.candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.id == candidate_id)
+                        .map(|candidate| &mut candidate.checks)
+                })
+            } else {
+                Some(&mut run.baseline_checks)
+            };
+            if let Some(checks) = checks {
+                if let Some(existing) = checks.get_mut(ordinal.saturating_sub(1)) {
+                    *existing = result.clone();
+                } else {
+                    checks.push(result.clone());
+                }
+            }
+            (
+                owner_id,
+                "check.finished",
+                serde_json::json!({
+                    "ordinal": ordinal,
+                    "name": result.name,
+                    "phase": result.phase,
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "duration_ms": result.duration_ms,
+                }),
+            )
+        }
+    };
+    persist_event(
+        state,
+        db,
+        EventRecord {
+            run_id: run.id.clone(),
+            attempt_id,
+            event_type: event_type.into(),
+            timestamp: Utc::now(),
+            payload,
+            generation: 1,
+            ..EventRecord::default()
+        },
+        run,
+    )
+}
+
+pub fn run_result(run: &RunRecord) -> RunResult {
+    let exit_code = if run.outcome.waiting_on == WaitingOn::Human {
+        4
+    } else if run
+        .phase3
+        .as_ref()
+        .is_some_and(|p| p.failure == Some(crate::FailureKind::Deadline))
+    {
+        124
+    } else {
+        match (run.outcome.work_result, run.outcome.verification) {
+            (WorkResult::Ready, VerificationState::Failed) => 3,
+            (WorkResult::Ready, _) => 0,
+            (WorkResult::Deferred, _) => 5,
+            _ => 1,
+        }
+    };
+    RunResult {
+        phase3: run.phase3.clone(),
+        elapsed_ms: (run.completed_at.unwrap_or_else(Utc::now) - run.created_at)
+            .num_milliseconds()
+            .max(0),
+        schema_version: 1,
+        run_id: run.id.clone(),
+        mode: run.mode,
+        state_revision: run.state_revision,
+        outcome: run.outcome.clone(),
+        exit_code,
+        attempts: run.attempts.clone(),
+        allocation: run.allocation.clone(),
+        capacity: run.capacity.clone(),
+        admission: run.admission.clone(),
+    }
 }
 
 fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> Result<()> {
     run.status = RunStatus::Interrupted;
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = WorkResult::Interrupted;
+    run.outcome.verification = VerificationState::NotRun;
+    run.outcome.review = ReviewState::NotRequested;
+    run.outcome.phase = RunPhase::Finished;
     run.completed_at = Some(Utc::now());
     run.candidates
         .sort_by(|left, right| left.label.cmp(&right.label));
-    state.save_run(run)?;
     db.sync_run(run)?;
     persist_event(
         state,
@@ -1269,7 +2474,38 @@ fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> 
             event_type: "run.interrupted".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"candidate_count": run.candidates.len()}),
+            ..EventRecord::default()
         },
+        run,
+    )
+}
+
+fn finish_deferred(
+    state: &State,
+    db: &mut Database,
+    run: &mut RunRecord,
+    message: &str,
+) -> Result<()> {
+    run.status = RunStatus::Deferred;
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = WorkResult::Deferred;
+    run.outcome.verification = VerificationState::NotRun;
+    run.outcome.review = ReviewState::NotRequested;
+    run.outcome.phase = RunPhase::Finished;
+    run.outcome.waiting_on = WaitingOn::None;
+    run.completed_at = Some(Utc::now());
+    db.sync_run(run)?;
+    persist_event(
+        state,
+        db,
+        EventRecord {
+            run_id: run.id.clone(),
+            event_type: "run.deferred".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"reason": message}),
+            ..EventRecord::default()
+        },
+        run,
     )
 }
 
@@ -1280,10 +2516,14 @@ fn finish_failed(
     message: &str,
 ) -> Result<()> {
     run.status = RunStatus::Failed;
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = WorkResult::Failed;
+    run.outcome.verification = VerificationState::NotRun;
+    run.outcome.review = ReviewState::NotRequested;
+    run.outcome.phase = RunPhase::Finished;
     run.completed_at = Some(Utc::now());
     run.candidates
         .sort_by(|left, right| left.label.cmp(&right.label));
-    state.save_run(run)?;
     db.sync_run(run)?;
     persist_event(
         state,
@@ -1294,7 +2534,9 @@ fn finish_failed(
             event_type: "run.failed".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"error": message}),
+            ..EventRecord::default()
         },
+        run,
     )
 }
 
@@ -1394,13 +2636,17 @@ impl Drop for SignalListener {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+    if let (Ok(mut terminate), Ok(mut hangup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
         }
     } else {
         let _ = tokio::signal::ctrl_c().await;
@@ -1408,7 +2654,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -1417,13 +2663,22 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         Some(id) => state.load_run(id)?,
         None => load_latest_for_source(state, source_path, false)?,
     };
-    if id.is_none() && run.routing.is_some() && run.candidates.len() == 1 {
+    if run.phase3.is_some() {
+        return phase3::emit(&run, RunOutputMode::Human);
+    }
+    if id.is_none()
+        && (run.routing.is_some() || run.allocation.is_some())
+        && run.candidates.len() == 1
+    {
         let database = Database::open(state.db_path())?;
-        let observation = database.routing_observation_for_run(&run.id)?;
-        let human_outcome = observation
+        let routed_feedback = database
+            .routing_observation_for_run(&run.id)?
+            .and_then(|observation| observation.human_evaluation);
+        let allocation_feedback = database.latest_goal_feedback(&run.id)?;
+        let human_outcome = allocation_feedback
             .as_ref()
-            .and_then(|observation| observation.human_evaluation.as_ref())
-            .map(|evaluation| &evaluation.outcome);
+            .map(|feedback| &feedback.outcome)
+            .or_else(|| routed_feedback.as_ref().map(|feedback| &feedback.outcome));
         print_single_result_summary(&run, "Latest task", true, human_outcome);
         return Ok(());
     }
@@ -1431,6 +2686,31 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     print_run_header(&run, reveal);
     println!("\nTask\n  {}\n", one_line(&run.task, 120));
     print_candidates(&run, reveal);
+    Ok(())
+}
+
+pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
+    let run = match id {
+        Some(id) => state.load_run(id)?,
+        None => load_latest_for_source(state, source_path, false)?,
+    };
+    println!("{}", serde_json::to_string(&run_result(&run))?);
+    Ok(())
+}
+
+pub fn status_jsonl(state: &State, id: Option<&str>, source_path: &Path) -> Result<()> {
+    let run = match id {
+        Some(id) => state.load_run(id)?,
+        None => load_latest_for_source(state, source_path, false)?,
+    };
+    let database = Database::open(state.db_path())?;
+    for event in database.events_for_run(&run.id)? {
+        println!("{}", serde_json::json!({"type": "event", "event": event}));
+    }
+    println!(
+        "{}",
+        serde_json::json!({"type": "result", "result": run_result(&run)})
+    );
     Ok(())
 }
 
@@ -1464,6 +2744,10 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
     let database = Database::open(state.db_path())?;
     if let Some(observation) = database.routing_observation_for_run(&run.id)? {
         print_routing_observation(&observation);
+    }
+    if let Some(decision) = &run.allocation {
+        println!();
+        print_allocation_details(decision);
     }
     println!("\nTask\n{}", run.task);
     println!("\nBaseline checks");
@@ -1605,6 +2889,10 @@ pub fn compare(
         blind: true,
     };
     run.evaluation = Some(evaluation.clone());
+    run.outcome.review = match &evaluation.outcome {
+        EvaluationOutcome::Neither => ReviewState::Rejected,
+        _ => ReviewState::Accepted,
+    };
     if run.status != RunStatus::Applied {
         run.status = RunStatus::Evaluated;
     }
@@ -1619,7 +2907,9 @@ pub fn compare(
             event_type: "evaluation.submitted".into(),
             timestamp: Utc::now(),
             payload: serde_json::to_value(&evaluation)?,
+            ..EventRecord::default()
         },
+        &mut run,
     )?;
     // Metadata is the reveal source of truth and is written last. Any earlier
     // validation, database, event, or serialization failure leaves it blind.
@@ -1649,6 +2939,14 @@ fn record_routing_evaluation(
         "another compare/apply/evaluate operation is already using this run",
     )?;
     let run = state.load_run(&resolved_run_id)?;
+    record_routing_evaluation_locked(state, run, input)
+}
+
+fn record_routing_evaluation_locked(
+    state: &State,
+    mut run: RunRecord,
+    input: RoutingEvaluationInput,
+) -> Result<RoutingObservation> {
     if run.routing.is_none() || run.candidates.len() != 1 {
         bail!(
             "This run was not predictively routed.\nUse `dispatch compare <run-id> --evaluate` for candidate comparison."
@@ -1677,7 +2975,129 @@ fn record_routing_evaluation(
         "routed run {} has no completed routing observation",
         run.id
     );
-    database.save_routing_human_evaluation(&run.id, &evaluation)
+    let observation = database.save_routing_human_evaluation(&run.id, &evaluation)?;
+    database.save_goal_feedback(
+        &run.id,
+        evaluation.outcome.clone(),
+        evaluation.reasons.clone(),
+        evaluation.explanation.clone(),
+    )?;
+    run.outcome.review = match &evaluation.outcome {
+        RoutingHumanOutcome::Accepted => ReviewState::Accepted,
+        RoutingHumanOutcome::Rejected => ReviewState::Rejected,
+    };
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run
+                .candidates
+                .first()
+                .map(|candidate| candidate.label.clone()),
+            event_type: match &evaluation.outcome {
+                RoutingHumanOutcome::Accepted => "review.accepted",
+                RoutingHumanOutcome::Rejected => "review.rejected",
+            }
+            .into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"reasons": evaluation.reasons}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(observation)
+}
+
+/// Captured from the displayed delivery, never resolved through "latest".
+#[derive(Debug, Clone)]
+pub struct ReviewCommand {
+    pub run_id: String,
+    pub candidate_id: String,
+    pub revision: u64,
+}
+
+pub(crate) fn review_target(
+    state: &State,
+    command: &ReviewCommand,
+) -> Result<(RunRecord, OperationLock)> {
+    crate::commands::ensure_machine_review_denied()?;
+    let id = state.resolve_run_id(&command.run_id)?;
+    anyhow::ensure!(
+        id == command.run_id,
+        "review requires the complete run identity"
+    );
+    let lock = OperationLock::acquire(
+        &state.run_dir(&id).join(".operation.lock"),
+        "run has a foreground owner",
+    )?;
+    let run = state.load_run(&id)?;
+    anyhow::ensure!(
+        run.state_revision == command.revision,
+        "stale review; the result changed"
+    );
+    anyhow::ensure!(
+        sole_candidate(&run)?.id == command.candidate_id,
+        "candidate does not belong to this delivery"
+    );
+    anyhow::ensure!(
+        run.outcome.lifecycle == LifecycleState::Finished
+            && run.outcome.work_result == WorkResult::Ready,
+        "review requires a delivered result"
+    );
+    anyhow::ensure!(
+        run.outcome.review == ReviewState::Pending,
+        "result has already been reviewed"
+    );
+    Ok((run, lock))
+}
+
+/// Re-enter review after a read-only inspector without resolving a new delivery.
+/// The fresh revision is returned only if the original candidate is still pending.
+pub fn refresh_review_target(state: &State, command: &ReviewCommand) -> Result<RunRecord> {
+    let current = state.load_run(&command.run_id)?;
+    let fresh = ReviewCommand {
+        revision: current.state_revision,
+        ..command.clone()
+    };
+    let (run, _lock) = review_target(state, &fresh)?;
+    Ok(run)
+}
+
+pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
+    let (run, _lock) = review_target(state, command)?;
+    // Bound display memory; the complete patch remains an artifact.
+    let mut bytes = Vec::new();
+    fs::File::open(&sole_candidate(&run)?.diff_path)?
+        .take(256 * 1024)
+        .read_to_end(&mut bytes)?;
+    let mut patch = String::from_utf8_lossy(&bytes).into_owned();
+    if patch.len() >= 256 * 1024 {
+        patch.push_str("\n[Preview limit reached; complete patch is in Details.]\n");
+    }
+    Ok(patch)
+}
+
+pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
+    let (run, _lock) = review_target(state, command)?;
+    if run.mode == RunMode::Allocation {
+        record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
+    } else {
+        record_routing_evaluation_locked(
+            state,
+            run,
+            RoutingEvaluationInput {
+                outcome: if accept { "accept" } else { "reject" }.into(),
+                reasons: vec![],
+                explanation: None,
+            },
+        )?;
+    }
+    let run = state.load_run(&command.run_id)?;
+    if accept {
+        apply_locked(state, run, &command.candidate_id, true)?;
+    }
+    state.load_run(&command.run_id)
 }
 
 pub fn accept_or_reject_latest(
@@ -1693,15 +3113,19 @@ pub fn accept_or_reject_latest(
         None => load_latest_unresolved_single(state, source_path)?,
     };
     let candidate = sole_candidate(&run)?.label.clone();
-    record_routing_evaluation(
-        state,
-        &run.id,
-        RoutingEvaluationInput {
-            outcome: if accept { "accept" } else { "reject" }.into(),
-            reasons,
-            explanation,
-        },
-    )?;
+    if run.mode == RunMode::Allocation {
+        record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
+    } else {
+        record_routing_evaluation(
+            state,
+            &run.id,
+            RoutingEvaluationInput {
+                outcome: if accept { "accept" } else { "reject" }.into(),
+                reasons,
+                explanation,
+            },
+        )?;
+    }
     if accept {
         apply(state, &run.id, &candidate)?;
     } else {
@@ -1715,6 +3139,11 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_for_source(state, source_path, true)?,
     };
+    if let Some(decision) = &run.allocation {
+        print_allocation_details(decision);
+        print_capacity_details(run.capacity.as_ref(), run.admission.as_ref());
+        return Ok(());
+    }
     let decision = run
         .routing
         .as_ref()
@@ -1792,13 +3221,283 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
     Ok(())
 }
 
+fn print_allocation_details(decision: &AllocationDecision) {
+    println!("Task classification");
+    println!(
+        "  language: {}",
+        decision
+            .task_features
+            .language
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!("  kind: {}", decision.task_features.task_kind.as_str());
+    println!("  scope: {}", decision.task_features.scope.as_str());
+    println!("\nSelected resource");
+    println!("  provider: {}", decision.selected.provider);
+    println!("  funding source: {}", decision.selected.funding_source);
+    println!("  harness: {}", decision.selected.harness);
+    println!("  requested model: {}", decision.selected.requested_model);
+    println!("  resolved model: {}", decision.selected.resolved_model);
+    println!(
+        "  effort: {}",
+        decision.selected.effort.as_deref().unwrap_or("default")
+    );
+    println!("  tier: {}", decision.selected.tier.as_str());
+    println!("  service mode: {}", decision.selected.service_mode);
+    println!("  runtime: {}", decision.selected.runtime);
+    println!("  pool: {}", decision.selected.pool);
+    println!(
+        "  profile no-overage assertion: {}",
+        decision.selected.no_overage_verified
+    );
+    println!(
+        "  internal composition: {}",
+        decision.selected.internal_composition
+    );
+    println!("\nSelection reason\n  {}", decision.reason);
+    println!("Policy\n  {}", decision.policy_version);
+    println!("Capability provenance\n  {}", decision.capability.source);
+    println!("\nConfigured alternatives");
+    for alternative in &decision.alternatives {
+        println!(
+            "  {} / {} / {}: {}",
+            alternative.choice.tier.as_str(),
+            alternative.choice.requested_model,
+            alternative.choice.effort.as_deref().unwrap_or("default"),
+            alternative
+                .exclusion
+                .as_deref()
+                .unwrap_or("eligible and selected")
+        );
+    }
+}
+
+fn print_capacity_details(
+    observation: Option<&crate::CapacityObservation>,
+    admission: Option<&crate::AdmissionSummary>,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+    println!("\nCapacity observation");
+    println!(
+        "  source: {} ({})",
+        observation.source, observation.source_version
+    );
+    println!("  sampled: {}", observation.sampled_at);
+    println!("  valid until: {}", observation.valid_until);
+    println!("  mapping: {}", enum_text(&observation.mapping));
+    println!("  scarcity: {}", enum_text(&observation.scarcity));
+    println!(
+        "  authentication: {}",
+        knowledge_text(&observation.auth_mode)
+    );
+    println!(
+        "  funding identity: {}",
+        knowledge_text(&observation.funding_identity)
+    );
+    println!("  plan: {}", knowledge_text(&observation.plan_type));
+    println!(
+        "  paid credits available: {}",
+        knowledge_text(&observation.credits_available)
+    );
+    println!(
+        "  service tier: {}",
+        knowledge_text(&observation.service_tier)
+    );
+    let funding_unknown = [
+        knowledge_is_unknown(&observation.auth_mode),
+        knowledge_is_unknown(&observation.funding_identity),
+        knowledge_is_unknown(&observation.plan_type),
+        knowledge_is_unknown(&observation.credits_available),
+        knowledge_is_unknown(&observation.service_tier),
+    ]
+    .into_iter()
+    .any(|value| value);
+    println!(
+        "  current funding evidence: {}",
+        if needs_refresh(observation, Utc::now()) {
+            "expired; Dispatch must refresh it before another launch"
+        } else if funding_unknown {
+            "no conflicting change reported; one or more facts remain unknown"
+        } else {
+            "fresh reported facts are consistent with the configured included route"
+        }
+    );
+    println!("  attribution: {}", observation.attribution);
+    println!("  windows:");
+    for constraint in &observation.constraints {
+        println!(
+            "    {} / {}: used={}, remaining={}, reset={}, duration={}",
+            constraint
+                .provider_bucket_id
+                .as_deref()
+                .unwrap_or("unknown-bucket"),
+            constraint.window_id.as_deref().unwrap_or("unknown-window"),
+            constraint
+                .reported_used_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "unknown".into()),
+            knowledge_text(&constraint.remaining),
+            knowledge_text(&constraint.reset_at),
+            knowledge_text(&constraint.window_duration_secs),
+        );
+    }
+    if let Some(reference) = &observation.raw_observation_ref {
+        println!("  raw observation: {}", reference.display());
+    }
+    if let Some(admission) = admission {
+        println!("\nShared admission");
+        println!("  pool: {}", admission.pool_id);
+        println!("  state: {}", enum_text(&admission.state));
+        println!(
+            "  fence: {}",
+            admission
+                .fence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        );
+        println!("  generation: {}", admission.generation);
+        println!("  enqueued: {}", admission.enqueued_at);
+    }
+}
+
+fn knowledge_text<T: serde::Serialize>(value: &crate::CapacityValue<T>) -> String {
+    match value {
+        crate::CapacityValue::Reported { value } => {
+            serde_json::to_value(value).map_or_else(|_| "reported".into(), display_json_value)
+        }
+        crate::CapacityValue::Estimated {
+            lower,
+            upper,
+            method,
+            samples,
+        } => format!(
+            "estimated {}..{} ({method}, {samples} samples)",
+            serde_json::to_value(lower).map_or_else(|_| "?".into(), display_json_value),
+            serde_json::to_value(upper).map_or_else(|_| "?".into(), display_json_value),
+        ),
+        crate::CapacityValue::Unknown { reason } => format!("unknown ({reason})"),
+    }
+}
+
+fn knowledge_is_unknown<T>(value: &crate::CapacityValue<T>) -> bool {
+    matches!(value, crate::CapacityValue::Unknown { .. })
+}
+
+fn display_json_value(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => value,
+        value => value.to_string(),
+    }
+}
+
+fn enum_text<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value).map_or_else(|_| "unknown".into(), display_json_value)
+}
+
+fn record_allocation_feedback(
+    state: &State,
+    run_id: &str,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+) -> Result<()> {
+    let resolved_run_id = state.resolve_run_id(run_id)?;
+    let _run_lock = OperationLock::acquire(
+        &state.run_dir(&resolved_run_id).join(".operation.lock"),
+        "another compare/apply/evaluate operation is already using this run",
+    )?;
+    let run = state.load_run(&resolved_run_id)?;
+    record_allocation_feedback_locked(state, run, accept, reasons, explanation, false)
+}
+
+fn record_allocation_feedback_locked(
+    state: &State,
+    mut run: RunRecord,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+    quiet: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        run.mode == RunMode::Allocation && run.allocation.is_some(),
+        "run {} is not an allocation run",
+        run.id
+    );
+    anyhow::ensure!(
+        run.phase3
+            .as_ref()
+            .is_none_or(|p| p.final_attempt_id.is_some()
+                && run.outcome.lifecycle == LifecycleState::Finished
+                && run.outcome.work_result == WorkResult::Ready),
+        "review requires a delivered candidate; use the typed answer/cancel operation for a pending question"
+    );
+    sole_candidate(&run)?;
+    let reasons = normalize_reasons(reasons)?;
+    anyhow::ensure!(
+        !reasons.iter().any(|reason| reason == "cleaner-change"),
+        "structured reason \"cleaner-change\" is only valid for candidate comparison"
+    );
+    let outcome = if accept {
+        RoutingHumanOutcome::Accepted
+    } else {
+        RoutingHumanOutcome::Rejected
+    };
+    let mut database = Database::open(state.db_path())?;
+    let feedback = database.save_goal_feedback(&run.id, outcome.clone(), reasons, explanation)?;
+    run.outcome.review = if accept {
+        ReviewState::Accepted
+    } else {
+        ReviewState::Rejected
+    };
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run
+                .candidates
+                .first()
+                .map(|candidate| candidate.label.clone()),
+            event_type: if accept {
+                "review.accepted"
+            } else {
+                "review.rejected"
+            }
+            .into(),
+            timestamp: feedback.created_at,
+            payload: serde_json::json!({"feedback_revision": feedback.revision}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    if !quiet {
+        println!(
+            "Allocation feedback recorded (revision {}).",
+            feedback.revision
+        );
+    }
+    Ok(())
+}
+
 pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     let _run_lock = OperationLock::acquire(
         &state.run_dir(&resolved_run_id).join(".operation.lock"),
         "another compare/apply operation is already using this run",
     )?;
-    let mut run = state.load_run(&resolved_run_id)?;
+    let run = state.load_run(&resolved_run_id)?;
+    apply_locked(state, run, candidate_label, false)
+}
+
+fn apply_locked(
+    state: &State,
+    mut run: RunRecord,
+    candidate_label: &str,
+    quiet: bool,
+) -> Result<()> {
     anyhow::ensure!(
         matches!(
             run.status,
@@ -1818,10 +3517,44 @@ pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
             .join(format!("source-{source_key}.lock")),
         "another apply operation is already modifying this source",
     )?;
-    let report = source::safe_apply(&run, &normalized_label)?;
+    let report = match source::safe_apply(&run, &normalized_label) {
+        Ok(report) => report,
+        Err(error) => {
+            let message = format!("{error:#}");
+            run.outcome.application = if message.contains("source changed")
+                || message.contains("source has changed")
+                || message.contains("source drift")
+            {
+                ApplicationState::BlockedBySourceDrift
+            } else {
+                ApplicationState::Failed
+            };
+            run.outcome.phase = RunPhase::Finished;
+            let database = Database::open(state.db_path())?;
+            persist_event(
+                state,
+                &database,
+                EventRecord {
+                    run_id: run.id.clone(),
+                    candidate_label: Some(normalized_label.clone()),
+                    event_type: "application.failed".into(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::json!({
+                        "application": run.outcome.application,
+                        "error": message,
+                    }),
+                    ..EventRecord::default()
+                },
+                &mut run,
+            )?;
+            return Err(error);
+        }
+    };
     run.applied_candidate = Some(normalized_label.clone());
     run.status = RunStatus::Applied;
-    state.save_run(&run)?;
+    run.outcome.review = ReviewState::Accepted;
+    run.outcome.application = ApplicationState::Applied;
+    run.outcome.phase = RunPhase::Finished;
     let mut db = Database::open(state.db_path())?;
     db.sync_run(&run)?;
     persist_event(
@@ -1833,14 +3566,18 @@ pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
             event_type: "result.applied".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"files_changed": report.files_changed}),
+            ..EventRecord::default()
         },
+        &mut run,
     )?;
-    println!(
-        "Applied Candidate {} to {} ({} file(s) changed).",
-        normalized_label,
-        run.source_path.display(),
-        report.files_changed
-    );
+    if !quiet {
+        println!(
+            "Applied Candidate {} to {} ({} file(s) changed).",
+            normalized_label,
+            run.source_path.display(),
+            report.files_changed
+        );
+    }
     Ok(())
 }
 
@@ -1951,8 +3688,9 @@ fn sole_candidate(run: &RunRecord) -> Result<&CandidateRecord> {
 fn load_latest_for_source(state: &State, source_path: &Path, single: bool) -> Result<RunRecord> {
     let source_path = source::resolve_source(Some(source_path))?;
     for path in state.list_metadata_paths()? {
-        let run: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
+        let run = state.load_run(&projected.id)?;
         if run.source_path == source_path && (!single || run.candidates.len() == 1) {
             return Ok(run);
         }
@@ -1964,10 +3702,17 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
     let source_path = source::resolve_source(Some(source_path))?;
     let database = Database::open(state.db_path())?;
     for path in state.list_metadata_paths()? {
-        let run: RunRecord = serde_json::from_slice(&fs::read(&path)?)
+        let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        if run.source_path != source_path || run.candidates.len() != 1 || run.routing.is_none() {
+        let run = state.load_run(&projected.id)?;
+        if run.source_path != source_path
+            || run.candidates.len() != 1
+            || (run.routing.is_none() && run.allocation.is_none())
+        {
             continue;
+        }
+        if run.mode == RunMode::Allocation && database.latest_goal_feedback(&run.id)?.is_none() {
+            return Ok(run);
         }
         if database
             .routing_observation_for_run(&run.id)?
@@ -2006,6 +3751,10 @@ fn print_run_header(run: &RunRecord, reveal: bool) {
     if let Some(decision) = &run.routing {
         println!();
         print_routing_decision(decision);
+    }
+    if let Some(decision) = &run.allocation {
+        println!();
+        print_allocation_decision(decision);
     }
 }
 
@@ -2248,6 +3997,80 @@ fn indent(value: &str, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_and_persistence_faults_dispose_acquired_intent_before_handoff()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for point in [1, 2, 3] {
+            let temp = tempfile::tempdir()?;
+            let state = State::discover(Some(temp.path().join("state")))?;
+            state.initialize()?;
+            let project = temp.path().join("project");
+            fs::create_dir(&project)?;
+            fs::write(project.join("original.txt"), "original")?;
+            let agent = temp.path().join("codex");
+            let marker = temp.path().join("spawned");
+            fs::write(
+                &agent,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fixture; exit 0; fi\ntouch '{}'\n",
+                    marker.display()
+                ),
+            )?;
+            fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+            fs::write(
+                project.join("dispatch.yml"),
+                format!(
+                    "execution:\n  timeout_secs: 3\nchecks:\n  baseline: ['true']\n  verify: ['true']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                    agent.display()
+                ),
+            )?;
+            fs::write(
+                state.root.join("resources.yml"),
+                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n",
+            )?;
+            let db = Database::open(state.db_path())?;
+            if point == 3 {
+                db.connection().execute_batch("CREATE TRIGGER fail_acquired_event BEFORE INSERT ON events WHEN NEW.event_type='admission.acquired' BEGIN SELECT RAISE(ABORT,'injected acquired-event persistence failure'); END;")?;
+            }
+            let result = CANCEL_AT_HANDOFF
+                .scope(
+                    point,
+                    run_dispatch(
+                        &state,
+                        RunRequest {
+                            source: project,
+                            task: "Deterministic handoff fixture".into(),
+                            harnesses: vec![],
+                            route: false,
+                            agent: Some("codex".into()),
+                            model: Some("fixture".into()),
+                            effort: Some("medium".into()),
+                            config_path: None,
+                            backend: None,
+                            timeout_secs: None,
+                            max_parallel: None,
+                            priority: 0,
+                            no_retry: false,
+                            allow_unsafe_local: true,
+                            allow_forwarded_env: false,
+                            output: RunOutputMode::Json,
+                        },
+                    ),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "fault point {point} must interrupt the run"
+            );
+            assert!(!marker.exists(), "fault point {point} spawned a model");
+            let (requests,leases):(i64,i64)=db.connection().query_row("SELECT (SELECT COUNT(*) FROM admission_requests WHERE status='released'),(SELECT COUNT(*) FROM pool_leases)",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            assert_eq!((requests, leases), (1, 0), "fault point {point}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn duration_format_is_compact() {

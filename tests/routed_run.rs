@@ -603,7 +603,8 @@ fn routed_run_records_verification_failure_without_a_human_label() -> anyhow::Re
             "--allow-unsafe-local",
         ])
         .assert()
-        .success();
+        .code(3)
+        .stdout(predicates::str::contains("Verification failed"));
 
     let (_, metadata) = only_metadata(&state)?;
     let run_id = metadata["id"].as_str().unwrap();

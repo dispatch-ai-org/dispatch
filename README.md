@@ -18,7 +18,55 @@ review → accept or reject
 
 Dispatch works locally and offline. A release contains a compact public-evidence snapshot, normal runs never fetch benchmark data, and Dispatch Cloud is optional.
 
-## Quick start
+## Interactive dogfood loop
+
+With Codex authenticated and included-resource profiles already validated in
+`$DISPATCH_HOME/resources.yml`, run from a source directory:
+
+```bash
+dispatch
+```
+
+Enter the outcome, then approve local execution for that goal. Dispatch displays
+allocation, work, verification, and any bounded recovery. A durable clarification
+appears directly in the session; submitting its answer continues automatically.
+At review, enter `d` for the diff, `a` to accept and safely apply, `r` to reject,
+`i` for artifact details, or `n` to leave the result pending and start another goal.
+These actions retain the displayed run, question, and candidate identities.
+Verification and human acceptance remain separate.
+
+The compact inline view preserves scrollback and uses the terminal's background.
+Enter submits, Alt+Enter inserts a newline, bracketed paste inserts without
+submitting, Ctrl+C cancels, and Ctrl+D exits an empty editor. During work,
+Ctrl+C waits for process cleanup; EOF/hangup also requests controlled cancellation.
+Input entered while work is active is discarded rather than queued as another goal.
+
+Use `dispatch --plain` for ordinary line input, `--ascii` for ASCII graph marks,
+and `--no-color` (or `NO_COLOR`) for native colors. `TERM=dumb` selects plain mode.
+Plain input is line-oriented; the integrated editor supports multiline paste.
+`dispatch --no-retry` disables automatic recovery for the interactive session.
+Bare invocation without terminal input and output prints help and exits 2.
+
+The interactive path requires `allocation_enabled: true` and explicitly validated
+included Codex resource profiles (see **Codex model allocation trial** below).
+It stops after intent if those are absent; it does not choose another provider.
+There is no automatic account authorization or subscription setup. A funding-plan
+change must be explicitly revalidated before real work can launch.
+
+Phase 4 implementation and the current release gates are recorded in
+[the first dogfood release report](docs/phase4-dogfood-release.md).
+
+## Machine control
+
+`dispatch control --stdio` provides scoped, foreground JSONL requests, replayable
+events, semantic waits, and durable retries. A human provisions the scope with
+`dispatch control-grant`; the client inherits a private grant handle. Human
+acceptance and application remain in the existing review workflow.
+
+See the [protocol and standalone client guide](docs/control-protocol.md) and
+[Phase 5 validation report](docs/phase5-validation.md). Neither requires Herdr.
+
+## One-shot CLI
 
 Install and authenticate at least one supported coding-agent CLI: Claude Code, Codex CLI, or Cursor Agent. Then, from a repository:
 
@@ -42,7 +90,7 @@ Or reject it without changing the source tree:
 dispatch reject
 ```
 
-Dispatch uses benchmark performance to choose only when at least two execution-eligible agents have compatible, nonzero evidence. It compares that evidenced subset using the existing Router; agents without evidence remain unknown, not inferior. Otherwise it uses the first available agent in the fixed order Claude Code → Codex → Cursor, independently of benchmark availability. A sole eligible agent is labeled “Only available agent.”
+The legacy one-shot path without allocation profiles uses benchmark performance to choose only when at least two execution-eligible agents have compatible, nonzero evidence. It compares that evidenced subset using the existing Router; agents without evidence remain unknown, not inferior. Otherwise it uses the first available agent in the fixed order Claude Code → Codex → Cursor, independently of benchmark availability. A sole eligible agent is labeled “Only available agent.”
 
 To deliberately override Dispatch's choice:
 
@@ -146,7 +194,7 @@ Real agents and project checks run with the permissions of the Dispatch process 
 
 Dispatch freezes the source into an internal Git baseline and gives the selected agent an independent candidate workspace. It does not run the agent directly in the original tree. `dispatch accept` uses the existing safe apply path and rejects source drift; `dispatch reject` never applies candidate changes.
 
-If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment.
+If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review`; failed checks are reported as `Verification failed`, never as completed or verified work.
 
 The local backend is the supported real-agent path in v0.1.2. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
 
@@ -154,7 +202,8 @@ The local backend is the supported real-agent path in v0.1.2. Docker execution i
 
 ```text
 dispatch run "<task>" [--source path] [--agent claude|codex|cursor]
-dispatch status [run-id]
+dispatch run "<task>" --json|--jsonl
+dispatch status [run-id] [--json|--jsonl]
 dispatch diff [run-id] [candidate]
 dispatch accept [run-id]
 dispatch reject [run-id]
@@ -164,6 +213,160 @@ dispatch version
 ```
 
 Without a run ID, `status`, `diff`, `accept`, `reject`, and `explain` resolve the latest relevant single-result run for the current source tree. Explicit run IDs remain available for history and debugging. `--task-file path|-` reads a task from a file or stdin, and `--source path` overrides the current directory.
+
+`run --json` writes one versioned result object to stdout. `run --jsonl` writes each committed, sequenced event followed by a final result object; `status --jsonl` replays that committed journal. Machine modes require non-interactive authorization flags when local execution needs acknowledgement, keeping stdout parseable.
+
+Advanced automation can follow committed events without controlling execution:
+
+```bash
+dispatch events <run-id> --after 0 --until attention --timeout 30
+dispatch events <run-id> --after <cursor> --until finished --timeout 30
+```
+
+Output is JSON Lines with a final committed cursor. `attention` includes human
+waiting or a finished outcome; `finished` waits for the core lifecycle to finish
+(including a result awaiting review). Timeout exits 124 without answering,
+launching, or repairing anything. Omit `--until` to replay through the current
+journal. Events now include their committed `payload.outcome`, so a transient
+question cannot disappear merely because it was answered before the next poll.
+A cursor ahead of the journal is rejected. Historical events written before
+Phase 4 remain readable, but cannot reconstruct transient states they did not
+record; current state is still available.
+
+One-shot exit codes are:
+
+- `0`: a result is ready for review and verification passed or was not configured;
+- `3`: a result is ready for review, but configured verification failed;
+- `5`: required subscription capacity is deferred without a model launch;
+- `1`: execution or orchestration failed;
+- `2`: command-line usage error.
+
+The result keeps execution, verification, review, and application as separate fields. Attempt records also keep requested, resolved, and harness-observed model/effort values separate; an unknown or mismatched observed identity is not replaced by configuration.
+
+### Codex model allocation trial
+
+`dispatch run --agent codex --model <id> --effort <level> "<task>"` selects one
+declared Codex resource through the normal isolated execution path. Dispatch
+validates the choice against the user-level `$DISPATCH_HOME/resources.yml`
+file (normally `~/.dispatch/resources.yml`); project configuration cannot
+enable allocation.
+
+To opt into deterministic light/standard/strong selection for ordinary runs,
+create that file with `allocation_enabled: true` and one verified profile per
+tier:
+
+```yaml
+version: 1
+allocation_enabled: true
+capacity:
+  codex_probe: true
+  probe_timeout_secs: 5
+  freshness_secs: 300
+  admission: true
+  lease_secs: 20
+  heartbeat_secs: 5
+  aging_secs: 60
+profiles:
+  - provider: openai
+    funding_source: chatgpt-plus
+    harness: codex
+    model: your-included-model-id
+    effort: low
+    service_mode: standard
+    runtime: local
+    pool: chatgpt-codex
+    provider_buckets: [your-observed-codex-limit-id]
+    tier: light
+    included: true
+    no_overage_verified: true
+    authorization_revision: 1
+```
+
+The deterministic policy uses standard when task type or scope is unknown; ordinary
+requests do not need to name a file or use a special opening phrase. Recognized
+feature/refactor work and known broad scope still require strong. Unknown inputs
+remain recorded as unknown and do not qualify a task for light. Explicit model
+constraints and funding checks still apply.
+
+Repeat the profile for `standard` and `strong`. `no_overage_verified` is an
+explicit assertion that the account or invocation cannot fall through to paid
+overage; an included model name or visible credits are not enough. Profiles
+without that assertion are shown in `dispatch explain` but are ineligible.
+Before launching a selected model, Dispatch uses the optional read-only Codex
+account/rate-limit probe to check fresh authentication, plan, credit, service,
+pool, and window facts. A reported change invalidates the earlier assertion;
+unavailable quota telemetry remains explicitly unknown and does not fabricate
+capacity. Reset timestamps only schedule another observation.
+
+`authorization_revision` is an explicit local funding-authorization epoch. If
+fresh evidence reports a changed account, plan, service tier, credit capability,
+or pool/window identity, that epoch remains rejected on later runs even though
+the raw observation is retained. Increment it only after affirmatively checking
+and accepting the new subscription-only account state. When an applicable
+window enters Reserve, background and standard work are deferred with exit 5;
+only an explicitly urgent (`--priority urgent`) request may proceed.
+
+Profiles backed by the same subscription allowance must use the same `pool`
+and opaque `provider_buckets` mapping. Foreground Dispatch processes sharing a
+state directory use a fair, fenced SQLite admission lease and initially allow
+one active model invocation per pool. The lease is released after child cleanup
+is confirmed and before local verification or review. This coordinates only
+cooperating local Dispatch processes; other applications, machines, and mixed
+provider activity remain outside its guarantee and quota changes are not
+attributed to an individual attempt without supporting evidence. `dispatch
+explain` and JSON output retain the detailed field-level observation.
+Setting `capacity.admission: false` does not bypass shared coordination for an
+allocation run. Dispatch rejects that run; disable allocation after coordinated
+owners have drained if a single uncoordinated session is intentionally desired.
+Allocation decisions and goal feedback remain local and never enter the v1
+routing sync envelope. Remove the file or set `allocation_enabled: false` to
+return ordinary runs to legacy agent routing; explicit model controls remain
+available when they match a verified profile.
+
+
+### Bounded recovery and clarification
+
+Allocation runs allow at most two model invocations in total. After a target
+check fails, Dispatch may make one stronger attempt if that exact check passed
+on the original baseline, all baseline checks passed, and a suitable verified
+profile satisfies the original constraints. `--no-retry` disables this automatic
+recovery. An explicit fixed model/effort is never silently overridden. Ordinary
+pre-existing baseline check failures permit initial work but disable recovery;
+missing tools and baseline infrastructure failures stop before model work.
+
+Every attempt uses fresh authorization, shared admission and a new fence. Failed
+workspaces and per-attempt evidence are retained. Recovery starts from the
+original baseline with bounded failure diagnostics; the final diff remains
+relative to that baseline. Mixed attribution is explicit and stays local.
+`--timeout` is one goal-wide deadline covering baseline checks, attempts,
+verification and human waiting; it does not reset for recovery or continuation.
+
+Codex may request an essential clarification using this exact JSON envelope in
+its final `agent_message` event, followed by a successful process exit:
+
+```json
+{"dispatch_checkpoint":{"version":1,"question":"Which behavior is required?","choices":["A","B"]}}
+```
+
+Dispatch validates the report after child cleanup and admission release, then
+persists a question with `lifecycle=waiting` and `waiting_on=human`. It never
+pauses a live model process. Malformed, non-final or unsuccessful reports do not
+create a question. Answer or cancel the specific question with its current
+revision (available in `dispatch status <run-id> --json`):
+
+```bash
+dispatch answer <run-id> <question-id> --revision 1 --answer "A" --json
+dispatch cancel <run-id> <question-id> --revision 1 --json
+```
+
+Answers are authorized by the local run owner's OS identity and accepted once.
+The answer command owns a fresh foreground continuation using the original
+baseline and answer. That invocation consumes the remaining slot in the same
+two-invocation budget. A second checkpoint cannot create a third invocation.
+There is no daemon, automatic crash replay or separate human `resume` command.
+Pending questions and all attempt evidence survive process exit and reload.
+JSON/JSONL includes each attempt, its bindings and checks, the final delivery
+pointer, elapsed time, normalized failures, and question state.
 
 ## Public routing data
 

@@ -1113,6 +1113,7 @@ mod tests {
 
     fn evaluated_run(id: &str) -> RunRecord {
         RunRecord {
+            phase3: None,
             id: id.into(),
             task: "Fix the retry race.".into(),
             exact_prompt: "private system prompt".into(),
@@ -1123,6 +1124,9 @@ mod tests {
             baseline_path: PathBuf::from("/Users/alice/private/baseline"),
             baseline_commit: "private-commit".into(),
             status: RunStatus::Evaluated,
+            mode: crate::RunMode::Legacy,
+            state_revision: 0,
+            outcome: crate::RunOutcome::default(),
             created_at: at(1),
             completed_at: Some(at(4)),
             environment: EnvironmentRecord {
@@ -1144,7 +1148,11 @@ mod tests {
                 candidate("candidate-a", "A", "cursor", Some(20_892)),
                 candidate("candidate-b", "B", "codex", None),
             ],
+            attempts: Vec::new(),
             routing: None,
+            allocation: None,
+            capacity: None,
+            admission: None,
             evaluation: Some(EvaluationRecord {
                 outcome: EvaluationOutcome::Candidate("B".into()),
                 reasons: vec!["correctness".into(), "cleaner-change".into()],

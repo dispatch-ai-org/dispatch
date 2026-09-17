@@ -1,0 +1,14 @@
+{
+  "scenario": "native-delta",
+  "marker": "review-summary",
+  "presentation_env": {
+    "TERM": "xterm-256color",
+    "COLORTERM": "truecolor",
+    "DISPATCH_COLOR": "truecolor"
+  },
+  "seconds": 2.541631,
+  "bytes": 5582,
+  "width": 100,
+  "height": 30,
+  "sha256": "57e1e32c46332068e7beef5cb9673fd6850df0ef50918855cbd9fa0e689884e9"
+}

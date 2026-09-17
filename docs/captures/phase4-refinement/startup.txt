@@ -1,0 +1,5 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  What do you want to accomplish?
+  ›
+  Enter send · Alt+Enter newline · Ctrl+C cancel · Ctrl+D exit

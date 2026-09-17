@@ -1,0 +1,10 @@
+{
+  "source": "startup.ansi",
+  "terminal_columns": 100,
+  "terminal_rows": 30,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 25,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc"
+}

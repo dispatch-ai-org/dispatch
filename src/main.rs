@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use dispatch::{orchestrator, state::State};
 use tracing_subscriber::EnvFilter;
 
@@ -20,12 +20,56 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Use ordinary line input and scrollback instead of the live viewport.
+    #[arg(long, global = true)]
+    plain: bool,
+    /// Use ASCII graph characters.
+    #[arg(long, global = true)]
+    ascii: bool,
+    /// Keep native terminal colors (also respects NO_COLOR).
+    #[arg(long, global = true)]
+    no_color: bool,
+    /// Disable bounded recovery in the interactive session.
+    #[arg(long, hide = true)]
+    no_retry: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Foreground, scoped bidirectional JSON Lines (requires a human-issued grant).
+    Control {
+        #[arg(long, required = true)]
+        stdio: bool,
+        #[arg(long)]
+        grant_fd: i32,
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Authorize a fixed machine scope as the local human owner; prints a private key path.
+    ControlGrant {
+        source: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        #[arg(long, default_value_t = 2)]
+        max_invocations: u32,
+        #[arg(long)]
+        allow_unsafe_local: bool,
+        #[arg(long)]
+        delegate_factual: bool,
+    },
+    /// Follow committed semantic events (advanced, read-only JSON Lines).
+    #[command(hide = true)]
+    Events {
+        run_id: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long, value_enum)]
+        until: Option<dispatch::follow::Until>,
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// Create a small project-local Dispatch configuration.
     #[command(hide = true)]
     Init {
@@ -45,6 +89,30 @@ enum Command {
     },
     /// Work on a software task with the best available coding agent.
     Run(RunArgs),
+    /// Answer a durable clarification and continue within the existing goal limit.
+    Answer {
+        run_id: String,
+        question_id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, default_value_t = 1)]
+        generation: u32,
+        #[arg(long)]
+        answer: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a goal awaiting a durable clarification.
+    Cancel {
+        run_id: String,
+        question_id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, default_value_t = 1)]
+        generation: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect locally cached evidence for supported real harnesses.
     #[command(hide = true)]
     Recommend(RecommendArgs),
@@ -55,7 +123,15 @@ enum Command {
         command: EvidenceCommand,
     },
     /// Show the state of one run (or the latest run).
-    Status { run_id: Option<String> },
+    Status {
+        run_id: Option<String>,
+        /// Print the versioned result projection as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Replay committed events and the result as JSON Lines.
+        #[arg(long, conflicts_with = "json")]
+        jsonl: bool,
+    },
     /// List recent runs.
     History {
         #[arg(short, long, default_value_t = 20)]
@@ -203,6 +279,14 @@ struct RunArgs {
     #[arg(long, value_parser = ["claude", "codex", "cursor"], conflicts_with_all = ["route", "harnesses"])]
     agent: Option<String>,
 
+    /// Select a configured Codex model resource.
+    #[arg(long, conflicts_with_all = ["route", "harnesses"])]
+    model: Option<String>,
+
+    /// Override Codex reasoning effort for this attempt.
+    #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], conflicts_with_all = ["route", "harnesses"], hide = true)]
+    effort: Option<String>,
+
     /// Select one locally runnable real harness using cached routing evidence.
     #[arg(long, conflicts_with_all = ["harnesses", "agent"], hide = true)]
     route: bool,
@@ -219,6 +303,14 @@ struct RunArgs {
     #[arg(long, hide = true)]
     max_parallel: Option<usize>,
 
+    /// Disable the single automatic stronger recovery.
+    #[arg(long, hide = true)]
+    no_retry: bool,
+
+    /// Admission priority within the shared local subscription pool.
+    #[arg(long, value_parser = ["background", "normal", "urgent"], default_value = "normal", hide = true)]
+    priority: String,
+
     /// Explicitly allow real agents or project checks to execute on the host.
     #[arg(long, hide = true)]
     allow_unsafe_local: bool,
@@ -226,6 +318,14 @@ struct RunArgs {
     /// Forward only the environment variable names allowlisted in dispatch.yml.
     #[arg(long, hide = true)]
     allow_forwarded_env: bool,
+
+    /// Print only the final versioned result projection.
+    #[arg(long, conflicts_with = "jsonl")]
+    json: bool,
+
+    /// Stream committed events followed by the final result as JSON Lines.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
 }
 
 #[derive(Debug, Args)]
@@ -327,14 +427,129 @@ async fn run() -> Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 
     let state = State::discover(cli.state_dir)?;
-    match cli.command {
+    let Some(command) = cli.command else {
+        if !dispatch::presenter::suitable() {
+            Cli::command().print_help()?;
+            println!();
+            std::process::exit(2);
+        }
+        return dispatch::presenter::session(
+            &state,
+            dispatch::presenter::Options {
+                plain: cli.plain,
+                ascii: cli.ascii,
+                no_color: cli.no_color,
+                no_retry: cli.no_retry,
+            },
+        )
+        .await;
+    };
+    match command {
+        Command::Control {
+            stdio: _,
+            grant_fd,
+            read_only,
+        } => dispatch::control::stdio(state, grant_fd, read_only).await,
+        Command::ControlGrant {
+            source,
+            timeout,
+            max_invocations,
+            allow_unsafe_local,
+            delegate_factual,
+        } => {
+            let path = dispatch::commands::grant(
+                &state,
+                &source,
+                timeout,
+                max_invocations,
+                allow_unsafe_local,
+                delegate_factual,
+            )?;
+            println!("{}", path.display());
+            Ok(())
+        }
+        Command::Events {
+            run_id,
+            after,
+            until,
+            timeout,
+        } => {
+            let reached = dispatch::follow::events(
+                &state,
+                &run_id,
+                after,
+                until,
+                std::time::Duration::from_secs(timeout),
+                std::io::stdout(),
+            )
+            .await?;
+            if !reached {
+                std::process::exit(124);
+            }
+            Ok(())
+        }
         Command::Init { path, force } => orchestrator::init(&state, &path, force),
         Command::Doctor { source, config } => {
             orchestrator::doctor(&state, &source, config.as_deref()).await
+        }
+        Command::Answer {
+            run_id,
+            question_id,
+            revision,
+            generation,
+            answer,
+            json,
+        } => {
+            let output = if json {
+                orchestrator::RunOutputMode::Json
+            } else {
+                orchestrator::RunOutputMode::Human
+            };
+            let run = orchestrator::answer_question(
+                &state,
+                orchestrator::QuestionCommand {
+                    run_id,
+                    question_id,
+                    revision,
+                    generation,
+                },
+                answer,
+                output,
+            )
+            .await?;
+            let code = orchestrator::run_result(&run).exit_code;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Cancel {
+            run_id,
+            question_id,
+            revision,
+            generation,
+            json,
+        } => {
+            orchestrator::cancel_question(
+                &state,
+                orchestrator::QuestionCommand {
+                    run_id,
+                    question_id,
+                    revision,
+                    generation,
+                },
+                if json {
+                    orchestrator::RunOutputMode::Json
+                } else {
+                    orchestrator::RunOutputMode::Human
+                },
+            )?;
+            Ok(())
         }
         Command::Run(args) => {
             let (source, task) = read_run_input(&args)?;
@@ -344,16 +559,34 @@ async fn run() -> Result<()> {
                 harnesses: args.harnesses.unwrap_or_default(),
                 route: args.route,
                 agent: args.agent,
+                model: args.model,
+                effort: args.effort,
                 config_path: args.config,
                 backend: args.backend,
                 timeout_secs: args.timeout,
                 max_parallel: args.max_parallel,
+                no_retry: args.no_retry,
+                priority: match args.priority.as_str() {
+                    "background" => -1,
+                    "urgent" => 1,
+                    _ => 0,
+                },
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
+                output: if args.json {
+                    orchestrator::RunOutputMode::Json
+                } else if args.jsonl {
+                    orchestrator::RunOutputMode::Jsonl
+                } else {
+                    orchestrator::RunOutputMode::Human
+                },
             };
-            orchestrator::run_dispatch(&state, request)
-                .await
-                .map(|_| ())
+            let run = orchestrator::run_dispatch(&state, request).await?;
+            let exit_code = orchestrator::run_result(&run).exit_code;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
         }
         Command::Recommend(args) => {
             let task = read_task(args.task_input)?;
@@ -362,8 +595,18 @@ async fn run() -> Result<()> {
         Command::Evidence {
             command: EvidenceCommand::Local { source },
         } => dispatch::evidence::inspect_local(&state, &source),
-        Command::Status { run_id } => {
-            orchestrator::status(&state, run_id.as_deref(), &std::env::current_dir()?)
+        Command::Status {
+            run_id,
+            json,
+            jsonl,
+        } => {
+            if json {
+                orchestrator::status_json(&state, run_id.as_deref(), &std::env::current_dir()?)
+            } else if jsonl {
+                orchestrator::status_jsonl(&state, run_id.as_deref(), &std::env::current_dir()?)
+            } else {
+                orchestrator::status(&state, run_id.as_deref(), &std::env::current_dir()?)
+            }
         }
         Command::History { limit } => orchestrator::history(&state, limit),
         Command::Explain { run_id } => {

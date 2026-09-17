@@ -460,7 +460,11 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
 
     let metadata: Value = serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["status"], "interrupted");
+    assert_eq!(metadata["outcome"]["lifecycle"], "finished");
+    assert_eq!(metadata["outcome"]["work_result"], "interrupted");
+    assert_eq!(metadata["outcome"]["verification"], "not_run");
     assert_eq!(metadata["candidates"][0]["status"], "cancelled");
+    assert_eq!(metadata["attempts"][0]["outcome"], "cancelled");
 }
 
 fn first_metadata_path(state: &Path) -> Option<PathBuf> {

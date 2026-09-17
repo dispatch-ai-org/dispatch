@@ -101,15 +101,70 @@ impl State {
 
     pub fn load_run(&self, id_or_prefix: &str) -> Result<RunRecord> {
         let id = self.resolve_run_id(id_or_prefix)?;
-        let bytes = fs::read(self.metadata_path(&id))
-            .with_context(|| format!("run {id} has no readable metadata"))?;
-        let run: RunRecord = serde_json::from_slice(&bytes)
-            .with_context(|| format!("run {id} metadata is invalid"))?;
+        let projected = fs::read(self.metadata_path(&id))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok());
+        let database = if self.db_path().is_file() {
+            Some(crate::db::Database::open(self.db_path())?)
+        } else {
+            None
+        };
+        let committed = database
+            .as_ref()
+            .map(|database| database.committed_run_projection(&id))
+            .transpose()?
+            .flatten();
+        let mut run = match (projected, committed) {
+            (Some(projected), Some(committed)) => {
+                if committed.phase3.is_some()
+                    || committed.state_revision >= projected.state_revision
+                {
+                    self.save_run(&committed)?;
+                    committed
+                } else {
+                    projected
+                }
+            }
+            (Some(projected), None) => projected,
+            (None, Some(committed)) => {
+                self.save_run(&committed)?;
+                committed
+            }
+            (None, None) => bail!("run {id} has no readable metadata or committed projection"),
+        };
         anyhow::ensure!(
             run.id == id,
             "run metadata identity does not match directory {id}"
         );
+        if let Some(database) = database {
+            crate::orchestrator::phase3::repair_abandoned(self, &database, &mut run)?;
+            if let Some(policy) = &mut run.phase3 {
+                policy.questions = database.questions_for_run(&id)?;
+            }
+            if let Some(admission) = database.admission_summary_for_run(&id)? {
+                run.admission = Some(admission);
+            }
+            self.repair_event_projection(&id, &database.events_for_run(&id)?)?;
+        }
         Ok(run)
+    }
+
+    fn repair_event_projection(&self, run_id: &str, events: &[EventRecord]) -> Result<()> {
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, event)?;
+            bytes.push(b'\n');
+        }
+        let path = self.events_path(run_id);
+        if fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        let parent = path.parent().context("events path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join("events.jsonl.tmp");
+        fs::write(&temporary, bytes)?;
+        fs::rename(temporary, path)?;
+        Ok(())
     }
 
     pub fn resolve_run_id(&self, id_or_prefix: &str) -> Result<String> {
@@ -122,7 +177,7 @@ impl State {
             "invalid run ID or prefix: {id_or_prefix:?}"
         );
         let normalized = id_or_prefix.to_ascii_uppercase();
-        if self.metadata_path(&normalized).is_file() {
+        if self.run_dir(&normalized).is_dir() {
             return Ok(normalized);
         }
         let mut matches = Vec::new();
@@ -133,7 +188,7 @@ impl State {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(&normalized) && entry.path().join("metadata.json").is_file() {
+                if name.starts_with(&normalized) {
                     matches.push(name);
                 }
             }

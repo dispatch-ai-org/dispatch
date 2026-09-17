@@ -1,0 +1,14 @@
+{
+  "scenario": "large-color",
+  "marker": "changed-file-index",
+  "presentation_env": {
+    "TERM": "xterm-256color",
+    "COLORTERM": "truecolor",
+    "DISPATCH_COLOR": "truecolor"
+  },
+  "seconds": 7.4096,
+  "bytes": 7630,
+  "width": 100,
+  "height": 30,
+  "sha256": "6b018d9b3ef14853502473981384ea32e3b1db521cb563c96acaaa6e6395f6c8"
+}
