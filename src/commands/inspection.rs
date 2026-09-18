@@ -46,18 +46,37 @@ pub(crate) fn artifact(
         .result
         .as_ref()
         .context("not_ready: immutable attempt artifacts unavailable")?;
+    let final_diff = matches!(kind, ArtifactKind::FinalDiff);
     let path = match kind {
+        ArtifactKind::FinalDiff => {
+            ensure!(
+                run.phase3
+                    .as_ref()
+                    .and_then(|p| p.final_attempt_id.as_deref())
+                    == Some(attempt_id),
+                "unauthorized final artifact identity"
+            );
+            crate::planning::verify_delivery(&run)?;
+            &run.candidates
+                .first()
+                .context("not_ready: no final delivery")?
+                .diff_path
+        }
         ArtifactKind::Diff => &candidate.diff_path,
         ArtifactKind::Stdout => &candidate.stdout_path,
         ArtifactKind::Stderr => &candidate.stderr_path,
     };
     let resolved = path.canonicalize()?;
-    let expected = scope
-        .state_root
-        .join("runs")
-        .join(id)
-        .join("attempts")
-        .join(attempt_id);
+    let expected = if final_diff {
+        scope.state_root.join("runs").join(id).join("delivery")
+    } else {
+        scope
+            .state_root
+            .join("runs")
+            .join(id)
+            .join("attempts")
+            .join(attempt_id)
+    };
     ensure!(
         expected.canonicalize()? == expected && resolved.starts_with(&expected),
         "unauthorized artifact path"
@@ -89,7 +108,7 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
         run.outcome.lifecycle == LifecycleState::Finished,
         "not_ready: execution has not finished"
     );
-    let artifacts: Vec<Value> = run
+    let mut artifacts: Vec<Value> = run
         .attempts
         .iter()
         .filter(|a| a.detail.result.is_some())
@@ -102,6 +121,11 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
             .map(|kind| json!({"run_id":id,"attempt_id":a.id,"kind":kind}))
         })
         .collect();
+    if let Some(p) = crate::planning::planning(&run)
+        && p.final_candidate.is_some()
+    {
+        artifacts.push(json!({"run_id":id,"attempt_id":run.phase3.as_ref().unwrap().final_attempt_id,"kind":"final_diff"}));
+    }
     let mut value = json!({"result_id":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"delivery_revision":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"result":orchestrator::run_result(&run),"candidates":run.candidates,"baseline_checks":run.baseline_checks,"artifacts":artifacts});
     remove_paths(&mut value);
     Ok(value)
@@ -110,7 +134,11 @@ fn remove_paths(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|k, _| {
-                !k.ends_with("_path") && k != "input_baseline" && k != "private_evidence"
+                !k.ends_with("_path")
+                    && !matches!(
+                        k.as_str(),
+                        "input_baseline" | "private_evidence" | "path" | "patch" | "manifest"
+                    )
             });
             for v in map.values_mut() {
                 remove_paths(v)

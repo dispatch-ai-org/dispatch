@@ -708,6 +708,7 @@ impl AdmissionCoordinator {
             transaction.commit()?;
             anyhow::bail!("launch deferred: {reason}");
         }
+        crate::planning::fence(&transaction, &token.attempt_id)?;
         let changed = transaction.execute(
             "UPDATE pool_leases SET launch_lifecycle='spawn_may_have_occurred',launch_observation_id=?6 WHERE pool_id=?1 AND request_id=?2 AND owner_session=?3 AND generation=?4 AND fence=?5 AND launch_lifecycle='launch_intent_committed'",
             params![token.pool_id, token.request_id, token.owner_session, integer(token.generation)?, integer(token.fence)?, newest.id],

@@ -1,4 +1,5 @@
 pub(crate) mod phase3;
+mod planned;
 pub use phase3::{QuestionCommand, answer_question, cancel_question};
 use std::{
     collections::{HashSet, VecDeque},
@@ -113,6 +114,8 @@ const EVALUATION_REASONS: &[&str] = &[
 ];
 
 pub struct RunRequest {
+    pub plan: bool,
+    pub max_invocations: Option<u32>,
     pub source: PathBuf,
     pub task: String,
     pub harnesses: Vec<String>,
@@ -635,6 +638,7 @@ fn authorize_local_commands(label: &str, output: RunOutputMode) -> Result<()> {
 }
 
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
+    let preparation_started = Utc::now();
     RUN_OUTPUT_MODE.store(request.output.code(), Ordering::Relaxed);
     anyhow::ensure!(!request.task.trim().is_empty(), "task must not be empty");
     let source_path = source::resolve_source(Some(&request.source))?;
@@ -665,6 +669,25 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     );
 
     let resources = crate::commands::resources(state)?;
+    if request.plan {
+        anyhow::ensure!(
+            resources.allocation_enabled
+                && resources.capacity.admission
+                && !request.route
+                && request.harnesses.is_empty(),
+            "planned mode requires included-resource allocation and shared admission"
+        );
+        crate::planning::validate_policy(&source_path, &config)?;
+        anyhow::ensure!(
+            request.max_invocations.is_none_or(|v| (2..=6).contains(&v)),
+            "planned budget must be between two and six invocations"
+        );
+    } else {
+        anyhow::ensure!(
+            request.max_invocations.is_none_or(|v| (1..=2).contains(&v)),
+            "direct mode permits at most two invocations"
+        );
+    }
     let allocation_requested =
         (resources.allocation_enabled && !request.route && request.harnesses.is_empty())
             || request.model.is_some()
@@ -679,7 +702,14 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         local_authorized = true;
     }
     let (mut harnesses, routing, allocation) = if allocation_requested {
-        let features = classify_task(&source_path, &request.task)?;
+        let features = if request.plan {
+            crate::TaskFeatures {
+                scope: crate::TaskScope::Broad,
+                ..Default::default()
+            }
+        } else {
+            classify_task(&source_path, &request.task)?
+        };
         let decision = select_available_resource(
             state,
             &source_path,
@@ -689,7 +719,8 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
-            true,
+            !request.plan,
+            request.plan.then_some(crate::ResourceTier::Strong),
         )
         .await?;
         (
@@ -732,6 +763,25 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     );
     let fixed_model = request.model.clone().or(fixed_config.model.clone());
     let fixed_effort = request.effort.clone().or(fixed_config.effort.clone());
+    if request.plan {
+        anyhow::ensure!(
+            allocation
+                .as_ref()
+                .is_some_and(|d| d.selected.tier == crate::ResourceTier::Strong),
+            "planned mode requires a suitable strong planner within the explicit constraints"
+        );
+        if request.output == RunOutputMode::Human {
+            println!(
+                "Planned mode: one planner, up to four sequential tasks, one shared extra; at most {} invocations within {} seconds. Final human review required.",
+                request
+                    .max_invocations
+                    .unwrap_or(6)
+                    .min(crate::commands::invocation_limit(true)),
+                config.execution.timeout_secs
+            );
+        }
+    }
+    let unbound_config = config.clone();
     if let Some(decision) = &allocation {
         config.harnesses.bind(&decision.selected, &resources);
     }
@@ -881,11 +931,18 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     };
     if run.mode == RunMode::Allocation {
         run.phase3 = Some(crate::GoalExecution {
-            max_invocations: crate::commands::invocation_limit(),
-            deadline_at: run.created_at
-                + chrono::TimeDelta::seconds(
-                    i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
-                ),
+            planning: None,
+            max_invocations: request
+                .max_invocations
+                .unwrap_or(if request.plan { 6 } else { 2 })
+                .min(crate::commands::invocation_limit(request.plan)),
+            deadline_at: if request.plan {
+                preparation_started
+            } else {
+                run.created_at
+            } + chrono::TimeDelta::seconds(
+                i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
+            ),
             no_retry: request.no_retry,
             fixed_harness,
             fixed_model,
@@ -900,6 +957,34 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             questions: Vec::new(),
         });
     }
+    if request.plan {
+        run.phase3.as_mut().unwrap().planning = Some(crate::planning::Planning {
+            version: 1,
+            revision: Ulid::new().to_string(),
+            approved_checks: crate::planning::catalog(&config.checks.verify),
+            owner_policy: config.planning.clone(),
+            plan: None,
+            tasks: vec![],
+            snapshots: vec![crate::planning::Snapshot {
+                id: Ulid::new().to_string(),
+                path: run.baseline_path.clone(),
+                fingerprint: run.source_fingerprint.clone(),
+                parent: None,
+                contribution: None,
+            }],
+            artifacts: vec![],
+            final_candidate: None,
+            final_patch_sha256: None,
+            root_checks: vec![],
+            error: None,
+        });
+        run.phase3.as_mut().unwrap().provenance = "planned_policy_chain".into();
+        config = unbound_config;
+        write_text(
+            &run_dir.join("config.snapshot.yml"),
+            &serde_yaml::to_string(&config)?,
+        )?;
+    }
     let _deadline = phase3::DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
     let created_event = EventRecord {
         run_id: run.id.clone(),
@@ -913,7 +998,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         }),
         ..EventRecord::default()
     };
-    let created = db.create_run(&mut run, created_event)?;
+    let created = db.commit_run_transition(&mut run, created_event)?;
     publish_event(state, created, &run)?;
 
     persist_event(
@@ -1022,6 +1107,18 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &mut run,
     )?;
 
+    if request.plan {
+        return planned::drive(
+            state,
+            &mut db,
+            run,
+            config,
+            resources,
+            cancellation,
+            request.output,
+        )
+        .await;
+    }
     if run.mode == RunMode::Allocation {
         return phase3::drive(
             state,
@@ -1954,6 +2051,7 @@ fn print_single_result_summary(
 }
 
 struct CandidateExecution {
+    final_result: std::result::Result<String, String>,
     usage_categories: std::collections::BTreeMap<String, u64>,
     checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
     admission_released: bool,
@@ -1980,6 +2078,7 @@ async fn select_available_resource(
     model: Option<&str>,
     effort: Option<&str>,
     new_goal: bool,
+    minimum: Option<crate::ResourceTier>,
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
     let db = Database::open(state.db_path())?;
@@ -2115,7 +2214,7 @@ async fn select_available_resource(
             }
         }
     }
-    let mut decision = crate::router::select_resource_filtered(
+    let mut decision = crate::router::select_resource_filtered_lane(
         resources,
         features,
         &config.execution.backend,
@@ -2124,6 +2223,7 @@ async fn select_available_resource(
         None,
         None,
         &exclusions,
+        minimum,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -2238,6 +2338,7 @@ async fn execute_candidate(
         let mut request = HarnessRunRequest::new(&candidate.workspace_path, prompt, &candidate_dir)
             .with_timeout(timeout)
             .with_cancellation(cancellation.clone());
+        request.read_only = config.harnesses.get(&candidate.harness_id).read_only;
         if let Some((coordinator, token, _)) = &admission {
             request = request.with_observer(Arc::new(AdmissionLeaseObserver::new(
                 coordinator.clone(),
@@ -2257,12 +2358,14 @@ async fn execute_candidate(
         (None, _) => true,
     };
 
+    let mut final_result = Err("invocation did not return a final result".into());
     let mut checkpoint = None;
     let mut usage_categories = std::collections::BTreeMap::new();
     let mut failure;
     let mut identities = (None, None, None, None, None, None);
     match execution {
         Ok(result) => {
+            final_result = result.final_result;
             usage_categories = result.usage_categories;
             failure = result.failure;
             if admission.is_some()
@@ -2371,6 +2474,7 @@ async fn execute_candidate(
         }
     }
     CandidateExecution {
+        final_result,
         usage_categories,
         checkpoint,
         admission_released,
@@ -3226,6 +3330,7 @@ pub(crate) fn review_target(
         "run has a foreground owner",
     )?;
     let run = state.load_run(&id)?;
+    crate::planning::verify_delivery(&run)?;
     anyhow::ensure!(
         run.state_revision == command.revision,
         "stale review; the result changed"
@@ -3704,6 +3809,7 @@ fn apply_locked(
         run.id,
         run.status.as_str()
     );
+    crate::planning::verify_delivery(&run)?;
     let candidate = find_candidate(&run, candidate_label)?;
     let normalized_label = candidate.label.clone();
     let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
@@ -4238,6 +4344,8 @@ mod tests {
                     run_dispatch(
                         &state,
                         RunRequest {
+                            plan: false,
+                            max_invocations: None,
                             source: project,
                             task: "Deterministic handoff fixture".into(),
                             harnesses: vec![],

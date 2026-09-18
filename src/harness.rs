@@ -136,6 +136,7 @@ pub struct HarnessTelemetry {
 
 #[derive(Debug, Clone)]
 pub struct HarnessRunRequest {
+    pub read_only: bool,
     pub workspace: PathBuf,
     pub prompt: String,
     pub output_dir: PathBuf,
@@ -151,6 +152,7 @@ impl HarnessRunRequest {
         output_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
+            read_only: false,
             workspace: workspace.into(),
             prompt: prompt.into(),
             output_dir: output_dir.into(),
@@ -178,6 +180,7 @@ impl HarnessRunRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessRunResult {
+    pub final_result: std::result::Result<String, String>,
     #[serde(default)]
     pub usage_categories: std::collections::BTreeMap<String, u64>,
     pub harness_id: String,
@@ -216,6 +219,10 @@ pub trait HarnessAdapter: Send + Sync {
 
     /// Constructs argv only. Process spawning remains the executor's job.
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec>;
+
+    fn final_result(&self, _stdout: &str) -> std::result::Result<String, String> {
+        Err("structured final results unsupported by this adapter".into())
+    }
 
     fn checkpoint(
         &self,
@@ -292,12 +299,14 @@ pub async fn run_harness(
     if let (Some(observer), Some(failure)) = (&request.observer, telemetry.failure) {
         observer.provider_failure(failure)?;
     }
+    let final_result = adapter.final_result(&execution.raw_stdout_lossy());
     execution.clear_raw_capture();
 
     let requested_model = adapter.model().map(str::to_owned);
     let requested_effort = adapter.effort().map(str::to_owned);
 
     Ok(HarnessRunResult {
+        final_result,
         usage_categories: telemetry.usage_categories,
         harness_id: adapter.id().into(),
         harness_version: harness_version.or(telemetry.harness_version.clone()),
@@ -396,6 +405,10 @@ impl HarnessAdapter for ClaudeAdapter {
         claude::checkpoint(events)
     }
 
+    fn final_result(&self, stdout: &str) -> std::result::Result<String, String> {
+        structured_final(stdout, "claude")
+    }
+
     fn parse_output(&self, stdout: &str, _stderr: &str) -> HarnessTelemetry {
         claude::parse_output(
             stdout,
@@ -458,12 +471,21 @@ impl HarnessAdapter for CodexAdapter {
         codex_checkpoint(events)
     }
 
+    fn final_result(&self, stdout: &str) -> std::result::Result<String, String> {
+        structured_final(stdout, "codex")
+    }
+
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
         let mut args = vec![
             "exec".into(),
             "--ephemeral".into(),
             "--sandbox".into(),
-            "workspace-write".into(),
+            if request.read_only {
+                "read-only"
+            } else {
+                "workspace-write"
+            }
+            .into(),
             "--json".into(),
             "-C".into(),
             ".".into(),
@@ -890,6 +912,50 @@ fn field_f64(value: &Value, names: &[&str]) -> Option<f64> {
         .find_map(|name| value.get(*name).and_then(Value::as_f64))
 }
 
+/// Strict final boundary for plans and scoped dependency reports; never scan fragments.
+fn structured_final(stdout: &str, harness: &str) -> std::result::Result<String, String> {
+    (|| -> Result<String> {
+        let events = stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let last = events.last().context("missing final event")?;
+        let text = if harness == "claude" {
+            anyhow::ensure!(
+                last["type"] == "result"
+                    && last["subtype"] == "success"
+                    && last["is_error"] == false
+                    && events.iter().filter(|e| e["type"] == "result").count() == 1,
+                "missing or nonfinal successful result"
+            );
+            last["result"].as_str().context("malformed final result")?
+        } else {
+            anyhow::ensure!(
+                last["type"] == "turn.completed"
+                    && !events
+                        .iter()
+                        .any(|e| matches!(e["type"].as_str(), Some("error" | "turn.failed"))),
+                "missing or failed terminal turn"
+            );
+            let message = events
+                .iter()
+                .rev()
+                .find(|e| e["type"] == "item.completed" && e["item"]["type"] == "agent_message")
+                .context("missing final agent message")?;
+            message["item"]["text"]
+                .as_str()
+                .context("malformed final agent message")?
+        };
+        anyhow::ensure!(
+            text.len() <= 32768,
+            "structured final result exceeds 32 KiB"
+        );
+        Ok(text.to_owned())
+    })()
+    .map_err(|e| e.to_string())
+}
+
 /// Only the last completed `agent_message` item can supply a checkpoint.
 /// Its text must be a string containing one bounded, versioned JSON envelope.
 /// A malformed final item fails closed; earlier malformed items cannot hide a
@@ -961,6 +1027,7 @@ mod tests {
     fn constructs_current_official_agent_commands() {
         let temp = tempfile::tempdir().unwrap();
         let configured = HarnessConfig {
+            read_only: false,
             model: Some("test-model".into()),
             effort: Some("high".into()),
             executable: Some(PathBuf::from("custom-agent")),

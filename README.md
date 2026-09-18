@@ -57,6 +57,12 @@ change must be explicitly revalidated before real work can launch.
 Phase 4 implementation and the current release gates are recorded in
 [the first dogfood release report](docs/phase4-dogfood-release.md).
 
+For an explicitly multipart goal, opt in with `/plan <goal>` in the composer or
+`dispatch run /path/to/project --task 'Goal' --plan`. Planning uses one planner,
+up to four sequential tasks and one shared extra under one deadline, with one
+final review. It requires an owner-approved check contract and suitable included
+profiles. Ordinary goals remain direct. See [bounded planned work](docs/planning.md).
+
 ## Machine control
 
 `dispatch control --stdio` provides scoped, foreground JSONL requests, replayable
@@ -468,8 +474,8 @@ No Cloud service is required to create, execute, inspect, accept, or reject a ta
 - Real-agent release testing centers on Codex CLI and Cursor Agent; agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Public evidence is observational benchmark evidence, not ground truth, a quality label, confidence, or calibrated probability.
 - If no compatible public evidence exists, the deterministic fallback order is the existing real-adapter order: Claude Code, then Codex, then Cursor, restricted to agents detected as locally executable.
-- Local empirical observations do not influence routing yet.
-- No automatic retry, escalation, task decomposition, agent racing in normal mode, ML, embeddings, LLM judging, background refresh, or Cloud routing lookup exists.
+- Phase 7 private evidence supports explicit owner-controlled trials; no private policy is activated automatically.
+- Direct allocation has bounded recovery. Task decomposition is opt-in and sequential; no agent racing, learned planner, ML, embeddings, LLM judging, background refresh, daemon, or Cloud routing lookup is added. Planning effectiveness remains unmeasured.
 
 ## Development
 

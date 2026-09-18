@@ -270,6 +270,8 @@ pub enum ApplicationState {
 #[serde(rename_all = "snake_case")]
 pub enum RunPhase {
     Preparing,
+    Planning,
+    Integrating,
     Executing,
     Verifying,
     Reviewing,
@@ -784,6 +786,8 @@ pub struct RunResult {
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalExecution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<crate::planning::Planning>,
     pub max_invocations: u32,
     pub deadline_at: DateTime<Utc>,
     pub no_retry: bool,
@@ -804,6 +808,14 @@ pub struct GoalExecution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumed_artifacts: Vec<String>,
     #[serde(default)]
     pub usage_categories: std::collections::BTreeMap<String, u64>,
     pub parent_attempt_id: Option<String>,

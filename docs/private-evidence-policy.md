@@ -259,3 +259,24 @@ maximum serious rework/regressions, and tolerable end-to-end latency increase. I
 review or optional repair coverage cannot support a guardrail, report that guardrail
 as unresolved. These choices are prospective trial conditions, not new automatic
 promotion logic or an assertion that 20 goals establishes causality.
+
+## Planned goals after Phase 8
+
+An opt-in planned root is one allocation-policy outcome. Planner, initial child,
+repair and continuation attempts retain separate identities and provider telemetry;
+one root review never creates child reviews or fills the twenty-review gate.
+The existing combined/continued-delivery exclusion applies even to a failed
+single-planner goal. Planned selection uses deterministic contract rules and never
+applies the standalone private-quality rule to a child. No threshold, historical
+decision snapshot, live activation or versioned sync envelope is changed.
+
+Prepared/actual/unknown launch categories remain separate. Initial child tasks are
+not mislabeled as continuations. For planned roots, committed check-finished events
+account for baseline, child, child-input comparison and root verification without
+counting the final projection twice. All harness invocations contribute burden;
+provider usage categories stay separate, cost/allowance and unmeasured human effort
+stay unknown. The existing end-to-end metric spans root creation through completion, including
+integration and later preparation. Initial discovery/source capture precede that
+metric, although the planned deadline starts before them; do not present it as
+complete submission latency. No component timing or savings estimate is fabricated.
+Fixture acceptance is explicitly scripted provenance, never human-quality data.

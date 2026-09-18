@@ -387,6 +387,24 @@ fn summarize(
         origin_counts.goals += 1;
         out.counts.goals += 1;
         let economics = out.economics.entry(origin.into()).or_default();
+        let planned = crate::planning::planning(&run).is_some();
+        if planned {
+            // Committed check events include baseline, child-input comparisons and
+            // root integration checks, without counting the final projection twice.
+            let mut checks = c.prepare("SELECT payload_json FROM events WHERE run_id=?1 AND event_type='check.finished' AND timestamp<=?2 ORDER BY sequence")?;
+            for row in checks.query_map(
+                params![
+                    run.id,
+                    cutoff.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+                |r| r.get::<_, String>(0),
+            )? {
+                let value: Value = serde_json::from_str(&row?)?;
+                if let Some(ms) = value.get("duration_ms").and_then(Value::as_u64) {
+                    economics.verification_ms.add(ms);
+                }
+            }
+        }
         economics.allowance_attribution =
             "unknown_or_mixed_pool_activity; provider units are not interchangeable".into();
         if let Some(completed) = run.completed_at {
@@ -449,8 +467,10 @@ fn summarize(
                 if launched || result.duration_ms > 0 {
                     economics.harness_ms.add(result.duration_ms);
                 }
-                for check in &result.checks {
-                    economics.verification_ms.add(check.duration_ms);
+                if !planned {
+                    for check in &result.checks {
+                        economics.verification_ms.add(check.duration_ms);
+                    }
                 }
                 for (category, value) in &attempt.detail.usage_categories {
                     economics
@@ -521,6 +541,10 @@ fn summarize(
         bump(&mut out.counts.first_attempt_checks, first_checks);
         bump(&mut origin_counts.first_attempt_checks, first_checks);
         for attempt in run.attempts.iter().skip(1) {
+            // Initial children are part of the planned allocation policy, not retries.
+            if attempt.role == "task" {
+                continue;
+            }
             out.counts.continuations += 1;
             origin_counts.continuations += 1;
             let trigger = if attempt.detail.reason.as_deref() == Some("target_verification_failure")

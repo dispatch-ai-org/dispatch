@@ -1,0 +1,21 @@
+  o Update a.c within its stated contract - fixture-light - Waiting
+  o Update b.c within its stated contract - fixture-standard - Pending
+    requires checked output: a
+  2 of 6 invocation records - one shared extra
+  Which positive value?
+  2 / 3
+  Goal  Update the C components and their dependency
+
+  Failed
+  * goal == * fixture-light -- o verify -- o review
+  Verification has not run
+  Planned work - sequential execution
+  x Update a.c within its stated contract - fixture-light - Failed
+  o Update b.c within its stated contract - fixture-standard - Pending
+    requires checked output: a
+  Stopped: original deadline expired while awaiting clarification
+  2 of 6 invocation records - one shared extra
+  The shared deadline expired; no continuation time remains.
+  Work stopped. [i] details  [n] next goal
+  >
+  Enter choose - Ctrl+C back - Ctrl+D exit

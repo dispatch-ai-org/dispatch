@@ -1,0 +1,6 @@
+  *-+-o  DISPATCH
+    +-o  source
+  What do you want to accomplish?
+  Use /plan before a goal for bounded sequential planning.
+  >
+  Enter send - Alt+Enter newline - Ctrl+C cancel - Ctrl+D exit

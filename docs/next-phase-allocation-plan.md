@@ -18,6 +18,19 @@ Split proposals that mix these categories so a host accommodation cannot become 
 
 This clarification updates Phase 5 priority and acceptance criteria. It does not start Phase 5 implementation or reopen completed Phase 0–4 execution semantics. The original dated implementation audit and historical sequencing notes below remain historical context.
 
+## Approved Phase 8 sequencing adjustment — September 18, 2026
+
+The founder authorized implementation of the bounded, opt-in planning experiment
+before twenty comparable Phase 7 reviews or demonstrated savings. This changes the
+implementation sequence only. Phase 7 screening thresholds and live private policy
+remain unchanged. Evidence is still required before making planning the default or
+claiming improved economics. The implemented v1 uses one planner, at most four
+sequential tasks, and one extra invocation shared across repair and continuation,
+with an absolute ceiling of six and one original deadline. See
+[the implementation guide](planning.md), [validation](phase8-validation.md), and
+[functional freeze/design handoff](phase8-design-handoff.md). Historical gates below
+remain relevant to empirical claims and default changes.
+
 ## A. Product thesis
 
 Dispatch should become the local allocation layer between a software goal and the coding resources available to accomplish it. Its first promise is concrete: **get more accepted, verified software work from the subscriptions a developer already owns**. The developer states an outcome; Dispatch chooses a suitable harness and model configuration, executes in an isolated candidate workspace, verifies the result, and makes review and acceptance straightforward.

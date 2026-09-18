@@ -50,6 +50,7 @@ fn unresolved_admission(db: &Database, id: &str) -> Result<bool> {
 }
 
 fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str) -> Result<()> {
+    crate::planning::stop_active(run, reason);
     run.status = RunStatus::Interrupted;
     run.completed_at = Some(Utc::now());
     run.outcome.lifecycle = LifecycleState::Finished;
@@ -76,7 +77,12 @@ fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str
 
 // Called only after this foreground owner's work/guards have returned. Read
 // the committed projection so a publication error cannot rewrite evidence.
-fn finish_error<T>(state: &State, db: &Database, id: &str, result: Result<T>) -> Result<T> {
+pub(super) fn finish_error<T>(
+    state: &State,
+    db: &Database,
+    id: &str,
+    result: Result<T>,
+) -> Result<T> {
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
@@ -104,6 +110,45 @@ fn finish_error<T>(state: &State, db: &Database, id: &str, result: Result<T>) ->
 }
 
 pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord) -> Result<()> {
+    if run
+        .phase3
+        .as_ref()
+        .is_some_and(|p| p.planning.is_some() && Utc::now() >= p.deadline_at)
+        && run.outcome.lifecycle == LifecycleState::Waiting
+        && run.outcome.waiting_on == WaitingOn::Human
+        && let Ok(_lock) = OperationLock::acquire(
+            &state.run_dir(&run.id).join(".operation.lock"),
+            "run is supervised",
+        )
+        && let Some(mut current) = db.committed_run_projection(&run.id)?
+        && current.outcome.waiting_on == WaitingOn::Human
+    {
+        let policy = current.phase3.as_mut().unwrap();
+        for question in policy
+            .questions
+            .iter_mut()
+            .filter(|q| q.state == QuestionState::Pending)
+        {
+            question.state = QuestionState::Cancelled;
+            question.revision += 1;
+            question.resolved_at = Some(Utc::now());
+            question.actor_uid = Some(policy.owner_uid);
+            question.actor = Some("original_deadline".into());
+        }
+        if let Some(p) = policy.planning.as_mut() {
+            p.error = Some("original deadline expired while awaiting clarification".into());
+        }
+        let mut writer = Database::open_control(state.db_path())?;
+        stop(
+            state,
+            &mut writer,
+            &mut current,
+            FailureKind::Deadline,
+            "original deadline expired while awaiting clarification",
+        )?;
+        *run = current;
+        return Ok(());
+    }
     if !expects_execution(run) {
         return Ok(());
     }
@@ -141,9 +186,10 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
     // leave that uncertainty to the existing supervision/reconciliation path.
     if expects_execution(run)
         && gone
-        && !run.attempts.is_empty()
-        && run.attempts.iter().all(|a| a.completed_at.is_some())
-        && !unresolved_admission(db, &run.id)?
+        && (run.phase3.as_ref().is_some_and(|p| p.planning.is_some())
+            || (!run.attempts.is_empty()
+                && run.attempts.iter().all(|a| a.completed_at.is_some())
+                && !unresolved_admission(db, &run.id)?))
     {
         interrupt_run(
             state,
@@ -155,7 +201,7 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
     Ok(())
 }
 
-fn transition(
+pub(super) fn transition(
     state: &State,
     db: &Database,
     run: &mut RunRecord,
@@ -175,6 +221,27 @@ fn transition(
         },
         run,
     )
+}
+
+pub(super) fn sync_transition(
+    state: &State,
+    db: &mut Database,
+    run: &mut RunRecord,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    let event = db.commit_run_transition(
+        run,
+        EventRecord {
+            run_id: run.id.clone(),
+            attempt_id: run.attempts.last().map(|a| a.id.clone()),
+            event_type: kind.into(),
+            timestamp: Utc::now(),
+            payload,
+            ..Default::default()
+        },
+    )?;
+    publish_event(state, event, run)
 }
 
 pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
@@ -248,6 +315,7 @@ pub(super) fn stop(
     failure: FailureKind,
     reason: &str,
 ) -> Result<()> {
+    crate::planning::stop_active(run, reason);
     if RUN_OUTPUT_MODE.load(Ordering::Relaxed) != RunOutputMode::Silent.code() {
         eprintln!("{reason}");
     }
@@ -277,13 +345,21 @@ pub(super) fn stop(
     };
     if let Some(attempt) = run.attempts.last_mut().filter(|a| a.completed_at.is_none()) {
         attempt.completed_at = run.completed_at;
-        attempt.outcome = "not_launched".into();
+        let knowledge: Option<String> = db.connection().query_row("SELECT launch_knowledge FROM admission_requests WHERE attempt_id=?1 ORDER BY enqueued_at DESC LIMIT 1",[&attempt.id],|r|r.get(0)).optional()?;
+        attempt.outcome = if knowledge
+            .as_deref()
+            .is_none_or(|k| matches!(k, "launch_intent_committed" | "launch_not_started"))
+        {
+            "not_launched"
+        } else {
+            "interrupted"
+        }
+        .into();
         attempt.detail.failure = Some(failure);
         attempt.detail.capacity = run.capacity.clone();
         attempt.detail.admission = run.admission.clone().filter(|a| a.attempt_id == attempt.id);
     }
-    db.sync_run(run)?;
-    transition(
+    sync_transition(
         state,
         db,
         run,
@@ -308,7 +384,10 @@ fn rank(tier: &ResourceTier) -> u8 {
     }
 }
 
-fn verification_failure(run: &RunRecord, candidate: &CandidateRecord) -> Option<FailureKind> {
+pub(super) fn verification_failure(
+    run: &RunRecord,
+    candidate: &CandidateRecord,
+) -> Option<FailureKind> {
     // Required checks must all be evaluable before any target failure can
     // justify spending. Missing exits include signals and failed spawns.
     if candidate
@@ -415,6 +494,7 @@ async fn recovery_route(
             Some(&p.model),
             p.effort.as_deref(),
             false,
+            None,
         )
         .await
         {
@@ -429,7 +509,7 @@ async fn recovery_route(
     blocked
 }
 
-fn diagnostics(attempt: &AttemptRecord) -> String {
+pub(super) fn diagnostics(attempt: &AttemptRecord) -> String {
     let Some(candidate) = &attempt.detail.result else {
         return String::new();
     };
@@ -461,9 +541,6 @@ fn prepare(
     decision: AllocationDecision,
     reason: Option<String>,
 ) -> Result<CandidateRecord> {
-    let id = Ulid::new().to_string();
-    let dir = state.run_dir(&run.id).join("attempts").join(&id);
-    let workspace = source::create_candidate_workspace(&run.baseline_path, &dir.join("workspace"))?;
     let mut prompt = run.exact_prompt.clone();
     if let Some(parent) = run.attempts.last() {
         prompt.push_str(&format!("\n\n{}", diagnostics(parent)));
@@ -483,6 +560,21 @@ fn prepare(
         ));
     }
     prompt.push_str("\nIf an essential ambiguity prevents safe completion, stop work and emit exactly this JSON as your final agent message: {\"dispatch_checkpoint\":{\"version\":1,\"question\":\"the essential question\",\"choices\":[]}}. You may add \"category\":\"factual\" inside dispatch_checkpoint only for factual task clarification. Omit category for funding, unsafe execution, permissions, or human review decisions. Do not wait in a live process. Otherwise complete the task normally.\n");
+    let input = run.baseline_path.clone();
+    prepare_input(state, run, decision, reason, &input, &prompt)
+}
+
+pub(super) fn prepare_input(
+    state: &State,
+    run: &mut RunRecord,
+    decision: AllocationDecision,
+    reason: Option<String>,
+    input: &Path,
+    prompt: &str,
+) -> Result<CandidateRecord> {
+    let id = Ulid::new().to_string();
+    let dir = state.run_dir(&run.id).join("attempts").join(&id);
+    let workspace = source::create_candidate_workspace(input, &dir.join("workspace"))?;
     let candidate = CandidateRecord {
         id: id.clone(),
         label: "A".into(),
@@ -505,12 +597,12 @@ fn prepare(
         diff_stats: DiffStats::default(),
         checks: vec![],
     };
-    write_text(&candidate.prompt_path, &prompt)?;
+    write_text(&candidate.prompt_path, prompt)?;
     run.attempts.push(AttemptRecord {
         detail: AttemptDetail {
             parent_attempt_id: run.attempts.last().map(|a| a.id.clone()),
             reason,
-            input_baseline: Some(run.baseline_path.clone()),
+            input_baseline: Some(input.to_path_buf()),
             decision: Some(decision.clone()),
             ..Default::default()
         },
@@ -871,9 +963,8 @@ async fn drive_inner(
         } else {
             RunStatus::Failed
         };
-        db.sync_run(&run)?;
         let payload = serde_json::json!({"outcome":run.outcome});
-        transition(state, db, &mut run, "run.finished", payload)?;
+        sync_transition(state, db, &mut run, "run.finished", payload)?;
         break;
     }
     emit(&run, output)?;
@@ -999,6 +1090,10 @@ pub async fn answer_question(
     let cancellation = operation_cancellation();
     let _signals = SignalListener::install(cancellation.clone());
     let _deadline = DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
+    if run.phase3.as_ref().is_some_and(|p| p.planning.is_some()) {
+        return super::planned::drive(state, &mut db, run, config, resources, cancellation, output)
+            .await;
+    }
     drive(state, &mut db, run, config, resources, cancellation, output).await
 }
 

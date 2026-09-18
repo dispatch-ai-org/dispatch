@@ -40,6 +40,8 @@ pub const OPERATIONS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
+    #[serde(default)]
+    pub allow_plan: bool,
     pub principal: String,
     pub owner_uid: u32,
     pub source: PathBuf,
@@ -75,8 +77,30 @@ pub fn grant(
     allow_unsafe_local: bool,
     delegate_factual: bool,
 ) -> Result<PathBuf> {
+    grant_mode(
+        state,
+        source,
+        timeout_secs,
+        max_invocations,
+        allow_unsafe_local,
+        delegate_factual,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grant_mode(
+    state: &State,
+    source: &Path,
+    timeout_secs: u64,
+    max_invocations: u32,
+    allow_unsafe_local: bool,
+    delegate_factual: bool,
+    allow_plan: bool,
+) -> Result<PathBuf> {
     ensure!(
-        (1..=86400).contains(&timeout_secs) && (1..=2).contains(&max_invocations),
+        (1..=86400).contains(&timeout_secs)
+            && (1..=if allow_plan { 6 } else { 2 }).contains(&max_invocations),
         "invalid grant limits"
     );
     state.initialize()?;
@@ -107,7 +131,15 @@ pub fn grant(
         .collect::<std::result::Result<_, _>>()?;
     ensure!(!profiles.is_empty(), "no included authorized resources");
     let principal = ulid::Ulid::new().to_string();
+    if allow_plan {
+        ensure!(
+            max_invocations >= 2,
+            "planned grant needs room for a planner and at least one task"
+        );
+        crate::planning::validate_policy(&source, &config)?;
+    }
     let scope = Scope {
+        allow_plan,
         principal: principal.clone(),
         owner_uid: uid(),
         source: source.clone(),
@@ -301,8 +333,11 @@ pub(crate) fn actor() -> Option<String> {
 pub(crate) fn private_policy_revision() -> Option<u64> {
     CALLER.try_with(|c| c.scope.private_policy_revision).ok()
 }
-pub(crate) fn invocation_limit() -> u32 {
-    CALLER.try_with(|c| c.scope.max_invocations).unwrap_or(2)
+pub(crate) fn invocation_limit(planned: bool) -> u32 {
+    CALLER
+        .try_with(|c| c.scope.max_invocations)
+        .unwrap_or(if planned { 6 } else { 2 })
+        .min(if planned { 6 } else { 2 })
 }
 
 pub(crate) fn validate_submission(
@@ -313,6 +348,10 @@ pub(crate) fn validate_submission(
     CALLER
         .try_with(|c| {
             c.scope.policy(state)?;
+            ensure!(
+                !request.plan || c.scope.allow_plan,
+                "authorization_required: grant does not permit planned execution"
+            );
             ensure!(
                 c.scope.private_policy_revision
                     == crate::private_evidence::policy_revision(state, &c.scope.source)?,
@@ -595,6 +634,10 @@ pub(crate) fn ensure_recoverable(
     );
     let policy = run.phase3.as_ref().context("no bounded policy")?;
     ensure!(
+        policy.planning.is_none(),
+        "planned crash recovery is unsupported; inspect retained evidence without replay"
+    );
+    ensure!(
         policy.max_invocations <= scope.max_invocations
             && policy.deadline_at
                 <= run.created_at + chrono::TimeDelta::seconds(scope.timeout_secs as i64),
@@ -650,6 +693,8 @@ pub(crate) fn ensure_recoverable(
 pub enum Operation {
     Initialize,
     Submit {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        plan: bool,
         task: String,
         #[serde(default)]
         model: Option<String>,
@@ -714,6 +759,7 @@ pub enum Predicate {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
+    FinalDiff,
     Diff,
     Stdout,
     Stderr,
@@ -739,6 +785,7 @@ impl Operation {
 pub(crate) async fn execute(state: &State, scope: &Scope, command: Operation) -> Result<RunRecord> {
     match command {
         Operation::Submit {
+            plan,
             task,
             model,
             effort,
@@ -746,6 +793,8 @@ pub(crate) async fn execute(state: &State, scope: &Scope, command: Operation) ->
             orchestrator::run_dispatch(
                 state,
                 RunRequest {
+                    plan,
+                    max_invocations: None,
                     source: scope.source.clone(),
                     task,
                     harnesses: vec![],

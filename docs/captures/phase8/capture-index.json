@@ -1,0 +1,84 @@
+{
+  "fixture": "tests/fixtures/phase8_planning.py",
+  "binary_sha256": "335375b7dc1073076ac69d043d8418235222bab7e9a914c7890350ea5c8d4995",
+  "platform": "macOS arm64 PTY",
+  "options": [
+    "--ascii",
+    "--no-color"
+  ],
+  "native_terminal_screenshots": false,
+  "captures": [
+    {
+      "scenario": "pty_wide",
+      "milestone": "startup",
+      "source_sha256": "b2a3859ee5a208b72295b177cf6e600f4e77fe8d35f99ac0d45bd1f8f82cb002",
+      "output": "pty_wide-startup.png",
+      "marker": {
+        "seconds": 0.138424,
+        "bytes": 677,
+        "width": 100,
+        "height": 32
+      }
+    },
+    {
+      "scenario": "pty_wide",
+      "milestone": "review",
+      "source_sha256": "3a0247069cb36448616f02f18296c085ac0a5ab48cfbc0b8be2dfffdc1f31c72",
+      "output": "pty_wide-review.png",
+      "marker": {
+        "seconds": 9.906746,
+        "bytes": 9081,
+        "width": 100,
+        "height": 32
+      }
+    },
+    {
+      "scenario": "pty_narrow",
+      "milestone": "review",
+      "source_sha256": "bc9a52cdbb747e80e942d8f0d6e8936352283ec6f38e0688c8a2cb6490a6a10d",
+      "output": "pty_narrow-review.png",
+      "marker": {
+        "seconds": 9.237644,
+        "bytes": 8303,
+        "width": 38,
+        "height": 32
+      }
+    },
+    {
+      "scenario": "pty_plain",
+      "milestone": "review",
+      "source_sha256": "4c36785e8272e6090d1bb1431497aefd9982e1f940156029569e86806f911d31",
+      "output": "pty_plain-review.png",
+      "marker": {
+        "seconds": 9.677587,
+        "bytes": 1174,
+        "width": 100,
+        "height": 32
+      }
+    },
+    {
+      "scenario": "pty_question_deadline",
+      "milestone": "question",
+      "source_sha256": "d234568b69091237b46b4e42123104eb0bfd63e7231758151eba142ea7322005",
+      "output": "pty_question_deadline-question.png",
+      "marker": {
+        "seconds": 4.523515,
+        "bytes": 6605,
+        "width": 100,
+        "height": 32
+      }
+    },
+    {
+      "scenario": "pty_question_deadline",
+      "milestone": "deadline",
+      "source_sha256": "3fae91689503b4b9d8572734a8ba571211d9874bbdcf95cf4a737f74dec39cb6",
+      "output": "pty_question_deadline-deadline.png",
+      "marker": {
+        "seconds": 6.956536,
+        "bytes": 9595,
+        "width": 100,
+        "height": 32
+      }
+    }
+  ]
+}

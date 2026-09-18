@@ -283,6 +283,13 @@ pub fn command(
         );
         args.extend(["--effort".into(), effort.clone()]);
     }
+    if request.read_only {
+        for flag in ["--tools", "--allowedTools"] {
+            if let Some(index) = args.iter().position(|a| a == flag) {
+                args[index + 1] = "Read,Glob,Grep".into();
+            }
+        }
+    }
     args.extend(config.extra_args.clone());
     args.extend(["--".into(), request.prompt.clone()]);
     Ok(local_command(executable, args))

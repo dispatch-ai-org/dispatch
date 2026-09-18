@@ -301,6 +301,62 @@ pub fn collect_diff(baseline_path: &Path, workspace: &Path, diff_path: &Path) ->
     })
 }
 
+/// Materialize a contribution against its exact input using the same patch safety as apply.
+/// Publication is immutable; a DB reference is committed separately by the caller.
+pub(crate) fn integrate_snapshot(
+    input: &Path,
+    patch: &Path,
+    directory: &Path,
+) -> Result<SourceSnapshot> {
+    fs::create_dir_all(directory)?;
+    let workspace = create_candidate_workspace(input, &directory.join("integration-workspace"))?;
+    if fs::metadata(patch)?.len() > 0 {
+        for p in inspect_patch_paths(&workspace, patch)? {
+            ensure_safe_patch_path(&p)?;
+        }
+        for check in [true, false] {
+            let mut command = git_command(&workspace);
+            command.arg("apply");
+            if check {
+                command.arg("--check");
+            }
+            command
+                .args(["--binary", "--whitespace=nowarn", "--"])
+                .arg(patch);
+            checked_output(command, "contribution cannot be integrated cleanly")?;
+        }
+    }
+    create_snapshot(&workspace, &directory.join("published"))
+}
+
+/// Checks see the owner's original verification files alongside the proposed implementation.
+pub(crate) fn restore_verification(
+    baseline: &Path,
+    workspace: &Path,
+    paths: &[String],
+) -> Result<()> {
+    for name in paths {
+        let original = crate::planning::path(baseline, name)?;
+        let target = crate::planning::path(workspace, name)?;
+        if target.is_dir() {
+            fs::remove_dir_all(&target)?;
+        } else if target.exists() {
+            fs::remove_file(&target)?;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if original.is_dir() {
+            fs::create_dir(&target)?;
+            copy_tree_contents(&original, &target)?;
+        } else {
+            fs::copy(&original, &target)?;
+            fs::set_permissions(&target, fs::metadata(original)?.permissions())?;
+        }
+    }
+    Ok(())
+}
+
 /// Hash the complete logical source tree, excluding Git and Dispatch state.
 /// Content, paths, symlink targets, file kinds, and permission bits are covered;
 /// timestamps are intentionally ignored.

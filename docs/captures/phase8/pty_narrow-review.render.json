@@ -1,0 +1,10 @@
+{
+  "source": "pty_narrow.review.ansi",
+  "terminal_columns": 38,
+  "terminal_rows": 32,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 13,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc"
+}

@@ -708,6 +708,20 @@ CREATE TRIGGER private_fixture_no_update BEFORE UPDATE ON private_fixture_domain
 BEGIN SELECT RAISE(ABORT,'fixture domain is permanent'); END;
 "#,
     ),
+    (
+        20,
+        "bounded_planning",
+        r#"
+CREATE TABLE planned_goals(run_id TEXT PRIMARY KEY REFERENCES runs(id), revision TEXT NOT NULL UNIQUE, policy_json TEXT NOT NULL, plan_json TEXT);
+CREATE TABLE planned_tasks(run_id TEXT NOT NULL REFERENCES planned_goals(run_id), id TEXT NOT NULL, state TEXT NOT NULL, task_json TEXT NOT NULL, PRIMARY KEY(run_id,id));
+CREATE TABLE planned_artifacts(run_id TEXT NOT NULL REFERENCES planned_goals(run_id), id TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(run_id,id));
+CREATE TABLE planned_snapshots(run_id TEXT NOT NULL REFERENCES planned_goals(run_id), id TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(run_id,id));
+CREATE TABLE planned_invocations(attempt_id TEXT PRIMARY KEY REFERENCES attempts(id), run_id TEXT NOT NULL REFERENCES planned_goals(run_id), slot TEXT NOT NULL, knowledge TEXT NOT NULL, UNIQUE(run_id,slot));
+CREATE TRIGGER planned_launch_update AFTER UPDATE OF launch_lifecycle ON pool_leases BEGIN
+ UPDATE planned_invocations SET knowledge=NEW.launch_lifecycle WHERE attempt_id=NEW.attempt_id;
+END;
+"#,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1254,7 +1268,7 @@ impl Database {
     }
 
     /// Initial run, acceptance event, ownership and receipt share one commit.
-    pub(crate) fn create_run(
+    pub(crate) fn commit_run_transition(
         &mut self,
         run: &mut RunRecord,
         event: EventRecord,
@@ -1660,6 +1674,7 @@ impl Database {
             .expect("normalized event object")
             .insert("outcome".into(), serde_json::to_value(&run.outcome)?);
         persist_questions(transaction, run)?;
+        crate::planning::persist(transaction, run)?;
         let outcome_json = serde_json::to_string(&run.outcome)?;
         validate_terminal_write(transaction, run, event.event_type == "review.accepted")?;
         let mut projection = run.clone();
@@ -3141,9 +3156,65 @@ mod tests {
     }
 
     #[test]
+    fn schema19_projection_and_direct_grant_survive_planning_migration() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("prior.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 19) {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1,?2,?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+            if *version == 12 {
+                insert_legacy_run(&connection, "prior")?;
+            }
+        }
+        let original = serde_json::to_string(&run("prior"))?;
+        connection.execute(
+            "UPDATE runs SET run_projection_json=?1 WHERE id='prior'",
+            [&original],
+        )?;
+        let grant = json!({"principal":"old","owner_uid":0,"source":"/project","state_root":"/state","config_digest":"old","profiles":[],"timeout_secs":30,"max_invocations":2,"allow_unsafe_local":true,"delegate_factual":false,"expires_at":at(4)});
+        connection.execute(
+            "INSERT INTO control_grants VALUES ('old','hash',?1)",
+            [grant.to_string()],
+        )?;
+        drop(connection);
+        let database = Database::open(&path)?;
+        assert_eq!(database.schema_version()?, 20);
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT run_projection_json FROM runs WHERE id='prior'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            original
+        );
+        assert!(
+            database
+                .committed_run_projection("prior")?
+                .unwrap()
+                .phase3
+                .is_none()
+        );
+        let scope: crate::commands::Scope = serde_json::from_value(grant)?;
+        assert!(!scope.allow_plan);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM planned_goals", [], |r| r
+                    .get::<_, u32>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 19);
+        assert_eq!(database.schema_version()?, 20);
         let foreign_keys: i64 =
             database
                 .connection
@@ -3364,7 +3435,7 @@ mod tests {
                     .state,
                 crate::AdmissionState::Reconciliation
             );
-            assert_eq!(Database::open(&path)?.schema_version()?, 19);
+            assert_eq!(Database::open(&path)?.schema_version()?, 20);
         }
         Ok(())
     }
@@ -3390,7 +3461,7 @@ mod tests {
         }
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 19);
+        assert_eq!(migrated.schema_version()?, 20);
         assert_eq!(
             migrated
                 .latest_goal_feedback("phase-six-history")?
@@ -3430,7 +3501,7 @@ mod tests {
             0
         );
         drop(migrated);
-        assert_eq!(Database::open(&path)?.schema_version()?, 19);
+        assert_eq!(Database::open(&path)?.schema_version()?, 20);
         Ok(())
     }
 
@@ -3456,7 +3527,7 @@ mod tests {
         connection.execute("INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,started_at,outcome,raw_telemetry_path) VALUES ('attempt','phase-two','candidate','executor',1,1,'codex',?1,'completed','telemetry')",[timestamp(at(1))])?;
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 19);
+        assert_eq!(migrated.schema_version()?, 20);
         assert_eq!(
             migrated.connection.query_row(
                 "SELECT outcome FROM attempts WHERE id='attempt'",
@@ -3508,7 +3579,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 19);
+        assert_eq!(migrated.schema_version()?, 20);
         let violations: i64 = migrated.connection.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check",
             [],
@@ -3529,7 +3600,7 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 19);
+        assert_eq!(database.schema_version()?, 20);
         assert_eq!(
             database
                 .connection
@@ -3539,7 +3610,7 @@ mod tests {
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 19);
+        assert_eq!(Database::open(&path)?.schema_version()?, 20);
         Ok(())
     }
 
@@ -3630,7 +3701,7 @@ mod tests {
         let settings = previous.sync_settings()?;
         drop(previous);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 19);
+        assert_eq!(migrated.schema_version()?, 20);
         assert_eq!(migrated.sync_settings()?, settings);
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {

@@ -58,6 +58,31 @@ pub(crate) fn select_resource_filtered(
     fixed_effort: Option<&str>,
     exclusions: &[Option<String>],
 ) -> Result<AllocationDecision> {
+    select_resource_filtered_lane(
+        resources,
+        features,
+        execution_backend,
+        requested_model,
+        requested_effort,
+        fixed_model,
+        fixed_effort,
+        exclusions,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_resource_filtered_lane(
+    resources: &ResourceConfig,
+    features: &TaskFeatures,
+    execution_backend: &str,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    fixed_model: Option<&str>,
+    fixed_effort: Option<&str>,
+    exclusions: &[Option<String>],
+    minimum: Option<ResourceTier>,
+) -> Result<AllocationDecision> {
     if let (Some(requested), Some(fixed)) = (requested_model, fixed_model) {
         anyhow::ensure!(
             requested == fixed,
@@ -72,7 +97,8 @@ pub(crate) fn select_resource_filtered(
     }
     let model_constraint = requested_model.or(fixed_model);
     let effort_constraint = requested_effort.or(fixed_effort);
-    let (desired_tier, policy_reason) = allocation_policy(features);
+    let (default_tier, policy_reason) = allocation_policy(features);
+    let desired_tier = minimum.clone().unwrap_or(default_tier);
     let choices = resources
         .profiles
         .iter()
@@ -98,7 +124,7 @@ pub(crate) fn select_resource_filtered(
                 .is_some_and(|effort| profile.effort.as_deref() != Some(effort))
             {
                 Some("effort does not satisfy the fixed selection constraint".to_owned())
-            } else if model_constraint.is_none()
+            } else if (minimum.is_some() || model_constraint.is_none())
                 && tier_rank(&profile.tier) < tier_rank(&desired_tier)
             {
                 Some(format!(

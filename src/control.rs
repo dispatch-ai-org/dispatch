@@ -149,6 +149,7 @@ where
     let mut worker_request: Option<String> = None;
     let mut active: Option<String> = None;
     let mut cancel = CancellationToken::new();
+    let mut question_deadline = None;
     let mut failure = None;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     loop {
@@ -157,6 +158,12 @@ where
             _=closed.cancelled()=>{failure=Some("output closed or stalled");break},
             _=orchestrator::shutdown_signal()=>break,
             _=tick.tick()=>{
+                if worker.is_none() && question_deadline.is_some_and(|d|chrono::Utc::now() >= d) {
+                    if let Some(id) = active.as_deref() { let _ = state.load_run(id)?; }
+                    active = None;
+                    question_deadline = None;
+                }
+
                 if let Some(rx) = committed.as_mut()
                     && let Ok(value) = rx.try_recv()
                 {
@@ -189,6 +196,7 @@ where
                     if let Some(id) = active.as_deref()
                         && let Ok(run) = session.scope.run(&state, id)
                     {
+                        question_deadline = run.phase3.as_ref().filter(|p|p.planning.is_some() && run.outcome.waiting_on == crate::WaitingOn::Human).map(|p|p.deadline_at);
                         if cancel.is_cancelled() {
                             let _ = commands::close_question(&state, &session, &run);
                         }
@@ -231,7 +239,7 @@ where
                 let known = serde_json::to_value(&request)?;
                 if raw
                     .as_object()
-                    .is_some_and(|map| map.keys().any(|k| known.get(k).is_none()))
+                    .is_some_and(|map| map.keys().any(|k| known.get(k).is_none() && !(k == "plan" && matches!(request.operation, Operation::Submit { .. }))))
                 {
                     let _ = output.send(error(
                         id.as_deref(),
@@ -259,7 +267,7 @@ where
                 }
                 if matches!(request.operation, Operation::Initialize) {
                     initialized = true;
-                    let _=output.send(response(&id,json!({"protocol_version":1,"supported_versions":[1],"operations":commands::OPERATIONS,"session_id":session.id,"principal":session.scope.principal,"ownership_mode":"foreground","read_only":session.read_only,"scope":*session.scope,"limits":{"request_bytes":FRAME_LIMIT,"response_bytes":OUTPUT_LIMIT,"pending_requests":PENDING_LIMIT,"observers":8,"output_messages":OUTPUT_QUEUE,"stalled_output_seconds":STALL_SECS,"wait_timeout_ms":60000,"artifact_preview_bytes":16384}})));
+                    let _=output.send(response(&id,json!({"protocol_version":1,"supported_versions":[1],"capabilities":{"planned_execution":1,"sequential_tasks":true,"planned_max_invocations":6},"operations":commands::OPERATIONS,"session_id":session.id,"principal":session.scope.principal,"ownership_mode":"foreground","read_only":session.read_only,"scope":*session.scope,"limits":{"request_bytes":FRAME_LIMIT,"response_bytes":OUTPUT_LIMIT,"pending_requests":PENDING_LIMIT,"observers":8,"output_messages":OUTPUT_QUEUE,"stalled_output_seconds":STALL_SECS,"wait_timeout_ms":60000,"artifact_preview_bytes":16384}})));
                     continue;
                 }
                 if !initialized {
@@ -376,6 +384,7 @@ where
                     }
                     let state = state.clone();
                     let scope = session.scope.clone();
+                    question_deadline = None;
                     cancel = CancellationToken::new();
                     let cancellation = cancel.clone();
                     let (updates, _) = tokio::sync::watch::channel(None);

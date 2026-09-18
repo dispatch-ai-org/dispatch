@@ -337,3 +337,55 @@ the authorization boundary. Enabling Claude does not enlarge a pre-existing gran
 No protocol actor/resource field can bypass that boundary. Both adapters use the
 same submit, question/answer, event, artifact and receipt paths. See the
 [Phase 6 support matrix](phase6-validation.md) for fixture versus live evidence.
+
+## Opt-in planned goals (Phase 8, additive v1 capability)
+
+`initialize` now advertises `planned_execution: 1`, `sequential_tasks: true`, and
+`planned_max_invocations: 6`. The envelope remains protocol version 1; old requests
+and receipts retain direct behavior. A newly issued grant must explicitly include
+planned execution, and each planned submit must opt in independently:
+
+```sh
+dispatch control-grant /path/to/project --allow-plan --max-invocations 6 \
+  --timeout 600 --allow-unsafe-local --delegate-factual
+```
+
+```json
+{"protocol_version":1,"request_id":"planned-001","op":"submit","task":"Implement the multipart goal","plan":true}
+```
+
+Missing `plan` and `plan:false` both mean direct work. Old grants deserialize with
+`allow_plan:false`; reissue a grant to authorize planning. Grant issuance retains
+its default maximum of **two**, so specify the intended limit. There is no per-task
+client budget, new-resource authority, replanning command or task-control API.
+The grant's existing source/config/profile/expiry/policy fences cover all roles.
+Direct submits remain capped at two even under a larger planned grant.
+
+Status projects the persisted `phase3.planning` revision, owner check catalog,
+validated contracts, sequential task state, decisions, required artifacts, snapshots,
+root checks, error and final-candidate reference. Attempts add optional task/plan/
+input identity and consumed artifacts. No transport scheduler is introduced.
+`plan.validated`, `task.runnable`, `dependency.recorded`, `integration.started`,
+`task.integrated`, `integration.repaired` and `planning.verification.started` join
+the existing semantic events; normal attempt/check/question/finish events remain.
+
+Result includes one final candidate and per-attempt burden. Its `final_diff` scoped
+artifact reference retrieves B0-to-final changes; a child's `diff` is only its own
+contribution. For compatibility, `result_id`/`delivery_revision` retain the final
+attempt identity; `phase3.planning.final_candidate` identifies the separate root
+candidate. The final-diff reference uses that final attempt as its access handle,
+checks the root delivery identity and is confined to the delivery directory.
+Local paths are removed from the result projection; the scoped status view retains
+its existing owner-state inspection contract. Human review/apply stays outside stdio.
+
+Idempotent planned submit never launches a second planner. Answers keep exact
+question/revision/generation checks and consume the one shared extra. Outstanding
+awaits remain responsive to answers/cancel; a foreground pending question expires
+at the original deadline. A polling wait timeout is not execution completion.
+Use the returned cursor and persisted deadline when following multiple tasks.
+
+Disconnect/cancel uses existing cleanup. Uncertain reservations remain retained.
+Planned crash recovery is explicitly unsupported: `recover` refuses rather than
+replaying a planner/child or resetting its budget. Completed and failed histories
+remain inspectable; old direct recovery semantics are unchanged. See
+[planning guide](planning.md) and [Phase 8 evidence](phase8-validation.md).
