@@ -161,6 +161,44 @@ def run_fixture(binary, source, state, scenario):
     source, state = Path(source), Path(state)
     captures = os.environ.get("DISPATCH_REVIEW_CAPTURES", str(state.parent / "captures"))
     args = [binary, "--state-dir", str(state)]
+    if scenario in ("plain-transition", "dumb-transition"):
+        flags = ['--plain', '--no-color'] if scenario == 'plain-transition' else ['--no-color']
+        environment = {'TERM': 'dumb'} if scenario == 'dumb-transition' else None
+        with Session(args + flags, source, captures, scenario, env=environment) as session:
+            session.wait('accomplish?')
+            for number in (1, 2):
+                start = len(session.clean)
+                session.send(f'Add tests in tests/collision_test.c for case {number}\r')
+                session.wait('[y/N]')
+                session.send('y\r')
+                session.wait('Review changes')
+                transition = session.clean[start:session.position]
+                assert transition.count('Ready for review') == 1, transition
+                assert 'Verification passed' in transition, transition
+                with sqlite3.connect(state / 'dispatch.db') as db:
+                    runs = [json.loads(row[0]) for row in db.execute('SELECT run_projection_json FROM runs')]
+                    assert len(runs) == number
+                    for run in runs:
+                        assert Path(run['source_path']).resolve() == source.resolve()
+                        assert run['allocation']['task_features'] == {'language':'c','task_kind':'tests','scope':'localized'}
+                        assert run['outcome']['review'] == 'pending'
+                        assert run['outcome']['verification'] == 'passed'
+                        assert db.execute("SELECT count(*) FROM events WHERE run_id=? AND event_type='run.finished'", (run['id'],)).fetchone()[0] == 1
+                session.send('i\r')
+                session.wait('[Enter] Back to review')
+                session.send('\r')
+                session.wait('Review changes')
+                session.send('d\r')
+                session.wait('[q] back')
+                session.send('q\r')
+                session.wait('Review changes')
+                session.send('n\r')
+                session.wait('accomplish?')
+            session.send(b'\x04')
+            session.finish()
+            assert not has_color(bytes(session.output))
+        print('PASS one plain review transition per distinct delivery; committed completion events preserved')
+        return
     if scenario == "large": args += ["--ascii"]
     if scenario not in ("native-delta", "large-color"): args += ["--no-color"]
     environment = {"NO_COLOR": None, "DISPATCH_COLOR": "truecolor", "COLORTERM": "truecolor"} if scenario in ("native-delta", "large-color") else None

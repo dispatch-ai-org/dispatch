@@ -22,6 +22,7 @@ struct SourceEvidence {
     rust: usize,
     python: usize,
     go: usize,
+    c: usize,
     cpp_implementations: usize,
     cpp_headers: usize,
     files: BTreeSet<String>,
@@ -63,6 +64,8 @@ fn inspect_source(root: &Path) -> Result<SourceEvidence> {
             "rs" => evidence.rust += 1,
             "py" => evidence.python += 1,
             "go" => evidence.go += 1,
+            // .h is ambiguous; uppercase .C conventionally denotes C++, not C.
+            "c" if extension == "c" => evidence.c += 1,
             "cpp" | "cc" | "cxx" => evidence.cpp_implementations += 1,
             "h" | "hpp" | "hh" | "hxx" => evidence.cpp_headers += 1,
             _ => {}
@@ -97,6 +100,7 @@ fn primary_language(evidence: &SourceEvidence) -> Option<String> {
         ("rust", evidence.rust),
         ("python", evidence.python),
         ("go", evidence.go),
+        ("c", evidence.c),
         ("cpp", cpp),
     ];
     languages.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
@@ -120,15 +124,36 @@ fn classify_task_kind(task: &str) -> TaskKind {
         &words
     };
 
-    if starts_with_any(
-        words,
-        &[
-            &["add", "tests"],
-            &["write", "tests"],
-            &["write", "unit", "tests"],
-            &["increase", "test", "coverage"],
-        ],
-    ) {
+    // Explicit test-writing intent can include a small count and a test category.
+    // Inspect only the leading object; later verification instructions are not intent.
+    let mut object = words.get(1..).unwrap_or_default();
+    object = object.strip_prefix(&["yet"]).unwrap_or(object);
+    if object.first().is_some_and(|w| matches!(*w, "a" | "an")) {
+        object = &object[1..];
+    }
+    if object.first().is_some_and(|w| {
+        matches!(
+            *w,
+            "one" | "two" | "three" | "another" | "additional" | "second" | "third"
+        )
+    }) {
+        object = &object[1..];
+    }
+    if object.first().is_some_and(|w| matches!(*w, "new" | "more")) {
+        object = &object[1..];
+    }
+    if object
+        .first()
+        .is_some_and(|w| matches!(*w, "unit" | "regression" | "collision"))
+    {
+        object = &object[1..];
+    }
+    let writing_tests = words.first().is_some_and(|w| matches!(*w, "add" | "write"))
+        && object
+            .first()
+            .is_some_and(|w| matches!(*w, "test" | "tests"));
+
+    if writing_tests || starts_with_any(words, &[&["increase", "test", "coverage"]]) {
         TaskKind::Tests
     } else if starts_with_any(words, &[&["fix"], &["resolve"], &["correct"]]) {
         TaskKind::BugFix
@@ -139,7 +164,17 @@ fn classify_task_kind(task: &str) -> TaskKind {
             &["implement", "a", "new"],
             &["introduce"],
         ],
-    ) {
+    ) || [
+        &["add", "another"][..],
+        &["add", "yet", "another"][..],
+        &["add", "one", "more"][..],
+        &["add", "a", "new"][..],
+        &["add", "a", "second"][..],
+        &["add", "a", "third"][..],
+    ]
+    .iter()
+    .any(|phrase| words.starts_with(phrase) && words.len() > phrase.len())
+    {
         TaskKind::Feature
     } else if starts_with_any(
         words,

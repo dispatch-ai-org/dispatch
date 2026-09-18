@@ -115,12 +115,27 @@ private_evidence:
       verify: ['cargo test --locked']
 ```
 
-This is an owner assertion that this morphology has routine risk and that the
-listed **existing configured verify commands** are relevant. The commands must
+This is an owner assertion that the listed **existing configured verify commands**
+are relevant to this task class. It does not independently establish low risk,
+minimum suitability, or light-profile eligibility. The commands must
 exactly equal `checks.verify`; a mapping does not execute or install new checks.
 Unknown language/kind/scope, absent checks, or conflicting mappings cannot screen.
+Explicit localized and multi-file mappings support descriptive cohorts; rule v1
+screens only localized tasks. A multi-file mapping returns
+`task_scope_outside_trial_rule` even with sufficient reviews. Broad scope remains
+excluded. Adding a mapping does not retrospectively change frozen run metadata.
 The current classifier conservatively requires enough source files to establish
-language; a file extension in task text alone is not enough.
+language; a file extension in task text alone is not enough. C uses the existing
+dominance threshold (at least two lowercase `.c` implementation files). Ambiguous
+`.h` headers and uppercase `.C` files do not establish C; ignored/generated source
+directories do not contribute. C recognition does not establish task kind or scope.
+Feature intent such as “add another …” or “add a third …” is recognized separately
+from scope. Explicit test-writing objects (including “add a third regression test”)
+remain test tasks; later instructions to run tests do not change feature intent.
+Scope still requires pre-execution file evidence. A task/check mapping never supplies
+missing scope, and neither new mappings nor stronger checks rewrite old decisions
+or verification results. Recognizing feature intent retains the existing strong-tier
+suitability requirement, even when scope remains unknown.
 
 Compatibility includes canonical project, deterministic language/kind/scope,
 explicit mapping and check-contract digest, effective policy version, provider,
@@ -140,7 +155,7 @@ these proposal cohorts.
 
 `private-quality-trial-v1` has fixed screening parameters:
 
-- One project, one mapped task/check class, one compatible light-profile cohort.
+- One project, one mapped localized task/check class, one compatible light-profile cohort.
 - Ninety-day window, at most 1,000 project goals, at least **20 reviewed** comparable
   goals and **80% review coverage**.
 - At least **5** explicitly classified quality/rework rejections and at least

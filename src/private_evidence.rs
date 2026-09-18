@@ -254,7 +254,7 @@ fn context(source: &Path, features: &TaskFeatures, config: &Config) -> Result<Co
                 && !m.id.is_empty()
                 && features.language.is_some()
                 && features.task_kind != TaskKind::Unknown
-                && features.scope == TaskScope::Localized
+                && matches!(features.scope, TaskScope::Localized | TaskScope::MultiFile)
         })
         .collect();
     Ok(ContextKey {
@@ -723,6 +723,10 @@ fn proposal(
 ) -> Result<(Option<Proposal>, String)> {
     if summary.truncated || summary.context.mapping.is_none() {
         return Ok((None, "incomplete_window_or_unmapped_task".into()));
+    }
+    // Explicit multi-file mappings support descriptive evidence, not rule-v1 trials.
+    if summary.context.features.scope != TaskScope::Localized {
+        return Ok((None, "task_scope_outside_trial_rule".into()));
     }
     if decision.selected.tier != ResourceTier::Light {
         return Ok((None, "base_choice_is_not_light".into()));
@@ -1445,6 +1449,125 @@ mod tests {
         );
         (summary, d, b)
     }
+    #[test]
+    fn explicit_multifile_mapping_is_descriptive_only_and_checks_stay_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = TaskFeatures {
+            language: Some("c".into()),
+            task_kind: TaskKind::Feature,
+            scope: TaskScope::MultiFile,
+        };
+        let mut c = Config::default();
+        c.checks.verify = vec!["sh ./verify.sh".into()];
+        assert!(context(dir.path(), &f, &c).unwrap().mapping.is_none());
+        c.private_evidence.routine_mappings.push(Mapping {
+            id: "raylib-feature-collisions".into(),
+            features: f.clone(),
+            verify: c.checks.verify.clone(),
+        });
+        let ctx = context(dir.path(), &f, &c).unwrap();
+        assert!(ctx.mapping.is_some());
+        // Even enough synthetic light-profile reviews cannot broaden rule v1.
+        let (mut summary, mut decision, behaviors) = screened();
+        summary.context = ctx;
+        decision.task_features = f.clone();
+        let (p, reason) = proposal(&summary, &decision, &behaviors).unwrap();
+        assert!(p.is_none());
+        assert_eq!(reason, "task_scope_outside_trial_rule");
+        for invalid in [
+            TaskFeatures {
+                language: None,
+                ..f.clone()
+            },
+            TaskFeatures {
+                task_kind: TaskKind::Unknown,
+                ..f.clone()
+            },
+            TaskFeatures {
+                scope: TaskScope::Unknown,
+                ..f.clone()
+            },
+            TaskFeatures {
+                scope: TaskScope::Broad,
+                ..f.clone()
+            },
+        ] {
+            c.private_evidence.routine_mappings[0].features = invalid.clone();
+            assert!(context(dir.path(), &invalid, &c).unwrap().mapping.is_none());
+        }
+        c.private_evidence.routine_mappings[0].features = f.clone();
+        c.checks.verify = vec!["true".into()];
+        assert!(context(dir.path(), &f, &c).unwrap().mapping.is_none());
+        c.checks.verify = vec![];
+        c.private_evidence.routine_mappings[0].verify.clear();
+        assert!(context(dir.path(), &f, &c).unwrap().mapping.is_none());
+        c.checks.verify = vec!["sh ./verify.sh".into()];
+        c.private_evidence.routine_mappings[0].verify = c.checks.verify.clone();
+        c.private_evidence
+            .routine_mappings
+            .push(c.private_evidence.routine_mappings[0].clone());
+        assert!(context(dir.path(), &f, &c).unwrap().mapping.is_none());
+    }
+
+    #[test]
+    fn c_test_and_feature_mappings_do_not_infer_unknown_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("main.c"), "// synthetic C source").unwrap();
+        std::fs::write(
+            dir.path().join("tests/collision_test.c"),
+            "// synthetic test",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.checks.verify = vec!["sh ./verify.sh".into()];
+        for (id, kind, scope) in [
+            ("feature", TaskKind::Feature, TaskScope::MultiFile),
+            ("tests", TaskKind::Tests, TaskScope::Localized),
+        ] {
+            config.private_evidence.routine_mappings.push(Mapping {
+                id: id.into(),
+                features: TaskFeatures {
+                    language: Some("c".into()),
+                    task_kind: kind,
+                    scope,
+                },
+                verify: config.checks.verify.clone(),
+            });
+        }
+        let classify = |task| crate::classifier::classify_task(dir.path(), task).unwrap();
+        let tests = classify("Add tests in tests/collision_test.c");
+        let feature = classify("Add another platform in main.c and tests/collision_test.c");
+        let unspecified = classify(
+            "Add yet another platform. make them equidistant from one another and the border of the sim.",
+        );
+        let test_mapping = context(dir.path(), &tests, &config).unwrap().mapping;
+        let feature_mapping = context(dir.path(), &feature, &config).unwrap().mapping;
+        assert!(test_mapping.is_some() && feature_mapping.is_some());
+        assert_ne!(test_mapping, feature_mapping);
+        assert_eq!(unspecified.task_kind, TaskKind::Feature);
+        assert_eq!(unspecified.scope, TaskScope::Unknown);
+        assert!(
+            context(dir.path(), &unspecified, &config)
+                .unwrap()
+                .mapping
+                .is_none()
+        );
+        config.checks.verify.push("extra check".into());
+        assert!(
+            context(dir.path(), &tests, &config)
+                .unwrap()
+                .mapping
+                .is_none()
+        );
+        assert!(
+            context(dir.path(), &feature, &config)
+                .unwrap()
+                .mapping
+                .is_none()
+        );
+    }
+
     #[test]
     fn default_config_preserves_historical_grant_digest_and_malformed_proposals_fail() {
         let config = serde_json::to_value(Config::default()).unwrap();

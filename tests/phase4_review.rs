@@ -99,7 +99,15 @@ print('{"type":"result","model":"light-model"}')
         );
         let invocations = fs::read_to_string(self.state.parent().unwrap().join("invocations"))
             .context("fixture did not execute")?;
-        assert_eq!(invocations.lines().count(), 1, "review invoked a model");
+        assert_eq!(
+            invocations.lines().count(),
+            if matches!(scenario, "plain-transition" | "dumb-transition") {
+                2
+            } else {
+                1
+            },
+            "unexpected fixture invocation count"
+        );
         Ok(())
     }
 
@@ -175,6 +183,28 @@ print('fixture reviewer finished', flush=True)
         )?;
         Ok(())
     }
+}
+
+#[test]
+fn phase4_plain_review_transition_appears_once_per_delivery() -> Result<()> {
+    for scenario in ["plain-transition", "dumb-transition"] {
+        let fixture = Fixture::new("tiny")?;
+        fs::remove_dir_all(fixture.source.join("src"))?;
+        fs::create_dir(fixture.source.join("tests"))?;
+        fs::write(
+            fixture.source.join("main.c"),
+            "int main(void) { return 0; }\n",
+        )?;
+        fs::write(
+            fixture.source.join("tests/collision_test.c"),
+            "// C fixture\n",
+        )?;
+        let agent = fixture.source.parent().unwrap().join("fixture-agent");
+        let script = fs::read_to_string(&agent)?.replace("src/lib.rs", "tests/collision_test.c");
+        fs::write(agent, script)?;
+        fixture.exercise(scenario)?;
+    }
+    Ok(())
 }
 
 #[test]

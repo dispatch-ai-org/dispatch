@@ -213,7 +213,64 @@ def shadow(f,enabled=True):
     path.write_text(path.read_text().replace('shadow: false','shadow: true') if enabled else path.read_text().replace('shadow: true','shadow: false'))
 
 
+def c_cohort(binary):
+    os.environ['DISPATCH_FIXTURE_PROVIDER']='codex'
+    f=Fixture(binary)
+    try:
+        with sqlite3.connect(f.state/'dispatch.db') as db:
+            db.execute('INSERT INTO private_fixture_domain VALUES (1)')
+        (f.source/'src/lib.rs').rename(f.source/'main.c')
+        (f.source/'src').rmdir()
+        agent=f.root/'codex'
+        agent.write_text(agent.read_text().replace('src/lib.rs','main.c'))
+        resources=f.state/'resources.yml'
+        resources.write_text(resources.read_text().replace('tier: light','tier: standard'))
+        def feature(task):
+            return command(f,'run',f.source,'--task',task,'--model','fixture-model',
+                           '--allow-unsafe-local','--json','--no-retry')
+        old=feature('Add support for a platform in main.c')
+        frozen=copy.deepcopy(old['allocation']['private_evidence'])
+        assert frozen['context']['features']['language'] is None,frozen
+        (f.source/'tests').mkdir()
+        (f.source/'tests/collision_test.c').write_text('// explicitly synthetic C fixture\n')
+        (f.source/'verify.sh').write_text('#!/bin/sh\nset -eu\ntest -f result.txt\n')
+        config=f.source/'dispatch.yml'
+        config.write_text(config.read_text().replace("['test -f result.txt']","['sh ./verify.sh']")+'''private_evidence:
+  shadow: true
+  routine_mappings:
+    - id: c-platform-features
+      features: {language: c, task_kind: feature, scope: multi_file}
+      verify: ['sh ./verify.sh']
+''')
+        new=feature('Add support for a second platform in main.c and tests/collision_test.c')
+        decision=new['allocation']['private_evidence']
+        assert decision['context']['features']=={'language':'c','task_kind':'feature','scope':'multi_file'},decision
+        mapping={'id':'c-platform-features','features':{'language':'c','task_kind':'feature','scope':'multi_file'},'verify':['sh ./verify.sh']}
+        expected=hashlib.sha256(json.dumps(mapping,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        assert decision['context']['mapping']==expected,decision
+        assert decision['reason']=='task_scope_outside_trial_rule',decision
+        assert new['outcome']['verification']=='passed',new
+        seed(f,new,9000)
+        current=summary(f,new['run_id'])
+        assert current['counts']['eligible_executions']==1,current
+        cohort=next(iter(current['resources'].values()))
+        assert (cohort['reviewed'],cohort['accepted_verified'])==(1,1),cohort
+        assert proposal(f,new['run_id'])['reason']=='task_scope_outside_trial_rule'
+        historical=command(f,'evidence','private',old['run_id'])
+        assert historical['at_decision_time']==frozen,historical
+        assert historical['current']['context']['features']['language'] is None,historical
+        assert historical['current']['context']['mapping'] is None,historical
+        with sqlite3.connect(f.state/'dispatch.db') as db:
+            assert db.execute('SELECT count(*) FROM private_policy_transitions').fetchone()[0]==0
+        assert f.count()==2
+        print('PASS synthetic C feature cohort; frozen unknown history; localized-only trials; two fixture invocations, no activation')
+    finally:
+        f.cleanup()
+
+
 def scenario(binary,name):
+    if name=='c_cohort':
+        return c_cohort(binary)
     f,light,strong=fixture(binary,domain=name!='ordinary')
     try:
         if name=='smoke':

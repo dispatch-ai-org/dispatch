@@ -1077,7 +1077,8 @@ impl Ui {
                     let event = update.as_ref()
                         .filter(|(_, committed)| committed.id == run.id && committed.state_revision == run.state_revision)
                         .map(|(event, _)| event);
-                    if self.options.plain || pending_question(&run).is_some() || run.outcome.work_result != WorkResult::Ready {
+                    // The review menu owns the ready-delivery summary in both modes.
+                    if pending_question(&run).is_some() || run.outcome.work_result != WorkResult::Ready {
                         self.commit(&projection(&run, event, self.width(), self.options.ascii))?;
                     }
                     return Ok(run);
@@ -1087,7 +1088,9 @@ impl Ui {
                         let update = rx.borrow_and_update().clone();
                         if let Some((event, run)) = update {
                             let current = label(&run, Some(&event));
-                            if self.screen.is_none() && current != last_label {
+                            // A committed ready event may arrive before the future returns.
+                            // Preserve that event, but let the review menu present it once.
+                            if self.screen.is_none() && current != last_label && current != "Ready for review" {
                                 if let Err(error) = self.commit(current) {
                                     cancellation.cancel();
                                     let _ = (&mut work).await;

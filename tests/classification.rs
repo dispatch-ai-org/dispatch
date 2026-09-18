@@ -267,3 +267,150 @@ fn classified_features_feed_the_router_and_prefer_specific_evidence() -> anyhow:
     );
     Ok(())
 }
+
+#[test]
+fn c_evidence_preserves_feature_kind_and_known_scope() -> anyhow::Result<()> {
+    let source = repository(&["main.c", "tests/collision_test.c"]);
+    let features = classify_task(
+        source.path(),
+        "Add support for a platform in main.c and tests/collision_test.c",
+    )?;
+    assert_eq!(features.language.as_deref(), Some("c"));
+    assert_eq!(features.task_kind, TaskKind::Feature);
+    assert_eq!(features.scope, TaskScope::MultiFile);
+    let unspecified = classify_task(source.path(), "Change the simulation")?;
+    assert_eq!(unspecified.language.as_deref(), Some("c"));
+    assert_eq!(unspecified.task_kind, TaskKind::Unknown);
+    assert_eq!(unspecified.scope, TaskScope::Unknown);
+    Ok(())
+}
+
+#[test]
+fn weak_ambiguous_and_generated_c_evidence_stays_unknown() -> anyhow::Result<()> {
+    for files in [
+        vec!["main.c"],
+        vec!["main.c", "library.h", "other.h"],
+        vec!["library.h", "other.h"],
+        vec![
+            "main.c",
+            "build/generated.c",
+            "vendor/dependency.c",
+            ".cache/cached.c",
+        ],
+        vec!["main.c", "test.c", "widget.cpp"],
+        vec!["main.c", "test.c", "app.py", "worker.py"],
+        vec!["main.C", "test.C"],
+    ] {
+        let source = repository(&files);
+        assert_eq!(
+            classify_task(source.path(), "Add tests in main.c")?.language,
+            None,
+            "{files:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn recorded_dogfood_prompts_preserve_independent_kind_and_scope() -> anyhow::Result<()> {
+    // Original pre-execution source inventory, not the delivered diff.
+    let source = repository(&[
+        "main.c",
+        "tests/collision_test.c",
+        "verify.sh",
+        "build.sh",
+        "dispatch.yml",
+        "main",
+    ]);
+    let tests = "Add tests in tests/collision_test.c for two missing collision regression cases: an overlapping ball below a platform already moving downward, and an overlapping ball to the right already moving rightward. Assert that each ball is pushed out to the appropriate face but its velocity stays unchanged because it is moving away. Reuse the existing helpers and keep all current cases. Modify only this test file, run the configured verification, and do not change application behavior, configuration, feedback, or routing policy.";
+    let feature = "Add yet another platform. make them equidistant from one another and the border of the sim.";
+    for (prompt, kind, scope) in [
+        (tests, TaskKind::Tests, TaskScope::Localized),
+        (feature, TaskKind::Feature, TaskScope::Unknown),
+        (
+            "Add two collision tests for balls already moving away.",
+            TaskKind::Tests,
+            TaskScope::Unknown,
+        ),
+        (
+            "Add a third platform with equal spacing between platforms and screen edges.",
+            TaskKind::Feature,
+            TaskScope::Unknown,
+        ),
+    ] {
+        let f = classify_task(source.path(), prompt)?;
+        assert_eq!(f.language.as_deref(), Some("c"));
+        assert_eq!((f.task_kind, f.scope), (kind, scope), "{prompt}");
+    }
+    Ok(())
+}
+
+#[test]
+fn additive_wording_does_not_infer_locality_or_confuse_tests_with_features() -> anyhow::Result<()> {
+    let source = repository(&["main.c", "tests/collision_test.c"]);
+    for prompt in [
+        "Please add another platform and space the platforms evenly.",
+        "Add one more platform across the simulation. Run tests afterward.",
+        "Add a new platform and update every subsystem as needed.",
+        "Add a second platform; add tests afterward.",
+        "Add another export format across the application",
+    ] {
+        let f = classify_task(source.path(), prompt)?;
+        assert_eq!(
+            (f.task_kind, f.scope),
+            (TaskKind::Feature, TaskScope::Unknown),
+            "{prompt}"
+        );
+    }
+    for prompt in [
+        "Add two collision tests in tests/collision_test.c",
+        "Please write three regression tests in tests/collision_test.c",
+        "Add another test in tests/collision_test.c",
+        "Add yet another collision test in tests/collision_test.c",
+        "Add a new unit test in tests/collision_test.c",
+        "Add a third regression test in tests/collision_test.c",
+        "Add one more test in tests/collision_test.c",
+        "Add an additional unit test in tests/collision_test.c",
+    ] {
+        let f = classify_task(source.path(), prompt)?;
+        assert_eq!(
+            (f.task_kind, f.scope),
+            (TaskKind::Tests, TaskScope::Localized),
+            "{prompt}"
+        );
+    }
+    let f = classify_task(
+        source.path(),
+        "Add another platform in main.c and tests/collision_test.c",
+    )?;
+    assert_eq!(
+        (f.task_kind, f.scope),
+        (TaskKind::Feature, TaskScope::MultiFile)
+    );
+    Ok(())
+}
+
+#[test]
+fn vague_and_cross_cutting_intent_stays_unknown() -> anyhow::Result<()> {
+    let source = repository(&["main.c", "tests/collision_test.c"]);
+    for prompt in [
+        "Make it better",
+        "Improve the simulation across all subsystems",
+        "Change how everything works",
+        "Add something useful",
+        "Add whatever is missing",
+        "Make the platforms feel right",
+        "Add another",
+        "Add a third",
+        "Consider whether we should add another platform",
+        "Do not add another platform",
+    ] {
+        let f = classify_task(source.path(), prompt)?;
+        assert_eq!(
+            (f.task_kind, f.scope),
+            (TaskKind::Unknown, TaskScope::Unknown),
+            "{prompt}"
+        );
+    }
+    Ok(())
+}

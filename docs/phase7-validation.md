@@ -310,11 +310,178 @@ state, credentials, account evidence, grants and unrelated files are not include
 The staged diff and a credential-pattern/artifact scan are checked before committing.
 No push, tag, publication, version change, or Phase 8 work is authorized or performed.
 
+## C-project dogfood maintenance (2026-09-18)
+
+After the committed Phase 7 validation above, an owner-requested inspection of
+raylib run `01M2TH0CGFPXKV9BF1AMM971QK` confirmed frozen unknown language,
+`feature / multi_file`, no mapping, accepted/applied/passed, and no private
+attestation. This targeted inspection supersedes the earlier implementation-time
+"not inspected" statement only for this run. No historical feedback was imported.
+
+The confirmed limitations were ignored `.c` files, an empty project mapping, and
+mapping lookup restricting descriptive evidence to localized work. C now uses the
+existing conservative source dominance threshold; headers, weak/mixed evidence,
+and generated files cannot establish C. Explicit multi-file task/check mappings
+can form descriptive cohorts. Rule v1 retains its localized-only scope with
+`task_scope_outside_trial_rule`; recognition does not lower resource suitability.
+
+Regressions:
+
+- `c_evidence_preserves_feature_kind_and_known_scope`: two C implementations yield
+  C/feature/multi-file; vague task kind/scope remain unknown.
+- `weak_ambiguous_and_generated_c_evidence_stays_unknown`: single-file, headers,
+  generated source, mixed languages and uppercase `.C` remain insufficient.
+- `recognizing_c_does_not_lower_feature_suitability`: feature work still requires
+  strong suitability in automatic allocation; absent strong resources block.
+- `explicit_multifile_mapping_is_descriptive_only_and_checks_stay_exact`: mapped
+  multi-file evidence cannot trigger a trial even at screening thresholds;
+  unknown/broad/mismatched/empty/duplicate mappings remain excluded.
+- `private_c_feature_cohort_preserves_historical_unknown_and_trial_scope`: real
+  DB/core/CLI in disposable synthetic state; exact mapping digest, one eligible
+  reviewed synthetic goal, passed verification, unchanged old unknown metadata,
+  abstention, zero policy transitions, exactly two fake-harness invocations.
+
+Repeat the focused release fixture with:
+
+```sh
+python3 tests/fixtures/phase7_evidence.py /private/tmp/dispatch-phase7-current-target/release/dispatch c_cohort
+```
+
+The raylib project mapping is `c / feature / multi_file`, with `checks.verify` and
+mapping verification both exactly `sh ./verify.sh`. Its compile/link check and 11
+headless collision cases pass. It does not verify visual or keyboard behavior.
+The historical decision was compared to its pre-edit snapshot and remains equal;
+annotation count remains zero. Future compatible work can contribute descriptive
+evidence after genuine human review and explicit attestation. Neither this past
+run nor standard-tier Terra feature work joins the twenty light-profile reviews.
+No real policy was activated, model invoked, account changed, or attestation made.
+
+Production Rust LOC: 25,468 → 25,476 (**+8**), using the same physical-line method
+excluding complete `cfg(test)` items/modules and including comments/blank lines.
+No schema, dependencies, policy parameters, or public-prior contracts changed.
+
+Validation: `cargo test --locked --target-dir /private/tmp/dispatch-phase7-current-target
+-- --test-threads=4` passed **414 tests**, with one pre-existing ignored test and
+no failures. Formatting and diff checks passed; locked all-target Clippy passed
+with warnings denied. Logs are in `/private/tmp/dispatch-c-cohort-fix/`.
+The initial restricted run had seven existing owner-authority tests fail with
+`Operation not permitted`; rerunning with required process-inspection/loopback
+permissions resolved them. The new fixture also initially compared a mapping
+digest to its display ID; correcting the assertion to the canonical digest made
+it pass. Neither failure was treated as a timing flake or hidden by a timeout change.
+The locked release build passed. Release fixtures passed for `c_cohort`, Phase 7
+`smoke` (shadow/activation/rollback), Phase 6 Claude `direct`, Phase 5 `smoke` for
+Codex and Claude, and Phase 7 review `attest plain blocked revision failure`.
+All provider executables were synthetic. The tested binary was installed at
+`~/.local/bin/dispatch`; its SHA256 is
+`843e2b81d0be159faf836687c960094daf54a09ee58c10b19eef8db98a418ade`.
+The previous installed binary is backed up at
+`/private/tmp/dispatch-c-cohort-fix/dispatch-before-c-fix`. This maintenance patch
+is uncommitted; the earlier Phase 7 implementation commit remains unchanged.
+
+## Raylib dogfood follow-up: runs A and B
+
+This follow-up concerns the C application `/Users/jese/bin/raylib_bouncing_ball`,
+not work performed on Dispatch. The target is a plain directory, not a Git checkout;
+its before/after file diff was reviewed separately. Dispatch's existing uncommitted
+work was checkpointed and preserved, including classifier/presenter drafts found
+at the start of this follow-up. Nothing was committed or published.
+
+Stored source identities for `01M2TJPV49Y9EF9BGDHN0Q4M1D` (A) and
+`01M2TKBSDW8P0K3C0RQ61M6836` (B) both resolve to the C project. Their baseline and
+delivered configuration snapshots both contain only the feature/multi-file mapping
+and exactly `sh ./verify.sh`. The records identify Dispatch 0.1.2 and Codex CLI
+0.153.4; they do not record an exact Dispatch commit/binary hash. The currently
+installed binary matches the prior installation hash documented above and was used
+as the reproduction baseline. Historical decisions remain authoritative.
+
+Run A's full prompt starts “Add tests in tests/collision_test.c for two missing
+collision regression cases”; the original full prompt is reproduced in the
+classification regression. Its frozen C/tests/localized classification was correct,
+but no matching project mapping existed. Run B's exact prompt was “Add yet another
+platform. make them equidistant from one another and the border of the sim.” The
+installed classifier did not recognize that additive feature wording. Unknown scope
+was appropriate: the prompt named no source file. Its final one-file diff cannot
+become pre-execution evidence.
+
+The generic classifier draft recognizes bounded additive wording and explicit
+test-writing objects. This follow-up corrected article-plus-ordinal handling so
+“add a third regression test” remains Tests. Scope logic is unchanged: feature
+recognition never establishes locality. Ambiguous requests remain unknown; broad
+requests without file evidence do not become localized. Features retain the normal
+strong-tier requirement, so the fixed classification may block future automatic
+routing when no suitable strong profile is authorized. No profile was changed.
+
+Raylib now has a separate C/tests/localized mapping alongside its existing
+C/feature/multi-file mapping. Both exactly match `checks.verify: ['sh ./verify.sh']`.
+The shell check still compiles/links the application and runs all 13 original
+collision cases, and additionally compiles/runs `tests/layout_test.c`. A small
+`InitializePlatforms` extraction shares production rectangle setup with that test;
+the three 160×20 platforms, their vertical placement and 80-pixel horizontal gaps
+at 800×450 are unchanged. The test derives gap expectations from occupied width and
+checks all four gaps at application and alternate dimensions. A five-pixel placement
+mutation in a disposable copy fails the test. No rendering, keyboard, or runtime
+resize behavior is claimed from these headless checks.
+
+The installed binary reproduced two initial “Ready for review” messages for one
+delivery in a disposable copy of raylib using its actual C verification and a fake
+provider. Completion and review-menu paths both printed the same summary. The
+presenter draft gives the review menu ownership of that transition. The same copied
+C application passes after the fix. PTY coverage checks two distinct deliveries,
+one initial transition each, unchanged completion events, Details/diff navigation,
+plain and TERM=dumb/no-color behavior, invocation bounds and terminal restoration.
+
+Focused regressions: `recorded_dogfood_prompts_preserve_independent_kind_and_scope`,
+`additive_wording_does_not_infer_locality_or_confuse_tests_with_features`,
+`vague_and_cross_cutting_intent_stays_unknown`,
+`c_test_and_feature_mappings_do_not_infer_unknown_scope`, and
+`phase4_plain_review_transition_appears_once_per_delivery`. Existing historical
+decision, exact-check mapping, minimum-suitability and Phase 4–7 safety regressions
+remain part of the full suite. Checkpoints, local transcripts, reproduction script,
+mutation results and command logs are in `/private/tmp/dispatch-raylib-maintenance/`.
+
+Read-only before/after comparisons cover both complete committed projections,
+feedback revisions, annotations, and this project's policy/proposal records. A still
+has zero annotations; B retains its ordinary/human annotation for feedback revision 1
+and the exact reviewed delivery. There are no project policy transitions. New
+classification, mappings and tests apply prospectively; neither historical run gains
+new classification facts, cohort membership, or verification results. No real provider
+calls, account/funding changes, grant expansion, or real policy activation occurred.
+Validation for this follow-up:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked --target-dir /private/tmp/dispatch-phase7-current-target -- --test-threads=4`:
+  **419 passed**, zero failed, one pre-existing ignored test. No timeout inflation
+  or new ignored tests. Focused classification and all four Phase 4 review tests
+  also passed separately.
+- `cargo clippy --locked --all-targets --target-dir /private/tmp/dispatch-phase7-current-target -- -D warnings`:
+  passed; `git diff --check`: passed.
+- Locked release build and copied-raylib release PTY regression: passed.
+- Raylib `sh ./verify.sh`: compilation/linking with warnings denied, 13 collision
+  cases and layout checks at two dimensions passed. Placement-mutation negative
+  control failed as expected. Its separate file diff passed whitespace checking;
+  `tests/collision_test.c` is byte-for-byte unchanged by this maintenance task.
+
+The tested release was installed at `~/.local/bin/dispatch`, SHA256
+`e33d4780541b7beaf57960a8001e27b19ef40dcdafbbb208bd95a1fc39653654`.
+The prior executable remains at
+`/private/tmp/dispatch-raylib-maintenance/dispatch-before-maintenance`. The installed
+baseline was not used as the current build; Cargo's separate current target remains
+`/private/tmp/dispatch-phase7-current-target`. No real task was launched to validate
+the installation. The source changes remain uncommitted.
+
+Physical production LOC excluding Rust `cfg(test)` items/modules: Dispatch 25,507
+at this task's dirty checkpoint → 25,510 (+3); total uncommitted delta versus the
+25,468-line committed HEAD is +42, including the preserved prior fixes/drafts.
+Raylib `main.c`: 161 → 166 (+5), primarily extraction rather than new behavior.
+
 ## Remaining empirical gates and limitations
 
-Real local evidence counts were **not inspected**. The two Phase 6 smoke observations
+At the original implementation checkpoint, real local evidence counts were **not inspected**. The two Phase 6 smoke observations
 above are report chronology, not private-query results or human labels. No ordinary
-state, active real policy, profiles, grants, or account settings were changed.
+state, active real policy, profiles, grants, or account settings were changed at
+that checkpoint. The subsequent bounded C-project inspection and mapping change
+are documented separately above.
 
 Use the prospective protocol in [private-evidence-policy.md](private-evidence-policy.md):
 ordinary tasks, observe/shadow first, actual human review, optional repair reports,

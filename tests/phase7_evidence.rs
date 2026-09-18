@@ -23,6 +23,10 @@ fn private_fixture_shadow_activate_rollback() {
     scenario("smoke");
 }
 #[test]
+fn private_c_feature_cohort_preserves_historical_unknown_and_trial_scope() {
+    scenario("c_cohort");
+}
+#[test]
 fn private_outcomes_and_smoke_attribution() {
     scenario("outcomes");
 }

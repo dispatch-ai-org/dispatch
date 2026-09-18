@@ -377,6 +377,24 @@ mod allocation_tests {
     }
 
     #[test]
+    fn recognizing_c_does_not_lower_feature_suitability() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("main.c"), "// fixture").unwrap();
+        std::fs::write(source.path().join("test.c"), "// fixture").unwrap();
+        let features = crate::classifier::classify_task(
+            source.path(),
+            "Add support for a platform in main.c and test.c",
+        )
+        .unwrap();
+        assert_eq!(features.language.as_deref(), Some("c"));
+        let mut r = resources();
+        let d = select_resource(&r, &features, "local", None, None, None, None).unwrap();
+        assert_eq!(d.selected.tier, ResourceTier::Strong);
+        r.profiles.retain(|p| p.tier != ResourceTier::Strong);
+        assert!(select_resource(&r, &features, "local", None, None, None, None).is_err());
+    }
+
+    #[test]
     fn treats_models_of_one_harness_as_distinct_deterministic_choices() {
         let features = TaskFeatures {
             language: Some("rust".into()),
