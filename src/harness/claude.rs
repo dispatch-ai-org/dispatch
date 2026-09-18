@@ -449,6 +449,7 @@ pub fn parse_output(output: &str, expected: Option<&str>) -> HarnessTelemetry {
                 .into(),
         );
     }
+    telemetry.usage_categories = usage_categories(&telemetry.events);
     telemetry
 }
 
@@ -467,6 +468,27 @@ fn failure_label(result: &Value) -> &'static str {
     } else {
         "provider error"
     }
+}
+
+/// Terminal aggregates only. Categories and the normalized total are alternate views, never additive.
+pub(crate) fn usage_categories(events: &[Value]) -> std::collections::BTreeMap<String, u64> {
+    let results: Vec<_> = events.iter().filter(|e| e["type"] == "result").collect();
+    if results.len() != 1 {
+        return std::collections::BTreeMap::new();
+    }
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        results[0]["usage"][key]
+            .as_u64()
+            .map(|value| (key.into(), value))
+    })
+    .collect()
 }
 
 pub fn checkpoint(

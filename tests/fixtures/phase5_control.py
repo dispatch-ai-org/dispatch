@@ -417,7 +417,7 @@ def scenario(binary, name):
                 after=f.command('status',run_id,'--json',check=False)
                 assert after.returncode in (0,4),after.stderr
                 with sqlite3.connect(f.state/'dispatch.db') as db:
-                    assert db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0]==18
+                    assert db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0]==19
                     assert not db.execute('PRAGMA foreign_key_check').fetchall()
                     for table in tables: assert db.execute('SELECT * FROM '+table).fetchall()==rows[table],table
                 assert json.loads(after.stdout)['phase3']['questions'][0]['state']=='pending'

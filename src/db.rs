@@ -654,6 +654,60 @@ CREATE TABLE command_receipts (
 );
 "#,
     ),
+    (
+        19,
+        "private_outcome_annotations_and_policy",
+        r#"
+ALTER TABLE admission_requests ADD COLUMN launch_knowledge TEXT NOT NULL DEFAULT 'unknown';
+CREATE TRIGGER private_launch_insert AFTER INSERT ON pool_leases BEGIN
+ UPDATE admission_requests SET launch_knowledge=NEW.launch_lifecycle WHERE id=NEW.request_id;
+END;
+CREATE TRIGGER private_launch_update AFTER UPDATE OF launch_lifecycle ON pool_leases BEGIN
+ UPDATE admission_requests SET launch_knowledge=NEW.launch_lifecycle WHERE id=NEW.request_id;
+END;
+CREATE INDEX private_attempt_admission ON admission_requests(attempt_id);
+CREATE TABLE private_annotations (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    feedback_id TEXT REFERENCES goal_feedback_revisions(id),
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER private_annotations_append_only_update BEFORE UPDATE ON private_annotations
+BEGIN SELECT RAISE(ABORT,'provenance annotations are append-only'); END;
+CREATE TRIGGER private_annotations_append_only_delete BEFORE DELETE ON private_annotations
+BEGIN SELECT RAISE(ABORT,'provenance annotations are append-only'); END;
+CREATE TRIGGER private_decision_immutable BEFORE UPDATE OF run_projection_json ON runs
+WHEN json_extract(OLD.run_projection_json,'$.allocation.private_evidence') IS NOT NULL
+ AND json_extract(NEW.run_projection_json,'$.allocation.private_evidence') IS NOT json_extract(OLD.run_projection_json,'$.allocation.private_evidence')
+BEGIN SELECT RAISE(ABORT,'private decision snapshot is immutable'); END;
+CREATE INDEX private_annotation_run ON private_annotations(run_id, sequence);
+CREATE INDEX private_source_path ON sources(path);
+CREATE INDEX private_runs_source_window ON runs(source_id, created_at, id);
+CREATE TABLE private_proposals (
+    id TEXT PRIMARY KEY,
+    source_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('proposed','active','stale','superseded','revoked'))
+);
+CREATE TABLE private_policy_transitions (
+    source_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    previous_revision INTEGER NOT NULL,
+    proposal_id TEXT REFERENCES private_proposals(id),
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(source_key,revision)
+);
+CREATE TABLE private_fixture_domain (singleton INTEGER PRIMARY KEY CHECK(singleton=1));
+CREATE TRIGGER private_fixture_only_empty BEFORE INSERT ON private_fixture_domain
+WHEN EXISTS(SELECT 1 FROM runs) BEGIN SELECT RAISE(ABORT,'fixture domain requires empty state'); END;
+CREATE TRIGGER private_fixture_no_delete BEFORE DELETE ON private_fixture_domain
+BEGIN SELECT RAISE(ABORT,'fixture domain is permanent'); END;
+CREATE TRIGGER private_fixture_no_update BEFORE UPDATE ON private_fixture_domain
+BEGIN SELECT RAISE(ABORT,'fixture domain is permanent'); END;
+"#,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3089,7 +3143,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 18);
+        assert_eq!(database.schema_version()?, 19);
         let foreign_keys: i64 =
             database
                 .connection
@@ -3310,8 +3364,73 @@ mod tests {
                     .state,
                 crate::AdmissionState::Reconciliation
             );
-            assert_eq!(Database::open(&path)?.schema_version()?, 18);
+            assert_eq!(Database::open(&path)?.schema_version()?, 19);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn phase_seven_migration_preserves_feedback_and_unknown_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("phase-six.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().take(18) {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1,?2,?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+            if *version == 12 {
+                insert_legacy_run(&connection, "phase-six-history")?;
+            }
+        }
+        for revision in 1..=2 {
+            connection.execute("INSERT INTO goal_feedback_revisions VALUES (?1,'phase-six-history',?2,'accepted','[]',NULL,?3)",params![format!("retained-{revision}"),revision,timestamp(at(revision))])?;
+        }
+        drop(connection);
+        let migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 19);
+        assert_eq!(
+            migrated
+                .latest_goal_feedback("phase-six-history")?
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT COUNT(*) FROM goal_feedback_revisions",
+                [],
+                |r| r.get::<_, u64>(0)
+            )?,
+            2
+        );
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("SELECT COUNT(*) FROM private_annotations", [], |r| r
+                    .get::<_, u64>(0))?,
+            0
+        );
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT COUNT(*) FROM private_policy_transitions",
+                [],
+                |r| r.get::<_, u64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |r| r.get::<_, u64>(0)
+            )?,
+            0
+        );
+        drop(migrated);
+        assert_eq!(Database::open(&path)?.schema_version()?, 19);
         Ok(())
     }
 
@@ -3337,7 +3456,7 @@ mod tests {
         connection.execute("INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,started_at,outcome,raw_telemetry_path) VALUES ('attempt','phase-two','candidate','executor',1,1,'codex',?1,'completed','telemetry')",[timestamp(at(1))])?;
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 18);
+        assert_eq!(migrated.schema_version()?, 19);
         assert_eq!(
             migrated.connection.query_row(
                 "SELECT outcome FROM attempts WHERE id='attempt'",
@@ -3389,7 +3508,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 18);
+        assert_eq!(migrated.schema_version()?, 19);
         let violations: i64 = migrated.connection.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check",
             [],
@@ -3410,7 +3529,7 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 18);
+        assert_eq!(database.schema_version()?, 19);
         assert_eq!(
             database
                 .connection
@@ -3420,7 +3539,7 @@ mod tests {
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 18);
+        assert_eq!(Database::open(&path)?.schema_version()?, 19);
         Ok(())
     }
 
@@ -3511,7 +3630,7 @@ mod tests {
         let settings = previous.sync_settings()?;
         drop(previous);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 18);
+        assert_eq!(migrated.schema_version()?, 19);
         assert_eq!(migrated.sync_settings()?, settings);
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {

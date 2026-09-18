@@ -624,6 +624,8 @@ pub struct AllocationAlternative {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocationDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_evidence: Option<crate::private_evidence::DecisionEvidence>,
     pub version: u32,
     pub policy_version: String,
     pub task_features: TaskFeatures,
@@ -802,6 +804,8 @@ pub struct GoalExecution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptDetail {
+    #[serde(default)]
+    pub usage_categories: std::collections::BTreeMap<String, u64>,
     pub parent_attempt_id: Option<String>,
     pub reason: Option<String>,
     pub input_baseline: Option<PathBuf>,

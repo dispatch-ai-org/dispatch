@@ -163,6 +163,7 @@ pub(crate) fn select_resource_filtered(
         policy_reason.to_owned()
     };
     Ok(AllocationDecision {
+        private_evidence: None,
         version: 1,
         policy_version: "allocation-portfolio-v3".into(),
         task_features: features.clone(),

@@ -121,6 +121,8 @@ impl DetectionResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessTelemetry {
     #[serde(default)]
+    pub usage_categories: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
     pub events: Vec<Value>,
     pub tokens: Option<u64>,
     pub token_semantics: Option<String>,
@@ -176,6 +178,8 @@ impl HarnessRunRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessRunResult {
+    #[serde(default)]
+    pub usage_categories: std::collections::BTreeMap<String, u64>,
     pub harness_id: String,
     pub harness_version: Option<String>,
     pub requested_model: Option<String>,
@@ -294,6 +298,7 @@ pub async fn run_harness(
     let requested_effort = adapter.effort().map(str::to_owned);
 
     Ok(HarnessRunResult {
+        usage_categories: telemetry.usage_categories,
         harness_id: adapter.id().into(),
         harness_version: harness_version.or(telemetry.harness_version.clone()),
         requested_model: requested_model.clone(),
@@ -727,6 +732,7 @@ pub fn parse_jsonl_telemetry(output: &str) -> HarnessTelemetry {
     });
     let semantic_error = events.iter().find_map(reported_semantic_error);
     HarnessTelemetry {
+        usage_categories: Default::default(),
         events,
         tokens,
         token_semantics,

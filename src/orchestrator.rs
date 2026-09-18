@@ -95,6 +95,9 @@ fn operation_cancellation() -> CancellationToken {
 }
 
 const EVALUATION_REASONS: &[&str] = &[
+    "rework",
+    "changed-requirements",
+    "source-drift",
     "correctness",
     "completeness",
     "architecture",
@@ -686,6 +689,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
+            true,
         )
         .await?;
         (
@@ -1950,6 +1954,7 @@ fn print_single_result_summary(
 }
 
 struct CandidateExecution {
+    usage_categories: std::collections::BTreeMap<String, u64>,
     checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
     admission_released: bool,
     failure: Option<crate::FailureKind>,
@@ -1974,6 +1979,7 @@ async fn select_available_resource(
     agent: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
+    new_goal: bool,
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
     let db = Database::open(state.db_path())?;
@@ -2101,6 +2107,7 @@ async fn select_available_resource(
         };
         exclusions.push(reason);
     }
+    let frozen_exclusions = exclusions.clone();
     if exclusions.iter().all(Option::is_some) {
         for exclusion in &mut exclusions {
             if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
@@ -2108,7 +2115,7 @@ async fn select_available_resource(
             }
         }
     }
-    crate::router::select_resource_filtered(
+    let mut decision = crate::router::select_resource_filtered(
         resources,
         features,
         &config.execution.backend,
@@ -2127,7 +2134,31 @@ async fn select_available_resource(
                 .collect::<Vec<_>>()
                 .join("; ")
         )
-    })
+    })?;
+    if !new_goal {
+        return Ok(decision);
+    }
+    // The base path may bind a blocked choice so admission records its deferral.
+    // That disposition does not make a capacity-blocked alternative a trial target.
+    for (alternative, exclusion) in decision.alternatives.iter_mut().zip(frozen_exclusions) {
+        if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
+            alternative.eligible = false;
+            alternative.exclusion = exclusion;
+        }
+    }
+    crate::private_evidence::select(
+        state,
+        source,
+        config,
+        decision,
+        agent.is_some()
+            || model.is_some()
+            || effort.is_some()
+            || resources.profiles.iter().any(|p| {
+                let h = config.harnesses.get(&p.harness);
+                h.model.is_some() || h.effort.is_some()
+            }),
+    )
 }
 
 async fn observe_capacity(
@@ -2227,10 +2258,12 @@ async fn execute_candidate(
     };
 
     let mut checkpoint = None;
+    let mut usage_categories = std::collections::BTreeMap::new();
     let mut failure;
     let mut identities = (None, None, None, None, None, None);
     match execution {
         Ok(result) => {
+            usage_categories = result.usage_categories;
             failure = result.failure;
             if admission.is_some()
                 && result.execution.status == ExecutionStatus::Succeeded
@@ -2338,6 +2371,7 @@ async fn execute_candidate(
         }
     }
     CandidateExecution {
+        usage_categories,
         checkpoint,
         admission_released,
         failure,
@@ -2372,6 +2406,7 @@ fn update_attempt_finished(
         .iter_mut()
         .find(|attempt| attempt.candidate_id == candidate.id)
         .expect("candidate attempt exists");
+    attempt.detail.usage_categories = execution.usage_categories.clone();
     attempt.harness_version = candidate.harness_version.clone();
     attempt.requested_model = execution
         .requested_model
@@ -3301,6 +3336,9 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
     if let Some(decision) = &run.allocation {
         print_allocation_details(decision);
         print_capacity_details(run.capacity.as_ref(), run.admission.as_ref());
+        if let Err(error) = crate::private_evidence::explain(state, &run.id) {
+            println!("Private evidence unavailable: {error}");
+        }
         return Ok(());
     }
     let decision = run

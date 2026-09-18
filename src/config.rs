@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "crate::private_evidence::EvidenceConfig::is_disabled")]
+    pub private_evidence: crate::private_evidence::EvidenceConfig,
     pub execution: ExecutionConfig,
     pub checks: ChecksConfig,
     pub harnesses: HarnessesConfig,

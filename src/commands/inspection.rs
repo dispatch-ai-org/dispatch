@@ -109,7 +109,9 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
 fn remove_paths(value: &mut Value) {
     match value {
         Value::Object(map) => {
-            map.retain(|k, _| !k.ends_with("_path") && k != "input_baseline");
+            map.retain(|k, _| {
+                !k.ends_with("_path") && k != "input_baseline" && k != "private_evidence"
+            });
             for v in map.values_mut() {
                 remove_paths(v)
             }
