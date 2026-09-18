@@ -785,6 +785,8 @@ pub struct GoalExecution {
     pub max_invocations: u32,
     pub deadline_at: DateTime<Utc>,
     pub no_retry: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_harness: Option<String>,
     pub fixed_model: Option<String>,
     pub fixed_effort: Option<String>,
     pub priority: i32,

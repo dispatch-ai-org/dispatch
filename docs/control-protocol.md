@@ -328,3 +328,12 @@ The fixture creates a temporary project, private state, a deterministic executab
 named `codex`, and a grant, then uses real OS pipes and the actual binary. It never
 connects to a provider. These tests establish mechanics, not subscription savings
 or multi-day product performance. See `phase5-validation.md` for the scenario map.
+
+## Second-provider profiles (Phase 6)
+
+A newly human-issued grant may include validated Codex and Claude profiles. The
+exact serialized profiles, including Claude's time-bound funding evidence, remain
+the authorization boundary. Enabling Claude does not enlarge a pre-existing grant.
+No protocol actor/resource field can bypass that boundary. Both adapters use the
+same submit, question/answer, event, artifact and receipt paths. See the
+[Phase 6 support matrix](phase6-validation.md) for fixture versus live evidence.

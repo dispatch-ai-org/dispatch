@@ -1,3 +1,5 @@
+pub mod claude;
+
 use std::{
     env,
     path::{Path, PathBuf},
@@ -17,6 +19,48 @@ use crate::{
         ExecutionStatus, Executor, trusted_host_executable,
     },
 };
+
+pub(crate) async fn observe_resource(
+    executable: &Path,
+    selected: &crate::ResourceChoice,
+    coordinated_pool: &str,
+    profile: &crate::config::ResourceProfile,
+    config: &crate::config::CapacityConfig,
+    run_dir: &Path,
+) -> crate::capacity::CapacityProbeResult {
+    if selected.harness == "claude" {
+        crate::harness::claude::observe(executable, profile, coordinated_pool, run_dir, config)
+            .await
+    } else if selected.harness == "codex"
+        && config.codex_probe
+        && crate::capacity::supports_codex_account_probe(executable)
+    {
+        crate::capacity::probe_codex(
+            executable,
+            coordinated_pool,
+            &profile.provider_buckets,
+            &selected.service_mode,
+            config,
+        )
+        .await
+    } else {
+        let reason = if config.codex_probe {
+            "Codex account probe unavailable for this configured executable"
+        } else {
+            "capacity probe disabled"
+        };
+        crate::capacity::CapacityProbeResult {
+            observation: crate::capacity::unknown_observation(
+                coordinated_pool,
+                &selected.service_mode,
+                chrono::Utc::now(),
+                config.freshness_secs,
+                reason,
+            ),
+            raw: serde_json::json!({"unavailable": reason}),
+        }
+    }
+}
 
 pub const SUPPORTED_HARNESSES: &[&str] = &[
     "claude",
@@ -85,6 +129,7 @@ pub struct HarnessTelemetry {
     pub effort: Option<String>,
     pub harness_version: Option<String>,
     pub semantic_error: Option<String>,
+    pub failure: Option<crate::FailureKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +190,8 @@ pub struct HarnessRunResult {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub events: Vec<Value>,
+    pub failure: Option<crate::FailureKind>,
+    pub checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
 }
 
 #[async_trait]
@@ -165,6 +212,17 @@ pub trait HarnessAdapter: Send + Sync {
 
     /// Constructs argv only. Process spawning remains the executor's job.
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec>;
+
+    fn checkpoint(
+        &self,
+        _events: &[Value],
+    ) -> Option<std::result::Result<crate::CheckpointReport, String>> {
+        None
+    }
+
+    async fn preflight(&self, _executor: &Executor, _request: &HarnessRunRequest) -> Result<()> {
+        Ok(())
+    }
 
     fn parse_output(&self, stdout: &str, _stderr: &str) -> HarnessTelemetry {
         parse_jsonl_telemetry(stdout)
@@ -198,6 +256,12 @@ pub async fn run_harness(
     } else {
         None
     };
+    if let Err(error) = adapter.preflight(executor, &request).await {
+        if let Some(observer) = &request.observer {
+            observer.preflight_failed()?;
+        }
+        return Err(error);
+    }
     let command = adapter.build_command(&request)?;
     let mut execution_request = ExecutionRequest::new(
         command,
@@ -206,7 +270,7 @@ pub async fn run_harness(
         request.output_dir.join("stderr.log"),
     );
     execution_request.timeout = request.timeout;
-    execution_request.observer = request.observer;
+    execution_request.observer = request.observer.clone();
     let mut execution = executor
         .execute_with_cancel(execution_request, request.cancellation)
         .await?;
@@ -220,6 +284,9 @@ pub async fn run_harness(
     {
         execution.status = ExecutionStatus::Failed;
         execution.error = Some(format!("harness reported an error: {error}"));
+    }
+    if let (Some(observer), Some(failure)) = (&request.observer, telemetry.failure) {
+        observer.provider_failure(failure)?;
     }
     execution.clear_raw_capture();
 
@@ -239,6 +306,16 @@ pub async fn run_harness(
         tokens: telemetry.tokens,
         token_semantics: telemetry.token_semantics,
         cost_usd: telemetry.cost_usd,
+        // A provider rejection after spawn is a failed invocation, not a
+        // pre-launch admission deferral. Its restriction is persisted above.
+        failure: telemetry.failure.map(|failure| {
+            if failure == crate::FailureKind::CapacityAdmission {
+                crate::FailureKind::HarnessProcess
+            } else {
+                failure
+            }
+        }),
+        checkpoint: adapter.checkpoint(&telemetry.events),
         events: telemetry.events,
     })
 }
@@ -296,17 +373,36 @@ impl HarnessAdapter for ClaudeAdapter {
         probe_version(&self.executable()).await
     }
 
+    fn effort(&self) -> Option<&str> {
+        self.config.effort.as_deref()
+    }
+
+    async fn preflight(&self, executor: &Executor, request: &HarnessRunRequest) -> Result<()> {
+        if let Some(evidence) = &self.config.claude_subscription {
+            claude::preflight(&self.executable(), evidence, executor, request).await?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint(
+        &self,
+        events: &[Value],
+    ) -> Option<std::result::Result<crate::CheckpointReport, String>> {
+        claude::checkpoint(events)
+    }
+
+    fn parse_output(&self, stdout: &str, _stderr: &str) -> HarnessTelemetry {
+        claude::parse_output(
+            stdout,
+            self.config
+                .allocation_service_mode
+                .as_ref()
+                .and(self.config.model.as_deref()),
+        )
+    }
+
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
-        let mut args = vec![
-            "-p".into(),
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            "--dangerously-skip-permissions".into(),
-        ];
-        push_model_and_extra_args(&mut args, &self.config);
-        args.push(request.prompt.clone());
-        Ok(CommandSpec::new(path_string(&self.executable())).args(args))
+        claude::command(&self.executable(), &self.config, request)
     }
 }
 
@@ -348,6 +444,13 @@ impl HarnessAdapter for CodexAdapter {
 
     async fn version(&self) -> Result<Option<String>> {
         probe_version(&self.executable()).await
+    }
+
+    fn checkpoint(
+        &self,
+        events: &[Value],
+    ) -> Option<std::result::Result<crate::CheckpointReport, String>> {
+        codex_checkpoint(events)
     }
 
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
@@ -632,6 +735,7 @@ pub fn parse_jsonl_telemetry(output: &str) -> HarnessTelemetry {
         effort,
         harness_version,
         semantic_error,
+        failure: None,
     }
 }
 
@@ -805,6 +909,12 @@ pub(crate) fn codex_checkpoint(
             })
             .then(|| Err("checkpoint was not the final agent message".into()));
     }
+    checkpoint_envelope(text)
+}
+
+pub(crate) fn checkpoint_envelope(
+    text: &str,
+) -> Option<std::result::Result<crate::CheckpointReport, String>> {
     Some(
         (|| -> Result<crate::CheckpointReport> {
             anyhow::ensure!(text.len() <= 16_384, "checkpoint report too large");
@@ -850,6 +960,7 @@ mod tests {
             executable: Some(PathBuf::from("custom-agent")),
             extra_args: vec!["--extra".into()],
             allocation_service_mode: None,
+            claude_subscription: None,
         };
 
         let codex = CodexAdapter::new(configured.clone())
@@ -899,7 +1010,7 @@ mod tests {
                 "--output-format",
                 "stream-json",
                 "--verbose",
-                "--dangerously-skip-permissions"
+                "--permission-mode"
             ]
         );
         assert_eq!(claude.args.last().unwrap(), "do the task");

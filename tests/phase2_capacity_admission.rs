@@ -583,7 +583,7 @@ fn foreground_configuration_changes_respect_overlap_and_allow_disjoint_work() ->
     fs::write(&release, "release")?;
     let holder = holder.wait_with_output()?;
     let expanded = expanded.wait_with_output()?;
-    for output in [&holder, &expanded, &disjoint] {
+    for output in [&holder, &disjoint] {
         assert!(
             output.status.success(),
             "{}",
@@ -599,7 +599,20 @@ fn foreground_configuration_changes_respect_overlap_and_allow_disjoint_work() ->
         independent_ran,
         "disjoint allowance was needlessly serialized"
     );
-    assert!(expanded_started.exists());
+    assert!(
+        !expanded.status.success(),
+        "stale queued result: stdout={} stderr={}",
+        String::from_utf8_lossy(&expanded.stdout),
+        String::from_utf8_lossy(&expanded.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&expanded.stderr)
+            .contains("resource configuration changed after admission")
+    );
+    assert!(
+        !expanded_started.exists(),
+        "removed queued profile must not launch"
+    );
     Ok(())
 }
 

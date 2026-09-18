@@ -45,7 +45,7 @@ use crate::{
         HarnessRunRequest, SUPPORTED_HARNESSES, adapter_for, build_prompt, probe_version,
         run_harness,
     },
-    router::{rank_harnesses, select_resource},
+    router::rank_harnesses,
     source,
     state::{State, write_text},
 };
@@ -613,6 +613,24 @@ fn harness_name(id: &str) -> &str {
     }
 }
 
+fn authorize_local_commands(label: &str, output: RunOutputMode) -> Result<()> {
+    anyhow::ensure!(
+        output == RunOutputMode::Human,
+        "machine output requires --allow-unsafe-local when local execution needs authorization"
+    );
+    print!(
+        "Dispatch will run {label} with your user permissions in an isolated candidate workspace. Continue? [y/N] "
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    anyhow::ensure!(
+        matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        "local execution was not authorized; explicitly accept the risk with --allow-unsafe-local for non-interactive use, or use --backend docker"
+    );
+    Ok(())
+}
+
 pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecord> {
     RUN_OUTPUT_MODE.store(request.output.code(), Ordering::Relaxed);
     anyhow::ensure!(!request.task.trim().is_empty(), "task must not be empty");
@@ -643,51 +661,38 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         names = config.execution.forwarded_env.join(", ")
     );
 
-    if (request.model.is_some() || request.effort.is_some())
-        && request
-            .agent
-            .as_deref()
-            .is_some_and(|agent| agent != "codex")
-    {
-        bail!("--model and --effort are Phase 1 Codex controls; use --agent codex");
-    }
     let resources = crate::commands::resources(state)?;
-    let trial_automatic = resources.allocation_enabled
-        && !request.route
-        && request.harnesses.is_empty()
-        && request.agent.is_none();
     let allocation_requested =
-        trial_automatic || request.model.is_some() || request.effort.is_some();
+        (resources.allocation_enabled && !request.route && request.harnesses.is_empty())
+            || request.model.is_some()
+            || request.effort.is_some();
     let automatic = request.route
         || (request.harnesses.is_empty() && request.agent.is_none() && !allocation_requested);
-    let fixed_model = request
-        .model
-        .clone()
-        .or(config.harnesses.codex.model.clone());
-    let fixed_effort = request
-        .effort
-        .clone()
-        .or(config.harnesses.codex.effort.clone());
+    let fixed_harness = request.agent.clone();
+    let mut local_authorized = request.allow_unsafe_local;
+    if allocation_requested && config.execution.backend == "local" && !local_authorized {
+        // Discovery executes configured programs too: obtain host consent before probes.
+        authorize_local_commands("configured coding-agent commands", request.output)?;
+        local_authorized = true;
+    }
     let (mut harnesses, routing, allocation) = if allocation_requested {
-        anyhow::ensure!(
-            config.harnesses.codex.extra_args.is_empty(),
-            "allocation profiles require harnesses.codex.extra_args to be empty so model, effort, fast-mode, and internal-orchestration controls cannot be shadowed"
-        );
         let features = classify_task(&source_path, &request.task)?;
-        let decision = select_resource(
+        let decision = select_available_resource(
+            state,
+            &source_path,
             &resources,
             &features,
-            &config.execution.backend,
+            &config,
+            request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
-            config.harnesses.codex.model.as_deref(),
-            config.harnesses.codex.effort.as_deref(),
-        )?;
-        config.harnesses.codex.model = Some(decision.selected.resolved_model.clone());
-        config.harnesses.codex.effort = decision.selected.effort.clone();
-        config.harnesses.codex.allocation_service_mode =
-            Some(decision.selected.service_mode.clone());
-        (vec!["codex".into()], None, Some(decision))
+        )
+        .await?;
+        (
+            vec![decision.selected.harness.clone()],
+            None,
+            Some(decision),
+        )
     } else if automatic {
         let decision =
             select_automatic_harness(state, &source_path, &request.task, &config).await?;
@@ -715,6 +720,17 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             None,
         )
     };
+    let fixed_config = config.harnesses.get(
+        allocation
+            .as_ref()
+            .map(|decision| decision.selected.harness.as_str())
+            .unwrap_or("codex"),
+    );
+    let fixed_model = request.model.clone().or(fixed_config.model.clone());
+    let fixed_effort = request.effort.clone().or(fixed_config.effort.clone());
+    if let Some(decision) = &allocation {
+        config.harnesses.bind(&decision.selected, &resources);
+    }
     anyhow::ensure!(!harnesses.is_empty(), "at least one harness is required");
     let mut seen = HashSet::new();
     for harness_id in &harnesses {
@@ -728,27 +744,15 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         || !config.checks.baseline.is_empty()
         || !config.checks.verify.is_empty();
     let unsafe_local = config.execution.backend == "local" && executes_untrusted_host_code;
-    if unsafe_local && !request.allow_unsafe_local && request.output != RunOutputMode::Human {
-        bail!(
-            "machine output requires --allow-unsafe-local when local execution needs authorization"
-        );
-    }
-    if unsafe_local && !request.allow_unsafe_local {
-        print!(
-            "Dispatch will run {} with your user permissions in an isolated candidate workspace. Continue? [y/N] ",
-            harnesses
+    if unsafe_local && !local_authorized {
+        authorize_local_commands(
+            &harnesses
                 .iter()
                 .map(|id| harness_name(id))
                 .collect::<Vec<_>>()
-                .join(", ")
-        );
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        anyhow::ensure!(
-            matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-            "local execution was not authorized; explicitly accept the risk with --allow-unsafe-local for non-interactive use, or use --backend docker"
-        );
+                .join(", "),
+            request.output,
+        )?;
     }
     anyhow::ensure!(
         harnesses.len() <= 702,
@@ -879,6 +883,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                     i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
                 ),
             no_retry: request.no_retry,
+            fixed_harness,
             fixed_model,
             fixed_effort,
             priority: request.priority,
@@ -1440,7 +1445,8 @@ async fn admit_attempt(
             .profiles
             .iter()
             .find(|profile| {
-                profile.pool == selected.pool
+                profile.enabled
+                    && profile.pool == selected.pool
                     && profile.provider == selected.provider
                     && profile.funding_source == selected.funding_source
                     && profile.model == selected.resolved_model
@@ -1454,14 +1460,14 @@ async fn admit_attempt(
         );
         let canonical_identity = canonical_pool_identity(
             &selected.provider,
-            &selected.funding_source,
-            &profile.provider_buckets,
+            &profile.funding_scope(),
+            &profile.admission_buckets(),
         );
         let coordinated_pool = coordinator.register_pool(
             &selected.pool,
             &selected.provider,
-            &selected.funding_source,
-            &profile.provider_buckets,
+            &profile.funding_scope(),
+            &profile.admission_buckets(),
         )?;
         if !resources.capacity.admission {
             let message = "shared admission cannot be disabled for allocation execution; drain/reconcile coordinated work and disable allocation instead";
@@ -1470,10 +1476,10 @@ async fn admit_attempt(
         }
         let executable = config
             .harnesses
-            .codex
+            .get(&selected.harness)
             .executable
             .clone()
-            .unwrap_or_else(|| PathBuf::from("codex"));
+            .unwrap_or_else(|| PathBuf::from(&selected.harness));
         let mut observation = observe_capacity(
             &executable,
             &selected,
@@ -1488,7 +1494,9 @@ async fn admit_attempt(
         db.sync_run(run)?;
         let route_snapshot_json = serde_json::to_string(&serde_json::json!({
             "resource": selected,
-            "provider_buckets": profile.provider_buckets,
+            "provider_buckets": profile.admission_buckets(),
+            "resource_profile": profile,
+            "resources_path": state.root.join("resources.yml"),
         }))?;
         let configuration_revision = format!(
             "sha256:{}",
@@ -1954,6 +1962,174 @@ struct CandidateExecution {
     observed_effort: Option<String>,
 }
 
+/// Resolve optional resources before binding a request or reserving any slot.
+/// Profile order is the explicit portfolio preference; capacity is never summed.
+#[allow(clippy::too_many_arguments)]
+async fn select_available_resource(
+    state: &State,
+    source: &Path,
+    resources: &crate::config::ResourceConfig,
+    features: &crate::TaskFeatures,
+    config: &Config,
+    agent: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<crate::AllocationDecision> {
+    let mut exclusions = Vec::new();
+    let db = Database::open(state.db_path())?;
+    let coordinator = AdmissionCoordinator::new(
+        state.db_path(),
+        Duration::from_secs(resources.capacity.lease_secs),
+        Duration::from_secs(resources.capacity.aging_secs),
+    );
+    for profile in &resources.profiles {
+        let harness = config.harnesses.get(&profile.harness);
+        if profile.enabled && agent.is_none_or(|a| a == profile.harness) {
+            anyhow::ensure!(
+                harness.extra_args.is_empty(),
+                "allocation profiles require harnesses.{}.extra_args to be empty so controlled invocation cannot be shadowed",
+                profile.harness
+            );
+        }
+        let reason = if !profile.enabled {
+            Some("resource disabled".into())
+        } else if agent.is_some_and(|a| a != profile.harness) {
+            Some("explicit harness constraint".into())
+        } else if harness.model.as_deref().is_some_and(|m| m != profile.model)
+            || harness
+                .effort
+                .as_deref()
+                .is_some_and(|e| Some(e) != profile.effort.as_deref())
+        {
+            Some("resource conflicts with fixed project harness configuration".into())
+        } else if model.is_some_and(|m| m != profile.model)
+            || effort.is_some_and(|e| Some(e) != profile.effort.as_deref())
+        {
+            Some("explicit model or effort constraint".into())
+        } else {
+            let adapter = adapter_for(&profile.harness, &config.harnesses)?;
+            if config.execution.backend == "local" && !adapter.detect().await.available {
+                Some(format!("{} executable unavailable", profile.harness))
+            } else if let Err(error) = profile.eligibility() {
+                Some(error.to_string())
+            } else {
+                let mut harnesses = config.harnesses.clone();
+                harnesses.bind_profile(profile);
+                let adapter = adapter_for(&profile.harness, &harnesses)?;
+                let request = HarnessRunRequest::new(source, "", source);
+                match adapter
+                    .preflight(&Executor::new(config.execution.clone()), &request)
+                    .await
+                {
+                    Ok(()) => None,
+                    Err(error) => {
+                        let pool = coordinator.register_pool(
+                            &profile.pool,
+                            &profile.provider,
+                            &profile.funding_scope(),
+                            &profile.admission_buckets(),
+                        )?;
+                        let mut observation = crate::capacity::unknown_observation(
+                            &pool,
+                            &profile.service_mode,
+                            Utc::now(),
+                            resources.capacity.freshness_secs,
+                            "adapter preflight rejected the resource",
+                        );
+                        observation.auth_mode = crate::CapacityValue::Reported {
+                            value: "adapter_preflight_rejected".into(),
+                        };
+                        db.append_capacity_observation(&observation)?;
+                        let revision = crate::commands::digest(profile)?;
+                        let _ = authorize_observation(
+                            &db,
+                            &pool,
+                            &observation,
+                            &revision,
+                            profile.authorization_revision,
+                            &profile.funding_source,
+                        );
+                        Some(error.to_string())
+                    }
+                }
+            }
+        };
+        let reason = if reason.is_none() && profile.included && profile.no_overage_verified {
+            let pool = coordinator.register_pool(
+                &profile.pool,
+                &profile.provider,
+                &profile.funding_scope(),
+                &profile.admission_buckets(),
+            )?;
+            // Provider-owned observations precede selection; no alternative is leased.
+            if profile.harness == "codex" && resources.capacity.codex_probe {
+                let executable = harness
+                    .executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(&profile.harness));
+                if supports_codex_account_probe(&executable) {
+                    let probe = probe_codex(
+                        &executable,
+                        &pool,
+                        &profile.provider_buckets,
+                        &profile.service_mode,
+                        &resources.capacity,
+                    )
+                    .await;
+                    db.append_capacity_observation(&probe.observation)?;
+                }
+            }
+            if matches!(
+                crate::capacity::resolved_scarcity(db.connection(), &pool, Utc::now())?,
+                crate::ScarcityState::Exhausted | crate::ScarcityState::Reserve
+            ) {
+                Some("retained capacity restriction excludes this pool".into())
+            } else if let Some(observation) = db.latest_capacity_observation(&pool)? {
+                crate::capacity::retained_authorization_conflict(
+                    db.connection(),
+                    &pool,
+                    i64::try_from(profile.authorization_revision)?,
+                    &observation,
+                    &profile.funding_source,
+                )?
+                .map(|reason| format!("funding revalidation failed: {reason}"))
+            } else {
+                None
+            }
+        } else {
+            reason
+        };
+        exclusions.push(reason);
+    }
+    if exclusions.iter().all(Option::is_some) {
+        for exclusion in &mut exclusions {
+            if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
+                *exclusion = None;
+            }
+        }
+    }
+    crate::router::select_resource_filtered(
+        resources,
+        features,
+        &config.execution.backend,
+        model,
+        effort,
+        None,
+        None,
+        &exclusions,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "{e}; {}",
+            exclusions
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })
+}
+
 async fn observe_capacity(
     executable: &Path,
     selected: &crate::ResourceChoice,
@@ -1963,32 +2139,15 @@ async fn observe_capacity(
     run_dir: &Path,
     db: &Database,
 ) -> Result<crate::CapacityObservation> {
-    let probe = if config.codex_probe && supports_codex_account_probe(executable) {
-        probe_codex(
-            executable,
-            coordinated_pool,
-            &profile.provider_buckets,
-            &selected.service_mode,
-            config,
-        )
-        .await
-    } else {
-        let reason = if config.codex_probe {
-            "Codex account probe unavailable for this configured executable"
-        } else {
-            "capacity probe disabled"
-        };
-        crate::capacity::CapacityProbeResult {
-            observation: crate::capacity::unknown_observation(
-                coordinated_pool,
-                &selected.service_mode,
-                Utc::now(),
-                config.freshness_secs,
-                reason,
-            ),
-            raw: serde_json::json!({"unavailable": reason}),
-        }
-    };
+    let probe = crate::harness::observe_resource(
+        executable,
+        selected,
+        coordinated_pool,
+        profile,
+        config,
+        run_dir,
+    )
+    .await;
     let mut observation = probe.observation;
     let capacity_dir = run_dir.join("capacity");
     fs::create_dir_all(&capacity_dir)?;
@@ -2068,16 +2227,16 @@ async fn execute_candidate(
     };
 
     let mut checkpoint = None;
-    let mut failure = None;
+    let mut failure;
     let mut identities = (None, None, None, None, None, None);
     match execution {
         Ok(result) => {
+            failure = result.failure;
             if admission.is_some()
-                && candidate.harness_id == "codex"
                 && result.execution.status == ExecutionStatus::Succeeded
                 && admission_released
             {
-                checkpoint = crate::harness::codex_checkpoint(&result.events);
+                checkpoint = result.checkpoint;
             }
             let _ = write_text(
                 &candidate_dir.join("harness.jsonl"),

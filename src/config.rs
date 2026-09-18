@@ -65,6 +65,41 @@ pub struct HarnessConfig {
     /// Selected allocation service mode. Project YAML cannot set this value.
     #[serde(skip)]
     pub allocation_service_mode: Option<String>,
+    #[serde(skip)]
+    pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
+}
+
+impl HarnessesConfig {
+    pub fn get(&self, harness: &str) -> &HarnessConfig {
+        match harness {
+            "claude" => &self.claude,
+            "cursor" => &self.cursor,
+            _ => &self.codex,
+        }
+    }
+    pub fn bind_profile(&mut self, profile: &ResourceProfile) {
+        let config = match profile.harness.as_str() {
+            "claude" => &mut self.claude,
+            _ => &mut self.codex,
+        };
+        config.model = Some(profile.model.clone());
+        config.effort = profile.effort.clone();
+        config.allocation_service_mode = Some(profile.service_mode.clone());
+        config.claude_subscription = profile.claude_subscription.clone();
+    }
+    pub fn bind(&mut self, choice: &crate::ResourceChoice, resources: &ResourceConfig) {
+        if let Some(profile) = resources.profiles.iter().find(|p| {
+            p.enabled
+                && p.harness == choice.harness
+                && p.provider == choice.provider
+                && p.funding_source == choice.funding_source
+                && p.pool == choice.pool
+                && p.model == choice.resolved_model
+                && p.effort == choice.effort
+        }) {
+            self.bind_profile(profile);
+        }
+    }
 }
 
 impl Config {
@@ -186,6 +221,10 @@ impl Default for CapacityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceProfile {
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
     pub provider: String,
     pub funding_source: String,
     pub harness: String,
@@ -207,6 +246,44 @@ pub struct ResourceProfile {
     /// conflicting account or funding observation invalidates an epoch.
     #[serde(default = "default_authorization_revision")]
     pub authorization_revision: u64,
+}
+
+impl ResourceProfile {
+    /// A local display-name change cannot manufacture a new account allowance.
+    pub fn funding_scope(&self) -> String {
+        self.claude_subscription
+            .as_ref()
+            .filter(|_| self.harness == "claude")
+            .map(|e| format!("claude-account:{}", e.account_sha256))
+            .unwrap_or_else(|| self.funding_source.clone())
+    }
+    pub fn admission_buckets(&self) -> Vec<String> {
+        // Claude v1 has no authoritative preflight bucket mapping. All choices
+        // for the authenticated account conservatively share one allowance.
+        if self.harness == "claude" {
+            Vec::new()
+        } else {
+            self.provider_buckets.clone()
+        }
+    }
+    pub fn eligibility(&self) -> Result<()> {
+        anyhow::ensure!(self.enabled, "resource profile disabled");
+        anyhow::ensure!(
+            self.included && self.no_overage_verified,
+            "included-only funding is not validated"
+        );
+        if self.harness == "claude" {
+            crate::harness::claude::eligibility(self)?;
+        }
+        Ok(())
+    }
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 fn default_authorization_revision() -> u64 {
@@ -257,6 +334,9 @@ impl ResourceConfig {
             "capacity aging must be positive"
         );
         for profile in &self.profiles {
+            if !profile.enabled {
+                continue;
+            }
             anyhow::ensure!(
                 profile.authorization_revision > 0,
                 "resource profile authorization_revision must be positive"
@@ -270,11 +350,14 @@ impl ResourceConfig {
             );
             validate_model(Some(&profile.model))?;
             validate_effort(profile.effort.as_deref())?;
-            if profile.harness == "codex" && profile.included {
+            if profile.included {
                 anyhow::ensure!(
                     profile.service_mode == "standard",
-                    "included Codex allocation profiles must use standard service mode"
+                    "included allocation profiles must use standard service mode"
                 );
+            }
+            if profile.harness == "claude" {
+                crate::harness::claude::validate_profile(profile)?;
             }
             for (name, value) in [
                 ("funding_source", &profile.funding_source),
@@ -297,22 +380,25 @@ impl ResourceConfig {
         }
         for (index, left) in self.profiles.iter().enumerate() {
             for right in &self.profiles[index + 1..] {
+                if !left.enabled || !right.enabled {
+                    continue;
+                }
                 if left.pool == right.pool {
                     anyhow::ensure!(
                         left.provider == right.provider
-                            && left.funding_source == right.funding_source
+                            && left.funding_scope() == right.funding_scope()
                             && left.provider_buckets == right.provider_buckets,
                         "profiles in one resource pool must share provider, funding source, and provider bucket mapping"
                     );
                 }
-                let overlapping_buckets = left.provider_buckets.is_empty()
+                let overlapping_buckets = left.admission_buckets().is_empty()
                     || right.provider_buckets.is_empty()
                     || left
                         .provider_buckets
                         .iter()
                         .any(|bucket| right.provider_buckets.contains(bucket));
                 if left.provider == right.provider
-                    && left.funding_source == right.funding_source
+                    && left.funding_scope() == right.funding_scope()
                     && overlapping_buckets
                 {
                     anyhow::ensure!(

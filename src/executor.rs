@@ -44,7 +44,8 @@ pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
     /// Adapter-owned environment additions. The executor still filters these
-    /// against `execution.forwarded_env` before passing them to a child.
+    /// against `execution.forwarded_env` before passing them to a child, except
+    /// explicit USER metadata needed by native credential stores.
     pub env: BTreeMap<String, String>,
 }
 
@@ -78,6 +79,12 @@ impl CommandSpec {
 }
 
 pub trait ExecutionObserver: std::fmt::Debug + Send + Sync {
+    fn provider_failure(&self, _failure: crate::FailureKind) -> Result<()> {
+        Ok(())
+    }
+    fn preflight_failed(&self) -> Result<()> {
+        Ok(())
+    }
     fn authorize_launch(&self) -> Result<()>;
     fn spawn_failed(&self) -> Result<()>;
     fn child_spawned(
@@ -485,7 +492,7 @@ impl Executor {
                 let mut command = request.command.clone();
                 command
                     .env
-                    .retain(|name, _| self.config.forwarded_env.contains(name));
+                    .retain(|name, _| name == "USER" || self.config.forwarded_env.contains(name));
                 for name in &self.config.forwarded_env {
                     if !command.env.contains_key(name)
                         && let Ok(value) = env::var(name)
@@ -1245,6 +1252,26 @@ mod tests {
                 .any(|line| { line == "DISPATCH_ALLOWED_TEST_VALUE=[REDACTED]" })
         );
         assert!(!result.stdout.contains("DISPATCH_BLOCKED_TEST_VALUE"));
+    }
+
+    #[tokio::test]
+    async fn adapter_username_reaches_child_without_forwarding_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = ExecutionRequest::new(
+            CommandSpec::new("/bin/sh")
+                .args(["-c", r#"test "$USER" = dispatch-fixture-user && test -z "${ANTHROPIC_API_KEY+x}" && test -z "${DISPATCH_CONTROL_GRANT_FD+x}""#])
+                .env("USER", "dispatch-fixture-user")
+                .env("ANTHROPIC_API_KEY", "forbidden")
+                .env("DISPATCH_CONTROL_GRANT_FD", "199"),
+            temp.path(),
+            temp.path().join("stdout"),
+            temp.path().join("stderr"),
+        );
+        let result = Executor::new(ExecutionConfig::default())
+            .execute(request)
+            .await
+            .unwrap();
+        assert_eq!(result.status, ExecutionStatus::Succeeded);
     }
 
     #[tokio::test]

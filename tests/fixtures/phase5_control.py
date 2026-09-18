@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic real-pipe Phase 5 fixture. Never invokes a model provider."""
 import json
+import hashlib
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import select
@@ -20,6 +22,7 @@ from control_client import Client, workflow
 
 class Fixture:
     def __init__(self, binary, mode='success'):
+        self.provider = os.environ.get('DISPATCH_FIXTURE_PROVIDER', 'codex')
         self.binary = str(Path(binary).resolve())
         self.temp = tempfile.TemporaryDirectory(prefix='dispatch-phase5-')
         self.root = Path(self.temp.name)
@@ -37,7 +40,7 @@ class Fixture:
         os.mkfifo(self.barrier)
         self.ready = self.root / "ready"
         os.mkfifo(self.ready)
-        agent = self.root / 'codex'
+        agent = self.root / self.provider
         agent.write_text('''#!/usr/bin/env python3
 import json, pathlib, sys, os
 root=pathlib.Path(''' + repr(str(self.root)) + ''')
@@ -68,9 +71,49 @@ else:
     pathlib.Path('result.txt').write_text('ok\\n')
     print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Done'}}))
 ''')
+        if self.provider == 'claude':
+            os.environ.setdefault('USER', 'dispatch-fixture-user')
+            script = agent.read_text().replace("print('codex phase5 fixture');sys.exit()", "print('claude phase6 fixture');sys.exit()")
+            script = script.replace('prompt=sys.stdin.read()', """if 'auth' in sys.argv and 'status' in sys.argv:
+    assert sys.argv[-4:]==['--no-chrome','auth','status','--json']
+    assert os.environ.get('USER'), 'Keychain lookup needs username metadata'
+    count_path=root/'auth-count'
+    n=int(count_path.read_text())+1 if count_path.exists() else 1
+    count_path.write_text(str(n))
+    boundary=root/'auth-boundary'
+    if boundary.exists() and n==int(boundary.read_text()):
+        auth=json.loads((root/'auth.json').read_text());auth['email']='changed@example.invalid'
+        (root/'auth.json').write_text(json.dumps(auth))
+    print((root/'auth.json').read_text());sys.exit()
+assert '--dangerously-skip-permissions' not in sys.argv and '--bare' not in sys.argv
+assert os.environ.get('USER'), 'model invocation must use the same Keychain environment'
+assert sys.argv[sys.argv.index('--setting-sources')+1]==''
+assert sys.argv[sys.argv.index('--permission-mode')+1]=='dontAsk'
+assert sys.argv[sys.argv.index('--tools')+1]=='Bash,Read,Edit,Write,Glob,Grep'
+assert not any(k in os.environ for k in ['ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','CLAUDE_CODE_USE_BEDROCK','DISPATCH_CONTROL_GRANT_FD'])
+prompt=sys.argv[-1]
+def emit(text):
+    model=sys.argv[sys.argv.index('--model')+1]
+    model_usage={model:{'inputTokens':10,'outputTokens':4}}
+    settings=json.loads(sys.argv[sys.argv.index('--settings')+1])
+    # Reproduce the real CLI's extra title-generation model unless disabled.
+    if settings.get('env',{}).get('CLAUDE_CODE_DISABLE_TERMINAL_TITLE')!='1':
+        model_usage['claude-haiku-4-5-20251001']={'inputTokens':1095,'outputTokens':13}
+    print(json.dumps({'type':'system','subtype':'init','model':model}))
+    print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':text,
+        'usage':{'input_tokens':10,'output_tokens':4,'cache_read_input_tokens':6,'cache_creation_input_tokens':2},
+        'total_cost_usd':0.42,'modelUsage':model_usage}))
+""")
+            script = script.replace("print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':json.dumps({'dispatch_checkpoint':checkpoint})}}))", "emit(json.dumps({'dispatch_checkpoint':checkpoint}))")
+            script = script.replace("print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Done'}}))", "emit('Done')")
+            agent.write_text(script)
+            (self.root/'auth.json').write_text(json.dumps({'loggedIn':True,'authMethod':'claude.ai','apiProvider':'firstParty','email':'fixture@example.invalid','orgId':'fixture-org'}))
+            home = self.root/'home'
+            home.mkdir()
+            os.environ['HOME'] = str(home)
         agent.chmod(0o755)
         (self.source / 'dispatch.yml').write_text(
-            f"execution:\n  timeout_secs: 30\nchecks:\n  verify: ['test -f result.txt']\nharnesses:\n  codex:\n    executable: '{agent}'\n")
+            f"execution:\n  timeout_secs: 30\nchecks:\n  verify: ['test -f result.txt']\nharnesses:\n  {self.provider}:\n    executable: '{agent}'\n")
         (self.state / 'resources.yml').write_text('''version: 1
 allocation_enabled: true
 capacity:
@@ -90,6 +133,17 @@ profiles:
     no_overage_verified: true
     authorization_revision: 1
 ''')
+        if self.provider == 'claude':
+            path = self.state/'resources.yml'
+            text = path.read_text().replace('provider: openai','provider: anthropic').replace('funding_source: chatgpt-plus','funding_source: claude-fixture').replace('harness: codex','harness: claude')
+            now = datetime.now(timezone.utc)
+            evidence = {'contract_version':1,'cli_version':'claude phase6 fixture',
+                'executable_sha256':hashlib.sha256(agent.read_bytes()).hexdigest(),
+                'account_sha256':hashlib.sha256(json.dumps(['fixture@example.invalid','fixture-org'],separators=(',',':')).encode()).hexdigest(),
+                'checked_at':now.isoformat(),'valid_until':(now+timedelta(hours=1)).isoformat(),
+                'print_mode_included':True,'usage_credits_disabled':True,'unmanaged_account':True}
+            text += '    claude_subscription: '+json.dumps(evidence)+'\n'
+            path.write_text(text)
         self.key = Path(self.command('control-grant', self.source, '--allow-unsafe-local',
                                      '--delegate-factual').stdout.decode().strip())
         self.clients = []
@@ -111,6 +165,11 @@ profiles:
             return json.loads(db.execute('SELECT run_projection_json FROM runs WHERE id=?', (run_id,)).fetchone()[0])
 
     def cleanup(self):
+        if sys.exc_info()[0] is not None:
+            for metadata in (self.state/'runs').glob('*/metadata.json'):
+                run=json.loads(metadata.read_text())
+                print('fixture failure:', run.get('outcome'),
+                      [c.get('error') for c in run.get('candidates',[])], file=sys.stderr)
         for c in self.clients:
             if c.process.poll() is None:
                 c.close()

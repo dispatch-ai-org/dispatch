@@ -279,11 +279,11 @@ struct RunArgs {
     #[arg(long, value_parser = ["claude", "codex", "cursor"], conflicts_with_all = ["route", "harnesses"])]
     agent: Option<String>,
 
-    /// Select a configured Codex model resource.
+    /// Select a configured model resource.
     #[arg(long, conflicts_with_all = ["route", "harnesses"])]
     model: Option<String>,
 
-    /// Override Codex reasoning effort for this attempt.
+    /// Select the configured provider-specific effort for this attempt.
     #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], conflicts_with_all = ["route", "harnesses"], hide = true)]
     effort: Option<String>,
 

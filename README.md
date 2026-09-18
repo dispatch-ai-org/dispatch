@@ -48,7 +48,8 @@ Plain input is line-oriented; the integrated editor supports multiline paste.
 Bare invocation without terminal input and output prints help and exits 2.
 
 The interactive path requires `allocation_enabled: true` and explicitly validated
-included Codex resource profiles (see **Codex model allocation trial** below).
+included resource profiles (see **Model allocation** below and the
+[Phase 6 contract and setup guide](docs/phase6-validation.md)).
 It stops after intent if those are absent; it does not choose another provider.
 There is no automatic account authorization or subscription setup. A funding-plan
 change must be explicitly revalidated before real work can launch.
@@ -243,7 +244,7 @@ One-shot exit codes are:
 
 The result keeps execution, verification, review, and application as separate fields. Attempt records also keep requested, resolved, and harness-observed model/effort values separate; an unknown or mismatched observed identity is not replaced by configuration.
 
-### Codex model allocation trial
+### Model allocation
 
 `dispatch run --agent codex --model <id> --effort <level> "<task>"` selects one
 declared Codex resource through the normal isolated execution path. Dispatch
@@ -252,8 +253,8 @@ file (normally `~/.dispatch/resources.yml`); project configuration cannot
 enable allocation.
 
 To opt into deterministic light/standard/strong selection for ordinary runs,
-create that file with `allocation_enabled: true` and one verified profile per
-tier:
+create that file with `allocation_enabled: true` and the verified profiles you
+actually have:
 
 ```yaml
 version: 1
@@ -288,7 +289,7 @@ feature/refactor work and known broad scope still require strong. Unknown inputs
 remain recorded as unknown and do not qualify a task for light. Explicit model
 constraints and funding checks still apply.
 
-Repeat the profile for `standard` and `strong`. `no_overage_verified` is an
+Add suitable `standard` or `strong` profiles when available. `no_overage_verified` is an
 explicit assertion that the account or invocation cannot fall through to paid
 overage; an included model name or visible credits are not enough. Profiles
 without that assertion are shown in `dispatch explain` but are ineligible.
@@ -323,6 +324,16 @@ routing sync envelope. Remove the file or set `allocation_enabled: false` to
 return ordinary runs to legacy agent routing; explicit model controls remain
 available when they match a verified profile.
 
+
+Claude Code can use the same allocation, admission, recovery and review paths.
+Its included-only profiles additionally require private, time-bound account and
+invocation evidence; configuring a login or a model name alone is insufficient.
+See the [Phase 6 setup/support matrix](docs/phase6-validation.md) before enabling
+one. A bounded live smoke passed with Claude Code 2.1.274, personal Pro,
+`claude-sonnet-5` at medium effort, and usage credits disabled; this is specific
+to the tested account state and configuration. Keep Codex first in profile order
+to preserve that default. Either provider can be configured alone, and explicit
+`--agent` choices never fall back.
 
 ### Bounded recovery and clarification
 

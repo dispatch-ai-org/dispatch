@@ -347,9 +347,11 @@ fn verification_failure(run: &RunRecord, candidate: &CandidateRecord) -> Option<
     }
 }
 
-fn recovery_route(
+async fn recovery_route(
+    state: &State,
     run: &RunRecord,
     resources: &crate::config::ResourceConfig,
+    config: &Config,
 ) -> Option<AllocationDecision> {
     let policy = run.phase3.as_ref()?;
     if policy.no_retry || run.attempts.len() >= policy.max_invocations.min(2) as usize {
@@ -360,22 +362,70 @@ fn recovery_route(
         .profiles
         .iter()
         .filter(|p| {
-            rank(&p.tier) > rank(&previous.selected.tier)
-                && p.provider == previous.selected.provider
-                && p.funding_source == previous.selected.funding_source
+            p.enabled
+                && rank(&p.tier) > rank(&previous.selected.tier)
+                && policy
+                    .fixed_harness
+                    .as_deref()
+                    .is_none_or(|h| h == p.harness)
+                && policy.fixed_model.as_deref().is_none_or(|m| m == p.model)
+                && policy
+                    .fixed_effort
+                    .as_deref()
+                    .is_none_or(|e| Some(e) == p.effort.as_deref())
         })
         .collect::<Vec<_>>();
     profiles.sort_by_key(|p| rank(&p.tier));
-    profiles.into_iter().find_map(|p| {
-        let mut decision = select_resource(resources,&previous.task_features,&run.environment.execution_backend,
-            Some(&p.model),p.effort.as_deref(),policy.fixed_model.as_deref(),policy.fixed_effort.as_deref()).ok()?;
-        if rank(&decision.selected.tier) <= rank(&previous.selected.tier)
-            || decision.selected.provider != previous.selected.provider
-            || decision.selected.funding_source != previous.selected.funding_source { return None; }
-        decision.policy_version = "bounded-recovery-v1".into();
-        decision.reason = "One stronger recovery after a target check that passed on the original baseline failed after implementation.".into();
-        Some(decision)
-    })
+    let mut config = config.clone();
+    // Dynamic selection is not a project constraint on a subsequent attempt.
+    let old = if previous.selected.harness == "claude" {
+        &mut config.harnesses.claude
+    } else {
+        &mut config.harnesses.codex
+    };
+    old.model = policy.fixed_model.clone();
+    old.effort = policy.fixed_effort.clone();
+    let mut blocked = None;
+    for p in profiles {
+        // Keep a bound recovery disposition for the existing admission authority
+        // when every suitable resource is blocked; it records the specific cause.
+        if blocked.is_none() {
+            let mut constrained = resources.clone();
+            constrained
+                .profiles
+                .retain(|candidate| candidate.harness == p.harness);
+            blocked = crate::router::select_resource(
+                &constrained,
+                &previous.task_features,
+                &run.environment.execution_backend,
+                Some(&p.model),
+                p.effort.as_deref(),
+                policy.fixed_model.as_deref(),
+                policy.fixed_effort.as_deref(),
+            )
+            .ok();
+        }
+        if let Ok(mut decision) = super::select_available_resource(
+            state,
+            &run.source_path,
+            resources,
+            &previous.task_features,
+            &config,
+            Some(&p.harness),
+            Some(&p.model),
+            p.effort.as_deref(),
+        )
+        .await
+        {
+            if rank(&decision.selected.tier) <= rank(&previous.selected.tier) {
+                continue;
+            }
+            decision.policy_version = "bounded-recovery-v1".into();
+            decision.reason = "One stronger recovery after a target check that passed on the original baseline failed after implementation.".into();
+            return Some(decision);
+        }
+    }
+    blocked
 }
 
 fn diagnostics(attempt: &AttemptRecord) -> String {
@@ -586,7 +636,8 @@ async fn drive_inner(
                 && p.pool == selected.pool
                 && p.model == selected.resolved_model
                 && p.effort == selected.effort
-                && p.harness == "codex"
+                && p.harness == selected.harness
+                && p.enabled
                 && p.runtime == selected.runtime
                 && p.service_mode == selected.service_mode
                 && p.included
@@ -601,10 +652,7 @@ async fn drive_inner(
             )?;
             break;
         }
-        config.harnesses.codex.model = Some(decision.selected.resolved_model.clone());
-        config.harnesses.codex.effort = decision.selected.effort.clone();
-        config.harnesses.codex.allocation_service_mode =
-            Some(decision.selected.service_mode.clone());
+        config.harnesses.bind(&decision.selected, &resources);
         run.phase3.as_mut().unwrap().final_attempt_id = None;
         run.phase3.as_mut().unwrap().failure = None;
         let candidate = prepare(state, &mut run, decision.clone(), reason.take())?;
@@ -702,6 +750,10 @@ async fn drive_inner(
             persist_check_lifecycle(state, db, &mut run, event)?;
         }
         run.admission = db.admission_summary_for_run(&run.id)?;
+        if let Some(capacity) = &run.capacity {
+            run.capacity = db.latest_capacity_observation(&capacity.pool_id)?;
+            run.attempts.last_mut().unwrap().detail.capacity = run.capacity.clone();
+        }
         let candidate = execution.candidate.clone();
         run.candidates = vec![candidate.clone()];
         refresh_outcome(&mut run);
@@ -795,7 +847,8 @@ async fn drive_inner(
         if target_failure {
             resources = crate::commands::resources(state)?;
         }
-        if target_failure && let Some(next) = recovery_route(&run, &resources) {
+        if target_failure && let Some(next) = recovery_route(state, &run, &resources, &config).await
+        {
             run.outcome.lifecycle = LifecycleState::Preparing;
             run.outcome.work_result = WorkResult::Pending;
             run.outcome.review = ReviewState::NotRequested;

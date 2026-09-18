@@ -243,6 +243,57 @@ impl AdmissionLeaseObserver {
 }
 
 impl ExecutionObserver for AdmissionLeaseObserver {
+    fn provider_failure(&self, failure: crate::FailureKind) -> Result<()> {
+        if failure == crate::FailureKind::Authorization {
+            return self.preflight_failed();
+        }
+        if failure != crate::FailureKind::CapacityAdmission {
+            return Ok(());
+        }
+        let db = crate::db::Database::open(&self.coordinator.db_path)?;
+        let mut observation = crate::capacity::unknown_observation(
+            &self.token.pool_id,
+            "standard",
+            Utc::now(),
+            300,
+            "provider rejected an invocation; a fresh authoritative availability signal is required",
+        );
+        observation.source = "harness_rejection_v1".into();
+        observation.scarcity = crate::ScarcityState::Exhausted;
+        observation.attributable_attempt_id = Some(self.token.attempt_id.clone());
+        let route: serde_json::Value = serde_json::from_str(&self.token.route_snapshot_json)?;
+        if let Some(buckets) = route["provider_buckets"]
+            .as_array()
+            .filter(|b| !b.is_empty())
+        {
+            let template = observation.constraints[0].clone();
+            observation.constraints = buckets
+                .iter()
+                .filter_map(|b| b.as_str())
+                .map(|bucket| {
+                    let mut constraint = template.clone();
+                    constraint.kind = "provider_rejection".into();
+                    constraint.provider_bucket_id = Some(bucket.into());
+                    constraint.scope = crate::CapacityValue::Reported {
+                        value: "configured shared funding pool".into(),
+                    };
+                    constraint
+                })
+                .collect();
+            observation.mapping = crate::CapacityMapping::Mapped;
+        }
+        db.append_capacity_observation(&observation)
+    }
+
+    fn preflight_failed(&self) -> Result<()> {
+        let db = crate::db::Database::open(&self.coordinator.db_path)?;
+        db.connection().execute(
+            "INSERT INTO capacity_authorizations(id,pool_id,authorization_revision,observation_id,route_revision,evidence_json,status,reason,created_at,valid_until) SELECT ?1,pool_id,authorization_revision,observation_id,route_revision,evidence_json,'rejected','adapter preflight rejected the bound invocation; revalidate funding and configuration',?2,valid_until FROM capacity_authorizations WHERE id=?3",
+            rusqlite::params![ulid::Ulid::new().to_string(), Utc::now().to_rfc3339(), self.token.authorization_id],
+        )?;
+        Ok(())
+    }
+
     fn authorize_launch(&self) -> Result<()> {
         self.coordinator.authorize_launch(&self.token)
     }
@@ -566,6 +617,22 @@ impl AdmissionCoordinator {
     /// evidence and atomically changes explicit launch knowledge before the OS
     /// spawn call is attempted.
     pub fn authorize_launch(&self, token: &LeaseToken) -> Result<()> {
+        let route: serde_json::Value = serde_json::from_str(&token.route_snapshot_json)?;
+        if let Some(path) = route["resources_path"].as_str() {
+            let resources = crate::config::ResourceConfig::load(
+                std::path::Path::new(path)
+                    .parent()
+                    .context("invalid resource config path")?,
+            )?;
+            anyhow::ensure!(
+                resources.allocation_enabled
+                    && resources.capacity.admission
+                    && resources.profiles.iter().any(|p| p.enabled
+                        && serde_json::to_value(p).ok().as_ref()
+                            == Some(&route["resource_profile"])),
+                "resource configuration changed after admission; stale launch refused"
+            );
+        }
         let configuration_revision = format!(
             "sha256:{}",
             hex::encode(Sha256::digest(token.route_snapshot_json.as_bytes()))

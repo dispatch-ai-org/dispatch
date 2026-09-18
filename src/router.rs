@@ -35,6 +35,29 @@ pub fn select_resource(
     fixed_model: Option<&str>,
     fixed_effort: Option<&str>,
 ) -> Result<AllocationDecision> {
+    select_resource_filtered(
+        resources,
+        features,
+        execution_backend,
+        requested_model,
+        requested_effort,
+        fixed_model,
+        fixed_effort,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_resource_filtered(
+    resources: &ResourceConfig,
+    features: &TaskFeatures,
+    execution_backend: &str,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    fixed_model: Option<&str>,
+    fixed_effort: Option<&str>,
+    exclusions: &[Option<String>],
+) -> Result<AllocationDecision> {
     if let (Some(requested), Some(fixed)) = (requested_model, fixed_model) {
         anyhow::ensure!(
             requested == fixed,
@@ -59,26 +82,27 @@ pub fn select_resource(
         .profiles
         .iter()
         .zip(&choices)
-        .map(|(profile, choice)| {
-            let exclusion = if profile.harness != "codex" {
-                Some("Phase 1 executes only Codex resource profiles".to_owned())
+        .enumerate()
+        .map(|(index, (profile, choice))| {
+            let exclusion = if let Some(reason) = exclusions.get(index).and_then(Option::as_ref) {
+                Some(reason.clone())
+            } else if let Err(error) = profile.eligibility() {
+                Some(error.to_string())
             } else if profile.runtime != execution_backend {
                 Some(format!(
                     "profile runtime does not match the {execution_backend} execution backend"
                 ))
-            } else if !profile.included {
-                Some("profile is not marked included".to_owned())
-            } else if !profile.no_overage_verified {
-                Some("subscription-only no-overage control is not verified".to_owned())
             } else if model_constraint.is_some_and(|model| profile.model != model) {
                 Some("model does not satisfy the fixed selection constraint".to_owned())
             } else if effort_constraint
                 .is_some_and(|effort| profile.effort.as_deref() != Some(effort))
             {
                 Some("effort does not satisfy the fixed selection constraint".to_owned())
-            } else if model_constraint.is_none() && profile.tier != desired_tier {
+            } else if model_constraint.is_none()
+                && tier_rank(&profile.tier) < tier_rank(&desired_tier)
+            {
                 Some(format!(
-                    "policy selected the {} tier",
+                    "policy requires at least the {} tier",
                     desired_tier.as_str()
                 ))
             } else {
@@ -93,29 +117,30 @@ pub fn select_resource(
         .collect::<Vec<_>>();
     let selected = alternatives
         .iter()
-        .find(|alternative| alternative.eligible)
+        .filter(|alternative| alternative.eligible)
+        .min_by_key(|alternative| tier_rank(&alternative.choice.tier))
         .map(|alternative| alternative.choice.clone())
         .with_context(|| match model_constraint {
             Some(model) => format!(
-                "no included, no-overage-verified Codex resource profile matches model {model:?}{}",
+                "no included, no-overage-verified resource profile matches model {model:?}{}",
                 effort_constraint
                     .map(|effort| format!(" and effort {effort:?}"))
                     .unwrap_or_default()
             ),
             None => format!(
-                "no included, no-overage-verified Codex resource profile is configured for the {} tier",
+                "no included, no-overage-verified resource profile is configured for the {} tier",
                 desired_tier.as_str()
             ),
         })?;
     let capability = CapabilitySnapshot {
         version: 1,
         source: "user_validated_profile".into(),
-        harness: "codex".into(),
+        harness: selected.harness.clone(),
         observed_at: Utc::now(),
         models: resources
             .profiles
             .iter()
-            .filter(|profile| profile.harness == "codex")
+            .filter(|profile| profile.harness == selected.harness)
             .map(|profile| ModelCapability {
                 model: profile.model.clone(),
                 efforts: profile.effort.iter().cloned().collect(),
@@ -128,18 +153,32 @@ pub fn select_resource(
         "Explicit model or effort constraint selected this resource.".into()
     } else if fixed_model.is_some() || fixed_effort.is_some() {
         "Project harness configuration fixed this resource.".into()
+    } else if selected.tier != desired_tier {
+        format!(
+            "Minimum suitable lane is {}; the first available configured {} resource was selected.",
+            desired_tier.as_str(),
+            selected.tier.as_str()
+        )
     } else {
         policy_reason.to_owned()
     };
     Ok(AllocationDecision {
         version: 1,
-        policy_version: "allocation-trial-v2".into(),
+        policy_version: "allocation-portfolio-v3".into(),
         task_features: features.clone(),
         selected,
         reason,
         capability,
         alternatives,
     })
+}
+
+fn tier_rank(tier: &ResourceTier) -> u8 {
+    match tier {
+        ResourceTier::Light => 0,
+        ResourceTier::Standard => 1,
+        ResourceTier::Strong => 2,
+    }
 }
 
 fn profile_choice(profile: &ResourceProfile) -> ResourceChoice {
@@ -305,6 +344,8 @@ mod allocation_tests {
 
     fn profile(tier: ResourceTier, model: &str, effort: &str) -> ResourceProfile {
         ResourceProfile {
+            enabled: true,
+            claude_subscription: None,
             provider: "openai".into(),
             funding_source: "chatgpt-plus".into(),
             harness: "codex".into(),
@@ -368,7 +409,7 @@ mod allocation_tests {
         assert_eq!(decision.selected.requested_model, "standard-model");
         assert_eq!(decision.task_features, features);
         assert!(decision.reason.contains("unknown"));
-        assert_eq!(decision.policy_version, "allocation-trial-v2");
+        assert_eq!(decision.policy_version, "allocation-portfolio-v3");
         resources.profiles[1].no_overage_verified = false;
         assert!(select_resource(&resources, &features, "local", None, None, None, None).is_err());
     }

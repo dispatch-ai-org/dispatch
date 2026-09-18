@@ -100,12 +100,7 @@ pub fn grant(
     let profiles: Vec<Value> = resources
         .profiles
         .iter()
-        .filter(|p| {
-            p.included
-                && p.no_overage_verified
-                && p.harness == "codex"
-                && p.runtime == config.execution.backend
-        })
+        .filter(|p| p.eligibility().is_ok() && p.runtime == config.execution.backend)
         .map(serde_json::to_value)
         .collect::<std::result::Result<_, _>>()?;
     ensure!(!profiles.is_empty(), "no included authorized resources");

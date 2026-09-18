@@ -744,7 +744,8 @@ async fn response(
 
 pub fn funding_change(observation: &CapacityObservation, funding_source: &str) -> Option<String> {
     if let CapacityValue::Reported { value } = &observation.auth_mode
-        && value != "chatgpt"
+        && !(value == "chatgpt"
+            || (value == "claude.ai" && observation.source == "claude_auth_status_v1"))
     {
         return Some(format!("authentication changed to {value}"));
     }
