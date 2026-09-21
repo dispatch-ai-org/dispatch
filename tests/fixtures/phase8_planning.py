@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import select
@@ -24,7 +25,8 @@ def finish(client, run_id):
         if reply['reached']:return client.call('result',run_id=run_id)
         cursor=reply['cursor']
         status=client.call('status',run_id=run_id)
-        deadline=datetime.fromisoformat(status['phase3']['deadline_at'].replace('Z','+00:00'))
+        # Dispatch emits nanosecond timestamps; Python < 3.11 (ubuntu-22.04) accepts at most microseconds.
+        deadline=datetime.fromisoformat(re.sub(r'(\.\d{6})\d+',r'\1',status['phase3']['deadline_at'].replace('Z','+00:00')))
         assert datetime.now(timezone.utc)<deadline,reply
 
 
