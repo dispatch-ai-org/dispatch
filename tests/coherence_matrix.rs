@@ -2141,7 +2141,6 @@ fn scenarios() -> Vec<Scenario> {
         ),
         Scenario {
             nested_repos: &["vendor/dep"],
-            known_gap: true,
             ..settled(
                 "17a nested git repo, edited",
                 rust,
@@ -2149,12 +2148,11 @@ fn scenarios() -> Vec<Scenario> {
                 &[("src/stats.rs", STATS_DELTA)],
                 &[Op::Write("vendor/dep/lib.rs", VENDOR_LIB_WORLD)],
                 Continue,
-                "KNOWN GAP: a committed nested repo is a gitlink in the outer index, so observe (ls-files) never lists its files and reports them Deleted.",
+                "A committed nested repo is a gitlink in the outer index; its files are not comparable, so an edit inside it is not world drift.",
             )
         },
         Scenario {
             nested_repos: &["vendor/dep"],
-            known_gap: true,
             ..settled(
                 "17b nested git repo, untouched",
                 rust,
@@ -2162,7 +2160,7 @@ fn scenarios() -> Vec<Scenario> {
                 &[("src/stats.rs", STATS_DELTA)],
                 &[],
                 Continue,
-                "KNOWN GAP: the world is unchanged, yet observe reports the nested repo's files as Deleted, so the unchanged-world fast path never fires.",
+                "The world is unchanged: the nested repo's files are not reported Deleted, so the unchanged-world fast path fires.",
             )
         },
         settled(

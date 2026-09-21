@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata},
     io::{Read, Write},
@@ -558,6 +559,103 @@ pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result
         .arg(patch);
     checked_output(apply, "candidate patch does not apply to the merged tree")?;
     Ok(())
+}
+
+/// Copy the files that make up the current source into `dest` for a throwaway
+/// checking tree. Unlike `create_snapshot`, ignored build output (`target/`,
+/// `node_modules/`, ...) is not copied: a Git source contributes exactly what
+/// `git ls-files -co --exclude-standard` lists, a directory source its whole
+/// tree. Build caches are therefore absent, so a check such as `cargo test`
+/// builds from scratch in the scratch tree; a check may point `CARGO_TARGET_DIR`
+/// (or the equivalent) elsewhere to reuse a cache. Nested repositories that Git
+/// lists as one directory entry are copied whole. The result is a plain
+/// directory, not a Git repository. A tracked file deleted from the worktree is
+/// simply absent; a file that vanishes while it is copied is an error.
+pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    if matches!(kind, SourceKind::Directory) {
+        return copy_tree_contents(source, dest);
+    }
+    let mut list = git_command(source);
+    list.args(["ls-files", "-co", "--exclude-standard", "-z"]);
+    let listing = checked_output(list, "failed to list the current source files")?;
+    let mut real_directories = HashSet::new();
+    for raw in listing.stdout.split(|byte| *byte == 0) {
+        let relative = bytes_to_path(raw.strip_suffix(b"/").unwrap_or(raw));
+        if raw.is_empty()
+            || relative
+                .components()
+                .any(|part| is_excluded_name(part.as_os_str()))
+        {
+            continue;
+        }
+        let from = source.join(&relative);
+        let to = dest.join(&relative);
+        // Reading through a parent that became a symlink would leave the tree.
+        if !parents_are_directories(source, &relative, &mut real_directories)
+            || fs::symlink_metadata(&to).is_ok()
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&from) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", from.display()));
+            }
+        };
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&to).with_context(|| format!("failed to create {}", to.display()))?;
+            copy_tree_contents(&from, &to)?;
+        } else if metadata.file_type().is_symlink() {
+            let link_target = fs::read_link(&from)
+                .with_context(|| format!("failed to read symlink {}", from.display()))?;
+            ensure_symlink_stays_within(source, &from, &link_target)?;
+            create_symlink(&link_target, &to, &from)
+                .with_context(|| format!("failed to copy symlink {}", from.display()))?;
+        } else if metadata.is_file() {
+            // `fs::copy` carries the permission bits, including execute.
+            fs::copy(&from, &to).with_context(|| format!("failed to copy {}", from.display()))?;
+        } else {
+            bail!(
+                "unsupported special file in source tree: {}",
+                from.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// True when every parent directory of `relative` under `root` is a real
+/// directory (not a symlink); verified parents are remembered in `known`.
+pub(crate) fn parents_are_directories(
+    root: &Path,
+    relative: &Path,
+    known: &mut HashSet<Vec<u8>>,
+) -> bool {
+    let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return true;
+    };
+    if known.contains(&path_bytes(parent)) {
+        return true;
+    }
+    if !parents_are_directories(root, parent, known) {
+        return false;
+    }
+    match fs::symlink_metadata(root.join(parent)) {
+        Ok(metadata) if metadata.is_dir() => {
+            known.insert(path_bytes(parent));
+            true
+        }
+        _ => false,
+    }
 }
 
 fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
@@ -1789,6 +1887,69 @@ mod tests {
         symlink("/tmp/outside", source.join("absolute")).unwrap();
         let error = fingerprint_tree(&source).unwrap_err().to_string();
         assert!(error.contains("absolute symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_tree_copies_listed_files_only_and_never_follows_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        write(&source.join(".gitignore"), "target/\n");
+        write(&source.join("src/lib.rs"), "pub fn f() {}\n");
+        write(&source.join("gone.txt"), "deleted later\n");
+        write(&source.join("run.sh"), "#!/bin/sh\n");
+        fs::set_permissions(source.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("run.sh", source.join("link")).unwrap();
+        initialize_user_repository(&source);
+        fs::remove_file(source.join("gone.txt")).unwrap();
+        write(&source.join("target/out.bin"), "ignored\n");
+        write(&source.join("untracked.txt"), "u\n");
+        write(&source.join("dep/lib.rs"), "nested\n");
+        run_git(&source.join("dep"), &["init", "--quiet"]);
+
+        let scratch = temp.path().join("scratch");
+        create_scratch_tree(&source, &SourceKind::Git, &scratch).unwrap();
+
+        assert!(!scratch.join("target").exists() && !scratch.join("gone.txt").exists());
+        assert!(!scratch.join(".git").exists() && !scratch.join("dep/.git").exists());
+        assert_eq!(
+            fs::read_to_string(scratch.join("untracked.txt")).unwrap(),
+            "u\n"
+        );
+        assert!(scratch.join("dep/lib.rs").is_file());
+        assert_eq!(
+            fs::metadata(scratch.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
+        assert_eq!(
+            fs::read_link(scratch.join("link")).unwrap(),
+            Path::new("run.sh")
+        );
+
+        // A symlink that leaves the tree is refused, and a parent swapped for a
+        // symlink is not read through.
+        symlink("../outside", source.join("escape")).unwrap();
+        let error = create_scratch_tree(&source, &SourceKind::Git, &temp.path().join("s2"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes candidate isolation"), "{error}");
+        fs::remove_file(source.join("escape")).unwrap();
+        fs::remove_dir_all(source.join("src")).unwrap();
+        symlink("dep", source.join("src")).unwrap();
+        let scratch = temp.path().join("s3");
+        create_scratch_tree(&source, &SourceKind::Git, &scratch).unwrap();
+        assert!(
+            fs::symlink_metadata(scratch.join("src"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
