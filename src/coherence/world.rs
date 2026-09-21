@@ -141,9 +141,13 @@ pub fn observe(
     })
 }
 
+/// Most files whose metadata `signal` mixes in for a Git source.
+const MAX_SIGNAL_FILES: usize = 5000;
+
 /// Cheap change doorbell that never reads file contents. For Git sources it
-/// covers HEAD and `git status`; a further edit to a file that is already
-/// modified in both Git's view and the previous signal is not detected.
+/// covers HEAD, `git status`, and the size and modification time of the files
+/// `git status` reports (metadata only, at most `MAX_SIGNAL_FILES`), so that
+/// editing an already-modified file again moves the signal.
 pub fn signal(source: &Path, kind: &SourceKind) -> Result<Signal> {
     let mut hasher = Sha256::new();
     match kind {
@@ -191,9 +195,60 @@ pub fn signal(source: &Path, kind: &SourceKind) -> Result<Signal> {
             status.args(["status", "--porcelain=v2", "-z", "--untracked-files=all"]);
             let status = checked_output(status, "failed to read the source repository status")?;
             hasher.update(&status.stdout);
+            for path in status_paths(&status.stdout)
+                .into_iter()
+                .take(MAX_SIGNAL_FILES)
+            {
+                let metadata = fs::symlink_metadata(source.join(bytes_to_path(path)));
+                let (size, modified) = metadata.as_ref().map_or((0, 0), |metadata| {
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |elapsed| elapsed.as_nanos());
+                    (metadata.len(), modified)
+                });
+                hasher.update(size.to_le_bytes());
+                hasher.update(modified.to_le_bytes());
+            }
             Ok(Signal(format!("{head}:{}", hex::encode(hasher.finalize()))))
         }
     }
+}
+
+/// The paths `git status --porcelain=v2 -z` reports as changed, untracked or
+/// unmerged. A rename record is followed by its original path as a separate
+/// NUL-terminated field, which is skipped. Ignored entries are not listed.
+fn status_paths(status: &[u8]) -> Vec<&[u8]> {
+    let mut paths = Vec::new();
+    let mut records = status.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        let fields = match record.first() {
+            Some(b'1') => 9,
+            Some(b'2') => 10,
+            Some(b'u') => 11,
+            Some(b'?') => 2,
+            _ => continue,
+        };
+        if record.first() == Some(&b'2') {
+            records.next();
+        }
+        // The path is the last field and may itself contain spaces.
+        let mut rest = record;
+        for _ in 1..fields {
+            match rest.iter().position(|byte| *byte == b' ') {
+                Some(space) => rest = &rest[space + 1..],
+                None => {
+                    rest = &[];
+                    break;
+                }
+            }
+        }
+        if !rest.is_empty() {
+            paths.push(rest);
+        }
+    }
+    paths
 }
 
 /// Every baseline entry keyed by raw path bytes. `git ls-tree -z` prints
@@ -796,6 +851,54 @@ mod tests {
         assert_ne!(quiet, edited);
         fixture.write("new.txt", "n\n");
         assert_ne!(edited, fixture.signal());
+    }
+
+    #[test]
+    fn git_signal_moves_when_an_already_dirty_file_is_edited_again() {
+        let fixture = Fixture::new(true, &[("a.txt", "one\n"), ("b.txt", "same\n")]);
+        fixture.write("a.txt", "edited once\n");
+        fixture.write("new.txt", "n\n");
+        let dirty = fixture.signal();
+        assert_eq!(dirty, fixture.signal());
+        // A longer edit of a modified tracked file.
+        fixture.write("a.txt", "edited twice, longer\n");
+        let longer = fixture.signal();
+        assert_ne!(dirty, longer);
+        // The same length with a new modification time.
+        fixture.write("a.txt", "edited twice, LONGER\n");
+        let file = fs::File::options()
+            .write(true)
+            .open(fixture.source.join("a.txt"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let touched = fixture.signal();
+        assert_ne!(longer, touched);
+        // An already-untracked file counts as well.
+        fixture.write("new.txt", "much longer than before\n");
+        let grown = fixture.signal();
+        assert_ne!(touched, grown);
+        assert_eq!(grown, fixture.signal());
+    }
+
+    #[test]
+    fn status_paths_reads_every_record_kind() {
+        let status = b"# branch.oid abc\0\
+            1 .M N... 100644 100644 100644 aaa bbb dir/a file.txt\0\
+            2 R. N... 100644 100644 100644 aaa bbb R100 new.txt\0old.txt\0\
+            u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.txt\0\
+            ? untracked.txt\0\
+            ! ignored.txt\0";
+        let paths: Vec<&[u8]> = status_paths(status);
+        assert_eq!(
+            paths,
+            [
+                &b"dir/a file.txt"[..],
+                b"new.txt",
+                b"conflict.txt",
+                b"untracked.txt"
+            ]
+        );
     }
 
     #[test]

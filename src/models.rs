@@ -964,6 +964,9 @@ pub enum FailureKind {
     InternalState,
     SourceDrift,
     InvocationLimit,
+    /// The mid-run coherence watcher stopped the agent because the source
+    /// moved underneath its work.
+    StaleWork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

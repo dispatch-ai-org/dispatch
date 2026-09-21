@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
     AttemptDetail, Clarification, FailureKind, GoalExecution, QuestionState, ResourceTier,
+    coherence::watch::{WatchMsg, WatchSpec, Watcher},
+    config::MidRunMode,
 };
 use rusqlite::OptionalExtension;
 
@@ -321,14 +323,14 @@ pub(super) fn stop(
     }
     run.phase3.as_mut().unwrap().failure = Some(failure);
     run.completed_at = Some(Utc::now());
-    run.status = if failure == FailureKind::CapacityAdmission {
-        RunStatus::Deferred
-    } else {
-        RunStatus::Failed
+    run.status = match failure {
+        FailureKind::CapacityAdmission => RunStatus::Deferred,
+        FailureKind::StaleWork => RunStatus::Interrupted,
+        _ => RunStatus::Failed,
     };
     run.outcome.lifecycle = LifecycleState::Finished;
     run.outcome.work_result = match failure {
-        FailureKind::Cancelled => WorkResult::Cancelled,
+        FailureKind::Cancelled | FailureKind::StaleWork => WorkResult::Cancelled,
         FailureKind::CapacityAdmission => WorkResult::Deferred,
         _ => WorkResult::Failed,
     };
@@ -374,6 +376,63 @@ pub(super) fn interrupted(run: &RunRecord) -> FailureKind {
     } else {
         FailureKind::Cancelled
     }
+}
+
+/// Like `interrupted`, for a cancellation that the coherence watcher itself
+/// requested (`stale`): the deadline still wins, otherwise the work is stale.
+fn interrupted_by(run: &RunRecord, stale: bool) -> FailureKind {
+    match interrupted(run) {
+        FailureKind::Cancelled if stale => FailureKind::StaleWork,
+        failure => failure,
+    }
+}
+
+/// The next verdict from the attempt's watcher; never ready without one.
+async fn next_watch_message(watcher: &mut Option<Watcher>) -> Option<WatchMsg> {
+    match watcher {
+        Some(watcher) => watcher.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Apply one watcher verdict on the owning loop: remember it on the run and
+/// persist it as an event. In `stop` mode (`stale` is `Some` only while the
+/// attempt is running) a verdict that warrants it also cancels the run.
+fn apply_watch(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    config: &Config,
+    cancellation: &CancellationToken,
+    message: WatchMsg,
+    stale: Option<&mut Option<String>>,
+) -> Result<()> {
+    let validity = message.validity;
+    remember_validity(run, &validity);
+    let kind = if validity.decision == Decision::Continue {
+        "coherence.checked"
+    } else {
+        "coherence.invalidated"
+    };
+    let payload = serde_json::json!({"coherence": validity});
+    transition(state, db, run, kind, payload.clone())?;
+    let policy = &config.coherence;
+    let stops = validity.decision == Decision::Stop
+        || (validity.decision == Decision::Refresh && policy.stop_on_refresh);
+    if let Some(stale) = stale
+        && policy.mid_run == MidRunMode::Stop
+        && stops
+    {
+        transition(state, db, run, "coherence.stopped", payload)?;
+        *stale = Some(
+            validity
+                .reasons
+                .first()
+                .map_or_else(|| "no detail".into(), |reason| reason.detail.clone()),
+        );
+        cancellation.cancel();
+    }
+    Ok(())
 }
 
 fn rank(tier: &ResourceTier) -> u8 {
@@ -818,6 +877,20 @@ async fn drive_inner(
         let prompt = fs::read_to_string(&candidate.prompt_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (coordinator, token) = guard.handoff();
+        // The watcher lives exactly as long as this attempt: it is finished
+        // below when the attempt returns, and aborted if an error leaves early.
+        let mut watcher = candidate.prompt_path.parent().map(|dir| {
+            Watcher::spawn(WatchSpec {
+                source: run.source_path.clone(),
+                kind: run.source_kind.clone(),
+                baseline: run.baseline_path.clone(),
+                baseline_commit: run.baseline_commit.clone(),
+                workspace: candidate.workspace_path.clone(),
+                delta_patch: dir.join("delta-live.patch"),
+                poll: Duration::from_secs(config.coherence.poll_secs),
+            })
+        });
+        let mut stale: Option<String> = None;
         let work = execute_candidate(
             candidate,
             prompt,
@@ -837,8 +910,23 @@ async fn drive_inner(
                         return Err(error.context("failed to persist attempt verification"));
                     }
                 }
+                Some(message)=next_watch_message(&mut watcher)=>{
+                    if let Err(error)=apply_watch(state,db,&mut run,&config,&cancellation,message,Some(&mut stale)) {
+                        cancellation.cancel(); let _=(&mut work).await;
+                        return Err(error.context("failed to persist coherence verdict"));
+                    }
+                }
             }
         };
+        if let Some(watcher) = watcher.as_mut() {
+            watcher.finish().await;
+            // A verdict sent just before the attempt ended is still evidence,
+            // but it can no longer stop anything.
+            while let Ok(message) = watcher.rx.try_recv() {
+                apply_watch(state, db, &mut run, &config, &cancellation, message, None)?;
+            }
+        }
+        drop(watcher);
         while let Ok(event) = rx.try_recv() {
             persist_check_lifecycle(state, db, &mut run, event)?;
         }
@@ -855,7 +943,7 @@ async fn drive_inner(
         run.outcome.review = ReviewState::NotRequested;
         update_attempt_finished(&mut run, &candidate, &execution);
         let failure = if cancellation.is_cancelled() {
-            Some(interrupted(&run))
+            Some(interrupted_by(&run, stale.is_some()))
         } else if !execution.admission_released {
             Some(FailureKind::InternalState)
         } else if candidate.status != CandidateStatus::Completed {
@@ -885,16 +973,16 @@ async fn drive_inner(
             serde_json::json!({"failure":failure}),
         )?;
         if let Some(failure) = failure.filter(|f| *f != FailureKind::TargetVerification) {
-            stop(
-                state,
-                db,
-                &mut run,
-                failure,
-                candidate
+            let message = match (&stale, failure) {
+                (Some(detail), FailureKind::StaleWork) => {
+                    format!("work stopped: the source changed underneath it ({detail})")
+                }
+                _ => candidate
                     .error
-                    .as_deref()
-                    .unwrap_or("attempt did not safely complete"),
-            )?;
+                    .clone()
+                    .unwrap_or_else(|| "attempt did not safely complete".into()),
+            };
+            stop(state, db, &mut run, failure, &message)?;
             break;
         }
         if let Some(Ok(report)) = execution.checkpoint {
