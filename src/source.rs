@@ -302,6 +302,48 @@ pub fn collect_diff(baseline_path: &Path, workspace: &Path, diff_path: &Path) ->
     })
 }
 
+/// Write the work-so-far of a live candidate workspace as a patch against the
+/// baseline, for the mid-run coherence watcher. It uses the same hardened
+/// temporary-index technique as `collect_diff` but does not validate the tree
+/// (the agent is still writing it) and computes no statistics. The result is
+/// advisory evidence only and is never applied.
+pub fn snapshot_delta(baseline_path: &Path, workspace: &Path, out_patch: &Path) -> Result<()> {
+    let index_directory = Builder::new()
+        .prefix("dispatch-index-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index_path = index_directory.path().join("index");
+
+    let mut read_tree = comparison_git_command(baseline_path, workspace);
+    read_tree
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["read-tree", "HEAD"]);
+    checked_output(read_tree, "failed to initialize temporary Git index")?;
+
+    let mut add = comparison_git_command(baseline_path, workspace);
+    add.env("GIT_INDEX_FILE", &index_path)
+        .args(["add", "-A", "--", "."])
+        .args(dispatch_exclusion_pathspecs());
+    checked_output(add, "failed to stage the work in progress")?;
+
+    let mut diff = comparison_git_command(baseline_path, workspace);
+    diff.env("GIT_INDEX_FILE", &index_path).args([
+        "diff",
+        "--cached",
+        "--binary",
+        "--full-index",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "HEAD",
+        "--",
+    ]);
+    let patch = checked_output(diff, "failed to collect the work in progress")?.stdout;
+    fs::write(out_patch, patch).with_context(|| format!("failed to write {}", out_patch.display()))
+}
+
 /// Materialize a contribution against its exact input using the same patch safety as apply.
 /// Publication is immutable; a DB reference is committed separately by the caller.
 pub(crate) fn integrate_snapshot(
