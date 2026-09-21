@@ -29,6 +29,9 @@ tempfile = "3.20"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tree-sitter = "0.27"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
 ulid = { version = "1.2", features = ["serde"] }
 unicode-segmentation = "=1.13.3"
 unicode-width = "=0.2.2"
