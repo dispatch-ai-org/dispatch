@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, File, Metadata},
-    io::Read,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
@@ -887,7 +887,7 @@ pub(crate) fn include_entry(entry: &DirEntry) -> bool {
     entry.depth() == 0 || !is_excluded_name(entry.file_name())
 }
 
-fn is_excluded_name(name: &OsStr) -> bool {
+pub(crate) fn is_excluded_name(name: &OsStr) -> bool {
     EXCLUDED_DIRECTORIES
         .iter()
         .any(|excluded| name == OsStr::new(excluded))
@@ -939,7 +939,7 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn plain_git_command() -> Command {
+pub(crate) fn plain_git_command() -> Command {
     #[cfg(target_os = "macos")]
     let git = {
         let command_line_tools = PathBuf::from("/Library/Developer/CommandLineTools/usr/bin/git");
@@ -971,7 +971,7 @@ fn plain_git_command() -> Command {
     command
 }
 
-fn git_command(directory: &Path) -> Command {
+pub(crate) fn git_command(directory: &Path) -> Command {
     let mut command = plain_git_command();
     command.arg("-C").arg(directory);
     command
@@ -980,7 +980,7 @@ fn git_command(directory: &Path) -> Command {
 /// Compare a candidate worktree using only the trusted baseline's repository
 /// metadata. Candidate-controlled `.git/config`, hooks, objects, and info
 /// attributes must never influence a host-side Git process.
-fn comparison_git_command(baseline_path: &Path, workspace: &Path) -> Command {
+pub(crate) fn comparison_git_command(baseline_path: &Path, workspace: &Path) -> Command {
     let mut command = plain_git_command();
     command
         .arg("--git-dir")
@@ -992,9 +992,28 @@ fn comparison_git_command(baseline_path: &Path, workspace: &Path) -> Command {
     command
 }
 
-fn checked_output(mut command: Command, context: &str) -> Result<Output> {
+pub(crate) fn checked_output(command: Command, context: &str) -> Result<Output> {
+    let output = run_git(command, None, context)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!("{context} (Git exited with {})", output.status);
+        }
+        bail!("{context}: {stderr}");
+    }
+    Ok(output)
+}
+
+/// Run Git under the same timeout and output limits as `checked_output`, but
+/// leave the exit status to the caller and optionally feed standard input.
+pub(crate) fn run_git(mut command: Command, input: Option<&[u8]>, context: &str) -> Result<Output> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -1004,6 +1023,15 @@ fn checked_output(mut command: Command, context: &str) -> Result<Output> {
     }
     let mut child = command.spawn().with_context(|| context.to_owned())?;
     let child_id = child.id();
+    let stdin_writer = match input {
+        Some(bytes) => {
+            let mut stdin = child.stdin.take().context("Git stdin was not captured")?;
+            let bytes = bytes.to_vec();
+            // A write error means Git exited early; its exit status reports why.
+            Some(thread::spawn(move || stdin.write_all(&bytes)))
+        }
+        None => None,
+    };
     let stdout = child.stdout.take().context("Git stdout was not captured")?;
     let stderr = child.stderr.take().context("Git stderr was not captured")?;
     let stdout_reader = thread::spawn(move || read_limited(stdout));
@@ -1027,6 +1055,9 @@ fn checked_output(mut command: Command, context: &str) -> Result<Output> {
         thread::sleep(Duration::from_millis(20));
     };
     kill_command_group(child_id);
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
     let stdout = stdout_reader
         .join()
         .map_err(|_| anyhow::anyhow!("{context}: stdout reader panicked"))??;
@@ -1043,20 +1074,11 @@ fn checked_output(mut command: Command, context: &str) -> Result<Output> {
         "{context}: Git error output exceeded the {} MiB safety limit",
         MAX_GIT_OUTPUT_BYTES / (1024 * 1024)
     );
-    let output = Output {
+    Ok(Output {
         status,
         stdout: stdout.bytes,
         stderr: stderr.bytes,
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            bail!("{context} (Git exited with {})", output.status);
-        }
-        bail!("{context}: {stderr}");
-    }
-    Ok(output)
+    })
 }
 
 struct LimitedOutput {
@@ -1101,7 +1123,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn hash_sized_bytes(hasher: &mut Sha256, value: &[u8]) {
+pub(crate) fn hash_sized_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value);
 }
@@ -1118,13 +1140,13 @@ fn hash_mode(hasher: &mut Sha256, metadata: &Metadata) {
 }
 
 #[cfg(unix)]
-fn path_bytes(path: &Path) -> Vec<u8> {
+pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
 }
 
 #[cfg(windows)]
-fn path_bytes(path: &Path) -> Vec<u8> {
+pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str()
         .encode_wide()
@@ -1133,13 +1155,13 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
 }
 
 #[cfg(windows)]
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 

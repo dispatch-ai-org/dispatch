@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod capacity;
 pub mod classifier;
+pub mod coherence;
 pub mod commands;
 pub mod config;
 pub mod control;
