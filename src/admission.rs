@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -135,7 +135,10 @@ fn process_start(_pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     output
         .status
         .success()

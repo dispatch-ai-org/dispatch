@@ -256,11 +256,9 @@ impl Ui {
         if self.options.plain {
             return self.inspect_plain(bundle, view).await;
         }
-        let notice;
-        if external && bundle.entries.len() <= 1 {
-            notice = self
-                .external_reviewer(bundle, Some(view.selected), state, target, false)
-                .await?;
+        let notice = if external && bundle.entries.len() <= 1 {
+            self.external_reviewer(bundle, Some(view.selected), state, target, false)
+                .await?
         } else {
             self.screen.take();
             self.screen = Some(Screen::open(true)?);
@@ -273,8 +271,8 @@ impl Ui {
             self.screen.take();
             self.screen = Some(Screen::new()?);
             self.render_key.clear();
-            notice = result?;
-        }
+            result?
+        };
         self.input_boundary().await?;
         Ok(notice)
     }
