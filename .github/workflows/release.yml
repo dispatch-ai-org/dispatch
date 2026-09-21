@@ -84,9 +84,13 @@ jobs:
               dist/dispatch-*.tar.gz dist/SHA256SUMS \
               --clobber
           else
+            # A tag with a hyphen (v0.2.0-rc.1) is a prerelease, never "latest".
+            prerelease=""
+            case "$RELEASE_TAG" in *-*) prerelease="--prerelease" ;; esac
             gh release create "$RELEASE_TAG" \
               dist/dispatch-*.tar.gz dist/SHA256SUMS \
               --verify-tag \
               --title "Dispatch $RELEASE_TAG" \
-              --notes-file .github/release-notes.md
+              --notes-file .github/release-notes.md \
+              $prerelease
           fi

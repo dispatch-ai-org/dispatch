@@ -1,38 +1,38 @@
-<!-- release: version -->
-# Local release candidate: 0.1.3-rc.1
+# Dispatch 0.2.0: install, upgrade, uninstall
 
-Release gate: **blocked** by the five-second planned-question deadline fixture in
-the final four-thread suite. The same timing failure reproduces on the baseline.
-Use these artifacts for local review; see `docs/product-rc-validation.md` in the
-source checkout for the complete evidence before deciding on publication.
+Dispatch 0.2.0 is an experimental developer preview. It adds
+[work coherence](coherence.md): finished work is validated against the source as it
+is now instead of being refused on any difference.
 
-Validated runtime scope: macOS arm64. This is an unsigned local candidate, not a
-published release. Linux has an existing CI recipe but was not executed for this
-candidate; Windows, SSH/tmux and native GUI terminals are not certified here.
+Runtime scope: macOS arm64 is the platform exercised interactively for this
+release. Linux x86_64 is built and smoke-tested by CI (build, package, `dispatch
+version`) but was not exercised interactively. Windows, SSH/tmux and native GUI
+terminals are not certified. Packages are unsigned and not notarized.
 
 ## Try without replacing an installation
 
-Extract the local archive into a new directory, then run the executable by its
+Download `dispatch-macos-arm64.tar.gz` (or `dispatch-linux-x86_64.tar.gz`) and
+`SHA256SUMS` from the GitHub release, or build a local archive (see the end of this
+page). Extract the archive into a new directory, then run the executable by its
 absolute path. `BUILD.json` records source and binary identities. From the output
 directory, `shasum -a 256 -c SHA256SUMS` checks the archive and adjacent executable.
 The archive contains only `dispatch`, `LICENSE`, `INSTALL.md`, and `BUILD.json`.
 No account state, logs, grants, credentials or fonts are bundled.
 
 ```sh
-mkdir -p /tmp/dispatch-rc-install
-# Use the artifact directory returned by the packaging command.
-tar -xzf /tmp/dispatch-rc/release/dispatch-macos-arm64.tar.gz -C /tmp/dispatch-rc-install
-/tmp/dispatch-rc-install/dispatch version
+shasum -a 256 -c SHA256SUMS --ignore-missing
+mkdir -p /tmp/dispatch-install
+tar -xzf dispatch-macos-arm64.tar.gz -C /tmp/dispatch-install
+/tmp/dispatch-install/dispatch version
 cd /path/to/your/project
-/tmp/dispatch-rc-install/dispatch --state-dir /path/to/private/dispatch-state setup
-/tmp/dispatch-rc-install/dispatch --state-dir /path/to/private/dispatch-state setup --checks
-/tmp/dispatch-rc-install/dispatch --state-dir /path/to/private/dispatch-state
+/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state setup
+/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state setup --checks
+/tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state
 ```
 
-<!-- release: version -->
-The expected version is `dispatch 0.1.3-rc.1`. Use `command -v dispatch` and
+The expected version is `dispatch 0.2.0`. Use `command -v dispatch` and
 `type -a dispatch` to locate older PATH installations. An explicit path is the
-reliable way to select this candidate. Do not replace a working binary just to try
+reliable way to select this build. Do not replace a working binary just to try
 it. Ordinary work uses the provider's account; test-only setup must use fixture
 homes and fake executables, as the acceptance scripts do.
 
@@ -52,10 +52,12 @@ configuration invalidates it. Planned crash recovery remains unsupported.
 
 ### Upgrading to 0.2.0
 
-<!-- release: version -->
-The database schema remains 20, so upgrading from a 0.1.x state directory runs no
-migration. Work coherence adds one optional field to a run's stored record and
-needs no backfill. A run created by an older version has no stored coherence data;
+Work coherence adds no database migration: the schema version stays at 20, the
+version of the unreleased 0.1.3 candidate. A state directory created by the
+published 0.1.x releases is older (v0.1.2 is at schema 11), so its first open runs
+the normal historical migrations to 20 and leaves a private
+`dispatch.schema-N-*.db` backup beside the database (see above). Work coherence
+itself adds one optional field to a run's stored record and needs no backfill. A run created by an older version has no stored coherence data;
 when you accept it, Dispatch derives everything it needs from the run's baseline,
 its patch and the current source, so it gets coherence checking at accept time
 automatically. It reads the configuration frozen with that run, which is a file
@@ -72,7 +74,7 @@ Uninstall by removing only the executable you installed and its archive/extracti
 directory. Keep `~/.dispatch` (or your explicit state directory), project files and
 provider accounts. State deletion and provider logout are separate owner actions.
 
-## Reproduce local packaging
+## Build a local archive
 
 ```sh
 cargo build --release --locked --target-dir /tmp/dispatch-rc/current/target

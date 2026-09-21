@@ -2,7 +2,6 @@
 
 # Dispatch
 
-<!-- release: version -->
 **Dispatch 0.2.0 — experimental developer preview**
 
 New in this version: [work coherence](#work-coherence-keeping-results-valid-while-the-code-moves).
@@ -254,15 +253,16 @@ coherence:
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix.
 
-## Install this candidate
+## Install
 
-<!-- release: version (install/candidate wording below is for the release engineer) -->
-Use the tested local archive and explicit executable paths in
-[install / upgrade / uninstall](docs/release-install.md). The current candidate
-has not been published. Older GitHub release downloads are not this build.
+Download the archive for your platform and `SHA256SUMS` from the
+[latest GitHub release](https://github.com/dispatch-ai-org/dispatch/releases), verify
+the checksum, and run the executable by its explicit path; see
+[install / upgrade / uninstall](docs/release-install.md).
 
-The validated runtime scope for this pass is macOS arm64. Linux has an existing
-CI recipe but was not run here. The macOS package is unsigned and not notarized.
+Interactive testing for this release was on macOS arm64. Linux x86_64 is built and
+smoke-tested by CI but not exercised interactively. The macOS package is unsigned and
+not notarized.
 Source builds use `cargo build --release --locked`; Git and the project’s actual
 check tools must be installed. No provider tool or font is installed by Dispatch.
 
