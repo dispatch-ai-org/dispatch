@@ -926,6 +926,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         allocation,
         capacity: None,
         admission: None,
+        coherence: None,
         evaluation: None,
         applied_candidate: None,
     };
@@ -2749,6 +2750,7 @@ pub fn run_result(run: &RunRecord) -> RunResult {
         allocation: run.allocation.clone(),
         capacity: run.capacity.clone(),
         admission: run.admission.clone(),
+        coherence: None,
     }
 }
 

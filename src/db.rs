@@ -3169,6 +3169,7 @@ mod tests {
             allocation: None,
             capacity: None,
             admission: None,
+            coherence: None,
             evaluation: None,
             applied_candidate: None,
         }

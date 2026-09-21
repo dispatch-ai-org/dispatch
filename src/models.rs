@@ -453,6 +453,122 @@ pub struct EnvironmentRecord {
     pub forwarded_env: Vec<String>,
 }
 
+/// Latest work-coherence state of a run against the moving source tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoherenceRecord {
+    #[serde(default = "coherence_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub refreshed_from: Option<String>,
+    #[serde(default)]
+    pub facts: Vec<MustHold>,
+    #[serde(default)]
+    pub validity: Option<Validity>,
+    #[serde(default)]
+    pub first_invalid_at: Option<DateTime<Utc>>,
+}
+
+fn coherence_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MustHold {
+    pub id: String,
+    pub kind: FactKind,
+    pub path: String,
+    #[serde(default)]
+    pub subject: String,
+    pub origin: FactOrigin,
+    #[serde(default)]
+    pub sig_fp: String,
+    #[serde(default)]
+    pub full_fp: Option<String>,
+    #[serde(default)]
+    pub display: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FactKind {
+    Signature,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FactOrigin {
+    Modified,
+    Referenced,
+    FileFallback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Continue,
+    Refresh,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisLevel {
+    Symbols,
+    FilesOnly,
+    Integration,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    FactBroken,
+    FactMissing,
+    SameSymbolEdited,
+    PatchConflict,
+    AlreadyApplied,
+    IntegrationCheckFailed,
+    AnalysisUncertain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reason {
+    pub code: ReasonCode,
+    #[serde(default)]
+    pub fact_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Validity {
+    pub decision: Decision,
+    pub evaluated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub world_digest: String,
+    #[serde(default)]
+    pub world_changed: bool,
+    #[serde(default)]
+    pub changed_files: u32,
+    /// Capped at 20.
+    #[serde(default)]
+    pub reasons: Vec<Reason>,
+    pub analysis: AnalysisLevel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoherenceSummary {
+    pub decision: Decision,
+    /// Capped at 5.
+    #[serde(default)]
+    pub reasons: Vec<Reason>,
+    #[serde(default)]
+    pub changed_files: u32,
+    pub analysis: AnalysisLevel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     #[serde(default)]
@@ -490,6 +606,8 @@ pub struct RunRecord {
     pub capacity: Option<CapacityObservation>,
     #[serde(default)]
     pub admission: Option<AdmissionSummary>,
+    #[serde(default)]
+    pub coherence: Option<CoherenceRecord>,
     pub evaluation: Option<EvaluationRecord>,
     pub applied_candidate: Option<String>,
 }
@@ -781,6 +899,8 @@ pub struct RunResult {
     pub capacity: Option<CapacityObservation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<AdmissionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<CoherenceSummary>,
 }
 
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.

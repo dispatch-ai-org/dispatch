@@ -13,9 +13,58 @@ pub struct Config {
     pub planning: crate::planning::PlanningConfig,
     #[serde(skip_serializing_if = "crate::private_evidence::EvidenceConfig::is_disabled")]
     pub private_evidence: crate::private_evidence::EvidenceConfig,
+    #[serde(skip_serializing_if = "CoherenceConfig::is_default")]
+    pub coherence: CoherenceConfig,
     pub execution: ExecutionConfig,
     pub checks: ChecksConfig,
     pub harnesses: HarnessesConfig,
+}
+
+/// How completed work is checked against a source tree that moved underneath it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoherenceConfig {
+    pub accept: AcceptMode,
+    pub mid_run: MidRunMode,
+    pub stop_on_refresh: bool,
+    pub poll_secs: u64,
+    pub integration_checks: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptMode {
+    /// Validate the patch against the moved tree before applying.
+    #[default]
+    Validate,
+    /// Legacy behavior: refuse on any source drift.
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidRunMode {
+    #[default]
+    Observe,
+    Stop,
+}
+
+impl Default for CoherenceConfig {
+    fn default() -> Self {
+        Self {
+            accept: AcceptMode::default(),
+            mid_run: MidRunMode::default(),
+            stop_on_refresh: false,
+            poll_secs: 10,
+            integration_checks: true,
+        }
+    }
+}
+
+impl CoherenceConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +199,10 @@ impl Config {
         anyhow::ensure!(
             !self.execution.memory.trim().is_empty(),
             "execution.memory must not be empty"
+        );
+        anyhow::ensure!(
+            self.coherence.poll_secs > 0,
+            "coherence.poll_secs must be positive"
         );
         for (name, harness) in [
             ("claude", &self.harnesses.claude),
@@ -436,6 +489,55 @@ mod tests {
         assert_eq!(config.execution.timeout_secs, 12);
         assert_eq!(config.execution.backend, "local");
         assert_eq!(config.checks.verify, vec!["cargo test"]);
+    }
+
+    #[test]
+    fn coherence_defaults_and_yaml() {
+        let config = CoherenceConfig::default();
+        assert_eq!(config.accept, AcceptMode::Validate);
+        assert_eq!(config.mid_run, MidRunMode::Observe);
+        assert!(!config.stop_on_refresh);
+        assert_eq!(config.poll_secs, 10);
+        assert!(config.integration_checks);
+
+        let config: Config = serde_yaml::from_str(
+            "coherence:\n  accept: strict\n  mid_run: stop\n  stop_on_refresh: true\n  poll_secs: 3\n  integration_checks: false\n",
+        )
+        .unwrap();
+        assert_eq!(config.coherence.accept, AcceptMode::Strict);
+        assert_eq!(config.coherence.mid_run, MidRunMode::Stop);
+        assert!(config.coherence.stop_on_refresh);
+        assert_eq!(config.coherence.poll_secs, 3);
+        assert!(!config.coherence.integration_checks);
+        config.validate().unwrap();
+        assert!(
+            serde_yaml::to_string(&config)
+                .unwrap()
+                .contains("coherence:")
+        );
+
+        let partial: Config = serde_yaml::from_str("coherence:\n  mid_run: stop\n").unwrap();
+        assert_eq!(partial.coherence.accept, AcceptMode::Validate);
+        assert_eq!(partial.coherence.poll_secs, 10);
+
+        let zero: Config = serde_yaml::from_str("coherence:\n  poll_secs: 0\n").unwrap();
+        assert!(zero.validate().is_err());
+    }
+
+    #[test]
+    fn absent_coherence_block_is_not_serialized() {
+        let config: Config = serde_yaml::from_str("checks:\n  verify: [cargo test]\n").unwrap();
+        assert!(config.coherence.is_default());
+        assert!(
+            !serde_yaml::to_string(&config)
+                .unwrap()
+                .contains("coherence")
+        );
+        assert!(
+            !serde_json::to_string(&Config::default())
+                .unwrap()
+                .contains("coherence")
+        );
     }
 
     #[test]
