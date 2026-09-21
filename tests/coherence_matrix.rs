@@ -7,12 +7,13 @@
 //!
 //! * strict today: the whole-tree fingerprint moved (what `safe_apply` does);
 //! * file overlap: a changed world file is also a file the delta touches;
-//! * coherence: `coherence::evaluate` (L0 today; symbol facts arrive later).
+//! * coherence: `coherence::evaluate` (L0 file/patch checks, then L1 symbol
+//!   and file facts).
 //!
-//! `expected` is the verdict the finished design should give. `expected_l0` is
-//! what the L0-only evaluator must give today. Rows where they differ are
-//! `pending_symbols`: they are reported, not asserted. All calls into the
-//! coherence API live in `verdict`, so a later evaluator changes one place.
+//! `expected` is the verdict the evaluator must give; `expected_l0` is kept
+//! equal to it now that L1 exists. A row whose two differ would be
+//! `pending_symbols`: reported, not asserted. Every row except the `known_gap`
+//! ones is gated. All calls into the coherence API live in `verdict`.
 #![cfg(unix)]
 
 use std::{
@@ -203,7 +204,7 @@ fn build(git_source: bool, s0: Files, nested: &[&str], delta: Files, world: &[Op
     })
 }
 
-/// The only place that calls the coherence API. WP6 re-points this function.
+/// The only place that calls the coherence API.
 fn verdict(ctx: &Ctx) -> Result<Verdict> {
     let started = Instant::now();
     let observation = world::observe(
@@ -219,6 +220,8 @@ fn verdict(ctx: &Ctx) -> Result<Verdict> {
         &WorkView {
             source: &ctx.source,
             delta_patch: &ctx.diff,
+            baseline: &ctx.snapshot.baseline_path,
+            baseline_commit: &ctx.snapshot.baseline_commit,
         },
     )?;
     let eval_ms = ms(started);
@@ -1282,6 +1285,9 @@ pub fn load(text: &str) -> User {
         email: value[\"email\"].as_str().map(str::to_owned),
     }
 }
+
+/// The schema this loader is written against.
+pub const USER_SCHEMA: &str = include_str!(\"../schema/user.json\");
 ";
 
 const SUMMARIZE: &str = "\
@@ -1393,6 +1399,230 @@ def summarize(rows):
     return summary
 ";
 
+const RENDER_RS: &str = "\
+/// Render one table row.
+pub fn render_row(cells: &[String]) -> String {
+    cells.join(\" | \")
+}
+";
+const RENDER_RS_WORLD: &str = "\
+/// Render one table row.
+pub fn render_row(cells: &[String], width: usize) -> String {
+    cells
+        .iter()
+        .map(|cell| format!(\"{cell:<width$}\"))
+        .collect::<Vec<_>>()
+        .join(\" | \")
+}
+";
+const REPORT_RS_NEW: &str = "\
+use crate::render::render_row;
+
+pub fn report(rows: &[Vec<String>]) -> String {
+    let lines: Vec<String> = rows.iter().map(|row| render_row(row)).collect();
+    lines.join(\"\\n\")
+}
+";
+
+const APP_RS: &str = "\
+use crate::billing;
+
+pub fn run(order: &Order) -> Receipt {
+    let receipt = billing::process(order);
+    receipt
+}
+";
+const APP_RS_DELTA: &str = "\
+use crate::billing;
+
+pub fn run(order: &Order) -> Receipt {
+    let receipt = billing::process(order);
+    println!(\"billed order {}\", order.id);
+    receipt
+}
+";
+const BILLING_RS: &str = "\
+pub fn process(order: &Order) -> Receipt {
+    Receipt::for_total(order.total())
+}
+";
+const AUDIT_RS: &str = "\
+pub fn process(entry: &Entry) -> Verdict {
+    Verdict::from_flags(entry.flags())
+}
+";
+const AUDIT_RS_WORLD: &str = "\
+pub fn process(entry: &Entry, strict: bool) -> Verdict {
+    Verdict::from_flags(entry.flags(), strict)
+}
+";
+
+const TABLE_RS: &str = "\
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+}
+
+pub fn width(table: &Table) -> usize {
+    table.rows.iter().map(|row| row.len()).max().unwrap_or(0)
+}
+
+pub fn height(table: &Table) -> usize {
+    table.rows.len()
+}
+
+pub fn transpose(table: &Table) -> Table {
+    let mut columns = vec![Vec::new(); width(table)];
+    for row in &table.rows {
+        for (index, cell) in row.iter().enumerate() {
+            columns[index].push(cell.clone());
+        }
+    }
+    Table { rows: columns }
+}
+
+// Everything above is layout; everything below is lookup.
+// Keep the two halves apart.
+// Do not add new helpers between them.
+// New lookups go at the very end.
+
+pub fn last_row(table: &Table) -> Option<&Vec<String>> {
+    let rows = &table.rows;
+    if rows.is_empty() {
+        return None;
+    }
+    rows.last()
+}
+";
+const TABLE_RS_DELTA: &str = "\
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+}
+
+pub fn width(table: &Table) -> usize {
+    table.rows.iter().map(|row| row.len()).max().unwrap_or(0)
+}
+
+pub fn height(table: &Table) -> usize {
+    table.rows.len()
+}
+
+pub fn transpose(table: &Table) -> Table {
+    let mut columns = vec![Vec::new(); width(table)];
+    for row in &table.rows {
+        for (index, cell) in row.iter().enumerate() {
+            columns[index].push(cell.clone());
+        }
+    }
+    Table { rows: columns }
+}
+
+// Everything above is layout; everything below is lookup.
+// Keep the two halves apart.
+// Do not add new helpers between them.
+// New lookups go at the very end.
+
+pub fn last_row(table: &Table) -> Option<&Vec<String>> {
+    let rows = &table.rows;
+    if rows.is_empty() {
+        return None;
+    }
+    rows.last()
+}
+
+pub fn banner() -> &'static str {
+    \"table v2\"
+}
+";
+const TABLE_RS_WORLD: &str = "\
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+    pub header: Option<Vec<String>>,
+}
+
+pub fn width(table: &Table, include_header: bool) -> usize {
+    let body = table.rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    match (&table.header, include_header) {
+        (Some(header), true) => body.max(header.len()),
+        _ => body,
+    }
+}
+
+pub fn height(table: &Table, include_header: bool) -> usize {
+    table.rows.len() + usize::from(include_header && table.header.is_some())
+}
+
+pub fn transpose(table: &Table) -> Table {
+    let mut columns = vec![Vec::new(); width(table, false)];
+    for row in &table.rows {
+        for (index, cell) in row.iter().enumerate() {
+            columns[index].push(cell.clone());
+        }
+    }
+    Table {
+        rows: columns,
+        header: None,
+    }
+}
+
+// Everything above is layout; everything below is lookup.
+// Keep the two halves apart.
+// Do not add new helpers between them.
+// New lookups go at the very end.
+
+pub fn last_row(table: &Table) -> Option<&Vec<String>> {
+    let rows = &table.rows;
+    if rows.is_empty() {
+        return None;
+    }
+    rows.last()
+}
+";
+
+const STORE_PY: &str = "\
+class Store:
+    def __init__(self, path):
+        self.path = path
+        self.data = {}
+
+    def save(self, key, value):
+        self.data[key] = value
+
+    def load(self, key):
+        return self.data[key]
+";
+const STORE_PY_WORLD: &str = "\
+class Store:
+    def __init__(self, path):
+        self.path = path
+        self.data = {}
+
+    def save(self, key, value, ttl):
+        self.data[key] = (value, ttl)
+
+    def load(self, key):
+        return self.data[key]
+";
+const SERVICE_PY: &str = "\
+from store import Store
+
+
+def persist(path, items):
+    store = Store(path)
+    for key, value in items:
+        pass
+    return store
+";
+const SERVICE_PY_DELTA: &str = "\
+from store import Store
+
+
+def persist(path, items):
+    store = Store(path)
+    for key, value in items:
+        store.save(key, value)
+    return store
+";
+
 const IGNORE: &str = "target/\n__pycache__/\n";
 const LOGO_OLD: &str = "\u{0}PNG-old\u{1}\u{2}";
 const LOGO_NEW: &str = "\u{0}PNG-new\u{1}\u{3}\u{4}";
@@ -1405,7 +1635,7 @@ const VENDOR_LIB_WORLD: &str = "pub fn vendored() -> u8 {\n    2\n}\n";
 
 use Decision::{Continue, Refresh, Stop};
 
-/// A scenario whose target verdict already matches what L0 gives today.
+/// A scenario whose target verdict is what the evaluator must give (L0 + L1).
 fn settled(
     name: &'static str,
     lang: Lang,
@@ -1427,23 +1657,6 @@ fn settled(
         pending_symbols: false,
         known_gap: false,
         note,
-    }
-}
-
-/// A scenario L0 gets wrong today because it needs symbol or file facts.
-fn pending(
-    name: &'static str,
-    lang: Lang,
-    s0: Files<'static>,
-    delta: Files<'static>,
-    world: &'static [Op<'static>],
-    expected: Decision,
-    note: &'static str,
-) -> Scenario {
-    Scenario {
-        expected_l0: Continue,
-        pending_symbols: true,
-        ..settled(name, lang, s0, delta, world, expected, note)
     }
 }
 
@@ -1505,7 +1718,7 @@ fn scenarios() -> Vec<Scenario> {
             Continue,
             "Python variant of row 4.",
         ),
-        pending(
+        settled(
             "05 callee signature changed",
             rust,
             &[("src/auth.rs", AUTH_RS), ("src/handler.rs", HANDLER_RS)],
@@ -1514,7 +1727,7 @@ fn scenarios() -> Vec<Scenario> {
             Refresh,
             "Delta calls validate(&token); world adds a ctx parameter. False CONTINUE for L0 and file overlap.",
         ),
-        pending(
+        settled(
             "05 callee signature changed",
             py,
             &[("auth.py", AUTH_PY), ("handler.py", HANDLER_PY)],
@@ -1523,7 +1736,7 @@ fn scenarios() -> Vec<Scenario> {
             Refresh,
             "Python variant of row 5.",
         ),
-        pending(
+        settled(
             "06 shared struct field added",
             rust,
             &[("src/model.rs", MODEL_RS), ("src/queue.rs", QUEUE_RS)],
@@ -1532,7 +1745,7 @@ fn scenarios() -> Vec<Scenario> {
             Refresh,
             "Delta constructs Job {id, name}; world adds a required field.",
         ),
-        pending(
+        settled(
             "06 shared struct field added",
             py,
             &[("model.py", MODEL_PY), ("queue.py", QUEUE_PY)],
@@ -1554,7 +1767,7 @@ fn scenarios() -> Vec<Scenario> {
             Continue,
             "Delta calls price -> unit_rate, whose behavior changed. Symbol facts see nothing; an integration-check oracle (L2) catches it later.",
         ),
-        pending(
+        settled(
             "08 contract file (json schema)",
             rust,
             &[
@@ -1584,7 +1797,7 @@ fn scenarios() -> Vec<Scenario> {
             Refresh,
             "Both sides rewrite the same line differently: PatchConflict.",
         ),
-        pending(
+        settled(
             "11 same symbol, disjoint hunks",
             rust,
             &[("src/summary.rs", SUMMARIZE)],
@@ -1593,7 +1806,7 @@ fn scenarios() -> Vec<Scenario> {
             Refresh,
             "Both edit summarize() in far-apart lines; git merges cleanly but the symbol was edited twice.",
         ),
-        pending(
+        settled(
             "11 same symbol, disjoint hunks",
             py,
             &[("summary.py", SUMMARIZE_PY)],
@@ -1643,8 +1856,8 @@ fn scenarios() -> Vec<Scenario> {
             &[("src/stats.rs", STATS)],
             &[("src/stats.rs", STATS_DELTA)],
             &[Op::Write("src/stats.rs", STATS_WORLD_BROKEN)],
-            Continue,
-            "Mid-edit save breaks an unrelated function. L0 Continues (mid-run semantics); accept-time would later report AnalysisUncertain.",
+            Refresh,
+            "Mid-edit save breaks an unrelated function in the file the delta edits. Accept-time AnalysisUncertain: a false REFRESH accepted by design (an unparsable file cannot be checked). L0 alone still Continues, and the mid-run watcher must not flip on this reason.",
         ),
         settled(
             "15a file deleted by the world",
@@ -1720,6 +1933,46 @@ fn scenarios() -> Vec<Scenario> {
                 "KNOWN GAP: the world is unchanged, yet observe reports the nested repo's files as Deleted, so the unchanged-world fast path never fires.",
             )
         },
+        settled(
+            "18 new file calls changed callee",
+            rust,
+            &[("src/render.rs", RENDER_RS)],
+            &[("src/report.rs", REPORT_RS_NEW)],
+            &[Op::Write("src/render.rs", RENDER_RS_WORLD)],
+            Refresh,
+            "The delta only adds report.rs, which calls render_row; the world adds a required width parameter to render_row in another file.",
+        ),
+        settled(
+            "19 name collision, other symbol changed",
+            rust,
+            &[
+                ("src/app.rs", APP_RS),
+                ("src/billing.rs", BILLING_RS),
+                ("src/audit.rs", AUDIT_RS),
+            ],
+            &[("src/app.rs", APP_RS_DELTA)],
+            &[Op::Write("src/audit.rs", AUDIT_RS_WORLD)],
+            Continue,
+            "Two unrelated functions are named process; the world changes audit's signature. The unique-name rule must not bind the delta's call to it.",
+        ),
+        settled(
+            "20 new function, big rewrite elsewhere",
+            rust,
+            &[("src/table.rs", TABLE_RS)],
+            &[("src/table.rs", TABLE_RS_DELTA)],
+            &[Op::Write("src/table.rs", TABLE_RS_WORLD)],
+            Continue,
+            "The delta appends a function with no references; the world rewrites the top of the same file, signatures included.",
+        ),
+        settled(
+            "21 class method signature changed",
+            py,
+            &[("store.py", STORE_PY), ("service.py", SERVICE_PY)],
+            &[("service.py", SERVICE_PY_DELTA)],
+            &[Op::Write("store.py", STORE_PY_WORLD)],
+            Refresh,
+            "The delta calls Store.save; the world adds a required ttl parameter to that method.",
+        ),
     ]
 }
 
@@ -1766,9 +2019,16 @@ fn scenario_matrix_reports_and_enforces_gates() {
 
     let coherence = count(&gated, |row| row.coherence, |row| row.expected_l0);
     let overlap = count(&gated, |row| row.overlap, |row| row.expected_l0);
+    // Every row but the known_gap ones is gated, so this covers all rows.
     assert_eq!(
         coherence.false_continue, 0,
-        "coherence produced a false CONTINUE on a non-pending row"
+        "coherence produced a false CONTINUE on a gated row"
+    );
+    // Row 14 (syntax error in the world) expects REFRESH by design, so it is
+    // not a false refresh; every other row must not refresh needlessly.
+    assert_eq!(
+        coherence.false_refresh, 0,
+        "coherence produced a false REFRESH on a gated row"
     );
     assert!(
         coherence.false_refresh < overlap.false_refresh,

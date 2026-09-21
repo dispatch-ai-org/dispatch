@@ -1,9 +1,10 @@
 //! Work coherence: is a run's finished work still valid against a source tree
 //! that may have moved since the run's baseline was taken?
 //!
-//! This is the pure L0 evaluator. It reads the source tree and the candidate
-//! patch and runs `git apply` only with `--check`, so it never mutates
-//! anything, and it never touches the database or the run record.
+//! This is the pure evaluator: L0 (file and patch state) then L1 (symbol and
+//! file facts, see `facts`). It reads the source tree, the candidate patch and
+//! the run's baseline, and runs `git apply` only with `--check`, so it never
+//! mutates anything, and it never touches the database or the run record.
 
 use std::{fmt, fs, future::Future, path::Path};
 
@@ -11,12 +12,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::{
-    AnalysisLevel, CandidateRecord, Decision, Reason, ReasonCode, RunRecord, Validity,
+    AnalysisLevel, CandidateRecord, Decision, MustHold, Reason, ReasonCode, RunRecord, Validity,
     coherence::world::WorldObservation,
     config::{AcceptMode, Config},
     source::{fingerprint_tree, git_command, run_git},
 };
 
+pub mod facts;
 pub mod integration;
 pub mod symbols;
 pub mod world;
@@ -24,11 +26,25 @@ pub mod world;
 const MAX_REASONS: usize = 20;
 const MAX_DETAIL_CHARS: usize = 300;
 
-/// What the evaluator needs to know about the work: where the source lives and
-/// the patch (the work's delta against its baseline).
+/// What the evaluator needs to know about the work: where the source lives,
+/// the patch (the work's delta against its baseline), and the run's private
+/// baseline repository and commit (S0).
 pub struct WorkView<'a> {
     pub source: &'a Path,
     pub delta_patch: &'a Path,
+    pub baseline: &'a Path,
+    pub baseline_commit: &'a str,
+}
+
+impl<'a> WorkView<'a> {
+    fn of(run: &'a RunRecord, candidate: &'a CandidateRecord) -> Self {
+        Self {
+            source: &run.source_path,
+            delta_patch: &candidate.diff_path,
+            baseline: &run.baseline_path,
+            baseline_commit: &run.baseline_commit,
+        }
+    }
 }
 
 /// Observe the current source tree and evaluate one candidate's patch of `run`.
@@ -40,13 +56,16 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
         &run.baseline_commit,
         &run.source_kind,
     )?;
-    evaluate(
-        &world,
-        &WorkView {
-            source: &run.source_path,
-            delta_patch: &candidate.diff_path,
-        },
-    )
+    evaluate(&world, &WorkView::of(run, candidate))
+}
+
+/// The facts the candidate's patch assumes about the baseline, for callers
+/// that store them on the run's `CoherenceRecord`. Independent of the world.
+pub fn derive_for_run(run: &RunRecord, candidate_label: &str) -> Result<Vec<MustHold>> {
+    let work = WorkView::of(run, find_candidate(run, candidate_label)?);
+    let patch = fs::read(work.delta_patch)
+        .with_context(|| format!("failed to read delta {}", work.delta_patch.display()))?;
+    Ok(facts::derive_facts(&work, &facts::parse_patch(&patch))?.facts)
 }
 
 fn find_candidate<'a>(run: &'a RunRecord, candidate_label: &str) -> Result<&'a CandidateRecord> {
@@ -161,12 +180,15 @@ fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> Result<T> {
     })
 }
 
-/// L0 verdict from file and patch state alone. Order matters: an unchanged
-/// world needs no analysis, an empty patch cannot conflict, a patch that
-/// already reverses cleanly is present in the source, and a patch that does not
-/// apply cleanly needs a refresh.
+/// L0 then L1. L0 is the verdict from file and patch state alone. Order
+/// matters: an unchanged world needs no analysis, an empty patch cannot
+/// conflict, a patch that already reverses cleanly is present in the source,
+/// and a patch that does not apply cleanly needs a refresh. Only when L0
+/// continues and the world moved does L1 check the symbols and files the patch
+/// assumes; any reason it finds means refresh.
 pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
     let world_changed = !world.changes.is_empty();
+    let mut analysis = AnalysisLevel::FilesOnly;
     // An unchanged world is checked first so that it costs no file or Git work.
     let (decision, mut reasons) = if !world_changed || patch_is_empty(work.delta_patch)? {
         (Decision::Continue, Vec::new())
@@ -192,7 +214,16 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         };
         (Decision::Refresh, vec![reason])
     } else {
-        (Decision::Continue, Vec::new())
+        let (found, level) = facts::check(work, world)?;
+        analysis = level;
+        (
+            if found.is_empty() {
+                Decision::Continue
+            } else {
+                Decision::Refresh
+            },
+            found,
+        )
     };
     reasons.truncate(MAX_REASONS);
     Ok(Validity {
@@ -202,7 +233,7 @@ pub fn evaluate(world: &WorldObservation, work: &WorkView) -> Result<Validity> {
         world_changed,
         changed_files: u32::try_from(world.changes.len()).unwrap_or(u32::MAX),
         reasons,
-        analysis: AnalysisLevel::FilesOnly,
+        analysis,
     })
 }
 
@@ -299,6 +330,8 @@ mod tests {
                 &WorkView {
                     source: &self.source,
                     delta_patch: patch,
+                    baseline: &self.snapshot.baseline_path,
+                    baseline_commit: &self.snapshot.baseline_commit,
                 },
             )
             .unwrap()
@@ -567,6 +600,20 @@ mod tests {
         assert_eq!(validity.decision, Decision::Stop);
         assert!(evaluate_run(&run, "B").is_err());
         assert!(matches!(run.source_kind, SourceKind::Git));
+    }
+
+    #[test]
+    fn derive_for_run_returns_the_patch_facts_without_observing_the_world() {
+        let fixture = Fixture::new(true, &[("a.rs", "pub fn one() -> u8 {\n    1\n}\n")]);
+        let patch = fixture.patch(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n pub fn one() -> u8 {\n-    1\n+    2\n }\n",
+        );
+        let run = fixture.run(patch);
+        let facts = derive_for_run(&run, "A").unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].subject, "one");
+        assert_eq!(facts[0].origin, FactOrigin::Modified);
+        assert!(derive_for_run(&run, "B").is_err());
     }
 
     #[test]
