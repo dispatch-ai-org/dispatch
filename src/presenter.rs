@@ -161,6 +161,30 @@ fn verification_text(state: VerificationState) -> &'static str {
     }
 }
 
+/// The one-line coherence verdict shown under the verification line.
+pub fn coherence_text(validity: &Validity) -> String {
+    match validity.decision {
+        Decision::Continue if !validity.world_changed => {
+            "Coherence: CONTINUE — world unchanged".into()
+        }
+        Decision::Continue => format!(
+            "Coherence: CONTINUE — {} file{} changed underneath, none affect this work",
+            validity.changed_files,
+            if validity.changed_files == 1 { "" } else { "s" }
+        ),
+        Decision::Refresh => format!(
+            "Coherence: REFRESH — {}",
+            validity
+                .reasons
+                .first()
+                .map_or("files changed underneath the work", |reason| reason
+                    .detail
+                    .as_str())
+        ),
+        Decision::Stop => "Coherence: STOP — this patch is already in the source".into(),
+    }
+}
+
 pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, ascii: bool) -> String {
     let (done, pending, failed, skip, active, inactive) = if ascii {
         ("*", "o", "x", "-", " == ", " -- ")
@@ -294,6 +318,11 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
     }
     if run.outcome.phase == RunPhase::Verifying || run.outcome.work_result != WorkResult::Pending {
         lines.push(verification_text(run.outcome.verification).to_owned());
+    }
+    if run.outcome.work_result == WorkResult::Ready
+        && let Some(validity) = run.coherence.as_ref().and_then(|c| c.validity.as_ref())
+    {
+        lines.push(clip(&coherence_text(validity), width));
     }
     if run.outcome.work_result == WorkResult::Ready
         && let [candidate] = run.candidates.as_slice()
@@ -1495,6 +1524,7 @@ async fn run_goal(
         allow_unsafe_local: local,
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,
+        refreshed_from: None,
     };
     ui.draft.clear();
     let mut run = ui
@@ -1855,6 +1885,109 @@ mod tests {
             assert_eq!(displayed, text);
         }
     }
+    fn with_validity(
+        decision: Decision,
+        world_changed: bool,
+        changed_files: u32,
+        detail: Option<&str>,
+    ) -> RunRecord {
+        let mut r = run();
+        r.outcome.work_result = WorkResult::Ready;
+        r.outcome.verification = VerificationState::Passed;
+        r.coherence = Some(CoherenceRecord {
+            version: 1,
+            refreshed_from: None,
+            facts: Vec::new(),
+            validity: Some(Validity {
+                decision,
+                evaluated_at: chrono::Utc::now(),
+                world_digest: String::new(),
+                world_changed,
+                changed_files,
+                reasons: detail
+                    .map(|detail| Reason {
+                        code: ReasonCode::FactBroken,
+                        fact_id: None,
+                        path: None,
+                        detail: detail.into(),
+                    })
+                    .into_iter()
+                    .collect(),
+                analysis: AnalysisLevel::Symbols,
+            }),
+            first_invalid_at: None,
+        });
+        r
+    }
+
+    #[test]
+    fn coherence_line_follows_verification_for_every_verdict() {
+        let cases = [
+            (
+                with_validity(Decision::Continue, false, 0, None),
+                "Coherence: CONTINUE — world unchanged",
+            ),
+            (
+                with_validity(Decision::Continue, true, 4, None),
+                "Coherence: CONTINUE — 4 files changed underneath, none affect this work",
+            ),
+            (
+                with_validity(Decision::Continue, true, 1, None),
+                "Coherence: CONTINUE — 1 file changed underneath, none affect this work",
+            ),
+            (
+                with_validity(
+                    Decision::Refresh,
+                    true,
+                    1,
+                    Some("auth::validate changed\nagain"),
+                ),
+                "Coherence: REFRESH — auth::validate changed again",
+            ),
+            (
+                with_validity(Decision::Refresh, true, 1, None),
+                "Coherence: REFRESH — files changed underneath the work",
+            ),
+            (
+                with_validity(Decision::Stop, true, 1, None),
+                "Coherence: STOP — this patch is already in the source",
+            ),
+        ];
+        for (r, expected) in cases {
+            let text = projection(&r, None, 120, false);
+            let lines = text.lines().collect::<Vec<_>>();
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with("Verification"))
+                .unwrap();
+            assert_eq!(lines[at + 1], expected, "{text}");
+            let ascii = projection(&r, None, 120, true);
+            assert!(ascii.contains(&expected.replace('—', "-")), "{ascii}");
+            assert!(!ascii.contains('—'));
+        }
+    }
+
+    #[test]
+    fn coherence_line_is_absent_without_validity_or_ready_work() {
+        let r = run();
+        assert!(!projection(&r, None, 90, false).contains("Coherence"));
+        let mut pending = with_validity(Decision::Refresh, true, 1, Some("x"));
+        pending.outcome.work_result = WorkResult::Pending;
+        assert!(!projection(&pending, None, 90, false).contains("Coherence"));
+        let mut plain = with_validity(Decision::Refresh, true, 1, Some("x"));
+        plain.coherence.as_mut().unwrap().validity = None;
+        assert!(!projection(&plain, None, 90, false).contains("Coherence"));
+    }
+
+    #[test]
+    fn coherence_line_is_clipped_to_the_width() {
+        let r = with_validity(Decision::Refresh, true, 1, Some(&"long detail ".repeat(20)));
+        let text = projection(&r, None, 40, false);
+        let line = text.lines().find(|l| l.starts_with("Coherence")).unwrap();
+        assert!(UnicodeWidthStr::width(line) <= 40, "{line}");
+        assert!(line.ends_with("..."));
+    }
+
     #[test]
     fn unconfigured_checks_never_look_verified() {
         let mut r = run();

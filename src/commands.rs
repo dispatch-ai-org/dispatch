@@ -811,6 +811,7 @@ pub(crate) async fn execute(state: &State, scope: &Scope, command: Operation) ->
                     allow_unsafe_local: scope.allow_unsafe_local,
                     allow_forwarded_env: false,
                     output: orchestrator::RunOutputMode::Silent,
+                    refreshed_from: None,
                 },
             )
             .await

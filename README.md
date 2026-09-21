@@ -186,6 +186,8 @@ dispatch diff [run-id] [candidate]
 dispatch accept [run-id]
 dispatch reject [run-id]
 dispatch explain [run-id]
+dispatch check [run-id] [--json]
+dispatch refresh [run-id]
 dispatch history [--limit count]
 dispatch version
 ```

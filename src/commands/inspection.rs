@@ -126,7 +126,7 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
     {
         artifacts.push(json!({"run_id":id,"attempt_id":run.phase3.as_ref().unwrap().final_attempt_id,"kind":"final_diff"}));
     }
-    let mut value = json!({"result_id":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"delivery_revision":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"result":orchestrator::run_result(&run),"candidates":run.candidates,"baseline_checks":run.baseline_checks,"artifacts":artifacts});
+    let mut value = json!({"result_id":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"delivery_revision":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"result":orchestrator::run_result(&crate::coherence::with_live_validity(&run)),"candidates":run.candidates,"baseline_checks":run.baseline_checks,"artifacts":artifacts});
     remove_paths(&mut value);
     Ok(value)
 }

@@ -133,6 +133,8 @@ pub struct RunRequest {
     pub allow_unsafe_local: bool,
     pub allow_forwarded_env: bool,
     pub output: RunOutputMode,
+    /// The run this one redoes on the current source (`dispatch refresh`).
+    pub refreshed_from: Option<String>,
 }
 
 #[derive(Default)]
@@ -927,7 +929,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         allocation,
         capacity: None,
         admission: None,
-        coherence: None,
+        coherence: request.refreshed_from.map(|old| CoherenceRecord {
+            version: 1,
+            refreshed_from: Some(old),
+            facts: Vec::new(),
+            validity: None,
+            first_invalid_at: None,
+        }),
         evaluation: None,
         applied_candidate: None,
     };
@@ -2034,6 +2042,9 @@ fn print_single_result_summary(
         );
     }
     println!("Verification\n  {}\n", result_verification(candidate));
+    if let Some(line) = coherence_line(run) {
+        println!("{line}\n");
+    }
     if show_status {
         println!("Status\n  {}\n", run.status.as_str());
     }
@@ -2751,7 +2762,17 @@ pub fn run_result(run: &RunRecord) -> RunResult {
         allocation: run.allocation.clone(),
         capacity: run.capacity.clone(),
         admission: run.admission.clone(),
-        coherence: None,
+        coherence: run
+            .coherence
+            .as_ref()
+            .and_then(|record| record.validity.as_ref())
+            .filter(|validity| validity.world_changed || validity.decision != Decision::Continue)
+            .map(|validity| crate::CoherenceSummary {
+                decision: validity.decision,
+                reasons: validity.reasons.iter().take(5).cloned().collect(),
+                changed_files: validity.changed_files,
+                analysis: validity.analysis,
+            }),
     }
 }
 
@@ -2964,6 +2985,8 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
         Some(id) => state.load_run(id)?,
         None => load_latest_for_source(state, source_path, false)?,
     };
+    // Display only: the live verdict is never written back.
+    let run = crate::coherence::with_live_validity(&run);
     if run.phase3.is_some() {
         return phase3::emit(&run, RunOutputMode::Human);
     }
@@ -2987,6 +3010,9 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     print_run_header(&run, reveal);
     println!("\nTask\n  {}\n", one_line(&run.task, 120));
     print_candidates(&run, reveal);
+    if let Some(line) = coherence_line(&run) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -2995,6 +3021,7 @@ pub fn status_json(state: &State, id: Option<&str>, source_path: &Path) -> Resul
         Some(id) => state.load_run(id)?,
         None => load_latest_for_source(state, source_path, false)?,
     };
+    let run = crate::coherence::with_live_validity(&run);
     println!("{}", serde_json::to_string(&run_result(&run))?);
     Ok(())
 }
@@ -3004,6 +3031,7 @@ pub fn status_jsonl(state: &State, id: Option<&str>, source_path: &Path) -> Resu
         Some(id) => state.load_run(id)?,
         None => load_latest_for_source(state, source_path, false)?,
     };
+    let run = crate::coherence::with_live_validity(&run);
     let database = Database::open(state.db_path())?;
     for event in database.events_for_run(&run.id)? {
         println!("{}", serde_json::json!({"type": "event", "event": event}));
@@ -3453,11 +3481,271 @@ pub fn accept_or_reject_latest(
     Ok(())
 }
 
+/// A finished, unapplied result: the only kind `check` and `refresh` act on.
+fn ensure_unapplied_ready(run: &RunRecord, action: &str) -> Result<()> {
+    anyhow::ensure!(
+        run.outcome.lifecycle == LifecycleState::Finished
+            && run.outcome.work_result == WorkResult::Ready
+            && run.outcome.application != ApplicationState::Applied
+            && run.status != RunStatus::Applied,
+        "run {} is not a ready, unapplied result; nothing to {action}",
+        run.id
+    );
+    Ok(())
+}
+
+/// `dispatch check`: evaluate the run's sole candidate against the source as it
+/// is now. Reads only; the verdict is printed, never stored.
+pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool) -> Result<()> {
+    let run = match run_id {
+        Some(run_id) => state.load_run(run_id)?,
+        None => load_latest_for_source(state, source_path, true)?,
+    };
+    ensure_unapplied_ready(&run, "check")?;
+    let candidate = sole_candidate(&run)?;
+    let validity = crate::coherence::evaluate_run(&run, &candidate.label)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"run_id": run.id, "validity": validity})
+        );
+        return Ok(());
+    }
+    println!("Run {}", run.id);
+    println!(
+        "Coherence: {}",
+        crate::coherence::verdict(validity.decision)
+    );
+    println!("Analysis: {}", snake_case(&validity.analysis));
+    println!("World changed files: {}", validity.changed_files);
+    for reason in &validity.reasons {
+        println!("  {}", reason_line(reason));
+    }
+    match validity.decision {
+        Decision::Continue => println!("Next: dispatch accept {}", run.id),
+        Decision::Refresh => println!(
+            "Next: dispatch refresh {id}  (or dispatch reject {id})",
+            id = run.id
+        ),
+        Decision::Stop => println!("Next: dispatch reject {}", run.id),
+    }
+    Ok(())
+}
+
+const REFRESH_MARKER: &str = "Context: this task was previously attempted against an earlier";
+
+/// The task sent to the agent when a run is refreshed: the original text plus a
+/// fixed addendum naming the earlier run and up to ten reasons it went stale.
+/// An addendum from an earlier refresh is replaced, not stacked.
+pub fn refresh_task(original: &str, old_id: &str, reasons: &[crate::Reason]) -> String {
+    let base = original
+        .split_once(&format!("\n\n{REFRESH_MARKER}"))
+        .map_or(original, |(base, _)| base)
+        .trim_end();
+    let mut lines = reasons
+        .iter()
+        .take(10)
+        .map(|reason| {
+            reason
+                .detail
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| format!("- {detail}"))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push("- files changed underneath the work".into());
+    }
+    format!(
+        "{base}\n\n{REFRESH_MARKER} version of the repository (run {old_id}). The repository has changed since then:\n{}\nRe-inspect the current code before making changes; do not assume the earlier attempt's assumptions still hold.",
+        lines.join("\n")
+    )
+}
+
+pub struct RefreshOptions {
+    pub allow_unsafe_local: bool,
+    pub allow_forwarded_env: bool,
+    pub config_path: Option<PathBuf>,
+    pub output: RunOutputMode,
+}
+
+/// `dispatch refresh`: the request for a new run of the same task on the
+/// current source. It repeats the original launch choices and demands the same
+/// explicit acknowledgements again; it never touches the old run.
+pub fn refresh_request(
+    state: &State,
+    run_id: Option<&str>,
+    source_path: &Path,
+    options: RefreshOptions,
+) -> Result<RunRequest> {
+    let run = match run_id {
+        Some(run_id) => state.load_run(run_id)?,
+        None => load_latest_for_source(state, source_path, true)?,
+    };
+    ensure_unapplied_ready(&run, "refresh")?;
+    let mut missing = Vec::new();
+    if run.environment.unsafe_local && !options.allow_unsafe_local {
+        missing.push("--allow-unsafe-local");
+    }
+    if !run.environment.forwarded_env.is_empty() && !options.allow_forwarded_env {
+        missing.push("--allow-forwarded-env");
+    }
+    anyhow::ensure!(
+        missing.is_empty(),
+        "refresh launches new work and never inherits authority; pass {} again, as for the original run",
+        missing.join(" and ")
+    );
+    let reasons = crate::coherence::live_validity(&run)
+        .map(|validity| validity.reasons)
+        .unwrap_or_default();
+    let allocation = run.mode == RunMode::Allocation;
+    let goal = run.phase3.as_ref();
+    let fixed = |value: Option<&String>| value.filter(|_| allocation).cloned();
+    Ok(RunRequest {
+        plan: false,
+        max_invocations: goal
+            .filter(|goal| goal.planning.is_none())
+            .map(|goal| goal.max_invocations),
+        source: run.source_path.clone(),
+        task: refresh_task(&run.task, &run.id, &reasons),
+        harnesses: if allocation {
+            Vec::new()
+        } else {
+            run.candidates
+                .iter()
+                .map(|candidate| candidate.harness_id.clone())
+                .collect()
+        },
+        route: false,
+        agent: fixed(goal.and_then(|goal| goal.fixed_harness.as_ref())),
+        model: fixed(goal.and_then(|goal| goal.fixed_model.as_ref())),
+        effort: fixed(goal.and_then(|goal| goal.fixed_effort.as_ref())),
+        config_path: options.config_path,
+        backend: Some(run.environment.execution_backend.clone()),
+        timeout_secs: Some(run.environment.timeout_secs),
+        max_parallel: Some(run.environment.max_parallel),
+        priority: goal.map_or(0, |goal| goal.priority),
+        no_retry: goal.is_some_and(|goal| goal.no_retry),
+        allow_unsafe_local: options.allow_unsafe_local,
+        allow_forwarded_env: options.allow_forwarded_env,
+        output: options.output,
+        refreshed_from: Some(run.id.clone()),
+    })
+}
+
+/// The Coherence line for a Ready run that carries a validity, else `None`.
+fn coherence_line(run: &RunRecord) -> Option<String> {
+    let validity = run.coherence.as_ref()?.validity.as_ref()?;
+    (run.outcome.work_result == WorkResult::Ready)
+        .then(|| crate::presenter::coherence_text(validity))
+}
+
+fn snake_case<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn reason_line(reason: &crate::Reason) -> String {
+    let detail = reason
+        .detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}: {detail}", snake_case(&reason.code))
+}
+
+/// Wall-clock seconds the candidate's attempts ran after `invalid_at`, and in
+/// total, from attempt timestamps only. `None` when no attempt has a duration.
+fn agent_seconds_after(run: &RunRecord, invalid_at: chrono::DateTime<Utc>) -> Option<(i64, i64)> {
+    let candidate = sole_candidate(run).ok()?;
+    let (mut after, mut total) = (0, 0);
+    for attempt in run
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.candidate_id == candidate.id)
+    {
+        let end = attempt.completed_at?;
+        total += (end - attempt.started_at).num_seconds().max(0);
+        after += (end - attempt.started_at.max(invalid_at))
+            .num_seconds()
+            .max(0);
+    }
+    (total > 0).then_some((after, total))
+}
+
+fn minutes_seconds(seconds: i64) -> String {
+    format!("{}m{}s", seconds / 60, seconds % 60)
+}
+
+/// Print the Coherence section when the run has coherence data (a moved world
+/// or a lineage); returns whether anything was printed.
+fn print_coherence_details(run: &RunRecord) -> bool {
+    let Some(record) = &run.coherence else {
+        return false;
+    };
+    let moved = record
+        .validity
+        .as_ref()
+        .filter(|v| v.world_changed || v.decision != Decision::Continue);
+    if moved.is_none() && record.refreshed_from.is_none() {
+        return false;
+    }
+    println!("\nCoherence");
+    if let Some(validity) = moved {
+        println!(
+            "  decision: {}",
+            crate::coherence::verdict(validity.decision)
+        );
+        println!("  analysis: {}", snake_case(&validity.analysis));
+        println!(
+            "  world changed: {} ({} file(s))",
+            if validity.world_changed { "yes" } else { "no" },
+            validity.changed_files
+        );
+        for reason in validity.reasons.iter().take(10) {
+            println!("  reason: {}", reason_line(reason));
+        }
+    }
+    if let Some(at) = record.first_invalid_at {
+        println!("  first invalid at: {}", at.to_rfc3339());
+        if let Some((after, total)) = agent_seconds_after(run, at) {
+            println!(
+                "  Agent time after the work became invalid: {} of {} ({}%)",
+                minutes_seconds(after),
+                minutes_seconds(total),
+                after * 100 / total
+            );
+        }
+    }
+    if let Some(old) = &record.refreshed_from {
+        println!("  refreshed from: {old}");
+    }
+    true
+}
+
 pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Result<()> {
     let run = match run_id {
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_for_source(state, source_path, true)?,
     };
+    // Display only: the live verdict is never written back.
+    let run = crate::coherence::with_live_validity(&run);
+    let selection = explain_selection(state, &run);
+    let coherence = print_coherence_details(&run);
+    match selection {
+        Err(error) if coherence => {
+            println!("\n{error}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+fn explain_selection(state: &State, run: &RunRecord) -> Result<()> {
     if let Some(decision) = &run.allocation {
         print_allocation_details(decision);
         print_capacity_details(run.capacity.as_ref(), run.admission.as_ref());
@@ -3847,7 +4135,11 @@ fn apply_locked(
                 source::apply_validated(&run, &normalized_label, &validity.world_digest)?,
                 Some(validity),
             )),
-            AcceptGate::Blocked(validity) => Err(CoherenceBlocked { validity }.into()),
+            AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
+                run_id: run.id.clone(),
+                validity,
+            }
+            .into()),
         });
     let (report, validity) = match applied {
         Ok(applied) => applied,
@@ -4342,6 +4634,140 @@ fn indent(value: &str, prefix: &str) -> String {
 mod tests {
     use super::*;
 
+    fn reason(detail: &str) -> crate::Reason {
+        crate::Reason {
+            code: crate::ReasonCode::FactBroken,
+            fact_id: None,
+            path: None,
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn run_result_summarizes_stored_validity_only_when_the_world_moved() {
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"01TEST", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"b", "baseline_path":"/b", "baseline_commit":"abc",
+            "status":"running", "created_at":"2026-09-17T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"t","os":"t","architecture":"t","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }))
+        .unwrap();
+        assert!(run_result(&run).coherence.is_none());
+        let mut validity = Validity {
+            decision: Decision::Continue,
+            evaluated_at: Utc::now(),
+            world_digest: String::new(),
+            world_changed: false,
+            changed_files: 0,
+            reasons: Vec::new(),
+            analysis: crate::AnalysisLevel::FilesOnly,
+        };
+        let record = |validity: &Validity| CoherenceRecord {
+            version: 1,
+            refreshed_from: None,
+            facts: Vec::new(),
+            validity: Some(validity.clone()),
+            first_invalid_at: None,
+        };
+        run.coherence = Some(record(&validity));
+        let json = serde_json::to_value(run_result(&run)).unwrap();
+        assert!(json.get("coherence").is_none(), "{json}");
+        validity.decision = Decision::Refresh;
+        validity.world_changed = true;
+        validity.changed_files = 3;
+        validity.reasons = (0..8).map(|n| reason(&format!("r{n}"))).collect();
+        run.coherence = Some(record(&validity));
+        let json = serde_json::to_value(run_result(&run)).unwrap();
+        assert_eq!(json["coherence"]["decision"], "refresh");
+        assert_eq!(json["coherence"]["changed_files"], 3);
+        assert_eq!(json["coherence"]["analysis"], "files_only");
+        assert_eq!(json["coherence"]["reasons"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn refresh_addendum_is_deterministic_and_bounded() {
+        let reasons = (0..12)
+            .map(|n| reason(&format!("fact {n} changed\nacross lines")))
+            .collect::<Vec<_>>();
+        let task = refresh_task("Fix the cache.\n", "RUN1", &reasons);
+        assert_eq!(task, refresh_task("Fix the cache.\n", "RUN1", &reasons));
+        assert!(task.starts_with(
+            "Fix the cache.\n\nContext: this task was previously attempted against an earlier version of the repository (run RUN1). The repository has changed since then:\n- fact 0 changed across lines\n"
+        ));
+        assert_eq!(task.lines().filter(|l| l.starts_with("- ")).count(), 10);
+        assert!(task.contains("- fact 9 changed across lines\nRe-inspect"));
+        assert!(!task.contains("fact 10"));
+        assert!(task.ends_with(
+            "Re-inspect the current code before making changes; do not assume the earlier attempt's assumptions still hold."
+        ));
+        assert_eq!(
+            refresh_task("Task", "R", &[]),
+            "Task\n\nContext: this task was previously attempted against an earlier version of the repository (run R). The repository has changed since then:\n- files changed underneath the work\nRe-inspect the current code before making changes; do not assume the earlier attempt's assumptions still hold."
+        );
+        // Refreshing a refreshed run replaces the addendum instead of stacking.
+        let again = refresh_task(&task, "RUN2", &[reason("new")]);
+        assert_eq!(again.matches("Context: this task").count(), 1);
+        assert!(again.starts_with("Fix the cache.\n\nContext:") && again.contains("(run RUN2)"));
+    }
+
+    #[test]
+    fn agent_time_after_invalid_uses_only_attempt_timestamps() {
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"01TEST", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"b", "baseline_path":"/b", "baseline_commit":"abc",
+            "status":"running", "created_at":"2026-09-17T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"t","os":"t","architecture":"t","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }))
+        .unwrap();
+        let start: chrono::DateTime<Utc> = "2026-09-17T10:00:00Z".parse().unwrap();
+        let attempt = |end: Option<chrono::DateTime<Utc>>| -> AttemptRecord {
+            serde_json::from_value(serde_json::json!({
+                "id":"a1","run_id":"01TEST","candidate_id":"c1","role":"work","ordinal":1,
+                "generation":1,"harness_id":"h","harness_version":null,"requested_model":null,
+                "resolved_model":null,"observed_model":null,"requested_effort":null,
+                "resolved_effort":null,"observed_effort":null,"started_at":start,
+                "completed_at":end,"outcome":"completed","raw_telemetry_path":""
+            }))
+            .unwrap()
+        };
+        let mut candidate: CandidateRecord = serde_json::from_value(serde_json::json!({
+            "id":"c1","label":"A","harness_id":"h","harness_version":null,"model":null,
+            "status":"completed","workspace_path":"","prompt_path":"","stdout_path":"",
+            "stderr_path":"","diff_path":"","duration_ms":0,"exit_code":0,"timed_out":false,
+            "tokens":null,"token_semantics":null,"cost_usd":null,"error":null,
+            "diff_stats":{"files_changed":0,"lines_added":0,"lines_removed":0},"checks":[]
+        }))
+        .unwrap();
+        candidate.id = "c1".into();
+        run.candidates = vec![candidate];
+        let end = start + chrono::TimeDelta::seconds(580);
+        run.attempts = vec![attempt(Some(end))];
+        let invalid = start + chrono::TimeDelta::seconds(328);
+        let (after, total) = agent_seconds_after(&run, invalid).unwrap();
+        assert_eq!((after, total), (252, 580));
+        assert_eq!(minutes_seconds(after), "4m12s");
+        assert_eq!(minutes_seconds(total), "9m40s");
+        assert_eq!(after * 100 / total, 43);
+        // Invalid before the attempt began: all of it; after it ended: none.
+        assert_eq!(
+            agent_seconds_after(&run, start - chrono::TimeDelta::seconds(5)),
+            Some((580, 580))
+        );
+        assert_eq!(
+            agent_seconds_after(&run, end + chrono::TimeDelta::seconds(5)),
+            Some((0, 580))
+        );
+        // An unfinished attempt means the timing is not known.
+        run.attempts = vec![attempt(None)];
+        assert_eq!(agent_seconds_after(&run, invalid), None);
+        run.attempts.clear();
+        assert_eq!(agent_seconds_after(&run, invalid), None);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_and_persistence_faults_dispose_acquired_intent_before_handoff()
@@ -4403,6 +4829,7 @@ mod tests {
                             allow_unsafe_local: true,
                             allow_forwarded_env: false,
                             output: RunOutputMode::Json,
+                            refreshed_from: None,
                         },
                     ),
                 )

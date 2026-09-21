@@ -166,6 +166,26 @@ not universal quality judgments. In particular:
 An execution-finished outcome with reconciliation still requires cleanup attention;
 consult admission and `waiting_on`, not just one boolean.
 
+#### `coherence` (additive)
+
+When the source has changed since the run's baseline (or a stored verdict says the
+work is stale), `result` also carries a `coherence` object; it is absent
+otherwise, so existing clients are unaffected. For a Ready, unapplied run it is
+computed at read time from the run's baseline, patch and the current source;
+otherwise the last stored verdict is used. It is read-only and never a control
+operation of its own.
+
+```json
+{"coherence":{"decision":"refresh","analysis":"symbols","changed_files":3,
+  "reasons":[{"code":"fact_broken","fact_id":"f1","detail":"auth::validate signature changed"}]}}
+```
+
+`decision` is `continue`, `refresh` or `stop`; `analysis` is `symbols`,
+`files_only` or `integration`; `reasons` holds at most five entries. Local paths
+are removed like everywhere else in the result projection. Acting on a verdict is
+a human step (`dispatch refresh`, `dispatch reject`); machine clients cannot
+review.
+
 ### Events and semantic waits
 
 ```json

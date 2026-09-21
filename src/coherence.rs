@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::{
-    AnalysisLevel, CandidateRecord, Decision, MustHold, Reason, ReasonCode, RunRecord, Validity,
+    AnalysisLevel, ApplicationState, CandidateRecord, CoherenceRecord, Decision, LifecycleState,
+    MustHold, Reason, ReasonCode, RunRecord, RunStatus, Validity, WorkResult,
     coherence::world::WorldObservation,
     config::{AcceptMode, Config},
     source::{fingerprint_tree, git_command, run_git},
@@ -59,6 +60,46 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
     evaluate(&world, &WorkView::of(run, candidate))
 }
 
+/// A fresh L0+L1 verdict for a finished result that has not been applied and
+/// has exactly one candidate; `None` for any other run, or when evaluation
+/// fails. Reads only; nothing is written.
+pub fn live_validity(run: &RunRecord) -> Option<Validity> {
+    if run.outcome.lifecycle != LifecycleState::Finished
+        || run.outcome.work_result != WorkResult::Ready
+        || run.outcome.application == ApplicationState::Applied
+        || run.status == RunStatus::Applied
+    {
+        return None;
+    }
+    let [candidate] = run.candidates.as_slice() else {
+        return None;
+    };
+    match evaluate_run(run, &candidate.label) {
+        Ok(validity) => Some(validity),
+        Err(error) => {
+            tracing::debug!("coherence evaluation of run {} failed: {error:#}", run.id);
+            None
+        }
+    }
+}
+
+/// A copy of `run` whose stored validity is replaced by the live one when there
+/// is one, for pure renderers. The copy is for display and is never persisted.
+pub fn with_live_validity(run: &RunRecord) -> RunRecord {
+    let mut shown = run.clone();
+    if let Some(validity) = live_validity(run) {
+        let record = shown.coherence.get_or_insert(CoherenceRecord {
+            version: 1,
+            refreshed_from: None,
+            facts: Vec::new(),
+            validity: None,
+            first_invalid_at: None,
+        });
+        record.validity = Some(validity);
+    }
+    shown
+}
+
 /// The facts the candidate's patch assumes about the baseline, for callers
 /// that store them on the run's `CoherenceRecord`. Independent of the world.
 pub fn derive_for_run(run: &RunRecord, candidate_label: &str) -> Result<Vec<MustHold>> {
@@ -81,10 +122,20 @@ fn find_candidate<'a>(run: &'a RunRecord, candidate_label: &str) -> Result<&'a C
     }
 }
 
+/// The word for a decision in every human-facing verdict.
+pub fn verdict(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Continue => "CONTINUE",
+        Decision::Refresh => "REFRESH",
+        Decision::Stop => "STOP",
+    }
+}
+
 /// The typed refusal returned when accepted work is no longer valid against the
 /// moved source. It replaces matching on error text to recognize drift.
 #[derive(Debug)]
 pub struct CoherenceBlocked {
+    pub run_id: String,
     pub validity: Validity,
 }
 
@@ -98,7 +149,16 @@ impl fmt::Display for CoherenceBlocked {
         for reason in &self.validity.reasons {
             write!(f, ": {}", reason.detail)?;
         }
-        write!(f, ". The source was left unchanged.")
+        write!(f, ". The source was left unchanged. ")?;
+        if self.validity.decision == Decision::Stop {
+            write!(f, "Run 'dispatch reject {}'.", self.run_id)
+        } else {
+            write!(
+                f,
+                "Run 'dispatch refresh {id}' to redo the work on the current source, or 'dispatch reject {id}'.",
+                id = self.run_id
+            )
+        }
     }
 }
 
@@ -600,6 +660,67 @@ mod tests {
         assert_eq!(validity.decision, Decision::Stop);
         assert!(evaluate_run(&run, "B").is_err());
         assert!(matches!(run.source_kind, SourceKind::Git));
+    }
+
+    #[test]
+    fn live_validity_covers_only_finished_unapplied_sole_candidates() {
+        use crate::{LifecycleState, RunStatus, WorkResult};
+        let fixture = Fixture::new(true, &base_files());
+        let mut run = fixture.run(fixture.patch(PATCH_A));
+        // Not finished, not ready: nothing to say.
+        assert!(live_validity(&run).is_none());
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Ready;
+        let unchanged = live_validity(&run).unwrap();
+        assert_eq!(unchanged.decision, Decision::Continue);
+        assert!(!unchanged.world_changed);
+        fixture.write("a.txt", "one\nTWO\nthree\nfour\nfive\n");
+        assert_eq!(live_validity(&run).unwrap().decision, Decision::Stop);
+        // The stored record is never touched; only the display copy carries it.
+        assert!(run.coherence.is_none());
+        let shown = with_live_validity(&run);
+        assert_eq!(
+            shown.coherence.unwrap().validity.unwrap().decision,
+            Decision::Stop
+        );
+        run.status = RunStatus::Applied;
+        assert!(live_validity(&run).is_none());
+        run.status = RunStatus::ReadyForEvaluation;
+        run.outcome.application = ApplicationState::Applied;
+        assert!(live_validity(&run).is_none());
+        run.outcome.application = ApplicationState::NotApplied;
+        run.candidates.push(run.candidates[0].clone());
+        assert!(live_validity(&run).is_none());
+        run.candidates.truncate(1);
+        // An error (missing patch) is swallowed.
+        run.candidates[0].diff_path = PathBuf::from("/nonexistent/delta.patch");
+        fixture.write("b.txt", "b edited\n");
+        assert!(live_validity(&run).is_none());
+    }
+
+    #[test]
+    fn blocked_message_names_the_next_commands() {
+        let fixture = Fixture::new(true, &base_files());
+        let run = fixture.run(fixture.patch(PATCH_A));
+        fixture.write("a.txt", "one\nTWO\nthree\nfour\nfive\n");
+        let validity = evaluate_run(&run, "A").unwrap();
+        let text = CoherenceBlocked {
+            run_id: "RUN1".into(),
+            validity: validity.clone(),
+        }
+        .to_string();
+        assert!(text.contains("STOP") && text.contains("Run 'dispatch reject RUN1'"));
+        let refresh = CoherenceBlocked {
+            run_id: "RUN1".into(),
+            validity: Validity {
+                decision: Decision::Refresh,
+                ..validity
+            },
+        }
+        .to_string();
+        assert!(refresh.contains(
+            "Run 'dispatch refresh RUN1' to redo the work on the current source, or 'dispatch reject RUN1'."
+        ));
     }
 
     #[test]

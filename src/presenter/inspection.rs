@@ -123,6 +123,8 @@ impl Ui {
         if self.closed {
             return Ok(Input::Eof);
         }
+        // Evaluated once per review prompt, not per redraw; display only.
+        let run = &crate::coherence::with_live_validity(run);
         let mut action = String::new();
         let mut summary = projection(
             run,

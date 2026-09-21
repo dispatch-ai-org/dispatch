@@ -78,6 +78,23 @@ changes; it never accepts. Choose `a` then Enter to accept and safely apply, `r`
 then Enter to reject, `n` to leave pending, or `i` for evidence and full paths.
 Source drift can preserve acceptance while blocking application.
 
+While a result waits for review the source may keep changing. A Ready run's
+status shows one `Coherence:` line (`CONTINUE`, `REFRESH` or `STOP`), computed
+fresh from the run's baseline, its patch and the source as it is now; it is
+display only and is never stored. `dispatch explain` adds a Coherence section
+when the source moved or the run is a refresh.
+
+- `dispatch check [run] [--json]` prints that verdict, the analysis level, how
+  many files changed underneath the work, the reasons, and the next command
+  (`dispatch accept`, `dispatch refresh` or `dispatch reject`). It changes
+  nothing and exits 0 whenever the evaluation succeeds, whatever the verdict.
+- `dispatch refresh [run]` starts a new run of the same task against the
+  current source. The task gets a fixed addendum naming the earlier run and up to
+  ten reasons it went stale. The old run is untouched. It repeats the original
+  launch choices (fixed agent/model/effort, or the same harnesses) and asks again
+  for `--allow-unsafe-local` / `--allow-forwarded-env` if the original run needed
+  them. It is always a new, human-typed launch; nothing refreshes automatically.
+
 Small diffs have an inline preview. Large sets open a file index: arrows/j/k select,
 `/` filters, Enter opens, Esc returns to files, and q returns to the same review.
 Within a file, arrows/h/l pan, arrows/j/k scroll, n/p navigate hunks, brackets switch

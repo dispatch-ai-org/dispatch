@@ -152,6 +152,15 @@ enum Command {
     },
     /// Explain why Dispatch chose the agent for the latest task.
     Explain { run_id: Option<String> },
+    /// Check whether a finished result is still valid against the source as it is now.
+    Check {
+        run_id: Option<String>,
+        /// Print the verdict as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Redo a stale result as a new run on the current source (a new agent launch).
+    Refresh(RefreshArgs),
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
@@ -366,6 +375,30 @@ struct RunArgs {
     /// Forward only the environment variable names allowlisted in dispatch.yml.
     #[arg(long, hide = true)]
     allow_forwarded_env: bool,
+
+    /// Print only the final versioned result projection.
+    #[arg(long, conflicts_with = "jsonl")]
+    json: bool,
+
+    /// Stream committed events followed by the final result as JSON Lines.
+    #[arg(long, conflicts_with = "json")]
+    jsonl: bool,
+}
+
+#[derive(Debug, Args)]
+struct RefreshArgs {
+    run_id: Option<String>,
+
+    /// Required again if the original run executed on the host.
+    #[arg(long)]
+    allow_unsafe_local: bool,
+
+    /// Required again if the original run forwarded environment variables.
+    #[arg(long)]
+    allow_forwarded_env: bool,
+
+    #[arg(long, hide = true)]
+    config: Option<PathBuf>,
 
     /// Print only the final versioned result projection.
     #[arg(long, conflicts_with = "jsonl")]
@@ -650,6 +683,7 @@ async fn run() -> Result<()> {
                 } else {
                     orchestrator::RunOutputMode::Human
                 },
+                refreshed_from: None,
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
             let exit_code = orchestrator::run_result(&run).exit_code;
@@ -709,6 +743,39 @@ async fn run() -> Result<()> {
         Command::History { limit } => orchestrator::history(&state, limit),
         Command::Explain { run_id } => {
             orchestrator::explain(&state, run_id.as_deref(), &std::env::current_dir()?)
+        }
+        Command::Check { run_id, json } => {
+            orchestrator::check(&state, run_id.as_deref(), &std::env::current_dir()?, json)
+        }
+        Command::Refresh(args) => {
+            let output = if args.json {
+                orchestrator::RunOutputMode::Json
+            } else if args.jsonl {
+                orchestrator::RunOutputMode::Jsonl
+            } else {
+                orchestrator::RunOutputMode::Human
+            };
+            let request = orchestrator::refresh_request(
+                &state,
+                args.run_id.as_deref(),
+                &std::env::current_dir()?,
+                orchestrator::RefreshOptions {
+                    allow_unsafe_local: args.allow_unsafe_local,
+                    allow_forwarded_env: args.allow_forwarded_env,
+                    config_path: args.config,
+                    output,
+                },
+            )?;
+            let old = request.refreshed_from.clone().unwrap_or_default();
+            let run = orchestrator::run_dispatch(&state, request).await?;
+            if output == orchestrator::RunOutputMode::Human {
+                println!("Refreshed from {old}; new run {}", run.id);
+            }
+            let exit_code = orchestrator::run_result(&run).exit_code;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
         }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
