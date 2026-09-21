@@ -2,9 +2,10 @@
 //! check those assumptions against the source as it is now (S1).
 //!
 //! Facts come from the patch alone. `Modified` facts are the S0 declarations a
-//! hunk touches; `Referenced` facts are declarations the added lines use and
+//! changed line falls in (context lines never count; a class or trait counts
+//! only for changes outside its members); `Referenced` facts are declarations the added lines use and
 //! that bind by the unique-name rule (exactly one declaration of that base name
-//! in the baseline); `File` facts cover files without symbol support and files
+//! in the baseline, and not a name the work itself declares); `File` facts cover files without symbol support and files
 //! the new code mentions by path. Work is proportional to the delta: only the
 //! delta's files and the few files `git grep` finds for its identifiers are
 //! read or parsed, all from the baseline commit through the hardened Git
@@ -23,7 +24,7 @@ use crate::{
     AnalysisLevel, FactKind, FactOrigin, MustHold, Reason, ReasonCode,
     coherence::{
         WorkView,
-        symbols::{FileSymbols, extract, identifiers_in, lang_for_path},
+        symbols::{FileSymbols, SymbolDecl, SymbolKind, extract, identifiers_in, lang_for_path},
         world::WorldObservation,
     },
     source::{git_command, run_git},
@@ -52,14 +53,19 @@ pub enum DeltaStatus {
     Deleted,
 }
 
-/// One text file of the delta with its hunk ranges (1-based, inclusive, taken
-/// from the hunk headers, so they include context lines).
+/// One text file of the delta and the lines it actually changes; context lines
+/// are never included. Ranges are 1-based and inclusive.
 #[derive(Clone, Debug)]
 pub struct DeltaFile {
     pub path: String,
     pub status: DeltaStatus,
+    /// S0 lines the delta removes or replaces.
     pub old_ranges: Vec<(u32, u32)>,
+    /// Lines the delta adds, in post-image coordinates.
     pub new_ranges: Vec<(u32, u32)>,
+    /// Pure insertions (added lines with nothing removed beside them), as the
+    /// S0 line after which the text goes; 0 means before line 1.
+    pub insertions: Vec<u32>,
     hunks: Vec<Hunk>,
 }
 
@@ -152,27 +158,62 @@ pub fn parse_patch(patch: &[u8]) -> Vec<DeltaFile> {
         if skip || malformed || hunks.is_empty() {
             continue;
         }
-        let (mut old_ranges, mut new_ranges) = (Vec::new(), Vec::new());
-        for hunk in &hunks {
-            if hunk.old_len == 0 {
-                let anchor = hunk.old_start.max(1);
-                old_ranges.push((anchor, anchor));
-            } else {
-                old_ranges.push((hunk.old_start, hunk.old_start + hunk.old_len - 1));
-            }
-            if hunk.new_len > 0 {
-                new_ranges.push((hunk.new_start, hunk.new_start + hunk.new_len - 1));
-            }
-        }
+        let (old_ranges, new_ranges, insertions) = changed_lines(&hunks);
         files.push(DeltaFile {
             path,
             status,
             old_ranges,
             new_ranges,
+            insertions,
             hunks,
         });
     }
     files
+}
+
+type Ranges = Vec<(u32, u32)>;
+
+/// The removed lines (S0), added lines (post-image) and pure-insertion anchors
+/// of `hunks`, with adjacent lines merged into ranges.
+fn changed_lines(hunks: &[Hunk]) -> (Ranges, Ranges, Vec<u32>) {
+    fn push(ranges: &mut Vec<(u32, u32)>, line: u32) {
+        match ranges.last_mut() {
+            Some((_, end)) if *end + 1 == line => *end = line,
+            _ => ranges.push((line, line)),
+        }
+    }
+    let (mut removed, mut added, mut insertions) = (Vec::new(), Vec::new(), Vec::new());
+    for hunk in hunks {
+        // A zero length makes the header's start the line *before* the hunk.
+        let mut old_line = hunk.old_start + u32::from(hunk.old_len == 0);
+        let mut new_line = hunk.new_start + u32::from(hunk.new_len == 0);
+        // The S0 line before the run of changed lines in progress, and whether
+        // the run removes anything (a run that only adds is an insertion).
+        let mut run: Option<(u32, bool)> = None;
+        for line in &hunk.lines {
+            if line.tag == b' ' {
+                if let Some((anchor, false)) = run.take() {
+                    insertions.push(anchor);
+                }
+                old_line += 1;
+                new_line += 1;
+                continue;
+            }
+            let entry = run.get_or_insert((old_line - 1, false));
+            if line.tag == b'-' {
+                entry.1 = true;
+                push(&mut removed, old_line);
+                old_line += 1;
+            } else {
+                push(&mut added, new_line);
+                new_line += 1;
+            }
+        }
+        if let Some((anchor, false)) = run {
+            insertions.push(anchor);
+        }
+    }
+    (removed, added, insertions)
 }
 
 /// The path of a `---`/`+++` line, or `None` for `/dev/null`.
@@ -469,6 +510,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
     let mut modified = Vec::new();
     let mut file_facts = Vec::new();
     let mut names = BTreeSet::new();
+    let mut introduced = BTreeSet::new();
     for file in delta {
         let lang = lang_for_path(&file.path);
         let s0 = match file.status {
@@ -485,33 +527,53 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
             }
             continue;
         };
-        // What the new code uses: identifiers on the post-image's changed lines.
+        let before = if file.status == DeltaStatus::Added {
+            Some(FileSymbols::default())
+        } else {
+            extract(lang, &s0).ok()
+        };
         if file.status != DeltaStatus::Deleted {
-            match post_image(&s0, &file.hunks)
-                .and_then(|post| identifiers_in(lang, &post, &file.new_ranges).ok())
+            let post = post_image(&s0, &file.hunks);
+            // What the new code uses: identifiers on the lines it adds.
+            match post
+                .as_ref()
+                .and_then(|post| identifiers_in(lang, post, &file.new_ranges).ok())
             {
                 Some(found) => names.extend(found.into_iter().filter(|name| bindable(name))),
                 None => derived.uncertain.push(file.path.clone()),
+            }
+            // Names the work declares itself are not the baseline's to bind.
+            if let (Some(post), Some(before)) = (&post, &before)
+                && let Ok(after) = extract(lang, post)
+            {
+                let known: HashSet<&str> =
+                    before.decls.iter().map(|d| base_name(&d.name)).collect();
+                introduced.extend(
+                    after
+                        .decls
+                        .iter()
+                        .map(|decl| base_name(&decl.name))
+                        .filter(|name| !known.contains(name))
+                        .map(str::to_owned),
+                );
             }
         }
         if file.status != DeltaStatus::Modified {
             continue;
         }
-        match extract(lang, &s0) {
-            Ok(symbols) if !symbols.has_error => {
+        match before {
+            Some(symbols) if !symbols.has_error => {
                 for decl in &symbols.decls {
-                    let touched = file
-                        .old_ranges
-                        .iter()
-                        .any(|&(low, high)| decl.start_line <= high && low <= decl.end_line);
-                    if touched {
+                    if touches(file, decl, &symbols.decls) {
+                        // A container is checked by its header alone.
+                        let full_fp = (!is_container(decl)).then(|| decl.full_fp.clone());
                         modified.push(make_fact(
                             FactKind::Signature,
                             &file.path,
                             &decl.name,
                             FactOrigin::Modified,
                             decl.sig_fp.clone(),
-                            Some(decl.full_fp.clone()),
+                            full_fp,
                             decl.display.clone(),
                         ));
                     }
@@ -523,6 +585,7 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
             }
         }
     }
+    names.retain(|name| !introduced.contains(name));
     let skip: HashSet<(String, String)> = modified
         .iter()
         .map(|fact| (fact.path.clone(), fact.subject.clone()))
@@ -540,6 +603,43 @@ pub fn derive_facts(work: &WorkView, delta: &[DeltaFile]) -> Result<Derived> {
         .take(MAX_FACTS)
         .collect();
     Ok(derived)
+}
+
+fn is_container(decl: &SymbolDecl) -> bool {
+    matches!(decl.kind, SymbolKind::Class | SymbolKind::Trait)
+}
+
+/// Whether the delta changes `decl`: it removes one of its lines, or inserts
+/// text strictly inside it. A container's members are symbols of their own, so
+/// only changes outside every member count for the container.
+fn touches(file: &DeltaFile, decl: &SymbolDecl, decls: &[SymbolDecl]) -> bool {
+    let members: Vec<&SymbolDecl> = if is_container(decl) {
+        decls
+            .iter()
+            .filter(|member| {
+                member.start_line >= decl.start_line
+                    && member.end_line <= decl.end_line
+                    && (member.start_line, member.end_line) != (decl.start_line, decl.end_line)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let removed = file.old_ranges.iter().any(|&(low, high)| {
+        (low.max(decl.start_line)..=high.min(decl.end_line)).any(|line| {
+            !members
+                .iter()
+                .any(|member| member.start_line <= line && line <= member.end_line)
+        })
+    });
+    let inserted = file.insertions.iter().any(|&anchor| {
+        decl.start_line <= anchor
+            && anchor < decl.end_line
+            && !members
+                .iter()
+                .any(|member| member.start_line <= anchor && anchor < member.end_line)
+    });
+    removed || inserted
 }
 
 fn bindable(name: &str) -> bool {
@@ -830,10 +930,12 @@ pub fn evaluate_facts(
                 format!("{} no longer declared in {}", fact.subject, fact.path),
             ));
         } else if fact.origin == FactOrigin::Modified {
-            if !decls
-                .iter()
-                .any(|decl| Some(&decl.full_fp) == fact.full_fp.as_ref())
-            {
+            // A container has no full fingerprint: only its header is compared.
+            let holds = |decl: &&SymbolDecl| match &fact.full_fp {
+                Some(full) => &decl.full_fp == full,
+                None => decl.sig_fp == fact.sig_fp,
+            };
+            if !decls.iter().any(holds) {
                 reasons.push(reason(
                     ReasonCode::SameSymbolEdited,
                     format!("{} was also edited in {}", fact.subject, fact.path),
@@ -1065,19 +1167,22 @@ mod tests {
 
         let modified = by_path["a.txt"];
         assert_eq!(modified.status, DeltaStatus::Modified);
-        // Two hunks with three lines of context each side.
-        assert_eq!(modified.old_ranges, vec![(1, 6), (24, 30)]);
-        assert_eq!(modified.new_ranges, vec![(1, 6), (24, 30)]);
+        // Only the edited lines: context is never reported.
+        assert_eq!(modified.old_ranges, vec![(3, 3), (27, 27)]);
+        assert_eq!(modified.new_ranges, vec![(3, 3), (27, 27)]);
+        assert!(modified.insertions.is_empty());
 
         let added = by_path["new.rs"];
         assert_eq!(added.status, DeltaStatus::Added);
         assert_eq!(added.new_ranges, vec![(1, 2)]);
-        assert_eq!(added.old_ranges, vec![(1, 1)]);
+        assert!(added.old_ranges.is_empty());
+        assert_eq!(added.insertions, vec![0]);
 
         let deleted = by_path["gone.txt"];
         assert_eq!(deleted.status, DeltaStatus::Deleted);
         assert_eq!(deleted.old_ranges, vec![(1, 2)]);
         assert!(deleted.new_ranges.is_empty());
+        assert!(deleted.insertions.is_empty());
     }
 
     #[test]
@@ -1088,9 +1193,12 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
 @@ -0,0 +1 @@\n+only\n\\ No newline at end of file\n";
         let files = parse_patch(patch);
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0].old_ranges, vec![(3, 3), (9, 10)]);
+        // The insertion goes after S0 line 3; the deletion removes lines 9-10.
+        assert_eq!(files[0].insertions, vec![3]);
+        assert_eq!(files[0].old_ranges, vec![(9, 10)]);
         assert_eq!(files[0].new_ranges, vec![(4, 5)]);
-        assert_eq!(files[1].old_ranges, vec![(1, 1)]);
+        assert_eq!(files[1].insertions, vec![0]);
+        assert!(files[1].old_ranges.is_empty());
         assert_eq!(files[1].new_ranges, vec![(1, 1)]);
         assert!(!files[1].hunks[0].lines[0].newline);
     }
@@ -1272,11 +1380,10 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
         let delta = "def charge(owner, amount):\n    account = Account(owner)\n    account.deposit(amount)\n    return account\n\n\ndef unrelated():\n    return 1\n";
         let repo = Repo::new(&[("models.py", models), ("billing.py", billing)]);
         let derived = repo.derive(&[("billing.py", Some(delta))]);
-        // Hunk ranges include context, so the neighbouring `unrelated` (three
-        // lines below the edit) counts as touched too.
+        // The neighbouring `unrelated` (three lines below) is context, not edited.
         assert_eq!(
             subjects(&derived.facts, FactOrigin::Modified),
-            ["billing.py:charge", "billing.py:unrelated"]
+            ["billing.py:charge"]
         );
         assert_eq!(
             subjects(&derived.facts, FactOrigin::Referenced),
@@ -1554,5 +1661,128 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
         let (reasons, analysis) = check(&work, &world).unwrap();
         assert!(reasons.is_empty());
         assert_eq!(analysis, AnalysisLevel::FilesOnly);
+    }
+
+    // ---- precise Modified facts ---------------------------------------------
+
+    #[test]
+    fn parse_patch_separates_replacements_from_pure_insertions() {
+        let repo = Repo::new(&[("a.txt", &numbered(20, &[]))]);
+        let mut edited = numbered(20, &[5]);
+        edited = edited.replace("line 12\n", "line 12\nextra\n");
+        let files = parse_patch(&repo.delta(&[("a.txt", Some(&edited))]));
+        assert_eq!(files[0].old_ranges, vec![(5, 5)]);
+        assert_eq!(files[0].insertions, vec![12]);
+        assert_eq!(files[0].new_ranges, vec![(5, 5), (13, 13)]);
+    }
+
+    const TWO_FNS: &str =
+        "pub fn a() -> u8 {\n    let x = 1;\n    x\n}\npub fn b() -> u8 {\n    2\n}\n";
+
+    fn modified_after(s0: &str, delta: &str) -> Vec<String> {
+        let repo = Repo::new(&[("src/x.rs", s0)]);
+        subjects(
+            &repo.derive(&[("src/x.rs", Some(delta))]).facts,
+            FactOrigin::Modified,
+        )
+    }
+
+    #[test]
+    fn only_the_declaration_a_changed_line_is_in_is_modified() {
+        // The last line of `a` changes and `b` starts right below: context
+        // does not make `b` modified.
+        let delta = TWO_FNS.replace("    x\n}", "    x + 1\n}");
+        assert_eq!(modified_after(TWO_FNS, &delta), ["src/x.rs:a"]);
+        // The closing brace line is part of the declaration too.
+        let delta = TWO_FNS.replace("    x\n}\npub", "    x\n} // done\npub");
+        assert_eq!(modified_after(TWO_FNS, &delta), ["src/x.rs:a"]);
+    }
+
+    #[test]
+    fn an_insertion_modifies_a_declaration_only_strictly_inside_it() {
+        // Inside `a`, after its first line.
+        let delta = TWO_FNS.replace("    let x = 1;\n", "    let x = 1;\n    let y = 2;\n");
+        assert_eq!(modified_after(TWO_FNS, &delta), ["src/x.rs:a"]);
+        // Between `a` and `b`: neither is modified.
+        let delta = TWO_FNS.replace("}\npub fn b", "}\npub fn c() {}\npub fn b");
+        assert!(modified_after(TWO_FNS, &delta).is_empty());
+        // Before the first line of the file.
+        let delta = format!("pub fn z() {{}}\n{TWO_FNS}");
+        assert!(modified_after(TWO_FNS, &delta).is_empty());
+    }
+
+    const STORE_CLASS: &str = "class Store:\n    LIMIT = 1\n\n    def save(self, key):\n        self.a = key\n\n    def drop(self, key):\n        return None\n";
+
+    #[test]
+    fn a_member_edit_does_not_make_its_container_modified() {
+        let repo = Repo::new(&[("store.py", STORE_CLASS)]);
+        let delta = STORE_CLASS.replace("self.a = key", "self.a = key + 1");
+        let derived = repo.derive(&[("store.py", Some(&delta))]);
+        assert_eq!(
+            subjects(&derived.facts, FactOrigin::Modified),
+            ["store.py:Store.save"]
+        );
+        // Another member changing underneath is irrelevant.
+        let world = STORE_CLASS.replace("return None", "return 5");
+        let world = repo.world(&[("store.py", Some(&world))]);
+        assert!(
+            evaluate_facts(&repo.work(), &world, &derived.facts)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_container_is_modified_by_class_level_changes_and_checked_by_its_header() {
+        let repo = Repo::new(&[("store.py", STORE_CLASS)]);
+        let delta = STORE_CLASS.replace("LIMIT = 1", "LIMIT = 2");
+        let derived = repo.derive(&[("store.py", Some(&delta))]);
+        assert_eq!(
+            subjects(&derived.facts, FactOrigin::Modified),
+            ["store.py:Store"]
+        );
+        assert!(derived.facts[0].full_fp.is_none());
+        // A member edit leaves the class fact holding.
+        let member = STORE_CLASS.replace("return None", "return 5");
+        let world = repo.world(&[("store.py", Some(&member))]);
+        assert!(
+            evaluate_facts(&repo.work(), &world, &derived.facts)
+                .unwrap()
+                .is_empty()
+        );
+        // A class-level edit does not.
+        let level = STORE_CLASS.replace("LIMIT = 1", "LIMIT = 3");
+        let world = repo.world(&[("store.py", Some(&level))]);
+        let reasons = evaluate_facts(&repo.work(), &world, &derived.facts).unwrap();
+        assert_eq!(codes(&reasons), [ReasonCode::SameSymbolEdited]);
+        assert_eq!(reasons[0].detail, "Store was also edited in store.py");
+    }
+
+    #[test]
+    fn a_rust_trait_default_method_edit_modifies_the_method_not_the_trait() {
+        let shape = "pub trait Shape {\n    fn area(&self) -> f64;\n\n    fn describe(&self) -> String {\n        String::new()\n    }\n}\n";
+        let delta = shape.replace("String::new()", "String::from(\"shape\")");
+        assert_eq!(modified_after(shape, &delta), ["src/x.rs:Shape::describe"]);
+        let delta = shape.replace("pub trait Shape {", "pub trait Shape: Sized {");
+        assert_eq!(modified_after(shape, &delta), ["src/x.rs:Shape"]);
+    }
+
+    #[test]
+    fn names_the_work_declares_itself_are_not_bound() {
+        let repo = Repo::new(&[("src/auth.rs", AUTH), ("src/handler.rs", HANDLER)]);
+        let delta = format!(
+            "{HANDLER_DELTA}\nfn validate(request: &str) -> bool {{\n    request.len() > 1\n}}\n"
+        );
+        let derived = repo.derive(&[("src/handler.rs", Some(&delta))]);
+        assert!(subjects(&derived.facts, FactOrigin::Referenced).is_empty());
+        assert_eq!(derived.unbound, 0);
+        // A brand-new file's declarations count as the work's own as well.
+        let derived = repo.derive(&[(
+            "src/extra.rs",
+            Some(
+                "pub fn validate() -> bool {\n    true\n}\n\npub fn go() -> bool {\n    validate()\n}\n",
+            ),
+        )]);
+        assert!(subjects(&derived.facts, FactOrigin::Referenced).is_empty());
     }
 }

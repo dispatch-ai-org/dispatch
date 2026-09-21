@@ -1623,6 +1623,238 @@ def persist(path, items):
     return store
 ";
 
+const STORE22_PY: &str = "\
+class Store:
+    def __init__(self):
+        self.data = {}
+
+    def save(self, key, value):
+        self.data[key] = value
+
+    def load(self, key):
+        return self.data[key]
+
+    def drop(self, key):
+        return self.data.pop(key, None)
+";
+const STORE22_PY_DELTA: &str = "\
+class Store:
+    def __init__(self):
+        self.data = {}
+
+    def save(self, key, value):
+        self.data[key] = (value, 1)
+
+    def load(self, key):
+        return self.data[key]
+
+    def drop(self, key):
+        return self.data.pop(key, None)
+";
+const STORE22_PY_WORLD: &str = "\
+class Store:
+    def __init__(self):
+        self.data = {}
+
+    def save(self, key, value):
+        self.data[key] = value
+
+    def load(self, key):
+        return self.data[key]
+
+    def drop(self, key):
+        del self.data[key]
+";
+
+const AB_RS: &str = "\
+pub fn a(x: i64) -> i64 {
+    let y = x + 1;
+    y * 2
+}
+pub fn b(x: i64) -> i64 {
+    let mut total = x;
+    total += 1;
+    total += 2;
+    total += 3;
+    total += 4;
+    total += 5;
+    total
+}
+";
+const AB_RS_DELTA: &str = "\
+pub fn a(x: i64) -> i64 {
+    let y = x + 1;
+    y * 3
+}
+pub fn b(x: i64) -> i64 {
+    let mut total = x;
+    total += 1;
+    total += 2;
+    total += 3;
+    total += 4;
+    total += 5;
+    total
+}
+";
+const AB_RS_WORLD: &str = "\
+pub fn a(x: i64) -> i64 {
+    let y = x + 1;
+    y * 2
+}
+pub fn b(x: i64) -> i64 {
+    let mut total = x;
+    total += 1;
+    total += 2;
+    total += 3;
+    total += 4;
+    total += 50;
+    total
+}
+";
+
+const APP24_RS: &str = "\
+pub fn run(order: &Order) -> Receipt {
+    Receipt::empty(order.id)
+}
+";
+const APP24_RS_DELTA: &str = "\
+fn process(order: &Order) -> Receipt {
+    Receipt::for_total(order.total())
+}
+
+pub fn run(order: &Order) -> Receipt {
+    process(order)
+}
+";
+const BILLING24_RS: &str = "\
+pub fn process(job: &Job) -> Outcome {
+    Outcome::done(job.id)
+}
+";
+const BILLING24_RS_WORLD: &str = "\
+pub fn process(job: &Job, retries: u32) -> Outcome {
+    Outcome::done_after(job.id, retries)
+}
+";
+
+const SHAPE_RS: &str = "\
+pub trait Shape {
+    fn area(&self) -> f64;
+
+    fn describe(&self) -> String {
+        let area = self.area();
+        format!(\"shape with area {area}\")
+    }
+
+    // Keep the required methods above and the provided ones below.
+    // New provided methods go after this comment.
+    // Do not reorder.
+    // Thanks.
+    fn is_large(&self) -> bool {
+        self.area() > 100.0
+    }
+}
+";
+const SHAPE_RS_DELTA: &str = "\
+pub trait Shape {
+    fn area(&self) -> f64;
+
+    fn describe(&self) -> String {
+        let area = self.area();
+        format!(\"a shape with area {area:.2}\")
+    }
+
+    // Keep the required methods above and the provided ones below.
+    // New provided methods go after this comment.
+    // Do not reorder.
+    // Thanks.
+    fn is_large(&self) -> bool {
+        self.area() > 100.0
+    }
+}
+";
+const SHAPE_RS_WORLD: &str = "\
+pub trait Shape {
+    fn area(&self) -> f64;
+
+    fn describe(&self) -> String {
+        let area = self.area();
+        format!(\"shape with area {area}\")
+    }
+
+    // Keep the required methods above and the provided ones below.
+    // New provided methods go after this comment.
+    // Do not reorder.
+    // Thanks.
+    fn is_large(&self) -> bool {
+        self.area() > 100.0
+    }
+
+    fn perimeter(&self) -> f64;
+}
+";
+
+const STORE26_RS: &str = "\
+pub struct Store {
+    pub data: Vec<u8>,
+}
+
+impl Store {
+    pub fn save(&mut self, value: u8) {
+        self.data.push(value);
+        self.data.push(0);
+    }
+
+    // The two halves below are independent.
+    // Callers use one or the other.
+    // Keep them apart.
+    // Really.
+    pub fn drop(&mut self) {
+        self.data.clear();
+    }
+}
+";
+const STORE26_RS_DELTA: &str = "\
+pub struct Store {
+    pub data: Vec<u8>,
+}
+
+impl Store {
+    pub fn save(&mut self, value: u8) {
+        self.data.push(value);
+        self.data.push(1);
+    }
+
+    // The two halves below are independent.
+    // Callers use one or the other.
+    // Keep them apart.
+    // Really.
+    pub fn drop(&mut self) {
+        self.data.clear();
+    }
+}
+";
+const STORE26_RS_WORLD: &str = "\
+pub struct Store {
+    pub data: Vec<u8>,
+}
+
+impl Store {
+    pub fn save(&mut self, value: u8) {
+        self.data.push(value);
+        self.data.push(0);
+    }
+
+    // The two halves below are independent.
+    // Callers use one or the other.
+    // Keep them apart.
+    // Really.
+    pub fn drop(&mut self, keep: usize) {
+        self.data.truncate(keep);
+    }
+}
+";
+
 const IGNORE: &str = "target/\n__pycache__/\n";
 const LOGO_OLD: &str = "\u{0}PNG-old\u{1}\u{2}";
 const LOGO_NEW: &str = "\u{0}PNG-new\u{1}\u{3}\u{4}";
@@ -1972,6 +2204,51 @@ fn scenarios() -> Vec<Scenario> {
             &[Op::Write("store.py", STORE_PY_WORLD)],
             Refresh,
             "The delta calls Store.save; the world adds a required ttl parameter to that method.",
+        ),
+        settled(
+            "22 sibling method edited in a class",
+            py,
+            &[("store.py", STORE22_PY)],
+            &[("store.py", STORE22_PY_DELTA)],
+            &[Op::Write("store.py", STORE22_PY_WORLD)],
+            Continue,
+            "The delta edits Store.save; the world edits Store.drop in the same class. Only the class-level header is the class's own.",
+        ),
+        settled(
+            "23 edit on the line above a neighbour",
+            rust,
+            &[("src/ab.rs", AB_RS)],
+            &[("src/ab.rs", AB_RS_DELTA)],
+            &[Op::Write("src/ab.rs", AB_RS_WORLD)],
+            Continue,
+            "The delta edits the last line of a; b starts right below and the world edits b's body further down. Context lines must not make b modified.",
+        ),
+        settled(
+            "24 new local function shares a baseline name",
+            rust,
+            &[("src/app.rs", APP24_RS), ("src/billing.rs", BILLING24_RS)],
+            &[("src/app.rs", APP24_RS_DELTA)],
+            &[Op::Write("src/billing.rs", BILLING24_RS_WORLD)],
+            Continue,
+            "The delta declares its own process(); an unrelated baseline process() elsewhere changes signature. The work's own names are not bound to the baseline.",
+        ),
+        settled(
+            "25 trait default method vs new trait method",
+            rust,
+            &[("src/shape.rs", SHAPE_RS)],
+            &[("src/shape.rs", SHAPE_RS_DELTA)],
+            &[Op::Write("src/shape.rs", SHAPE_RS_WORLD)],
+            Continue,
+            "The delta edits a default method body; the world adds a new method to the same trait. A trait is checked by its header, not its members.",
+        ),
+        settled(
+            "26 impl sibling signature changed",
+            rust,
+            &[("src/store.rs", STORE26_RS)],
+            &[("src/store.rs", STORE26_RS_DELTA)],
+            &[Op::Write("src/store.rs", STORE26_RS_WORLD)],
+            Continue,
+            "The delta edits Store::save; the world changes the signature of Store::drop in the same impl.",
         ),
     ]
 }
