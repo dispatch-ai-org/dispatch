@@ -4,7 +4,7 @@
 //! creates one empty file, `dispatch-fake-good.txt`.
 #![cfg(unix)]
 
-use std::{fs, path::PathBuf};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
 use assert_cmd::cargo_bin_cmd;
 use serde_json::Value;
@@ -20,6 +20,42 @@ struct Fixture {
 impl Fixture {
     /// `config` is appended to a `dispatch.yml` that sets a 30 second timeout.
     fn new(config: &str) -> Self {
+        Self::with_source(config, |_| {})
+    }
+
+    /// Like `new`, with a Git repository as the source: `setup` adds files
+    /// before everything is committed.
+    fn new_git(config: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
+        Self::with_source(config, |source| {
+            setup(source);
+            for args in [
+                &["init", "--quiet"][..],
+                &["add", "-A"],
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+            ] {
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(source)
+                    .args(args)
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?} failed");
+            }
+        })
+    }
+
+    fn with_source(config: &str, setup: impl FnOnce(&std::path::Path)) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let state = temp.path().join("state");
@@ -30,6 +66,7 @@ impl Fixture {
             format!("execution:\n  timeout_secs: 30\n{config}"),
         )
         .unwrap();
+        setup(&source);
         let output = cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
             .arg(&state)
@@ -254,5 +291,77 @@ fn a_run_without_local_execution_authority_is_never_verified() {
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(fixture.analysis(), "files_only");
     assert!(!fixture.run_dir().join("coherence-checks").exists());
+    fixture.assert_no_scratch();
+}
+
+/// Bytes of ignored build output written into the source after the run.
+const BIG_IGNORED_BYTES: usize = 20 * 1024 * 1024;
+
+/// Ignored output that appears after the run never reaches the scratch tree,
+/// while the world still moves through an untracked file that does.
+#[test]
+fn scratch_tree_of_a_git_source_omits_ignored_build_output() {
+    let fixture = Fixture::new_git(
+        "checks:\n  verify:\n    - test ! -e target/big.bin && test -f original.txt\n",
+        |source| fs::write(source.join(".gitignore"), "target/\n").unwrap(),
+    );
+    fs::create_dir_all(fixture.source.join("target")).unwrap();
+    fs::write(
+        fixture.source.join("target/big.bin"),
+        vec![7_u8; BIG_IGNORED_BYTES],
+    )
+    .unwrap();
+    fs::write(fixture.source.join("notes.txt"), "someone else's work\n").unwrap();
+
+    fixture.apply().success();
+
+    assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
+    assert!(fixture.source.join("target/big.bin").is_file());
+    assert_eq!(fixture.analysis(), "integration");
+    fixture.assert_no_scratch();
+}
+
+/// Execute bits and symlinks in a Git source reach the scratch tree.
+#[test]
+fn scratch_tree_of_a_git_source_keeps_modes_and_symlinks() {
+    let fixture = Fixture::new_git(
+        "checks:\n  verify:\n    - test -x script.sh && test -L link && test \"$(readlink link)\" = script.sh && test -f nested/file.txt\n",
+        |source| {
+            fs::write(source.join("script.sh"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(source.join("script.sh"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::write(source.join("nested/file.txt"), "x\n").unwrap();
+            std::os::unix::fs::symlink("script.sh", source.join("link")).unwrap();
+        },
+    );
+    add_forbidden(&fixture);
+
+    fixture.apply().success();
+
+    assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
+    assert_eq!(fixture.analysis(), "integration");
+    fixture.assert_no_scratch();
+}
+
+#[test]
+fn scratch_tree_of_a_directory_source_keeps_modes_and_symlinks() {
+    let fixture = Fixture::with_source(
+        "checks:\n  verify:\n    - test -x script.sh && test -L link && test -f nested/file.txt\n",
+        |source| {
+            fs::write(source.join("script.sh"), "#!/bin/sh\n").unwrap();
+            fs::set_permissions(source.join("script.sh"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::os::unix::fs::symlink("script.sh", source.join("link")).unwrap();
+            fs::create_dir_all(source.join("nested")).unwrap();
+            fs::write(source.join("nested/file.txt"), "x\n").unwrap();
+        },
+    );
+    add_forbidden(&fixture);
+
+    fixture.apply().success();
+
+    assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
+    assert_eq!(fixture.analysis(), "integration");
     fixture.assert_no_scratch();
 }

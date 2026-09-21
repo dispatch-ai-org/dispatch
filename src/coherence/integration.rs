@@ -4,7 +4,8 @@
 //! anything is applied. Static facts cannot see transitive or behavioral
 //! breakage; the user's checks can, and they cost no tokens.
 //!
-//! The source is only read. The scratch tree is removed on every exit path; the
+//! The source is only read. The scratch tree omits ignored build output (see
+//! `create_scratch_tree`) and is removed on every exit path; the
 //! check logs are kept under the run directory as evidence.
 
 use std::{
@@ -21,7 +22,7 @@ use crate::{
     Validity,
     config::Config,
     executor::run_checks_with_config,
-    source::{apply_patch_in_workspace, create_candidate_workspace, create_snapshot},
+    source::{apply_patch_in_workspace, create_scratch_tree},
 };
 
 /// Longest slice of a configured command quoted in a reason, so the log path
@@ -107,15 +108,15 @@ async fn run_checks(
     output_dir: &Path,
 ) -> Result<Vec<CheckResult>> {
     let scratch = Scratch(run_dir.join(format!("coherence-scratch-{id}")));
-    let snapshot = create_snapshot(&run.source_path, &scratch.0)
-        .context("failed to snapshot the current source")?;
-    let workspace =
-        create_candidate_workspace(&snapshot.baseline_path, &scratch.0.join("workspace"))?;
-    apply_patch_in_workspace(&workspace, patch)?;
+    // The current source minus ignored build output, as a plain directory;
+    // `git apply` does not need a repository.
+    create_scratch_tree(&run.source_path, &run.source_kind, &scratch.0)
+        .context("failed to copy the current source")?;
+    apply_patch_in_workspace(&scratch.0, patch)?;
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
     let results = run_checks_with_config(
-        &workspace,
+        &scratch.0,
         &config.checks.verify,
         CheckPhase::Verify,
         output_dir,

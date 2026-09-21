@@ -17,7 +17,7 @@ use crate::{
     SourceKind,
     source::{
         bytes_to_path, checked_output, git_command, hash_sized_bytes, include_entry,
-        is_excluded_name, path_bytes, run_git,
+        is_excluded_name, parents_are_directories, path_bytes, run_git,
     },
 };
 
@@ -65,6 +65,11 @@ struct Entry {
 /// Git sources use the source's own ignore rules; directory sources exclude
 /// only `.git` and `.dispatch`. Symlinks are never followed; a file found
 /// vanishing while it is being read is an error, and the caller may retry.
+///
+/// A nested repository (a committed gitlink or an untracked directory with its
+/// own `.git`) is not comparable: the baseline holds its files, but Git will not
+/// list them for the outer repository, and changes inside it are that
+/// repository's business. Its files are skipped on both sides, never Deleted.
 pub fn observe(
     source: &Path,
     baseline: &Path,
@@ -72,8 +77,8 @@ pub fn observe(
     kind: &SourceKind,
 ) -> Result<WorldObservation> {
     let baseline_tree = read_baseline_tree(baseline, baseline_commit)?;
-    let (present, listed_missing) = match kind {
-        SourceKind::Directory => (walk_directory(source)?, BTreeSet::new()),
+    let (present, listed_missing, nested) = match kind {
+        SourceKind::Directory => (walk_directory(source)?, BTreeSet::new(), Vec::new()),
         SourceKind::Git | SourceKind::GitWorktree => list_git_world(source)?,
     };
     let current = hash_world(source, baseline, present)?;
@@ -103,7 +108,7 @@ pub fn observe(
     // exclude it. A path Git listed but that is gone from disk is never ignored.
     let absent: Vec<&Vec<u8>> = baseline_tree
         .keys()
-        .filter(|path| !current.contains_key(*path))
+        .filter(|path| !current.contains_key(*path) && !inside_nested(&nested, path))
         .collect();
     let to_check: Vec<&Vec<u8>> = match kind {
         SourceKind::Directory => Vec::new(),
@@ -230,20 +235,43 @@ fn read_baseline_tree(baseline: &Path, commit: &str) -> Result<BTreeMap<Vec<u8>,
     Ok(tree)
 }
 
-/// Present regular files and symlinks as `(is_symlink, is_executable)`, and the
-/// paths Git lists that no longer exist as files. `ls-files -co` lists tracked
-/// and untracked files that the source's ignore rules do not exclude.
-fn list_git_world(source: &Path) -> Result<(Present, BTreeSet<Vec<u8>>)> {
+/// `(present, listed_but_missing, nested_repository_directories)`.
+type GitWorld = (Present, BTreeSet<Vec<u8>>, Vec<Vec<u8>>);
+
+/// Present regular files and symlinks as `(is_symlink, is_executable)`, the
+/// paths Git lists that no longer exist as files, and the nested repositories
+/// (directory paths without a trailing slash). `ls-files -co` lists tracked and
+/// untracked files that the source's ignore rules do not exclude; a gitlink
+/// shows as a bare directory and an untracked nested repository as `dir/`.
+fn list_git_world(source: &Path) -> Result<GitWorld> {
     let mut command = git_command(source);
     command.args(["ls-files", "-co", "--exclude-standard", "-z"]);
     let output = checked_output(command, "failed to list the current source files")?;
+
+    let mut nested = Vec::new();
+    let mut staged = git_command(source);
+    staged.args(["ls-files", "-s", "-z"]);
+    let staged = checked_output(staged, "failed to list the current source index")?;
+    for record in staged.stdout.split(|byte| *byte == 0) {
+        // `<mode> <hash> <stage>\t<path>`; mode 160000 is a gitlink.
+        if let Some(path) = record.strip_prefix(b"160000 ").and_then(|rest| {
+            rest.iter()
+                .position(|byte| *byte == b'\t')
+                .map(|i| &rest[i + 1..])
+        }) {
+            nested.push(path.to_vec());
+        }
+    }
 
     let mut present = BTreeMap::new();
     let mut missing = BTreeSet::new();
     let mut real_directories = HashSet::new();
     for raw in output.stdout.split(|byte| *byte == 0) {
-        // A trailing slash marks a nested repository that Git does not descend into.
-        if raw.is_empty() || raw.ends_with(b"/") {
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(directory) = raw.strip_suffix(b"/") {
+            nested.push(directory.to_vec());
             continue;
         }
         let relative = bytes_to_path(raw);
@@ -277,29 +305,17 @@ fn list_git_world(source: &Path) -> Result<(Present, BTreeSet<Vec<u8>>)> {
             }
         }
     }
-    Ok((present, missing))
+    // Files under a nested repository are not part of this world.
+    present.retain(|path, _| !inside_nested(&nested, path));
+    Ok((present, missing, nested))
 }
 
-fn parents_are_directories(root: &Path, relative: &Path, known: &mut HashSet<Vec<u8>>) -> bool {
-    let Some(parent) = relative
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    else {
-        return true;
-    };
-    if known.contains(&path_bytes(parent)) {
-        return true;
-    }
-    if !parents_are_directories(root, parent, known) {
-        return false;
-    }
-    match fs::symlink_metadata(root.join(parent)) {
-        Ok(metadata) if metadata.is_dir() => {
-            known.insert(path_bytes(parent));
-            true
-        }
-        _ => false,
-    }
+/// True when `path` lies strictly below one of the nested repository directories.
+fn inside_nested(nested: &[Vec<u8>], path: &[u8]) -> bool {
+    nested.iter().any(|directory| {
+        path.strip_prefix(directory.as_slice())
+            .is_some_and(|rest| rest.first() == Some(&b'/'))
+    })
 }
 
 fn walk_directory(source: &Path) -> Result<Present> {
@@ -650,6 +666,75 @@ mod tests {
         )
         .unwrap();
         assert!(world.changes.is_empty(), "{:?}", world.changes);
+    }
+
+    /// A Git source whose baseline was frozen as a plain directory, with
+    /// `vendor/dep` its own repository; `commit_nested` tracks it as a gitlink,
+    /// otherwise the outer repository leaves it untracked.
+    fn nested_repo_fixture(commit_nested: bool) -> Fixture {
+        let fixture = Fixture::new(
+            false,
+            &[
+                ("a.txt", "one\n"),
+                ("vendor/dep/lib.rs", "pub fn dep() {}\n"),
+            ],
+        );
+        let nested = fixture.source.join("vendor/dep");
+        git_in(&nested, &["init", "--quiet"]);
+        git_in(&nested, &["add", "-A"]);
+        git_in(&nested, &["commit", "--quiet", "-m", "nested"]);
+        git_in(&fixture.source, &["init", "--quiet"]);
+        git_in(
+            &fixture.source,
+            &["add", if commit_nested { "-A" } else { "a.txt" }],
+        );
+        git_in(&fixture.source, &["commit", "--quiet", "-m", "initial"]);
+        fixture
+    }
+
+    fn observe_as_git(fixture: &Fixture) -> WorldObservation {
+        observe(
+            &fixture.source,
+            &fixture.snapshot.baseline_path,
+            &fixture.snapshot.baseline_commit,
+            &SourceKind::Git,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn git_committed_nested_repo_is_not_comparable() {
+        let fixture = nested_repo_fixture(true);
+        let unchanged = observe_as_git(&fixture);
+        assert!(unchanged.changes.is_empty(), "{:?}", unchanged.changes);
+        assert_eq!(unchanged, observe_as_git(&fixture));
+        // Edits, additions, and removal inside the nested repo are its own business.
+        fixture.write("vendor/dep/lib.rs", "pub fn dep() { edited }\n");
+        fixture.write("vendor/dep/new.rs", "new\n");
+        assert_eq!(observe_as_git(&fixture), unchanged);
+        fs::remove_dir_all(fixture.source.join("vendor/dep")).unwrap();
+        assert_eq!(observe_as_git(&fixture), unchanged);
+        fixture.write("a.txt", "edited\n");
+        assert_eq!(
+            observe_as_git(&fixture).changes,
+            [change("a.txt", ChangeKind::Modified)]
+        );
+    }
+
+    #[test]
+    fn git_untracked_nested_repo_is_not_comparable() {
+        let fixture = nested_repo_fixture(false);
+        let unchanged = observe_as_git(&fixture);
+        assert!(unchanged.changes.is_empty(), "{:?}", unchanged.changes);
+        assert_eq!(unchanged, observe_as_git(&fixture));
+        fixture.write("vendor/dep/lib.rs", "pub fn dep() { edited }\n");
+        fixture.write("vendor/dep/new.rs", "new\n");
+        assert_eq!(observe_as_git(&fixture), unchanged);
+        fixture.write("b.txt", "b\n");
+        assert_eq!(
+            observe_as_git(&fixture).changes,
+            [change("b.txt", ChangeKind::Added)]
+        );
     }
 
     #[test]
