@@ -94,7 +94,7 @@ try:
             wait('Review changes');diff_start=len(clean);send(b'd\r');wait('delivered');pump(.2)
             if scenario!='plain': assert 'index ' not in clean[diff_start:], 'visual diff leaked index hashes'
             send(b'q\n' if scenario=='plain' else b'q');wait('Review changes')
-            if scenario=='drift': open(os.path.join(source,'new-user-file'),'w').write('user edit\n')
+            if scenario=='drift': open(os.path.join(source,'src','lib.rs'),'w').write('// user edit\n')  # conflicts with the delivered change; unrelated edits no longer block
             send(b'A\n' if scenario=='plain' else b'r\r' if scenario in ('reject','recovery','concurrent','natural') else b'a\r')
             wait('accomplish?');send(b'\x04')
     end=time.time()+8
