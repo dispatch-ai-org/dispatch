@@ -95,6 +95,72 @@ when the source moved or the run is a refresh.
   for `--allow-unsafe-local` / `--allow-forwarded-env` if the original run needed
   them. It is always a new, human-typed launch; nothing refreshes automatically.
 
+`check`, `refresh` and the `Coherence:` line act only on a finished, ready result
+that is not yet applied (`check` and the line also need exactly one candidate,
+which any single-agent run has). The verdict rules, limits and events
+are in the [coherence reference](coherence.md); the README has the short version.
+
+### What `explain` shows
+
+`dispatch explain` prints a **Coherence** section when the run's current verdict
+says the source moved or is not `CONTINUE`, or when the run is a refresh of an
+earlier one. It lists the decision, the analysis level (`symbols`, `files_only` or
+`integration`), whether the world changed and how many files, up to ten reasons
+as `code: detail`, `first invalid at`, and `refreshed from` for a refreshed run.
+For a Ready, unapplied run the verdict is recomputed for display; otherwise the
+last stored verdict is used. Viewing it never writes anything.
+
+A reason such as `fact_broken` carries the old and new signature
+(`old => new`). `same_symbol_edited`, `patch_conflict`, `fact_missing`,
+`integration_check_failed` (with the check and its log path) and
+`analysis_uncertain` (a file that does not parse, or a check that could not run)
+also make the verdict `REFRESH`; `already_applied` makes it `STOP`.
+
+The line **Agent time after the work became invalid: 4m12s of 9m40s (43%)**
+measures wall-clock time only. It sums the run's attempt durations, from their
+recorded start and end times, and counts the part after `first invalid at`. It is
+time, not dollars, on purpose: Dispatch does not know a transaction cost for every
+harness (the Claude adapter discards the nominal figure), and a dollar amount would
+be invented. `first invalid at` is stamped only when an invalid verdict is stored,
+by the mid-run watcher or by a blocked accept. `check`, `status` and `explain` never
+store one, and a blocked accept happens after the attempts have ended, so the
+figure is nonzero only for a run whose watcher saw the change while the agent worked.
+
+### While the agent works
+
+For runs that use included-resource allocation, a watcher runs beside each attempt.
+Every `coherence.poll_secs` it checks a cheap signal (Git `HEAD`, `git status`, and
+file metadata; for a plain directory, a metadata walk). Only when that signal moves
+does it observe the tree, capture the work so far with a temporary Git index, and
+evaluate it with the file, patch and symbol layers. Integration checks never run
+mid-run, and a file that does not parse is ignored, because a person may be
+mid-edit. The watcher never writes state; the run's own loop records what it
+reports, as events:
+
+- `coherence.invalidated`: the verdict became `REFRESH` or `STOP`, or is still
+  invalid for a different source state. At most one message per minute.
+- `coherence.checked`: the verdict is `CONTINUE` again after an invalid one.
+- `coherence.stopped`: recorded right before cancellation in `stop` mode.
+
+The payload carries the full validity object under `coherence`. In the default
+`observe` mode the agent is never touched. With `mid_run: stop`, a `STOP` verdict
+cancels the attempt through the normal cancellation path, and so does `REFRESH`
+if `stop_on_refresh: true`. The run then ends interrupted with work result
+`cancelled`, failure kind `stale_work` and exit code 1; the message reads "work
+stopped: the source changed underneath it (...)". The partial patch is kept, the
+result cannot be accepted, and nothing is recorded as a routing observation, goal
+feedback or evaluation, so the agent is not counted as having failed. The deadline
+still takes precedence if it had already passed.
+
+### `status --json`
+
+`dispatch status --json` (and `run --json`) adds a `coherence` object only when the
+source moved or the verdict is not `CONTINUE`: `decision` (`continue`, `refresh`
+or `stop`), `analysis`, `changed_files`, and `reasons` (at most five, each with
+`code`, `fact_id`, `path` and `detail`). It is absent for a run whose source did
+not move, so existing consumers are unaffected. Over the control protocol the
+same object is described in [control-protocol.md](control-protocol.md).
+
 Small diffs have an inline preview. Large sets open a file index: arrows/j/k select,
 `/` filters, Enter opens, Esc returns to files, and q returns to the same review.
 Within a file, arrows/h/l pan, arrows/j/k scroll, n/p navigate hunks, brackets switch

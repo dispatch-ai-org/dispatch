@@ -1,3 +1,4 @@
+<!-- release: version -->
 # Local release candidate: 0.1.3-rc.1
 
 Release gate: **blocked** by the five-second planned-question deadline fixture in
@@ -28,6 +29,7 @@ cd /path/to/your/project
 /tmp/dispatch-rc-install/dispatch --state-dir /path/to/private/dispatch-state
 ```
 
+<!-- release: version -->
 The expected version is `dispatch 0.1.3-rc.1`. Use `command -v dispatch` and
 `type -a dispatch` to locate older PATH installations. An explicit path is the
 reliable way to select this candidate. Do not replace a working binary just to try
@@ -47,6 +49,24 @@ separate directory; point the matching old binary at it with `--state-dir`. Neve
 point an old binary at current state or restore only a DB over newer artifacts.
 Old grant scope does not expand: issue a new grant explicitly if changed resource
 configuration invalidates it. Planned crash recovery remains unsupported.
+
+### Upgrading to 0.2.0
+
+<!-- release: version -->
+The database schema remains 20, so upgrading from a 0.1.x state directory runs no
+migration. Work coherence adds one optional field to a run's stored record and
+needs no backfill. A run created by an older version has no stored coherence data;
+when you accept it, Dispatch derives everything it needs from the run's baseline,
+its patch and the current source, so it gets coherence checking at accept time
+automatically. It reads the configuration frozen with that run, which is a file
+copied at run creation; if that copy cannot be read, accept keeps the strict
+any-drift refusal.
+
+The `coherence:` block in `dispatch.yml` is optional. With no block, accepting a
+result onto a source that changed elsewhere now validates the patch instead of
+refusing on any difference. To restore the old any-drift refusal, set
+`coherence.accept: strict` before starting the run. See the
+[coherence reference](coherence.md) for every key.
 
 Uninstall by removing only the executable you installed and its archive/extraction
 directory. Keep `~/.dispatch` (or your explicit state directory), project files and
