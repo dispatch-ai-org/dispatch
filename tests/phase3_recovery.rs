@@ -502,8 +502,11 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
         f.loaded(id)?.outcome.application,
         dispatch::ApplicationState::BlockedBySourceDrift
     );
-    // A refused acceptance is not recorded as an acceptance.
-    assert_eq!(f.loaded(id)?.outcome.review, dispatch::ReviewState::Pending);
+    // The human's review is still recorded; only the application is blocked.
+    assert_eq!(
+        f.loaded(id)?.outcome.review,
+        dispatch::ReviewState::Accepted
+    );
     let g = Fixture::new("success")?;
     let success = Fixture::result(&g.run(&[])?)?;
     let id = success["run_id"].as_str().unwrap();

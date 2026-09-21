@@ -3397,49 +3397,8 @@ fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     run.coherence = Some(record);
 }
 
-/// Refuse to record an acceptance for stale work. The verdict is persisted as
-/// evidence while the review stays pending, so nothing is half-accepted.
-/// `lock_held` says whether the caller already owns the run's operation lock.
-fn precheck_accept(state: &State, run: &RunRecord, lock_held: bool) -> Result<()> {
-    let candidate = sole_candidate(run)?.label.clone();
-    let mode = crate::coherence::accept_mode(&state.run_dir(&run.id));
-    let AcceptGate::Blocked(validity) = crate::coherence::gate(run, &candidate, mode)? else {
-        return Ok(());
-    };
-    let _guard = if lock_held {
-        None
-    } else {
-        Some(OperationLock::acquire(
-            &state.run_dir(&run.id).join(".operation.lock"),
-            "another compare/apply operation is already using this run",
-        )?)
-    };
-    let mut fresh = state.load_run(&run.id)?;
-    remember_validity(&mut fresh, &validity);
-    // The review stays pending; only the application state records the block.
-    fresh.outcome.application = ApplicationState::BlockedBySourceDrift;
-    let database = Database::open(state.db_path())?;
-    persist_event(
-        state,
-        &database,
-        EventRecord {
-            run_id: fresh.id.clone(),
-            candidate_label: Some(candidate),
-            event_type: "coherence.blocked".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"coherence": validity}),
-            ..EventRecord::default()
-        },
-        &mut fresh,
-    )?;
-    Err(CoherenceBlocked { validity }.into())
-}
-
 pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
     let (run, _lock) = review_target(state, command)?;
-    if accept {
-        precheck_accept(state, &run, true)?;
-    }
     if run.mode == RunMode::Allocation {
         record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
     } else {
@@ -3473,9 +3432,6 @@ pub fn accept_or_reject_latest(
         None => load_latest_unresolved_single(state, source_path)?,
     };
     let candidate = sole_candidate(&run)?.label.clone();
-    if accept {
-        precheck_accept(state, &run, false)?;
-    }
     if run.mode == RunMode::Allocation {
         record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
     } else {
