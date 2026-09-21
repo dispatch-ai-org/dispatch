@@ -5,18 +5,19 @@
 //! patch and runs `git apply` only with `--check`, so it never mutates
 //! anything, and it never touches the database or the run record.
 
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, future::Future, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 
 use crate::{
-    AnalysisLevel, Decision, Reason, ReasonCode, RunRecord, Validity,
+    AnalysisLevel, CandidateRecord, Decision, Reason, ReasonCode, RunRecord, Validity,
     coherence::world::WorldObservation,
     config::{AcceptMode, Config},
     source::{fingerprint_tree, git_command, run_git},
 };
 
+pub mod integration;
 pub mod symbols;
 pub mod world;
 
@@ -32,16 +33,7 @@ pub struct WorkView<'a> {
 
 /// Observe the current source tree and evaluate one candidate's patch of `run`.
 pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> {
-    let matches = run
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.label == candidate_label)
-        .collect::<Vec<_>>();
-    let candidate = match matches.as_slice() {
-        [candidate] => *candidate,
-        [] => bail!("candidate not found: {candidate_label}"),
-        _ => bail!("candidate label is ambiguous: {candidate_label}"),
-    };
+    let candidate = find_candidate(run, candidate_label)?;
     let world = world::observe(
         &run.source_path,
         &run.baseline_path,
@@ -55,6 +47,19 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
             delta_patch: &candidate.diff_path,
         },
     )
+}
+
+fn find_candidate<'a>(run: &'a RunRecord, candidate_label: &str) -> Result<&'a CandidateRecord> {
+    let matches = run
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.label == candidate_label)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [candidate] => Ok(*candidate),
+        [] => bail!("candidate not found: {candidate_label}"),
+        _ => bail!("candidate label is ambiguous: {candidate_label}"),
+    }
 }
 
 /// The typed refusal returned when accepted work is no longer valid against the
@@ -91,25 +96,68 @@ pub enum AcceptGate {
     Blocked(Validity),
 }
 
-/// The accept policy frozen with the run. An unreadable snapshot is treated as
-/// strict so that a missing file can only make acceptance more conservative.
-pub fn accept_mode(run_dir: &Path) -> AcceptMode {
+/// The configuration frozen with the run, or `None` when the snapshot cannot be
+/// read. Callers treat `None` as strict accept so that a missing file can only
+/// make acceptance more conservative.
+pub fn run_config(run_dir: &Path) -> Option<Config> {
     fs::read_to_string(run_dir.join("config.snapshot.yml"))
         .ok()
         .and_then(|text| serde_yaml::from_str::<Config>(&text).ok())
-        .map_or(AcceptMode::Strict, |config| config.coherence.accept)
 }
 
 /// Decide whether `candidate_label` of `run` may be accepted onto the source as
-/// it is now. Runs no external work when the tree is unchanged.
-pub fn gate(run: &RunRecord, candidate_label: &str, mode: AcceptMode) -> Result<AcceptGate> {
-    if mode == AcceptMode::Strict || fingerprint_tree(&run.source_path)? == run.source_fingerprint {
+/// it is now. Runs no external work when the tree is unchanged. When the world
+/// moved but L0 says the work is still valid, the run's own verification checks
+/// are run against the merged result before anything is applied.
+///
+/// The caller holds the per-run and per-source operation locks and has no
+/// database transaction open; the checks (each bounded by the run's execution
+/// timeout) hold only those locks.
+pub fn gate(run: &RunRecord, candidate_label: &str, run_dir: &Path) -> Result<AcceptGate> {
+    // An unreadable snapshot means strict, so the oracle is never reached.
+    let Some(config) = run_config(run_dir) else {
+        return Ok(AcceptGate::Legacy);
+    };
+    if config.coherence.accept == AcceptMode::Strict
+        || fingerprint_tree(&run.source_path)? == run.source_fingerprint
+    {
         return Ok(AcceptGate::Legacy);
     }
-    let validity = evaluate_run(run, candidate_label)?;
+    let mut validity = evaluate_run(run, candidate_label)?;
+    if validity.decision == Decision::Continue {
+        validity = block_on(integration::verify_integration(
+            run,
+            candidate_label,
+            validity,
+            &config,
+            run_dir,
+        ))??;
+    }
     Ok(match validity.decision {
         Decision::Continue => AcceptGate::Compatible(validity),
         Decision::Refresh | Decision::Stop => AcceptGate::Blocked(validity),
+    })
+}
+
+/// Drive a future to completion from synchronous code that may be running on a
+/// tokio worker. A multi-thread runtime lends the worker out; anything else (no
+/// runtime, or a current-thread one that cannot be blocked) gets a temporary
+/// runtime on its own thread.
+fn block_on<T: Send>(future: impl Future<Output = T> + Send) -> Result<T> {
+    use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+    if let Ok(handle) = Handle::try_current()
+        && handle.runtime_flavor() == RuntimeFlavor::MultiThread
+    {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(future)));
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<T> {
+                let runtime = Builder::new_current_thread().enable_all().build()?;
+                Ok(runtime.block_on(future))
+            })
+            .join()
+            .map_err(|_| anyhow!("integration check thread panicked"))?
     })
 }
 
@@ -519,6 +567,42 @@ mod tests {
         assert_eq!(validity.decision, Decision::Stop);
         assert!(evaluate_run(&run, "B").is_err());
         assert!(matches!(run.source_kind, SourceKind::Git));
+    }
+
+    #[test]
+    fn gate_without_a_readable_config_snapshot_is_legacy_and_skips_the_oracle() {
+        let fixture = Fixture::new(true, &base_files());
+        let run = fixture.run(fixture.patch(PATCH_A));
+        fixture.write("b.txt", "b edited\n");
+        let run_dir = fixture.root.path().join("run");
+        assert!(run_config(&run_dir).is_none());
+        assert!(matches!(
+            gate(&run, "A", &run_dir).unwrap(),
+            AcceptGate::Legacy
+        ));
+        fs::write(run_dir.join("config.snapshot.yml"), "coherence: [not a map").unwrap();
+        assert!(run_config(&run_dir).is_none());
+    }
+
+    #[test]
+    fn block_on_works_without_a_runtime_and_on_either_runtime_flavor() {
+        assert_eq!(block_on(async { 1 }).unwrap(), 1);
+        let current = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            current.block_on(async { block_on(async { 2 }) }).unwrap(),
+            2
+        );
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(multi.block_on(async { block_on(async { 3 }) }).unwrap(), 3);
+        // A spawned task runs on a worker, where `block_in_place` is allowed.
+        let spawned = multi.block_on(async { tokio::spawn(async { block_on(async { 4 }) }).await });
+        assert_eq!(spawned.unwrap().unwrap(), 4);
     }
 
     #[test]

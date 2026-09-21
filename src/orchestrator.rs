@@ -3840,9 +3840,8 @@ fn apply_locked(
             .join(format!("source-{source_key}.lock")),
         "another apply operation is already modifying this source",
     )?;
-    let mode = crate::coherence::accept_mode(&state.run_dir(&run.id));
-    let applied =
-        crate::coherence::gate(&run, &normalized_label, mode).and_then(|gate| match gate {
+    let applied = crate::coherence::gate(&run, &normalized_label, &state.run_dir(&run.id))
+        .and_then(|gate| match gate {
             AcceptGate::Legacy => Ok((source::safe_apply(&run, &normalized_label)?, None)),
             AcceptGate::Compatible(validity) => Ok((
                 source::apply_validated(&run, &normalized_label, &validity.world_digest)?,

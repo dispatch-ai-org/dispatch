@@ -550,6 +550,16 @@ fn apply_checked(
     })
 }
 
+/// Apply a candidate patch inside a disposable workspace (never the source).
+pub(crate) fn apply_patch_in_workspace(workspace: &Path, patch: &Path) -> Result<()> {
+    let mut apply = git_command(workspace);
+    apply
+        .args(["apply", "--binary", "--whitespace=nowarn", "--"])
+        .arg(patch);
+    checked_output(apply, "candidate patch does not apply to the merged tree")?;
+    Ok(())
+}
+
 fn copy_tree_contents(source: &Path, destination: &Path) -> Result<()> {
     let mut directory_permissions = Vec::new();
     for entry in WalkDir::new(source)
