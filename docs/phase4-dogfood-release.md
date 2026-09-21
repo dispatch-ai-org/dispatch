@@ -1,5 +1,7 @@
 # Phase 4 / first dogfood release report
 
+> **Historical: written 2026-09-17 for the first dogfood attempt; superseded by later phases and by the current README/product guide.** Its "NOT READY" status, Codex-only scope and provider statements below describe that moment, not the current product.
+
 Date: 2026-09-17. Status: **NOT READY for the first dogfood release**.
 Phase 4 implementation and three small current-account dogfood tasks are complete;
 the full real-task and manual terminal matrices remain incomplete. No release tag, publication, Phase 5 transport, daemon,

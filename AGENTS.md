@@ -120,6 +120,19 @@ Do not broaden the versioned evaluation envelope to upload source, patches, logs
 
 Do not opportunistically broaden a focused task.
 
+**Work coherence.** Dispatch checks finished work against a source tree that moved
+underneath it (see `docs/coherence.md`). tree-sitter is an approved dependency solely
+for symbol extraction in that layer. Unless explicitly requested, do not add:
+
+- automatic refresh or retry (`dispatch refresh` stays an explicit, human-typed launch);
+- a lock manager or pessimistic locking of files or symbols;
+- a persistent symbol or reference graph, index, or LSP integration;
+- additional languages or a plugin framework for them.
+
+Additional languages, or any graph or index, need evidence from dogfood failures
+first. Keep facts derived from (S0, Δ), the run's baseline and its patch, so that
+they are always recomputable and need no stored index.
+
 ## Working method
 
 When changing Dispatch:

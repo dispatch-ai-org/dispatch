@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="Dispatch">
+ <rect width="120" height="120" rx="24" fill="#0B1220"/>
+ <g transform="translate(60 60) scale(0.9) translate(-48.5 -40)">
+  <path d="M32 10h23a30 30 0 0 1 0 60H32" fill="none" stroke="#F8FAFC" stroke-width="12" stroke-linejoin="round"/>
+  <path d="M10 28h23" stroke="#67E8F9" stroke-width="8" stroke-linecap="round"/>
+  <path d="M10 40h34" stroke="#5EE9B5" stroke-width="8" stroke-linecap="round"/>
+  <path d="M10 52h22" stroke="#FFD236" stroke-width="8" stroke-linecap="round"/>
+ </g>
+</svg>

@@ -13,7 +13,7 @@ strong profile within those resources, executable checks, and the original
 verification files identified by the owner. No provider/account change is implied.
 
 ```sh
-dispatch run /path/to/project --task 'Implement the multipart goal' \
+dispatch run --source /path/to/project 'Implement the multipart goal' \
   --plan --max-invocations 4 --timeout 600 --allow-unsafe-local
 ```
 
@@ -30,6 +30,19 @@ Follow the normal final review: `d` diff, `i` Details, `a` accept and safely app
 ceremony and never apply to the original project. A failed partial result cannot
 be selected as a completed goal. Review after completed work does not consume the
 work deadline; source drift and artifact identity are still checked at apply.
+
+Source drift is handled differently while planned work runs and when it is accepted.
+While tasks execute, Dispatch keeps the strict stop: at each step boundary
+(including before each planner or task attempt and again after its admission) it
+compares the whole-tree fingerprint with the snapshot, and any difference (including an ignored build directory) stops the goal
+with `source drift; planned work stopped`. Planned runs also never start the
+mid-run coherence watcher. Once the goal has finished and its delivery is ready,
+accepting it goes through the same accept-time gate as a direct result: if the
+source moved, [work coherence](coherence.md) checks that the final patch still
+applies and that what it relied on still holds, so an unrelated edit made while you
+reviewed does not block it. Set `coherence.accept: strict` to keep the old
+any-drift refusal at apply too. The delivery's own identity checks (patch hash,
+snapshots, manifests) are unchanged.
 
 ## Shared limits
 

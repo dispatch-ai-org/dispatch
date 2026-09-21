@@ -168,23 +168,29 @@ consult admission and `waiting_on`, not just one boolean.
 
 #### `coherence` (additive)
 
-When the source has changed since the run's baseline (or a stored verdict says the
-work is stale), `result` also carries a `coherence` object; it is absent
-otherwise, so existing clients are unaffected. For a Ready, unapplied run it is
-computed at read time from the run's baseline, patch and the current source;
-otherwise the last stored verdict is used. It is read-only and never a control
-operation of its own.
+When the source has changed since the run's baseline, or the verdict is not
+`continue`, the run result also carries a `coherence` object. It is nested in the
+result projection (the reply's `result.result`, next to `outcome` and `attempts`)
+and is absent otherwise, so existing clients are unaffected. For a finished, Ready,
+unapplied run with exactly one candidate it is computed at read time from the run's
+baseline, patch and the current source; otherwise the last stored verdict is used.
+It is read-only and never a control operation of its own; there is no new operation.
 
 ```json
-{"coherence":{"decision":"refresh","analysis":"symbols","changed_files":3,
-  "reasons":[{"code":"fact_broken","fact_id":"f1","detail":"auth::validate signature changed"}]}}
+{"result":{"result":{"coherence":{"decision":"refresh","analysis":"symbols","changed_files":1,
+  "reasons":[{"code":"fact_broken","fact_id":"1f0c9a2b7d4e5a63",
+    "detail":"pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>"}]}}}}
 ```
 
-`decision` is `continue`, `refresh` or `stop`; `analysis` is `symbols`,
-`files_only` or `integration`; `reasons` holds at most five entries. Local paths
-are removed like everywhere else in the result projection. Acting on a verdict is
-a human step (`dispatch refresh`, `dispatch reject`); machine clients cannot
-review.
+The object mirrors `CoherenceSummary`: `decision` is `continue`, `refresh` or
+`stop`; `analysis` is `symbols`, `files_only` or `integration`; `changed_files` is
+the number of files that differ from the baseline; `reasons` holds at most five
+entries, each with `code`, `fact_id` (null unless a fact caused it) and `detail`.
+Reason codes are `fact_broken`, `fact_missing`, `same_symbol_edited`,
+`patch_conflict`, `already_applied`, `integration_check_failed` and
+`analysis_uncertain`. A reason's `path` is a local-path field, so it is removed like
+every other `*_path`/`path` key in this projection. Acting on a verdict is a human
+step (`dispatch refresh`, `dispatch reject`); machine clients cannot review.
 
 ### Events and semantic waits
 
@@ -280,7 +286,8 @@ failed verification infrastructure, and consumed invocation budgets fail closed.
 {"protocol_version":1,"request_id":"patch-001","op":"artifact","run_id":"RUN-ID","attempt_id":"ATTEMPT-ID","kind":"diff","offset":0}
 ```
 
-Kinds are `diff`, `stdout`, and `stderr`. The server resolves these through the
+Kinds are `diff`, `stdout`, `stderr`, and, for a completed planned goal only,
+`final_diff` (see Opt-in planned goals below). The server resolves these through the
 owned run's completed attempt evidence, canonicalizes the path, and requires it
 to remain within that exact attempt directory. The final file cannot be a
 symlink. It accepts no arbitrary local path. Responses contain bounded UTF-8-lossy
