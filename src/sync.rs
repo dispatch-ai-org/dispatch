@@ -1153,6 +1153,7 @@ mod tests {
             allocation: None,
             capacity: None,
             admission: None,
+            coherence: None,
             evaluation: Some(EvaluationRecord {
                 outcome: EvaluationOutcome::Candidate("B".into()),
                 reasons: vec!["correctness".into(), "cleaner-change".into()],

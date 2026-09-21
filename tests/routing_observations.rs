@@ -111,6 +111,7 @@ fn run(id: &str, routing: Option<RoutingDecision>, mut candidate: CandidateRecor
         allocation: None,
         capacity: None,
         admission: None,
+        coherence: None,
         evaluation: None,
         applied_candidate: None,
     }
