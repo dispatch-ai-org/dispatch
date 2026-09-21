@@ -431,6 +431,50 @@ pub fn fingerprint_tree(root: &Path) -> Result<String> {
 /// not changed since snapshotting. `git apply` performs a complete dry run
 /// before the real application, and its default all-or-nothing behavior is kept.
 pub fn safe_apply(run: &RunRecord, candidate_label: &str) -> Result<ApplyReport> {
+    apply_checked(run, candidate_label, ExpectedWorld::Fingerprint)
+}
+
+/// Like `safe_apply`, but for a source that moved after snapshotting and whose
+/// current non-ignored world (`world_digest`) coherence validation has already
+/// judged compatible. The patch is applied only if that exact world is still
+/// present at the check, after the dry run, and therefore at the real apply.
+pub fn apply_validated(
+    run: &RunRecord,
+    candidate_label: &str,
+    world_digest: &str,
+) -> Result<ApplyReport> {
+    apply_checked(run, candidate_label, ExpectedWorld::Digest(world_digest))
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedWorld<'a> {
+    Fingerprint,
+    Digest(&'a str),
+}
+
+impl ExpectedWorld<'_> {
+    fn holds(self, run: &RunRecord, source: &Path) -> Result<bool> {
+        Ok(match self {
+            Self::Fingerprint => fingerprint_tree(source)? == run.source_fingerprint,
+            Self::Digest(expected) => {
+                crate::coherence::world::observe(
+                    source,
+                    &run.baseline_path,
+                    &run.baseline_commit,
+                    &run.source_kind,
+                )?
+                .digest
+                    == expected
+            }
+        })
+    }
+}
+
+fn apply_checked(
+    run: &RunRecord,
+    candidate_label: &str,
+    expected: ExpectedWorld,
+) -> Result<ApplyReport> {
     let matches = run
         .candidates
         .iter()
@@ -443,9 +487,8 @@ pub fn safe_apply(run: &RunRecord, candidate_label: &str) -> Result<ApplyReport>
     };
 
     let source = resolve_source(Some(&run.source_path))?;
-    let current_fingerprint = fingerprint_tree(&source)?;
     ensure!(
-        current_fingerprint == run.source_fingerprint,
+        expected.holds(run, &source)?,
         "source has changed since this run was created; refusing to apply candidate {candidate_label}"
     );
 
@@ -488,7 +531,7 @@ pub fn safe_apply(run: &RunRecord, candidate_label: &str) -> Result<ApplyReport>
     // Close the most useful check/apply race window. The real `git apply` also
     // validates every hunk before writing any file.
     ensure!(
-        fingerprint_tree(&source)? == run.source_fingerprint,
+        expected.holds(run, &source)?,
         "source changed during apply validation; the source was left unchanged"
     );
 

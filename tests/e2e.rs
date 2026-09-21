@@ -366,20 +366,18 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
     let still_blind = String::from_utf8(still_blind.stdout).unwrap();
     assert!(still_blind.contains("Harness mapping  blind"));
     assert!(!still_blind.contains("fake-bad"));
-    fs::write(
-        source.join("original.txt"),
-        "user changed this after the run\n",
-    )
-    .unwrap();
+    // An unrelated edit no longer blocks apply (see tests/coherence_accept.rs);
+    // a change that occupies the candidate's own output does.
+    for name in ["dispatch-fake-good.txt", "dispatch-fake-bad.txt"] {
+        fs::write(source.join(name), "user wrote this after the run\n").unwrap();
+    }
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
         .args(["apply", second_run, "A"])
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "source has changed since this run was created",
-        ));
+        .stderr(predicates::str::contains("this work is stale"));
 }
 
 fn candidate_for<'a>(candidates: &'a [Value], harness: &str) -> &'a Value {

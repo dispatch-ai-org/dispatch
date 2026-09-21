@@ -5,7 +5,7 @@
 //! patch and runs `git apply` only with `--check`, so it never mutates
 //! anything, and it never touches the database or the run record.
 
-use std::{fs, path::Path};
+use std::{fmt, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -13,7 +13,8 @@ use chrono::Utc;
 use crate::{
     AnalysisLevel, Decision, Reason, ReasonCode, RunRecord, Validity,
     coherence::world::WorldObservation,
-    source::{git_command, run_git},
+    config::{AcceptMode, Config},
+    source::{fingerprint_tree, git_command, run_git},
 };
 
 pub mod symbols;
@@ -54,6 +55,62 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
             delta_patch: &candidate.diff_path,
         },
     )
+}
+
+/// The typed refusal returned when accepted work is no longer valid against the
+/// moved source. It replaces matching on error text to recognize drift.
+#[derive(Debug)]
+pub struct CoherenceBlocked {
+    pub validity: Validity,
+}
+
+impl fmt::Display for CoherenceBlocked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let verdict = match self.validity.decision {
+            Decision::Stop => "STOP",
+            _ => "REFRESH",
+        };
+        write!(f, "source has changed; this work is stale ({verdict})")?;
+        for reason in &self.validity.reasons {
+            write!(f, ": {}", reason.detail)?;
+        }
+        write!(f, ". The source was left unchanged.")
+    }
+}
+
+impl std::error::Error for CoherenceBlocked {}
+
+/// What acceptance may do about a possibly moved source.
+pub enum AcceptGate {
+    /// Strict mode, or the whole tree is byte-identical to the snapshot: the
+    /// existing all-or-nothing fingerprint rules apply unchanged.
+    Legacy,
+    /// The world moved but the work is still valid; apply against that world.
+    Compatible(Validity),
+    /// The work is stale; nothing may be accepted or applied.
+    Blocked(Validity),
+}
+
+/// The accept policy frozen with the run. An unreadable snapshot is treated as
+/// strict so that a missing file can only make acceptance more conservative.
+pub fn accept_mode(run_dir: &Path) -> AcceptMode {
+    fs::read_to_string(run_dir.join("config.snapshot.yml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<Config>(&text).ok())
+        .map_or(AcceptMode::Strict, |config| config.coherence.accept)
+}
+
+/// Decide whether `candidate_label` of `run` may be accepted onto the source as
+/// it is now. Runs no external work when the tree is unchanged.
+pub fn gate(run: &RunRecord, candidate_label: &str, mode: AcceptMode) -> Result<AcceptGate> {
+    if mode == AcceptMode::Strict || fingerprint_tree(&run.source_path)? == run.source_fingerprint {
+        return Ok(AcceptGate::Legacy);
+    }
+    let validity = evaluate_run(run, candidate_label)?;
+    Ok(match validity.decision {
+        Decision::Continue => AcceptGate::Compatible(validity),
+        Decision::Refresh | Decision::Stop => AcceptGate::Blocked(validity),
+    })
 }
 
 /// L0 verdict from file and patch state alone. Order matters: an unchanged
