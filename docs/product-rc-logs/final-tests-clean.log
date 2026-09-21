@@ -1,0 +1,628 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (/tmp/dispatch-rc/current/target/debug/deps/dispatch-943f65540ab25209)
+
+running 187 tests
+test admission::tests::a_recorded_child_requires_fenced_cleanup_before_release ... ok
+test admission::tests::cancellation_during_final_authorization_spawns_no_child_and_disposes_lease ... ok
+test admission::tests::cancellation_before_spawn_releases_only_affirmatively_unlaunched_lease ... ok
+test admission::tests::current_process_identity_is_exact_when_supported ... ok
+test admission::tests::cleanup_uncertainty_after_possible_spawn_never_releases ... ok
+test admission::tests::concurrent_admission_grants_exactly_one_pool_lease ... ok
+test admission::tests::final_fence_retains_rejection_until_same_constraints_are_reported_available ... ok
+test admission::tests::funding_upgrade_preserves_pool_history_and_fences ... ok
+test admission::tests::disjoint_funding_history_does_not_inherit_blockers ... ok
+test admission::tests::funding_upgrade_refuses_queued_owned_and_uncertain_overlapping_work ... ok
+test admission::tests::lost_reconciliation_cas_does_not_mutate_request ... ok
+test admission::tests::newer_shared_exhaustion_is_rechecked_at_launch_boundary ... ok
+test admission::tests::live_orphan_and_reused_pid_with_uncertain_group_block_replacement ... ok
+test admission::tests::overlapping_funding_history_does_not_conflate_window_sets ... ok
+test admission::tests::overlapping_funding_history_retains_persisted_rejection ... ok
+test admission::tests::overlapping_funding_history_allows_explicit_revalidation ... ok
+test admission::tests::overlapping_funding_history_retains_raw_account_conflict ... ok
+test admission::tests::overlapping_funding_history_retains_raw_paid_credit_conflict ... ok
+test admission::tests::owner_death_around_spawn_and_uncertain_child_both_block_replacement ... ok
+test admission::tests::dead_queued_owner_does_not_block_fifo_forever ... ok
+test admission::tests::bounded_aging_promotes_old_fifo_work ... ok
+test admission::tests::ownership_loss_before_spawn_denies_launch ... ok
+test admission::tests::overlapping_mappings_exclude_but_disjoint_and_unrelated_pools_do_not ... ok
+test admission::tests::stale_generation_cannot_acquire_a_lease ... ok
+test admission::tests::raw_conflict_then_unknown_cannot_cross_final_launch_fence ... ok
+test admission::tests::renamed_pool_resolves_to_the_owned_canonical_allowance ... ok
+test admission::tests::spawned_child_persistence_and_artifact_failure_with_uncertain_cleanup_stays_fenced ... ok
+test admission::tests::stale_pre_upgrade_binding_cannot_launch ... ok
+test capacity::tests::already_passed_reset_does_not_fabricate_replenishment_or_probe_loop ... ok
+test capacity::tests::changed_funding_and_window_identity_invalidate_prior_observation ... ok
+test capacity::tests::exhaustion_and_paid_credit_changes_are_not_hidden ... ok
+test capacity::tests::expired_short_window_cannot_erase_exhausted_long_window ... ok
+test admission::tests::stale_generation_cannot_release_newer_lease ... ok
+test capacity::tests::keeps_multiple_windows_separate_and_expires_at_reset ... ok
+test capacity::tests::missing_window_in_a_mapped_bucket_is_not_treated_as_unlimited ... ok
+test capacity::tests::null_window_and_unknown_mapping_stay_unknown ... ok
+test capacity::tests::partial_mapping_and_null_windows_preserve_applicable_restrictions ... ok
+test capacity::tests::failed_probe_after_known_telemetry_stays_unknown_without_erasing_identity ... ok
+test admission::tests::unknown_mapping_retains_funding_history ... ok
+test capacity::tests::provider_rejection_exhausts_only_a_mapped_pool ... ok
+test capacity::tests::rejected_evidence_does_not_become_the_next_authorized_baseline ... ok
+test capacity::tests::rejection_survives_unknown_and_reset_until_authoritative_supersession ... ok
+test capacity::tests::stale_and_estimated_reset_boundaries_request_refresh_without_replenishing ... ok
+test capacity::tests::account_facts_survive_rate_limit_probe_failure ... ok
+test config::tests::defaults_are_valid ... ok
+test config::tests::parses_chatgpt_and_claude_shaped_resource_profiles ... ok
+test config::tests::parses_partial_config_with_defaults ... ok
+test config::tests::shared_allowance_cannot_be_split_into_per_model_tanks ... ok
+test capacity::tests::unknown_probe_after_known_evidence_preserves_authorization_without_claiming_facts ... ok
+test db::tests::appends_structured_events_without_rewriting_them_on_sync ... ok
+test db::tests::applies_migration_and_enables_foreign_keys ... ok
+test db::tests::capacity_observations_append_without_replacing_prior_samples ... ok
+test db::tests::allocation_migration_preserves_phase_zero_rows_and_foreign_keys ... ok
+test db::tests::future_schema_is_refused_without_migration_or_backup ... ok
+test capacity::tests::probe_is_read_only_and_never_consumes_credits_or_resets ... ok
+test db::tests::feedback_migration_preserves_typed_outbox_bytes_status_and_retry_metadata ... ok
+test db::tests::opens_file_database_and_creates_parent_directories ... ok
+test db::tests::migration_preserves_legacy_evaluation_consent_and_outbox_without_expanding_scope ... ok
+test db::tests::persists_tie_neither_and_embedded_evaluations ... ok
+test db::tests::phase_three_migration_preserves_phase_two_rows ... ok
+test db::tests::phase_seven_migration_preserves_feedback_and_unknown_history ... ok
+test db::tests::rejects_evaluation_for_unknown_candidate_without_losing_previous_one ... ok
+test db::tests::saves_candidate_evaluation_and_verbatim_freeform_text ... ok
+test db::tests::stale_run_projection_cannot_overwrite_newer_revision ... ok
+test db::tests::migration_preserves_live_orphans_from_schema_14_and_already_applied_15 ... ok
+test db::tests::sync_consent_is_off_by_default_and_identity_is_stable ... ok
+test db::tests::syncs_run_candidates_checks_and_blind_harness_mapping ... ok
+test executor::tests::adapter_username_reaches_child_without_forwarding_credentials ... ok
+test executor::tests::cancellation_kills_a_running_process ... ok
+test executor::tests::captures_success_and_failure_without_merging_streams ... ok
+test db::tests::schema19_projection_and_direct_grant_survive_planning_migration ... ok
+test executor::tests::checks_keep_individual_pass_and_fail_results ... ok
+test executor::tests::detached_pipe_helper ... ok
+test executor::tests::docker_command_has_limits_single_mount_and_forwarded_environment ... ok
+test executor::tests::drains_but_caps_noisy_process_output ... ok
+test executor::tests::enforces_timeout ... ok
+test executor::tests::local_environment_is_cleared_and_allowlisted ... ok
+test executor::tests::redacts_forwarded_values_before_persisting_logs ... ok
+test harness::claude::tests::claude_malformed_contradictory_or_nonfinal_results_fail_closed ... ok
+test harness::claude::tests::claude_mixed_models_are_not_collapsed_and_unknown_stays_unknown ... ok
+test harness::claude::tests::claude_only_successful_final_result_can_supply_checkpoint ... ok
+test harness::claude::tests::claude_terminal_totals_preserve_cache_units_and_nominal_cost ... ok
+test harness::tests::constructs_current_official_agent_commands ... ok
+test harness::tests::fake_file_creation_refuses_symlink_escape ... ok
+test harness::tests::fake_file_creation_uses_a_safe_suffix_on_repeated_runs ... ok
+test db::tests::uncertain_cleanup_and_release_survive_equal_and_stale_projection_writes ... ok
+test harness::tests::fake_good_and_bad_mutate_only_their_workspace ... ok
+test harness::tests::parses_jsonl_events_and_directly_reported_usage ... ok
+test harness::tests::prompt_preserves_task_verbatim ... ok
+test harness::tests::recognizes_structured_harness_errors_and_observed_effort ... ok
+test harness::tests::fake_timeout_and_crash_have_distinct_results ... ok
+test orchestrator::tests::duration_format_is_compact ... ok
+test orchestrator::tests::init_generates_valid_config_with_verification_prompt ... ok
+test orchestrator::tests::init_refuses_configuration_symlinks ... ok
+test orchestrator::tests::init_rejects_state_nested_in_project_before_writing ... ok
+test orchestrator::tests::timed_out_candidate_reports_verification_not_run ... ok
+test orchestrator::tests::validates_structured_reasons_and_deduplicates ... ok
+test presenter::inspection::tests::path_labels_preserve_unicode_and_escape_terminal_and_direction_controls ... ok
+test presenter::tests::compact_input_and_activity_survive_resize ... ok
+test presenter::tests::malicious_content_cannot_control_terminal ... ok
+test presenter::tests::paste_unicode_resize_submit_once ... ok
+test presenter::tests::planned_review_keeps_verification_visible_before_long_task_list ... ok
+test presenter::tests::resize_work_and_question_preserves_committed_projection ... ok
+test presenter::tests::state_render_wide_narrow_ascii_snapshots ... ok
+test presenter::tests::terminal_panic_fixture ... ignored, subprocess helper, exercised by terminal_panic_restores_in_pty
+test executor::tests::detached_descendant_cannot_hold_capture_pipes_forever ... ok
+test presenter::tests::tiny_diff_emphasizes_only_changed_graphemes ... ok
+test presenter::tests::unconfigured_checks_never_look_verified ... ok
+test presenter::theme::tests::auto_capabilities_have_conservative_fallbacks ... ok
+test presenter::theme::tests::compact_unicode_ascii_and_narrow_signatures ... ok
+test presenter::theme::tests::exact_dark_brand_tokens_and_native_background ... ok
+test presenter::theme::tests::explicit_light_variant_and_color_fallbacks ... ok
+test private_evidence::tests::c_test_and_feature_mappings_do_not_infer_unknown_scope ... ok
+test capacity::tests::probe_timeout_is_an_expiring_unknown_observation ... ok
+test private_evidence::tests::constraints_unknown_identity_and_behavior_changes_are_conservative ... ok
+test private_evidence::tests::default_config_preserves_historical_grant_digest_and_malformed_proposals_fail ... ok
+test private_evidence::tests::explicit_multifile_mapping_is_descriptive_only_and_checks_stay_exact ... ok
+test private_evidence::tests::fixture_domain_cannot_be_enabled_after_history_or_removed ... ok
+test private_evidence::tests::one_sqlite_snapshot_keeps_feedback_revision_coherent ... ok
+test private_evidence::tests::sparse_missing_conflicting_and_unmapped_cohorts_abstain ... ok
+test private_evidence::tests::terminal_cache_categories_do_not_add_breakdowns_or_estimate_cash ... ok
+test private_evidence::tests::screening_parameters_are_not_calibration_or_activation ... ok
+test reviewer::tests::controls_are_escaped_in_full_external_display_copy_without_line_truncation ... ok
+test presenter::tests::terminal_panic_restores_in_pty ... ok
+test reviewer::tests::index_is_bounded_and_keeps_every_long_line_and_file ... ok
+test reviewer::tests::index_understands_binary_rename_deletion_and_quoted_names ... ok
+test reviewer::tests::baseline_drift_blocks_preparation_but_source_drift_does_not_change_review_material ... ok
+test reviewer::tests::permission_only_and_generated_hint_remain_reviewable ... ok
+test reviewer::tests::file_pair_rename_delete_and_binary_preserve_full_content ... ok
+test reviewer::tests::pairs_come_from_frozen_baseline_and_authoritative_patch_not_edited_candidate ... ok
+test reviewer::tests::symlinks_are_text_only_and_authentication_paths_never_export ... ok
+test router::allocation_tests::conflicting_cli_and_project_constraints_fail_instead_of_substituting ... ok
+test router::allocation_tests::fixed_constraints_win_and_unverified_overage_is_ineligible ... ok
+test router::allocation_tests::natural_goal_without_paths_uses_standard_and_preserves_unknown_features ... ok
+test router::allocation_tests::recognizing_c_does_not_lower_feature_suitability ... ok
+test router::allocation_tests::treats_models_of_one_harness_as_distinct_deterministic_choices ... ok
+test router::allocation_tests::uncertain_scope_does_not_require_strong_or_qualify_for_light ... ok
+test setup::tests::cancellation_writes_nothing_and_confirmation_is_atomic_and_private ... ok
+test setup::tests::checks_are_explicit_choices_preserve_configuration_and_refuse_drift ... ok
+test setup::tests::concurrent_and_manually_changed_configuration_cannot_be_overwritten ... ok
+test setup::tests::revalidation_does_not_change_model_tier_pool_or_disabled_policy ... ok
+test setup::tests::symlink_configuration_is_never_replaced ... ok
+test reviewer::tests::preference_argv_and_wait_contracts_do_not_assume_directory_diff_or_shell ... ok
+test reviewer::tests::stale_cross_candidate_and_concurrent_review_cannot_refresh_to_another_delivery ... ok
+test source::tests::fingerprints_ignore_state_but_detect_content_symlinks_and_execute_bits ... ok
+test source::tests::candidate_and_diff_include_untracked_text_binary_and_mode_changes ... ok
+test source::tests::identifies_plain_git_and_linked_worktree_sources ... ok
+test orchestrator::tests::cancellation_and_persistence_faults_dispose_acquired_intent_before_handoff ... ok
+test source::tests::diff_collection_ignores_candidate_controlled_git_configuration ... ok
+test source::tests::rejects_a_run_directory_nested_in_the_source ... ok
+test source::tests::rejects_symlinks_that_escape_candidate_isolation ... ok
+test source::tests::resolves_and_validates_source_directories ... ok
+test source::tests::git_apply_check_prevents_partial_application_of_a_conflicting_patch ... ok
+test source::tests::refuses_oversized_sparse_candidate_files_before_git ... ok
+test source::tests::internal_git_keeps_literal_bytes_despite_source_attributes ... ok
+test source::tests::safe_apply_rejects_source_drift_without_partial_changes ... ok
+test sync::tests::concurrent_feedback_changes_allocate_unique_contiguous_revisions ... ok
+test sync::tests::disabled_sync_with_token_does_not_queue_or_upload ... ok
+test source::tests::snapshot_is_exact_private_and_excludes_state ... ok
+test sync::tests::enable_records_consent_and_queues_without_uploading ... ok
+test sync::tests::envelope_distinguishes_verification_not_run_from_not_configured ... ok
+test sync::tests::envelope_preserves_semantics_unknowns_and_privacy_boundary ... ok
+test sync::tests::enabled_sync_without_token_fails_safely_and_stays_pending ... ok
+test sync::tests::failed_upload_retries_without_changing_local_evaluation ... ok
+test sync::tests::feedback_revisions_are_durable_immutable_and_only_follow_synced_parents ... ok
+test source::tests::safe_apply_updates_a_plain_source_only_when_it_has_not_drifted ... ok
+test source::tests::snapshot_of_git_source_uses_dirty_worktree_without_touching_original ... ok
+test sync::tests::feedback_wire_schema_is_narrow_and_preserves_parent_consent_identity ... ok
+test sync::tests::historical_evaluation_queues_only_after_opt_in_with_stable_id ... ok
+test sync::tests::feedback_uploads_in_numeric_revision_order_without_reposting_parent ... ok
+test sync::tests::immutable_feedback_event_survives_outbox_reconstruction ... ok
+test sync::tests::pending_routing_payload_refreshes_before_upload_but_synced_payload_is_immutable ... ok
+test sync::tests::preview_is_the_transmitted_payload_and_success_marks_synced ... ok
+test sync::tests::production_cloud_endpoint_is_the_default ... ok
+test sync::tests::historical_feedback_reconciliation_recovers_only_current_known_state ... ok
+test sync::tests::preview_requires_consent ... ok
+test sync::tests::routing_observation_v1_preserves_failure_unknown_and_not_run_states ... ok
+test sync::tests::routing_observation_v1_preserves_independent_signals_and_privacy ... ok
+test sync::tests::queued_feedback_requires_current_consent_and_token_at_transmission ... ok
+test sync::tests::rejected_token_leaves_outbox_retryable_without_leaking_secret ... ok
+test sync::tests::routing_observations_require_explicit_upgraded_consent ... ok
+test sync::tests::sync_reuses_locks_to_prevent_pending_payload_and_evaluation_races ... ok
+test sync::tests::routing_preview_is_explicit_when_a_run_has_two_record_types ... ok
+test sync::tests::feedback_upload_uses_existing_outbox_and_preserves_retries_and_conflicts ... ok
+test sync::tests::token_storage_is_separate_from_consent_and_preview ... ok
+test sync::tests::routing_upload_handles_replay_retry_and_idempotency_conflict ... ok
+test sync::tests::unsynced_parent_states_never_create_feedback_events ... ok
+
+test result: ok. 186 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.68s
+
+     Running unittests src/main.rs (/tmp/dispatch-rc/current/target/debug/deps/dispatch-2d63834f713712b5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/classification.rs (/tmp/dispatch-rc/current/target/debug/deps/classification-0ec116a1fe0319a8)
+
+running 20 tests
+test ambiguous_task_text_remains_unknown ... ok
+test ambiguous_language_evidence_remains_unknown ... ok
+test additive_wording_does_not_infer_locality_or_confuse_tests_with_features ... ok
+test c_evidence_preserves_feature_kind_and_known_scope ... ok
+test build_vendor_and_cache_artifacts_do_not_dominate_language ... ok
+test classifies_an_obviously_cpp_repository ... ok
+test classifies_an_obviously_go_repository ... ok
+test classification_is_deterministic_and_does_not_modify_the_source ... ok
+test classifies_an_obviously_python_repository ... ok
+test classifies_an_obviously_rust_repository ... ok
+test clear_feature_text_is_a_feature ... ok
+test clear_refactor_text_is_a_refactor ... ok
+test clear_repair_text_is_a_bug_fix ... ok
+test clear_test_writing_text_is_tests ... ok
+test explicit_known_file_paths_support_conservative_scope ... ok
+test scope_remains_unknown_without_explicit_known_files ... ok
+test vague_and_cross_cutting_intent_stays_unknown ... ok
+test recorded_dogfood_prompts_preserve_independent_kind_and_scope ... ok
+test weak_ambiguous_and_generated_c_evidence_stays_unknown ... ok
+test classified_features_feed_the_router_and_prefer_specific_evidence ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/datasets.rs (/tmp/dispatch-rc/current/target/debug/deps/datasets-3651ad1dabd76e7e)
+
+running 9 tests
+test aggregates_observations_into_existing_benchmark_prior ... ok
+test imported_prior_is_immediately_consumed_only_by_matching_harness ... ok
+test importing_same_snapshot_twice_is_idempotent ... ok
+test missing_or_ambiguous_upstream_identity_fails_closed ... ok
+test parses_minimal_real_shaped_swe_bench_snapshot ... ok
+test preserves_benchmark_dataset_system_and_model_identities ... ok
+test malformed_or_incomplete_records_fail_without_persisting ... ok
+test newer_snapshot_replaces_cached_aggregate_deterministically ... ok
+test datasets_import_cli_caches_swe_bench_snapshot ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+     Running tests/e2e.rs (/tmp/dispatch-rc/current/target/debug/deps/e2e-c7c7d9be39ab1a7d)
+
+running 3 tests
+test interrupt_cancels_children_and_persists_terminal_status ... ok
+test non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end ... ok
+test normal_local_commands_do_not_contact_cloud ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.71s
+
+     Running tests/local_evidence.rs (/tmp/dispatch-rc/current/target/debug/deps/local_evidence-7795cfe8af4a4fda)
+
+running 10 tests
+test groups_use_exact_morphology_harness_and_source_not_content_or_version ... ok
+test empty_verification_is_unknown_and_mixed_checks_follow_documented_precedence ... ok
+test cli_is_source_scoped_offline_unranked_and_keeps_recommend_output_identical ... ok
+test human_and_mechanical_counts_are_independent_and_unevaluated_is_not_a_vote ... ok
+test invalid_feedback_fails_closed_instead_of_inventing_a_human_outcome ... ok
+test local_inspection_excludes_public_priors_and_explicit_runs_and_cannot_change_router ... ok
+test process_timeout_verification_timeout_not_run_and_unknown_stay_distinct ... ok
+test latest_numeric_revision_wins_without_counting_history_or_mutating_records ... ok
+test cli_no_observations_is_successful_without_creating_state_or_source_files ... ok
+test local_acceptance_cannot_change_routed_execution_selection ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+     Running tests/phase0_outcomes.rs (/tmp/dispatch-rc/current/target/debug/deps/phase0_outcomes-5a027a7bf5829085)
+
+running 6 tests
+test jsonl_replay_is_ordered_and_repairs_a_missing_metadata_projection ... ok
+test run_jsonl_stream_contains_only_ordered_events_and_one_result ... ok
+test committed_transition_recovers_after_projection_write_failure ... ok
+test json_result_is_pure_and_preserves_requested_and_observed_identity ... ok
+test semantic_harness_error_with_process_exit_zero_fails_the_attempt ... ok
+test verification_failure_is_exit_three_and_unconfigured_is_explicit ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.40s
+
+     Running tests/phase1_allocation.rs (/tmp/dispatch-rc/current/target/debug/deps/phase1_allocation-dc78bb710bad9849)
+
+running 6 tests
+test allocation_rejects_inherited_extra_args_that_can_shadow_resource_controls ... ok
+test fixed_project_model_conflict_fails_before_creating_a_run ... ok
+test unknown_model_and_invalid_effort_are_rejected_without_substitution ... ok
+test enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_sync ... ok
+test quota_failure_mid_attempt_stops_without_a_paid_or_model_fallback ... ok
+test allocation_review_is_append_only_and_safe_apply_is_unchanged ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.01s
+
+     Running tests/phase2_capacity_admission.rs (/tmp/dispatch-rc/current/target/debug/deps/phase2_capacity_admission-fe204d2edcbce029)
+
+running 6 tests
+test reserve_defers_non_urgent_work_without_launching ... ok
+test queued_process_rechecks_newer_conflicting_evidence_from_another_process ... ok
+test timed_out_optional_probe_keeps_a_normal_run_usable_and_explained ... ok
+test disabling_admission_cannot_bypass_an_active_owner ... ok
+test foreground_configuration_changes_respect_overlap_and_allow_disjoint_work ... ok
+test two_foreground_processes_share_one_slot_and_checks_do_not_retain_it ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.34s
+
+     Running tests/phase3_recovery.rs (/tmp/dispatch-rc/current/target/debug/deps/phase3_recovery-d68ffe9a8856e8a2)
+
+running 38 tests
+test answer_setup_error_records_interruption_and_preserves_the_committed_answer ... ok
+test cancelled_question_rejects_answers_and_late_events ... ok
+test any_infrastructure_or_unknown_check_blocks_other_target_failures ... ok
+test clarification_answer_is_durable_released_and_single_use ... ok
+test committed_attempt_owner_fixture ... ok
+test checkpoint_requires_clean_exit_and_a_final_agent_report ... ok
+test checkpoint_continuation_cannot_create_third_invocation_and_malformed_stops ... ok
+test baseline_failure_and_harness_failure_do_not_escalate ... ok
+test dead_owner_after_answer_commit_is_repaired_without_replaying_or_reopening ... ok
+test dead_owner_after_attempt_finish_is_repaired_but_live_owner_is_not ... ok
+test completed_attempt_evidence_and_rejection_cannot_be_rewritten ... ok
+test initial_success_selects_first_without_recovery ... ok
+test continuation_rechecks_configuration_and_shared_funding ... ok
+test jsonl_exposes_both_attempts_and_delivery ... ok
+test no_suitable_stronger_route_and_fixed_model_do_not_escalate ... ok
+test one_or_multiple_known_target_failures_still_recover ... ok
+test phase4_cursor_observes_question_even_after_answer_and_is_read_only ... ok
+test phase4_follow_registration_racing_completion_cannot_lose_it ... ok
+test one_deadline_bounds_invocations_and_waiting_answers ... ok
+test phase4_natural_goal_reaches_review_with_light_and_standard_profiles_only ... ok
+test phase4_review_identity_rejects_cross_run_candidate_and_stale_commands ... ok
+test only_a_valid_final_agent_message_can_checkpoint ... ok
+test phase4_two_foreground_sessions_keep_their_own_deliveries ... ok
+test phase4_wait_timeout_does_not_answer_or_launch ... ok
+test question_commands_reject_wrong_identity_generation_and_local_actor ... ok
+test recovery_setup_error_records_interruption_before_returning ... ok
+test recovery_failure_stops_after_two_and_no_retry_stops_after_one ... ok
+test recovery_delivery_applies_from_original_baseline_and_pending_question_is_not_reviewable ... ok
+test recovery_success_retains_failed_workspace_original_diff_and_fresh_permissions ... ok
+test reload_repairs_missing_and_higher_stale_projections_without_replaying_work ... ok
+test reload_requires_positive_owner_and_cleanup_evidence ... ok
+test shared_capacity_or_funding_changes_block_recovery_before_spawn ... ok
+test signal_killed_verification_is_unknown_and_never_recovers ... ok
+test unavailable_baseline_tool_stops_before_model_invocation ... ok
+test verification_infrastructure_failure_does_not_trigger_recovery ... ok
+test source_drift_blocks_apply_and_human_rejection_cannot_continue ... ok
+test phase4_pty_intent_answer_recovery_review_and_restoration ... ok
+test recovery_uses_remaining_goal_deadline_instead_of_a_new_budget ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.70s
+
+     Running tests/phase4_cli.rs (/tmp/dispatch-rc/current/target/debug/deps/phase4_cli-a6687ecfec674385)
+
+running 2 tests
+test bare_non_tty_is_predictable_and_creates_no_state ... ok
+test presentation_flags_do_not_pollute_machine_results ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+
+     Running tests/phase4_review.rs (/tmp/dispatch-rc/current/target/debug/deps/phase4_review-52fec5eab0c56dc8)
+
+running 4 tests
+test phase4_available_native_pagers_return_to_the_same_review ... ok
+test phase4_plain_review_transition_appears_once_per_delivery ... ok
+test phase4_review_depths_typeahead_and_large_change_index ... ok
+test phase4_external_review_owns_terminal_preserves_evidence_and_apply_guards ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 51.44s
+
+     Running tests/phase5_control.rs (/tmp/dispatch-rc/current/target/debug/deps/phase5_control-d5a95b4c1e032214)
+
+running 30 tests
+test bounded_versioned_frames_and_no_unintended_execution ... ok
+test broken_output_pipe_cancels_owner ... ok
+test broken_pipe_cancels_queued_admission ... ok
+test cancelled_answer_receipt_never_reopens_work ... ok
+test broken_pipe_cancels_clarification ... ok
+test changed_funding_blocks_continuation ... ok
+test duplex_clarification_and_idempotent_answer ... ok
+test durable_submit_retry_and_payload_conflict ... ok
+test hangup_cancels_waiting_question ... ok
+test control_and_existing_foreground_share_admission ... ok
+test explicit_checkpoint_recovery_keeps_original_limits ... ok
+test migration_preserves_existing_questions_attempts_and_authorizations ... ok
+test observer_bound_leaves_cancellation_responsive ... ok
+test human_tui_and_control_share_allowance_without_review_transfer ... ok
+test owner_eof_cancels_execution ... ok
+test owner_eof_closes_question ... ok
+test lost_answer_reply_recovers_only_explicitly ... ok
+test owner_eof_during_admission_never_spawns ... ok
+test pending_wait_does_not_block_cancellation ... ok
+test receipt_failure_rolls_back_submit_effect_and_event ... ok
+test overlapping_changed_mappings_still_exclude_control ... ok
+test read_only_follower_disconnect_does_not_cancel_owner ... ok
+test resolved_artifact_paths_and_resource_scope_are_enforced ... ok
+test scoped_authority_and_stale_mutations ... ok
+test semantic_waits_and_ordered_event_replay ... ok
+test recovery_checks_original_source_lineage ... ok
+test recovery_rejects_live_owner_and_expired_budget ... ok
+test unclassified_questions_require_human_authority ... ok
+test standalone_verified_delivery_preserves_human_review ... ok
+test slow_output_cancels_without_blocking_child_drainage ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.30s
+
+     Running tests/phase6_portfolio.rs (/tmp/dispatch-rc/current/target/debug/deps/phase6_portfolio-2af61deebfb0d6c1)
+
+running 33 tests
+test claude_control_broken_pipe ... ok
+test claude_control_authority ... ok
+test claude_checkpoint_recovery ... ok
+test claude_control_answer_cancel_race ... ok
+test claude_control_cancellation ... ok
+test claude_control_framing ... ok
+test claude_control_changed_funding ... ok
+test claude_control_durable_idempotency ... ok
+test claude_control_clarification_idempotency ... ok
+test claude_control_lost_answer_receipt ... ok
+test claude_control_recovery_limits ... ok
+test claude_control_recovery_drift ... ok
+test claude_control_wait_events ... ok
+test claude_control_unclassified_question ... ok
+test claude_control_slow_output ... ok
+test claude_deadline_bounds_preflight_and_attempt ... ok
+test claude_effective_settings_preserve_context_without_hooks ... ok
+test claude_final_preflight_invalidates_epoch ... ok
+test claude_malformed_configuration_and_expired_evidence ... ok
+test claude_owner_eof ... ok
+test claude_only_cli_identity_usage_review ... ok
+test claude_observer_disconnect ... ok
+test claude_funding_hazards_before_launch ... ok
+test claude_profile_lifecycle_preserves_history ... ok
+test claude_question_eof ... ok
+test portfolio_grant_cannot_expand_and_receipts_do_not_replay ... ok
+test claude_scoped_control_verified_review ... ok
+test portfolio_missing_optional_and_explicit_failure ... ok
+test portfolio_preference_and_explicit_constraints ... ok
+test portfolio_retained_capacity_routes_to_other_provider ... ok
+test portfolio_independent_pools_and_same_pool_exclusion ... ok
+test portfolio_cross_harness_recovery_both_directions ... ok
+test claude_protocol_failures_do_not_recover ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.53s
+
+     Running tests/phase7_evidence.rs (/tmp/dispatch-rc/current/target/debug/deps/phase7_evidence-4b929462f7cdafb4)
+
+running 16 tests
+test private_c_feature_cohort_preserves_historical_unknown_and_trial_scope ... ok
+test private_behavior_and_check_compatibility ... ok
+test private_explicit_provenance_not_interface_inference ... ok
+test private_activation_preserves_inflight_and_queued_bindings ... ok
+test private_feedback_revision_stales_proposal ... ok
+test private_optional_analytics_failure_never_waives_authority ... ok
+test private_bounded_large_history ... ok
+test private_owner_helper_bounds_timeout_eof_and_normal_cleanup ... ok
+test private_outcomes_and_smoke_attribution ... ok
+test private_fixture_shadow_activate_rollback ... ok
+test private_policy_transition_is_atomic_and_revision_fenced ... ok
+test private_review_fixed_session_and_apply_blocked ... ok
+test private_stale_active_evidence_falls_back_after_restart ... ok
+test private_promoted_preference_preserves_constraints_and_scope ... ok
+test private_review_opt_in_cancel_duplicate_and_plain has been running for over 60 seconds
+test private_review_opt_in_cancel_duplicate_and_plain ... ok
+test private_review_revision_delivery_provenance_and_write_failure has been running for over 60 seconds
+test private_review_revision_delivery_provenance_and_write_failure ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 86.55s
+
+     Running tests/phase8_planning.rs (/tmp/dispatch-rc/current/target/debug/deps/phase8_planning-56de4ef7f3369de1)
+
+running 67 tests
+test bad_dependency ... ok
+test cancel ... ok
+test budget ... ok
+test already_ready ... ok
+test assistance ... ok
+test conflict ... ok
+test crash ... ok
+test claude_success ... ok
+test claude_question ... ok
+test control ... ok
+test cycle ... ok
+test cross_report ... ok
+test direct ... ok
+test deadline ... ok
+test cycle_report ... ok
+test disconnect ... ok
+test explicit_override ... ok
+test duplicate ... ok
+test fault_completion ... ok
+test failed ... ok
+test dependency ... ok
+test fault_fence ... ok
+test drift ... ok
+test fault_integration ... ok
+test fault_plan ... ok
+test fault_manifest ... ok
+test grant ... ok
+test fault_delivery ... ok
+test malformed ... ok
+test missing_check ... ok
+test fidelity ... ok
+test no_checks ... ok
+test no_planner ... ok
+test manifest_tamper ... ok
+test nonfinal ... ok
+test four ... ok
+test out_of_scope ... ok
+test oversized ... ok
+test mixed ... ok
+test no_retry ... ok
+test planning_false ... ok
+test planner_edit ... ok
+test pinned ... ok
+test private_attribution ... ok
+test pty_plain ... ok
+test pty_narrow ... FAILED
+test question_deadline ... ok
+test pty_wide ... ok
+test question ... ok
+test pty_question_deadline ... FAILED
+test question_no_retry ... ok
+test repair ... ok
+test root_fail ... ok
+test second_repair ... ok
+test root_repair ... ok
+test self_report ... ok
+test stale_report ... ok
+test symlink ... ok
+test tight ... ok
+test success ... ok
+test tight_repair ... ok
+test traversal ... ok
+test six ... ok
+test uncertain_cleanup ... ok
+test tamper ... ok
+test truncated ... ok
+test weaken ... ok
+
+failures:
+
+---- pty_narrow stdout ----
+
+thread 'pty_narrow' (26286088) panicked at tests/phase8_planning.rs:15:5:
+pty_narrow: 
+planning diagnostic: None
+fixture failure: {'version': 1, 'lifecycle': 'working', 'work_result': 'pending', 'verification': 'not_run', 'review': 'not_requested', 'application': 'not_applied', 'phase': 'verifying', 'waiting_on': 'none'} []
+Traceback (most recent call last):
+  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 432, in <module>
+    scenario(sys.argv[1],name)
+  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 320, in scenario
+    ui.wait('Review changes');ui.mark('review')
+    ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jese/bin/dispatch/tests/fixtures/review_refinement.py", line 113, in wait
+    raise AssertionError("waiting for " + repr(text) + "\n" + self.clean[-7000:])
+AssertionError: waiting for 'Review changes'
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+     +--+   DISPATCH                        ==   |  source                         ===  |  intent > work > review         ==+--+                                         Plain directory - local source               What do you want to accomplish? Direct by default - /plan for sequential work /resources accounts - /checks project checks >     Enter send - Alt+Enter newline - Ctrl+C cancel - Ctrl+D exit      /        p        l        a        n                 U        p        d        a        t        e                 t        h        e                 C                 c        o        m        p        o        n        e        n        t        s                 a        n        plan Update the C components and      lan Update the C components and       an Update the C components and t      n Update the C components and th       Update the C components and the      Update the C components and thei      pdate the C components and their      date the C components and their       ate the C components and their d      te the C components and their de      e the C components and their dep       the C components and their depe      the C components and their depen      he C components and their depend      e C components and their depende       C components and their dependen      C components and their dependenc       components and their dependency       Goal  /plan Update the C compone...                                Goal received. Preparing...                                                                                                                                                   L cal  x cution is not sandboxed. Agent and checks use your permissions in a separate workspace. Allow this goal? [y/N] >     Enter send - Alt+Enter newline - Ctrl+C cancel - Ctrl+D exit      y          Planned mode: one planner, up to     four sequential tasks, one shared      extra; maximum six invocations under   one deadline. One final human review.          Preparing... | 0s elapsed - Ctrl+C cancel      \ 9       Goal  Update the C components an...                               Preparing Planned work - sequential execution Planner - fixture-strong One shared extra for the entire goal Launches 0 recorded - 0 uncertain - limit 6 \ 9s elapsed - Ctrl+C cancel      |      /      lanning  - 10s elapsed - Ctrl+C cancel      \ 1      Working  Age t running - tool activity is i private logs             Choice: Using strong: the task h... Pl nned work - sequential execution o Update a.c within its stated ...    f xture-light - working o Update b.c within its stated ... fixture-standard - queued requires checked output: a One shared extra for the entire goal Launches 1 recorded - 0 uncertain - limit 4 \ 12s elapsed - Ctrl+C cancel      |      Ve ifying Verificatio  has n t run            Planned w rk - sequential execution o Update a.c wi hi  its stated .     fixture-light - work ng           b standard - queued   requires  hecked ou put: a       One sha d extr  for th   ntire goal                         Launc es 2 recorded - 0 uncertain - limit 4 / 13s  lapsed - Ctrl+C ca l                                                  - 4      Wo king   Agent runni g - to l activity is in private l gs                        Choice: Using s ro g: the task h . Planned work - sequent al execution * a light - check d + int grat d                   o Update b.c within i s sta ed ...   fixture-standard - working   requires checked output: a        One shared extra for the entire goal                          Launches 2 recorded - 0 uncertain - limit 4 | 16s elapsed - Ctrl+C cancel      / 7      Ve ifying Verificatio  has n t run            Planned w rk - sequential execution * Update a.c wi hi  its stated .     fixture-light - checked +         integrated                         o Update b.c within its stated ...   fixtur -standard - working   requires  hecked ou put: a       One sha d extr  for the e tire goal                         Launc es 3 recorded - 0 uncertain - limit 4 / 17s  lapsed - Ctrl+C ca l                                                  - 8      * checked + int grat d                   \ 9      |      /      -      \     
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- pty_question_deadline stdout ----
+
+thread 'pty_question_deadline' (26289121) panicked at tests/phase8_planning.rs:15:5:
+pty_question_deadline: 
+planning diagnostic: run 01M2V3RN74DG46XG08MRQZN7HM interrupted while waiting for shared subscription capacity
+fixture failure: {'version': 1, 'lifecycle': 'finished', 'work_result': 'failed', 'verification': 'not_run', 'review': 'not_requested', 'application': 'not_applied', 'phase': 'finished', 'waiting_on': 'none'} []
+Traceback (most recent call last):
+  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 432, in <module>
+    scenario(sys.argv[1],name)
+  File "/Users/jese/bin/dispatch/tests/fixtures/phase8_planning.py", line 315, in scenario
+    ui.wait('Your answer');ui.mark('question')
+    ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jese/bin/dispatch/tests/fixtures/review_refinement.py", line 113, in wait
+    raise AssertionError("waiting for " + repr(text) + "\n" + self.clean[-7000:])
+AssertionError: waiting for 'Your answer'
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+     +--+   DISPATCH                                                                                      ==   |  source                                                                                       ===  |  intent > work > review                                                                       ==+--+                                                                                                       Plain directory - local source                                                                             What do you want to accomplish? Direct by default - /plan for sequential work /resources accounts - /checks project checks >     Enter send - Alt+Enter newline - Ctrl+C cancel - Ctrl+D exit      /        p        l        a        n                 U        p        d        a        t        e                 t        h        e                 C                 c        o        m        p        o        n        e        n        t        s                 a        n        d                 t        h        e        i        r                 d        e        p        e        n        d        e        n        c        y         Goal  /plan Update the C components and their dependency                                                Goal re ived. Preparing...                                                                                                                                          L cal  x cution is not sandboxed. Agent and checks use your permissions in a separate workspace. Allow this goal? [y/N] >     Enter send - Alt+Enter newline - Ctrl+C cancel - Ctrl+D exit      y          Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations  under one deadline. One final human review.                                                                  Preparing... | 0s elapsed - Ctrl+C cancel       Goal  Update the C components and their dependency                               Preparing Planned work - sequential execution Planner - fixture-strong One shared extra for the entire goal Launches 0 recorded - 0 uncertain - limit 6 - 0s elapsed - Ctrl+C cancel      \      |      lanning  3      /      -      \      | 4         Goal  Update the C components and their dependency                                                                                                                                                         Failed                                                                                               Verification has not run                                                                             Planned work - sequential execution                                                                  x Update a.c within its stated contract                                                                fixture-light - failed                                                                             o Update b.c within its stated contract                                                                fixture-standard - queued                                                                            requires checked output: a                                                                         Stopped: run 01M2V3RN74DG46XG08MRQZN7HM interrupted while waiting for shared subscription capacity   One shared extra for the entire goal                                                                 The shared deadline expired; no continuation time remains.                                           run 01M2V3RN74DG46XG08MRQZN7HM interrupted while waiting for shared subscription capacity              
+
+
+
+
+
+
+
+
+     Work stopped. [i] details [n] next goal >     Enter choose - Ctrl+C back - Ctrl+D exit     
+
+
+
+failures:
+    pty_narrow
+    pty_question_deadline
+
+test result: FAILED. 65 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 146.65s
+
+error: test failed, to rerun pass `--test phase8_planning`

@@ -1,0 +1,12 @@
+{
+  "source": "direct.review.ansi",
+  "terminal_columns": 120,
+  "terminal_rows": 40,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 25,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "2d20e2fbca8031df0d126a9c86bad48a34a257f8fef44706f6160fbaecb85d9c",
+  "milestone_seconds": 5.499739
+}

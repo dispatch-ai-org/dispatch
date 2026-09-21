@@ -1,0 +1,40 @@
+  Changes / generated.lock
+
+  new file mode 100644
+  @@ -0,0 +1,2 @@
+  +generated
+  +xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Bounded page · Space next page · v full patch pager
+  q back  Esc files  ↑↓ scroll  ←→ pan  n/p hunk  [ ] file  e editor  v pager

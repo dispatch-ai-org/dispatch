@@ -1,0 +1,20 @@
+[
+  {
+    "binary": "baseline",
+    "checks": "shell",
+    "exclusive": true,
+    "seconds_to_question": 6.362,
+    "questions": 0,
+    "launches": 1,
+    "failure": "deadline"
+  },
+  {
+    "binary": "candidate",
+    "checks": "shell",
+    "exclusive": true,
+    "seconds_to_question": 6.798,
+    "questions": 0,
+    "launches": 0,
+    "failure": "deadline"
+  }
+]

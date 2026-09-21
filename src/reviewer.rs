@@ -54,6 +54,7 @@ pub struct ChangeEntry {
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
     pub binary: bool,
+    pub permission_change: bool,
     pub bytes: u64,
     /// Relative patch offsets; a bounded navigation index, never patch authority.
     pub hunks: Vec<u64>,
@@ -61,6 +62,35 @@ pub struct ChangeEntry {
     ranges: Vec<(u64, u64)>,
     blob: Option<String>,
     regular: bool,
+}
+
+impl ChangeEntry {
+    pub fn category(&self) -> &'static str {
+        if self.binary {
+            "binary"
+        } else if self.permission_change {
+            "permissions"
+        } else if self.path.file_name().is_some_and(|n| {
+            matches!(
+                n.to_str(),
+                Some(
+                    "Cargo.lock"
+                        | "package-lock.json"
+                        | "yarn.lock"
+                        | "pnpm-lock.yaml"
+                        | "generated.lock"
+                )
+            )
+        }) || self
+            .path
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("generated" | "dist" | "build")))
+        {
+            "generated?"
+        } else {
+            "text"
+        }
+    }
 }
 
 pub struct Preview {
@@ -545,6 +575,7 @@ pub fn index_patch(path: &Path) -> Result<Vec<ChangeEntry>> {
                 additions: Some(0),
                 deletions: Some(0),
                 binary: false,
+                permission_change: false,
                 bytes: 0,
                 hunks: Vec::new(),
                 start: offset,
@@ -553,7 +584,9 @@ pub fn index_patch(path: &Path) -> Result<Vec<ChangeEntry>> {
                 regular: false,
             });
         } else if let Some(entry) = entries.last_mut() {
-            if text.starts_with(b"new file mode ") {
+            if text.starts_with(b"old mode ") || text.starts_with(b"new mode ") {
+                entry.permission_change = true;
+            } else if text.starts_with(b"new file mode ") {
                 entry.kind = ChangeKind::Added;
                 entry.regular = text.starts_with(b"new file mode 100");
             } else if text.starts_with(b"deleted file mode ") {
@@ -1149,6 +1182,22 @@ mod tests {
                 target,
             })
         }
+    }
+
+    #[test]
+    fn permission_only_and_generated_hint_remain_reviewable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let patch = temp.path().join("change.patch");
+        fs::write(
+            &patch,
+            "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\ndiff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-before\n+after\n",
+        )?;
+        let entries = index_patch(&patch)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].category(), "permissions");
+        assert_eq!(entries[1].category(), "generated?");
+        assert_eq!(entries[1].additions, Some(1));
+        Ok(())
     }
 
     #[test]

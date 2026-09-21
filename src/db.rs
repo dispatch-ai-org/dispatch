@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{
     Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -923,6 +923,7 @@ impl Database {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database {}", path.display()))?;
         let mut database = Self { connection };
+        database.backup_before_upgrade(path)?;
         database.configure(false)?;
         database
             .connection
@@ -930,6 +931,42 @@ impl Database {
             .context("failed to enable FULL SQLite durability")?;
         database.migrate()?;
         Ok(database)
+    }
+
+    /// Keep a transactionally consistent, private rollback copy before a real
+    /// historical-schema upgrade. Opening current state creates no backup.
+    fn backup_before_upgrade(&self, path: &Path) -> Result<()> {
+        let initialized: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')", [], |r|r.get(0))?;
+        if !initialized {
+            return Ok(());
+        }
+        let version = self.schema_version()?;
+        let latest = MIGRATIONS.last().context("missing schema migrations")?.0;
+        ensure!(
+            version <= latest,
+            "state schema {version} is newer than this binary supports ({latest}); use the matching binary or restore a complete backed-up state directory"
+        );
+        if version == 0 || version == latest {
+            return Ok(());
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let backup = tempfile::Builder::new()
+            .prefix(&format!("dispatch.schema-{version}-"))
+            .suffix(".db")
+            .tempfile_in(parent)?;
+        self.connection
+            .execute("VACUUM INTO ?1", [backup.path().to_string_lossy().as_ref()])
+            .context("cannot preserve pre-upgrade database; state was not migrated")?;
+        backup.as_file().sync_all()?;
+        let (_, saved) = backup.keep()?;
+        fs::File::open(parent)?
+            .sync_all()
+            .with_context(|| format!("cannot sync database backup {}", saved.display()))?;
+        Ok(())
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -3156,6 +3193,33 @@ mod tests {
     }
 
     #[test]
+    fn future_schema_is_refused_without_migration_or_backup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("state.db");
+        let db = Database::open(&path)?;
+        db.connection.execute(
+            "INSERT INTO schema_migrations VALUES(21,'future','fixture')",
+            [],
+        )?;
+        drop(db);
+        assert!(
+            Database::open(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("newer than this binary")
+        );
+        assert_eq!(Database::open_read_only(&path)?.schema_version()?, 21);
+        assert!(!fs::read_dir(temp.path())?.any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("dispatch.schema")
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn schema19_projection_and_direct_grant_survive_planning_migration() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("prior.db");
@@ -3184,6 +3248,42 @@ mod tests {
         drop(connection);
         let database = Database::open(&path)?;
         assert_eq!(database.schema_version()?, 20);
+        let backups = fs::read_dir(tmp.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("dispatch.schema-19-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        let backup = Database::open_read_only(backups[0].path())?;
+        assert_eq!(backup.schema_version()?, 19);
+        assert_eq!(
+            backup.connection.query_row(
+                "SELECT run_projection_json FROM runs WHERE id='prior'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            original
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(backups[0].metadata()?.permissions().mode() & 0o777, 0o600);
+        }
+        drop(backup);
+        drop(Database::open(&path)?);
+        assert_eq!(
+            fs::read_dir(tmp.path())?
+                .filter_map(|e| e.ok())
+                .filter(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("dispatch.schema-19-"))
+                .count(),
+            1
+        );
         assert_eq!(
             database.connection.query_row(
                 "SELECT run_projection_json FROM runs WHERE id='prior'",

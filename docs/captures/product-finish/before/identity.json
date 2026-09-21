@@ -1,0 +1,7 @@
+{
+  "binary": "/private/tmp/dispatch-rc/baseline/target/debug/dispatch",
+  "binary_sha256": "a228fd603757914a7af82f8a2029257ddcaac3d19be13174512bf33f73b3d50e",
+  "git_head": "08fc0a7633d18c1cae39ab93cd36fc5405798cc1",
+  "fixture_only": true,
+  "platform": "darwin"
+}

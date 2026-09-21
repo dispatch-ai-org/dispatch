@@ -1,0 +1,13 @@
+  Accounts / Resources
+  Local operation · no Dispatch login required
+  codex: installed · auth checked on revalidation
+  claude: installed · auth checked on revalidation
+  [1] codex / fixed-codex-model · medium
+      funding configured · launch revalidation required
+  [2] claude / claude-sonnet-5 · medium
+      needs attention: Claude funding evidence expired or invalid (maximum 24 hours)
+
+  [c] Add Codex   [a] Add Claude
+  [number] Revalidate profile   [l] Provider login   [b] Back
+  ›
+  Enter choose · Ctrl+C back · Ctrl+D exit

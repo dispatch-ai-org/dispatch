@@ -1,0 +1,14 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations
+under one deadline. One final human review.
+  Goal  Update a.c to return a positive value
+
+  Working
+  ● goal ━━ ● fixture-light ── ○ verify ── ○ review
+  Planned work · sequential execution
+  ○ Update a.c within its stated contract · fixture-light · Working
+  ○ Update b.c within its stated contract · fixture-standard · Pending
+    requires checked output: a
+  2 of 6 invocation records · one shared extra
+  ◒ 4s elapsed · Ctrl+C cancel

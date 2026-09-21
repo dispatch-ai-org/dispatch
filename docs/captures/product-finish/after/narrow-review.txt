@@ -1,0 +1,19 @@
+  Planned mode: one planner, up to
+four sequential tasks, one shared
+extra; maximum six invocations under
+one deadline. One final human review.
+  Goal  Update a.c to return a pos...
+
+  Ready for review
+  Verification passed
+  2 files changed · +2 / -2 lines
+  Planned work · sequential execution
+  One shared extra for the entire
+  goal
+  Launches 3 recorded · 0 uncertain ·
+  limit 4
+
+  [Enter/d] Review changes   [e] Open
+  in editor
+  [a] Accept & apply   [r] Reject
+  [n] Leave pending   [i] Details

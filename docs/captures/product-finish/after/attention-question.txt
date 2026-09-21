@@ -1,0 +1,25 @@
+    ┌──╮  DISPATCH
+  ━━   ┃  source
+  ━━━  ┃  intent → work → review
+  ━━└──╯
+  Plain directory · local source
+  Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations under one deadline.
+One final human review.
+  Goal  Update a.c to return a positive value
+
+  Waiting for you
+  Planned work · sequential execution
+  ○ Update a.c within its stated contract
+    fixture-light · needs attention
+  ○ Update b.c within its stated contract
+    fixture-standard · queued
+    requires checked output: a
+  One shared extra for the entire goal
+  Decision needed · answering continues this goal within its remaining limit.
+  Which positive value?
+  2 / 3
+  Launches 2 recorded · 0 uncertain · limit 4
+  Deadline 2026-09-18 20:54:53 UTC · budget does not reset.
+  Your answer (Ctrl+C cancels this goal)
+  ›
+  Enter send · Alt+Enter newline · Ctrl+C cancel · Ctrl+D exit

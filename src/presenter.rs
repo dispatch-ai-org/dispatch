@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Context, Result};
 mod handoff;
 mod inspection;
+mod setup;
 mod theme;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -22,6 +23,7 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 use ratatui_textarea::TextArea;
+pub use setup::standalone as resource_setup;
 use std::{
     future::Future,
     io::{self, IsTerminal, Write},
@@ -229,8 +231,24 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
         String::new(),
         label(run, event).to_owned(),
     ];
-    if width >= 40 {
-        lines.push(graph);
+    if crate::planning::planning(run).is_none() {
+        lines.push(if width < 40 {
+            format!("{work_mark} {model}\n{verify_mark} checks  {review_mark} review")
+        } else {
+            graph
+        });
+    }
+    if run.outcome.phase == RunPhase::Executing
+        && run.outcome.work_result == WorkResult::Pending
+        && run.outcome.waiting_on == WaitingOn::None
+    {
+        lines.push("Agent running · tool activity is in private logs".into());
+        if let Some(decision) = &run.allocation {
+            lines.push(format!(
+                "Choice: {}",
+                clip(&decision.reason, width.saturating_sub(8))
+            ));
+        }
     }
     // One attempt is already represented by the work node. Show branches only
     // when the committed history contains recovery or clarification continuation.
@@ -294,7 +312,11 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
         if p.plan.is_none() {
             lines.push(format!("Planner · {model}"));
         }
-        for task in &p.tasks {
+        for task in p
+            .tasks
+            .iter()
+            .filter(|_| run.outcome.work_result != WorkResult::Ready)
+        {
             let spec = p
                 .plan
                 .as_ref()
@@ -305,13 +327,21 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
                 _ => pending,
             };
             let title = spec.map(|s| s.objective.as_str()).unwrap_or(&task.id);
+            let state = match task.state {
+                crate::planning::TaskState::Pending => "queued",
+                crate::planning::TaskState::Working => "working",
+                crate::planning::TaskState::Waiting => "needs attention",
+                crate::planning::TaskState::Integrated => "checked + integrated",
+                crate::planning::TaskState::Failed => "failed",
+            };
+            lines.push(format!("{mark} {}", clip(title, width.saturating_sub(3))));
             lines.push(format!(
-                "{mark} {} · {} · {:?}",
-                clip(title, width.saturating_sub(28)),
-                model_name(&task.decision.selected.resolved_model),
-                task.state
+                "  {} · {state}",
+                model_name(&task.decision.selected.resolved_model)
             ));
-            if let Some(spec) = spec {
+            if let Some(spec) =
+                spec.filter(|_| task.state != crate::planning::TaskState::Integrated)
+            {
                 let dependencies = spec
                     .prerequisites
                     .iter()
@@ -329,13 +359,12 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
         if let Some(error) = &p.error {
             lines.push(format!("Stopped: {}", clip(error, 240)));
         }
-        lines.push(format!(
-            "{} of {} invocation records · one shared extra",
-            run.attempts.len(),
-            run.phase3.as_ref().unwrap().max_invocations
-        ));
+        lines.push("One shared extra for the entire goal".into());
     }
     if let Some(q) = pending_question(run) {
+        lines.push(
+            "Decision needed · answering continues this goal within its remaining limit.".into(),
+        );
         lines.push(q.report.question.clone());
         if !q.report.choices.is_empty() {
             lines.push(q.report.choices.join(" / "));
@@ -403,6 +432,28 @@ pub fn review_command(run: &RunRecord) -> Result<ReviewCommand> {
         candidate_id: candidate.id.clone(),
         revision: run.state_revision,
     })
+}
+
+fn launch_accounting(state: &State, run: &RunRecord) -> String {
+    let maximum = run.phase3.as_ref().map_or(2, |p| {
+        p.planning
+            .as_ref()
+            .and_then(|p| p.plan.as_ref())
+            .map_or(p.max_invocations, |plan| {
+                p.max_invocations.min(plan.tasks.len() as u32 + 2)
+            })
+    });
+    let counts = (|| -> Result<(u32, u32)> {
+        let db = crate::db::Database::open_read_only(state.db_path())?;
+        db.connection().busy_timeout(Duration::from_millis(10))?;
+        Ok(db.connection().query_row("SELECT COALESCE(SUM(launch_knowledge IN ('child_recorded','cleanup_confirmed')),0), COALESCE(SUM(launch_knowledge NOT IN ('child_recorded','cleanup_confirmed','launch_intent_committed','launch_not_started')),0) FROM admission_requests WHERE run_id=?1",[&run.id],|r|Ok((r.get(0)?,r.get(1)?)))?)
+    })();
+    match counts {
+        Ok((known, uncertain)) => {
+            format!("Launches {known} recorded · {uncertain} uncertain · limit {maximum}")
+        }
+        Err(_) => format!("Launch count unavailable · limit {maximum}"),
+    }
 }
 
 fn details(run: &RunRecord) -> String {
@@ -523,7 +574,11 @@ fn activity_hint(elapsed: Duration, ascii: bool) -> String {
     } else {
         ["◐", "◓", "◑", "◒"]
     };
-    let frame = frames[(elapsed.as_millis() / 200 % 4) as usize];
+    let frame = if std::env::var_os("DISPATCH_REDUCED_MOTION").is_some() {
+        "."
+    } else {
+        frames[(elapsed.as_millis() / 200 % 4) as usize]
+    };
     format!("{frame} {}s elapsed · Ctrl+C cancel", elapsed.as_secs())
 }
 
@@ -533,8 +588,7 @@ fn content_area(area: Rect) -> Rect {
         area.x + margin,
         area.y,
         area.width
-            .saturating_sub(if margin > 0 { margin + 1 } else { 0 })
-            .min(100),
+            .saturating_sub(if margin > 0 { margin + 1 } else { 0 }),
         area.height,
     )
 }
@@ -565,20 +619,33 @@ fn styled_body<'a>(body: &'a str, palette: &Theme) -> Text<'a> {
     Text::from(
         body.lines()
             .map(|line| {
-                if line == "●─┬─○  DISPATCH" || line == "*-+-o  DISPATCH" {
-                    let (mark, wordmark) = line.split_once("  ").unwrap();
+                if line.ends_with("  DISPATCH")
+                    && (line.starts_with("  ┌") || line.starts_with("  +"))
+                {
+                    let (mark, wordmark) = line.rsplit_once("  ").unwrap();
                     return Line::from(vec![
-                        Span::styled(mark, palette.accent),
+                        Span::styled(mark, palette.foreground),
                         Span::styled(format!("  {wordmark}"), palette.foreground.bold()),
                     ]);
                 }
-                if let Some(context) = line
-                    .strip_prefix("  ╰─○")
-                    .or_else(|| line.strip_prefix("  +-o"))
-                {
+                if line.starts_with("━━") || line.starts_with("==") {
+                    let (cells, style) = if line.starts_with("━━━") || line.starts_with("===")
+                    {
+                        (3, palette.success)
+                    } else if line.starts_with("━━└") || line.starts_with("==+") {
+                        (2, palette.warning)
+                    } else {
+                        (2, palette.accent)
+                    };
+                    let bar = line
+                        .char_indices()
+                        .nth(cells)
+                        .map_or(line.len(), |(i, _)| i);
+                    let split = line.char_indices().nth(6).map_or(line.len(), |(i, _)| i);
                     return Line::from(vec![
-                        Span::styled(&line[..line.len() - context.len()], palette.accent),
-                        Span::styled(context, palette.secondary),
+                        Span::styled(&line[..bar], style),
+                        Span::styled(&line[bar..split], palette.foreground),
+                        Span::styled(&line[split..], palette.secondary),
                     ]);
                 }
                 if line.starts_with("● goal") || line.starts_with("* goal") {
@@ -638,10 +705,17 @@ fn draw_view(
     let input_height = editor.map_or(0, |e| {
         (e.text.lines().len().clamp(1, 3) as u16).min(area.height.saturating_sub(1))
     });
+    let hints = Paragraph::new(hint)
+        .style(palette.secondary)
+        .wrap(Wrap { trim: false });
+    let hint_height = (hints.line_count(area.width) as u16)
+        .min(3)
+        .min(area.height.saturating_sub(input_height));
     let paragraph = Paragraph::new(styled_body(body, palette)).wrap(Wrap { trim: false });
     let body_height = paragraph
         .line_count(area.width)
-        .min(area.height.saturating_sub(input_height + 1) as usize) as u16;
+        .min(area.height.saturating_sub(input_height + hint_height) as usize)
+        as u16;
     frame.render_widget(
         paragraph,
         Rect::new(area.x, area.y, area.width, body_height),
@@ -667,14 +741,14 @@ fn draw_view(
         );
     }
     frame.render_widget(
-        Paragraph::new(hint).style(palette.secondary),
+        hints,
         Rect::new(
             area.x,
             area.y + body_height + input_height,
             area.width,
             area.height
                 .saturating_sub(body_height + input_height)
-                .min(1),
+                .min(hint_height),
         ),
     );
 }
@@ -787,7 +861,7 @@ impl Screen {
                     viewport: if inspection {
                         Viewport::Fullscreen
                     } else {
-                        Viewport::Inline(height.clamp(1, 14))
+                        Viewport::Inline(height.clamp(1, 20))
                     },
                 },
             )?;
@@ -821,6 +895,9 @@ struct Ui {
     options: Options,
     palette: Theme,
     closed: bool,
+    draft: String,
+    launch_line: String,
+    render_key: String,
     reviewed: Option<(
         RunRecord,
         std::result::Result<crate::private_evidence::AnnotationRequest, String>,
@@ -876,6 +953,9 @@ impl Ui {
             options,
             palette: Theme::from_env(options.no_color),
             closed: false,
+            draft: String::new(),
+            launch_line: String::new(),
+            render_key: String::new(),
             reviewed: None,
             #[cfg(unix)]
             term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
@@ -884,11 +964,20 @@ impl Ui {
         })
     }
     fn width(&self) -> u16 {
-        terminal::size().map(|s| s.0).unwrap_or(80).min(103)
+        terminal::size().map(|s| s.0).unwrap_or(80)
     }
     fn draw(&mut self, body: &str, editor: Option<&Editor>, hint: &str) -> Result<()> {
         let body = self.display_text(body);
         let hint = self.display_text(hint);
+        let key = format!(
+            "{body}\0{hint}\0{:?}\0{:?}",
+            terminal::size(),
+            editor.map(|e| (e.text.lines(), e.text.cursor()))
+        );
+        if key == self.render_key {
+            return Ok(());
+        }
+        self.render_key = key;
         let Some(screen) = &mut self.screen else {
             return Ok(());
         };
@@ -919,6 +1008,7 @@ impl Ui {
         self.commit_text(text, false)
     }
     fn commit_text(&mut self, text: &str, diff: bool) -> Result<()> {
+        self.render_key.clear();
         let text = self.display_text(text);
         if let Some(screen) = &mut self.screen {
             // Bounded blocks enter ordinary terminal scrollback, never alternate screen.
@@ -941,7 +1031,7 @@ impl Ui {
                 ))
                 .wrap(Wrap { trim: false });
                 let height = paragraph
-                    .line_count(screen.terminal.size()?.width.clamp(1, 103))
+                    .line_count(screen.terminal.size()?.width.max(1))
                     .min(u16::MAX as usize) as u16;
                 screen.terminal.insert_before(height, |buffer| {
                     use ratatui::widgets::Widget;
@@ -949,7 +1039,7 @@ impl Ui {
                         Rect::new(
                             buffer.area.x,
                             buffer.area.y,
-                            buffer.area.width.min(103),
+                            buffer.area.width,
                             buffer.area.height,
                         ),
                         buffer,
@@ -1045,6 +1135,16 @@ impl Ui {
             return Ok(Input::Eof);
         }
         let mut editor = Editor::new();
+        if body.contains("accomplish?") && !self.draft.is_empty() {
+            let draft = std::mem::take(&mut self.draft);
+            if self.screen.is_none() {
+                self.commit(&format!(
+                    "Preserved goal: {draft}\nEnter it again to submit explicitly."
+                ))?;
+            } else {
+                editor.text.insert_str(draft);
+            }
+        }
         if self.screen.is_none() {
             self.commit(body)?;
             print!("> ");
@@ -1103,7 +1203,11 @@ impl Ui {
         self.closed = true;
         anyhow::bail!("input overflow while working; session closed")
     }
-    async fn work<F: Future<Output = Result<RunRecord>>>(&mut self, work: F) -> Result<RunRecord> {
+    async fn work<F: Future<Output = Result<RunRecord>>>(
+        &mut self,
+        state: &State,
+        work: F,
+    ) -> Result<RunRecord> {
         let cancellation = CancellationToken::new();
         let (updates, mut rx) = tokio::sync::watch::channel(None);
         let work = orchestrator::present(
@@ -1122,11 +1226,25 @@ impl Ui {
         }
         let mut last_label = String::new();
         let mut input_open = true;
+        let mut accounting_at = Instant::now();
         loop {
             if !cancellation.is_cancelled()
                 && let Some((event, run)) = &latest
             {
-                body = projection(run, Some(event), self.width(), self.options.ascii);
+                if accounting_at.elapsed() >= Duration::from_secs(1) {
+                    self.launch_line = launch_accounting(state, run);
+                    accounting_at = Instant::now();
+                }
+                body = format!(
+                    "{}\n{}",
+                    projection(
+                        run,
+                        Some(event),
+                        self.width().saturating_sub(3),
+                        self.options.ascii
+                    ),
+                    self.launch_line
+                );
             }
             if let Err(error) = self.draw(
                 &body,
@@ -1141,6 +1259,7 @@ impl Ui {
                 result = &mut work => {
                     self.discard_work_input()?;
                     let run = result?;
+                    self.launch_line = launch_accounting(state,&run);
                     let update = rx.borrow_and_update().clone();
                     let event = update.as_ref()
                         .filter(|(_, committed)| committed.id == run.id && committed.state_revision == run.state_revision)
@@ -1166,6 +1285,7 @@ impl Ui {
                                 }
                                 last_label = current.into();
                             }
+                            self.launch_line = launch_accounting(state,&run);
                             latest = Some((event, run));
                         }
                     }
@@ -1213,13 +1333,58 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
             options.ascii,
         ))?;
     }
+    let context = tokio::time::timeout(Duration::from_millis(200), async {
+        let inside = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !inside.status.success() {
+            return Ok::<_, io::Error>("Plain directory · local source".to_owned());
+        }
+        let branch = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        Ok(if branch.status.success() {
+            format!(
+                "Git checkout · branch {}",
+                sanitize(&String::from_utf8_lossy(&branch.stdout)).trim()
+            )
+        } else {
+            "Git checkout · detached HEAD".into()
+        })
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_else(|| "Project context unavailable · local source".into());
+    ui.commit(&context)?;
     loop {
         let prompt = if ui.reviewed.is_some() {
             "Next goal: What do you want to accomplish?\n[f] Use this review for local routing   [i] Details"
         } else {
-            "What do you want to accomplish?\nUse /plan before a goal for bounded sequential planning."
+            "What do you want to accomplish?\nDirect by default · /plan for sequential work
+/resources accounts · /checks project checks"
         };
         let task = match ui.prompt(prompt).await? {
+            Input::Submit(task) if task.trim() == "/resources" => {
+                if let Err(e) = setup::accounts(&mut ui, state, None).await {
+                    ui.commit(&format!("Resources: {e}"))?;
+                }
+                continue;
+            }
+            Input::Submit(task) if task.trim() == "/checks" => {
+                if let Err(e) = setup::checks(&mut ui, &source).await {
+                    ui.commit(&format!("Checks unchanged: {e}"))?;
+                }
+                continue;
+            }
             Input::Submit(task) if ui.reviewed.is_some() && task.trim() == "f" => {
                 let (run, request) = ui.reviewed.as_ref().unwrap().clone();
                 if let Err(error) = attest_review(&mut ui, state, &run, request).await {
@@ -1257,7 +1422,15 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
         }
         let result = run_goal(&mut ui, state, &source, task, options).await;
         if let Err(error) = result {
-            ui.commit(&format!("Stopped: {error:#}"))?;
+            ui.commit(&format!(
+                "Stopped: {}\n{}",
+                clip(&format!("{error:#}"), 400),
+                if ui.draft.is_empty() {
+                    "Inspect the retained result with dispatch status or history."
+                } else {
+                    "Goal preserved below; edit or explicitly submit again."
+                }
+            ))?;
         }
     }
 }
@@ -1269,12 +1442,19 @@ async fn run_goal(
     task: String,
     options: Options,
 ) -> Result<()> {
+    ui.draft = task.clone();
     let resources = crate::config::ResourceConfig::load(&state.root)?;
-    anyhow::ensure!(
-        resources.allocation_enabled,
-        "Included-resource allocation is not configured for this session. Configure the validated subscription profiles in {} before running work; see the README allocation setup.",
-        state.root.join("resources.yml").display()
-    );
+    if !resources.allocation_enabled || !resources.profiles.iter().any(|p| p.eligibility().is_ok())
+    {
+        ui.commit(&format!(
+            "{}\nSetup needed · your goal is preserved.",
+            goal_heading(&task, ui.width().saturating_sub(3))
+        ))?;
+        setup::accounts(ui, state, None).await?;
+        ui.draft = task;
+        ui.commit("Return to your goal. Submit explicitly when ready.")?;
+        return Ok(());
+    }
     let (config, _) = Config::discover(source, None)?;
     // This is an explicit per-goal host-execution permission, never trust from YAML.
     let local = config.execution.backend == "local";
@@ -1282,6 +1462,13 @@ async fn run_goal(
         match ui.prompt(&format!("{}\n\nLocal execution is not sandboxed.\nAgent and checks use your permissions in a separate workspace.\nAllow this goal? [y/N]",goal_heading(&task,ui.width().saturating_sub(3)))).await? {
             Input::Submit(answer) if matches!(answer.to_lowercase().as_str(), "y" | "yes") => {},
             _ => { ui.commit("Local execution was not authorized.")?; return Ok(()); }
+        }
+    }
+    if config.checks.verify.is_empty() {
+        if crate::setup::check_choices(source).is_empty() {
+            ui.commit("Unverified — no checks configured. Add project checks with /checks or dispatch.yml.")?;
+        } else {
+            setup::checks(ui, source).await?;
         }
     }
     let plan = task.starts_with("/plan ");
@@ -1309,16 +1496,32 @@ async fn run_goal(
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,
     };
-    let mut run = ui.work(orchestrator::run_dispatch(state, request)).await?;
+    ui.draft.clear();
+    let mut run = ui
+        .work(state, orchestrator::run_dispatch(state, request))
+        .await?;
     loop {
         if let Some(command) = question_command(&run) {
-            let prompt = "Your answer (Ctrl+C cancels this goal)";
+            let deadline = run
+                .phase3
+                .as_ref()
+                .map(|p| {
+                    format!(
+                        "Deadline {} · budget does not reset.\n",
+                        p.deadline_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    )
+                })
+                .unwrap_or_default();
+            let prompt = format!(
+                "{}\n{deadline}Your answer (Ctrl+C cancels this goal)",
+                ui.launch_line
+            );
             let answer = if let Some(policy) = run.phase3.as_ref().filter(|p| p.planning.is_some())
             {
                 let remaining = (policy.deadline_at - chrono::Utc::now())
                     .to_std()
                     .unwrap_or_default();
-                match tokio::time::timeout(remaining, ui.prompt(prompt)).await {
+                match tokio::time::timeout(remaining, ui.prompt(&prompt)).await {
                     Ok(answer) => answer?,
                     Err(_) => {
                         run = state.load_run(&run.id)?;
@@ -1327,17 +1530,20 @@ async fn run_goal(
                     }
                 }
             } else {
-                ui.prompt(prompt).await?
+                ui.prompt(&prompt).await?
             };
             match answer {
                 Input::Submit(answer) if !answer.trim().is_empty() => {
                     run = ui
-                        .work(orchestrator::answer_question(
+                        .work(
                             state,
-                            command,
-                            answer,
-                            RunOutputMode::Silent,
-                        ))
+                            orchestrator::answer_question(
+                                state,
+                                command,
+                                answer,
+                                RunOutputMode::Silent,
+                            ),
+                        )
                         .await?;
                     continue;
                 }
@@ -1518,7 +1724,7 @@ mod tests {
         );
         assert_eq!(
             render(&projection(&r, None, 24, true), 24),
-            "Goal  Fix cache\n\nReady for review\nVerification passed"
+            "Goal  Fix cache\n\nReady for review\no work\n* checks  * review\nVerification passed"
         );
         for (waiting, expected) in [
             (WaitingOn::Human, "Waiting for you"),
@@ -1564,6 +1770,25 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_a_decision_or_capacity_never_claims_agent_is_running() {
+        let mut r = run();
+        r.outcome.phase = RunPhase::Executing;
+        r.outcome.work_result = WorkResult::Pending;
+        r.outcome.waiting_on = WaitingOn::None;
+        assert!(projection(&r, None, 90, false).contains("Agent running"));
+        for waiting in [
+            WaitingOn::Human,
+            WaitingOn::Capacity,
+            WaitingOn::Admission,
+            WaitingOn::Reconciliation,
+            WaitingOn::Authorization,
+        ] {
+            r.outcome.waiting_on = waiting;
+            assert!(!projection(&r, None, 90, false).contains("Agent running"));
+        }
+    }
+
+    #[test]
     fn compact_input_and_activity_survive_resize() {
         let mut editor = Editor::new();
         editor.event(Event::Paste("α\n界".into()));
@@ -1586,7 +1811,12 @@ mod tests {
             let body_height = Paragraph::new("Your answer")
                 .wrap(Wrap { trim: false })
                 .line_count(area.width)
-                .min(5) as u16;
+                .min(
+                    6 - Paragraph::new("Enter send")
+                        .wrap(Wrap { trim: false })
+                        .line_count(area.width)
+                        .min(3),
+                ) as u16;
             assert_eq!(buffer[(area.x, body_height)].symbol(), ">");
             assert_eq!(editor.text.lines(), &["α", "界"]);
         }

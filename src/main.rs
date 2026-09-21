@@ -38,6 +38,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect local resource funding configuration without model calls.
+    Resources,
+    /// Guided local setup / explicit funding revalidation (requires a terminal).
+    Setup {
+        /// Choose and explicitly approve project verification commands.
+        #[arg(long, conflicts_with = "provider")]
+        checks: bool,
+        #[arg(value_parser = ["codex", "claude"])]
+        provider: Option<String>,
+    },
     /// Foreground, scoped bidirectional JSON Lines (requires a human-issued grant).
     Control {
         #[arg(long, required = true)]
@@ -488,6 +498,24 @@ async fn run() -> Result<()> {
         .await;
     };
     match command {
+        Command::Resources => {
+            println!("{}", dispatch::setup::status(&state)?);
+            Ok(())
+        }
+        Command::Setup { provider, checks } => {
+            dispatch::presenter::resource_setup(
+                &state,
+                provider,
+                checks,
+                dispatch::presenter::Options {
+                    plain: cli.plain,
+                    ascii: cli.ascii,
+                    no_color: cli.no_color,
+                    no_retry: cli.no_retry,
+                },
+            )
+            .await
+        }
         Command::Control {
             stdio: _,
             grant_fd,

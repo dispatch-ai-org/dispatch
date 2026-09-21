@@ -1,0 +1,12 @@
+{
+  "source": "attention.question.ansi",
+  "terminal_columns": 120,
+  "terminal_rows": 40,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 22,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "b8324c0913b1b167b50d93aaafb1e2989df4fa189665312a44981293fe9293a5",
+  "milestone_seconds": 7.788114
+}

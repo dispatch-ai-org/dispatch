@@ -1,0 +1,21 @@
+    ┌──╮  DISPATCH
+  ━━   ┃  source
+  ━━━  ┃  intent → work → review
+  ━━└──╯
+  Plain directory · local source
+  Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations under one deadline.
+One final human review.
+  Goal  Update a.c to return a positive value
+
+  Working
+  Agent running · tool activity is in private logs
+  Choice: Using strong: the task has broad scope.
+  Planned work · sequential execution
+  ○ Update a.c within its stated contract
+    fixture-light · working
+  ○ Update b.c within its stated contract
+    fixture-standard · queued
+    requires checked output: a
+  One shared extra for the entire goal
+  Launches 1 recorded · 0 uncertain · limit 4
+  ◑ 5s elapsed · Ctrl+C cancel

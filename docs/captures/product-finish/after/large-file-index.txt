@@ -1,0 +1,40 @@
+  Changes  ·  53 entries  ·  53 matching
+  1 rename(s) combine old and new paths
+  > modified +1 -1        a.c
+    added    generated?   generated.lock
+    modified binary       image.bin
+    modified +1 -1        item-00.txt
+    modified +1 -1        item-01.txt
+    modified +1 -1        item-02.txt
+    modified +1 -1        item-03.txt
+    modified +1 -1        item-04.txt
+    modified +1 -1        item-05.txt
+    modified +1 -1        item-06.txt
+    modified +1 -1        item-07.txt
+    modified +1 -1        item-08.txt
+    modified +1 -1        item-09.txt
+    modified +1 -1        item-10.txt
+    modified +1 -1        item-11.txt
+    modified +1 -1        item-12.txt
+    modified +1 -1        item-13.txt
+    modified +1 -1        item-14.txt
+    modified +1 -1        item-15.txt
+    modified +1 -1        item-16.txt
+    modified +1 -1        item-17.txt
+    modified +1 -1        item-18.txt
+    modified +1 -1        item-19.txt
+    modified +1 -1        item-20.txt
+    modified +1 -1        item-21.txt
+    modified +1 -1        item-22.txt
+    modified +1 -1        item-23.txt
+    modified +1 -1        item-24.txt
+    modified +1 -1        item-25.txt
+    modified +1 -1        item-26.txt
+    modified +1 -1        item-27.txt
+    modified +1 -1        item-28.txt
+    modified +1 -1        item-29.txt
+    modified +1 -1        item-30.txt
+    modified +1 -1        item-31.txt
+
+  Filter /
+  q back  Enter open  / filter  ↑↓ choose  e editor  v pager

@@ -17,6 +17,7 @@ pub mod private_evidence;
 pub mod public_priors;
 pub mod reviewer;
 pub mod router;
+pub mod setup;
 pub mod source;
 pub mod state;
 pub mod sync;

@@ -1,0 +1,28 @@
+{
+  "before": {
+    "samples": 10,
+    "local_ack_ms": {
+      "min": 50.83,
+      "median": 55.365,
+      "max": 58.75
+    },
+    "startup_to_captured_intent_ms": {
+      "min": 142.07500000000002,
+      "median": 145.1325,
+      "max": 150.762
+    }
+  },
+  "after": {
+    "samples": 10,
+    "local_ack_ms": {
+      "min": 50.58,
+      "median": 54.894999999999996,
+      "max": 59.29
+    },
+    "startup_to_captured_intent_ms": {
+      "min": 141.94899999999998,
+      "median": 152.1805,
+      "max": 153.57999999999998
+    }
+  }
+}

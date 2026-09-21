@@ -124,12 +124,13 @@ impl Ui {
             return Ok(Input::Eof);
         }
         let mut action = String::new();
-        let summary = projection(
+        let mut summary = projection(
             run,
             None,
             self.width().saturating_sub(3),
             self.options.ascii,
         );
+        summary.push_str(&format!("\n{}", self.launch_line));
         let actions = "[Enter/d] Review changes   [e] Open in editor\n[a] Accept & apply   [r] Reject   [n] Leave pending   [i] Details";
         if self.options.plain {
             return self
@@ -138,7 +139,11 @@ impl Ui {
         }
         loop {
             let width = self.width().saturating_sub(3);
-            let body = self.display_text(&projection(run, None, width, self.options.ascii));
+            let body = self.display_text(&format!(
+                "{}\n{}",
+                projection(run, None, width, self.options.ascii),
+                self.launch_line
+            ));
             let preview = self.display_text(preview);
             let notice = self.display_text(notice);
             let screen = self.screen.as_mut().context("terminal is unavailable")?;
@@ -170,7 +175,11 @@ impl Ui {
                 ];
                 let control = Paragraph::new(Text::from(controls)).wrap(Wrap { trim: false });
                 let height = control.line_count(area.width).min(area.height as usize) as u16;
-                let upper = area.height.saturating_sub(height + 1);
+                let upper = (Paragraph::new(Text::from(lines.clone()))
+                    .wrap(Wrap { trim: false })
+                    .line_count(area.width) as u16
+                    + 1)
+                .min(area.height.saturating_sub(height + 1));
                 // If space is limited, keep goal/state/verification above controls.
                 frame.render_widget(
                     Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
@@ -261,6 +270,7 @@ impl Ui {
             let result = self.inspect_loop(bundle, view, state, target).await;
             self.screen.take();
             self.screen = Some(Screen::new()?);
+            self.render_key.clear();
             notice = result?;
         }
         self.input_boundary().await?;
@@ -353,16 +363,51 @@ impl Ui {
                     );
                 }
                 if view.file {
-                    let lines = all_lines
+                    let lines: Vec<_> = all_lines
                         .iter()
                         .skip(view.row)
                         .take(body_height)
                         .cloned()
                         .collect::<Vec<_>>();
+                    let clipped = lines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(row, line)| {
+                            (line.width() > usize::from(view.column) + usize::from(area.width))
+                                .then_some(row)
+                        })
+                        .collect::<Vec<_>>();
                     frame.render_widget(
                         Paragraph::new(Text::from(lines)).scroll((0, view.column)),
                         Rect::new(area.x, area.y + 2, area.width, body_height as u16),
                     );
+                    for row in clipped {
+                        frame.render_widget(
+                            Paragraph::new(if ascii { ">" } else { "›" })
+                                .style(self.palette.warning),
+                            Rect::new(
+                                area.right().saturating_sub(1),
+                                area.y + 2 + row as u16,
+                                1,
+                                1,
+                            ),
+                        );
+                    }
+                    if let Some(entry) = selected {
+                        frame.render_widget(
+                            Paragraph::new(
+                                format!(
+                                    "{} · {} · column {} · arrows pan",
+                                    entry.kind.label(),
+                                    entry.category(),
+                                    view.column + 1
+                                )
+                                .replace('·', if ascii { "-" } else { "·" }),
+                            )
+                            .style(self.palette.secondary),
+                            Rect::new(area.x, area.y + 1, area.width, 1),
+                        );
+                    }
                 } else {
                     let at = visible
                         .iter()
@@ -375,8 +420,8 @@ impl Ui {
                         .take(body_height)
                         .map(|i| {
                             let e = &bundle.entries[*i];
-                            let count = if e.binary {
-                                "binary".into()
+                            let count = if e.category() != "text" {
+                                e.category().into()
                             } else {
                                 format!(
                                     "+{} -{}",
@@ -395,7 +440,13 @@ impl Ui {
                                 let kind = format!(
                                     "{}{}",
                                     e.kind.label(),
-                                    if e.binary { " binary" } else { "" }
+                                    if e.permission_change {
+                                        " mode"
+                                    } else if e.binary {
+                                        " binary"
+                                    } else {
+                                        ""
+                                    }
                                 );
                                 format!(
                                     "{marker} {:8} {}",
@@ -433,9 +484,9 @@ impl Ui {
                 } else if !notice.is_empty() {
                     notice.clone()
                 } else if preview.as_ref().is_some_and(|p| p.truncated) {
-                    "Bounded page · Space next page · v full patch pager".into()
+                    "Preview truncated · Space next page · v full patch".into()
                 } else if view.file {
-                    "Review copies only · external edits are never imported".into()
+                    "Clipped lines: > · arrows pan · v full patch".into()
                 } else {
                     format!("Filter /{}", view.filter)
                 };
@@ -444,7 +495,11 @@ impl Ui {
                 } else {
                     status
                 };
-                let hint = if view.file {
+                let hint = if area.width < 60 && view.file {
+                    "q back · Esc files · arrows pan/scroll"
+                } else if area.width < 60 {
+                    "q back · Enter open · / find · e editor"
+                } else if view.file {
                     "q back  Esc files  ↑↓ scroll  ←→ pan  n/p hunk  [ ] file  e editor  v pager"
                 } else {
                     "q back  Enter open  / filter  ↑↓ choose  e editor  v pager"
@@ -455,7 +510,9 @@ impl Ui {
                 );
                 frame.render_widget(
                     Paragraph::new(if ascii {
-                        hint.replace("↑↓", "j/k").replace("←→", "h/l")
+                        hint.replace("↑↓", "j/k")
+                            .replace("←→", "h/l")
+                            .replace('·', "-")
                     } else {
                         hint.into()
                     })

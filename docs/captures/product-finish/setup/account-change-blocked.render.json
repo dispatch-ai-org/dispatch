@@ -1,0 +1,12 @@
+{
+  "source": "account-change.blocked.ansi",
+  "terminal_columns": 100,
+  "terminal_rows": 36,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 19,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "5143a0a3839684c4b3f43f1bf0e37a8f4e9165d4fc615c73d6f560900dfb5d21",
+  "milestone_seconds": 0.266435
+}

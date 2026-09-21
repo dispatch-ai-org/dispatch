@@ -8,7 +8,7 @@ quality or lower cost. No private policy is activated.
 ## Start and review
 
 Configure included-resource allocation and eligible Codex or Claude profiles using
-[the existing setup contract](phase6-validation.md). Planning needs a suitable
+[the shared terminal setup guide](product-guide.md). Planning needs a suitable
 strong profile within those resources, executable checks, and the original
 verification files identified by the owner. No provider/account change is implied.
 

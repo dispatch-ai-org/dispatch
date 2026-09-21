@@ -1,0 +1,10 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Stopped: Included-resource allocation is not configured for this session. Configure the validated
+subscription profiles in
+/var/folders/jr/8r7_n16n09l9rnqfmkj58gbr0000gp/T/dispatch-phase5-xhfs5xhn/state/resources.yml before
+running work; see the README allocation setup.
+  What do you want to accomplish?
+  Use /plan before a goal for bounded sequential planning.
+  ›
+  Enter send · Alt+Enter newline · Ctrl+C cancel · Ctrl+D exit

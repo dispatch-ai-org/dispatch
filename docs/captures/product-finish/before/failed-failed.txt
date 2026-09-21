@@ -1,0 +1,12 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Goal  Update a.c to return a positive value
+
+  Failed
+  ● goal ━━ ● fixture-standard ━━ × verify ── ○ review
+  Verification failed
+  Work stopped; inspect Details for the recorded failure.
+  attempt did not safely complete
+  Work stopped. [i] details  [n] next goal
+  ›
+  Enter choose · Ctrl+C back · Ctrl+D exit

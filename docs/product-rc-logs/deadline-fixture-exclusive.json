@@ -1,0 +1,18 @@
+[
+  {
+    "binary": "baseline",
+    "checks": "compiler",
+    "exclusive": true,
+    "seconds_to_question": 6.802,
+    "questions": 1,
+    "launches": 2
+  },
+  {
+    "binary": "candidate",
+    "checks": "compiler",
+    "exclusive": true,
+    "seconds_to_question": 3.336,
+    "questions": 1,
+    "launches": 2
+  }
+]

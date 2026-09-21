@@ -1,0 +1,7 @@
+  Choose checks
+  [1] sh ./verify.sh
+  [n] Continue unverified   [b] Back
+  A check runs project code with your permissions. Choosing a command approves it for this project;
+  it does not prove task-specific correctness.
+  ›
+  Enter choose · Ctrl+C back · Ctrl+D exit

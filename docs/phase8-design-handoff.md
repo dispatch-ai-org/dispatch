@@ -8,16 +8,14 @@ cohesive visual/interaction polish and release hardening.
 
 ## Preserve the actual selected identity
 
-The current selected compact scheduler signature lives in
-[`src/presenter/theme.rs`](../src/presenter/theme.rs): two rows with a filled inlet,
-two hollow outlets, project context, native background, and explicit ASCII/color
-fallbacks. Phase 8 does not modify this file or replace the theme system.
+This is the historical Phase 8 handoff. The later owner-supplied reference
+established the open-D scheduler with cyan, emerald and amber bars as the brand
+foundation. The implemented finish pass and current assets are documented in
+[the design system](design-system.md). The old node-motif captures below remain
+historical evidence, not the selected logo specification.
 
-The retained approved terminal references are actual files under
-[`docs/captures/phase4-refinement`](captures/phase4-refinement/README.md), including
-`startup.png`, `working.png`, `tiny-review.png`, and `large-review.png`. These are
-recorded terminal-byte renderings with metadata, not native graphical screenshots.
-Do not substitute early fork/diamond mockups or invent a different asset path.
+The original Phase 4 and Phase 8 captures remain in `docs/captures`; the finish-pass
+before/after evidence is in [product-finish](captures/product-finish/README.md).
 
 ## Current states and observations
 

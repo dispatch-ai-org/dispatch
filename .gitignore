@@ -1,4 +1,5 @@
 /target/
 /research/
+/release-artifacts/
 *.tmp
 .DS_Store

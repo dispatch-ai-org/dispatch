@@ -82,7 +82,7 @@ class Screen:
                         self.rows, self.x, self.y = self.saved
                         self.saved = None
                 elif v == 25: self.cursor = command == 'h'
-                elif v not in (2004, 1, 1000, 1002, 1003, 1006, 1004):
+                elif v not in (2004, 1, 1000, 1002, 1003, 1006, 1004, 1015):
                     raise ValueError(f'Unsupported private mode {v}')
             return
         if command in 'Hf':
@@ -148,6 +148,8 @@ def main():
     args.add_argument('--width', type=int, default=100)
     args.add_argument('--height', type=int, default=30)
     args.add_argument('--font', default='/System/Library/Fonts/Menlo.ttc')
+    args.add_argument('--background', default='#070B10')
+    args.add_argument('--foreground', default='#F8FAFC')
     options = args.parse_args()
     screen = Screen(options.width, options.height)
     screen.feed(options.input.read_bytes().decode('utf-8'))
@@ -157,15 +159,15 @@ def main():
     font = ImageFont.truetype(options.font, 18)
     bold = ImageFont.truetype(options.font, 18, index=1)
     cell, line, pad = round(font.getlength('M')), 27, 20
-    image = Image.new('RGB',(options.width*cell+pad*2,len(rows)*line+pad*2),'#070B10')
+    image = Image.new('RGB',(options.width*cell+pad*2,len(rows)*line+pad*2),options.background)
     draw = ImageDraw.Draw(image)
     for y,row in enumerate(rows):
         for x,(c,style) in enumerate(row):
             fg,bg,isbold,under,inverse = style
-            fg,bg = fg or '#F8FAFC', bg or '#070B10'
+            fg,bg = fg or options.foreground, bg or options.background
             if inverse: fg,bg = bg,fg
             px,py = pad+x*cell,pad+y*line
-            if bg != '#070B10': draw.rectangle((px,py,px+cell,py+line),fill=bg)
+            if bg != options.background: draw.rectangle((px,py,px+cell,py+line),fill=bg)
             draw.text((px,py),c,font=bold if isbold else font,fill=fg)
             if under: draw.line((px,py+line-3,px+cell,py+line-3),fill=fg,width=1)
     options.output.parent.mkdir(parents=True,exist_ok=True)
@@ -175,7 +177,7 @@ def main():
         'source': options.input.name, 'terminal_columns': options.width,
         'terminal_rows': options.height, 'cropped_blank_rows_before': first,
         'cropped_blank_rows_after': options.height-last,
-        'background_for_preview': '#070B10', 'native_terminal_screenshot': False,
+        'background_for_preview': options.background, 'native_terminal_screenshot': False,
         'font': Path(options.font).name},indent=2)+'\n')
 
 if __name__ == '__main__': main()

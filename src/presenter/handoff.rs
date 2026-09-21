@@ -74,11 +74,24 @@ impl Drop for TerminalOwner {
 }
 
 pub(super) async fn run(ui: &mut Ui, launch: ReviewLaunch) -> Result<ExitStatus> {
+    run_named(
+        ui,
+        launch,
+        "Review copies only. Changes here are not part of the candidate.",
+    )
+    .await
+}
+pub(super) async fn run_named(
+    ui: &mut Ui,
+    launch: ReviewLaunch,
+    heading: &str,
+) -> Result<ExitStatus> {
     ui.input_boundary().await?;
+    let had_screen = ui.screen.is_some();
     let was_alternate = ALTERNATE.load(std::sync::atomic::Ordering::SeqCst);
     ui.screen.take();
     let owner = TerminalOwner::capture()?;
-    println!("\n  Review copies only. Changes here are not part of the candidate.");
+    println!("\n  {}", sanitize(heading));
     if let Some(warning) = &launch.warning {
         println!("  {}", sanitize(warning));
     }
@@ -121,7 +134,10 @@ pub(super) async fn run(ui: &mut Ui, launch: ReviewLaunch) -> Result<ExitStatus>
         group.disarm();
     }
     let killed = if explicit_return { None } else { group.kill() };
-    ui.screen = Some(Screen::open(was_alternate)?);
+    if had_screen {
+        ui.screen = Some(Screen::open(was_alternate)?);
+        ui.render_key.clear();
+    }
     ui.input_boundary().await?;
     if explicit_return {
         loop {

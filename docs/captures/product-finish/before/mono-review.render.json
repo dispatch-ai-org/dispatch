@@ -1,0 +1,12 @@
+{
+  "source": "mono.review.ansi",
+  "terminal_columns": 80,
+  "terminal_rows": 24,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 9,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "94e37d347d821829ce67cba990e98cade9b69b400d7c5488ef535ae244245232",
+  "milestone_seconds": 4.440336
+}

@@ -1,0 +1,18 @@
+  ==   |  source
+  ===  |  intent > work > review
+  ==+--+
+  Plain directory - local source
+  Goal  Update a.c to return a positive value
+
+  Ready for review
+  Verification passed
+  1 file changed - +1 / -1 lines
+  Launches 1 recorded - 0 uncertain - limit 2
+
+  Preview - a.c
+  -int a(void) { return 1; }
+  +int a(void) { return 2; }
+
+  [Enter/d] Review changes   [e] Open in editor
+  [a] Accept & apply   [r] Reject
+  [n] Leave pending   [i] Details

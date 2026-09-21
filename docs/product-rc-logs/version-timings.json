@@ -1,0 +1,14 @@
+{
+  "milliseconds": [
+    4.78,
+    4.48,
+    4.53,
+    4.88,
+    4.76,
+    4.59,
+    4.83,
+    4.64
+  ],
+  "median": 4.699999999999999,
+  "method": "8 fresh processes, filesystem cache not purged; version command only"
+}

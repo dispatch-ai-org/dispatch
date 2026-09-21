@@ -107,8 +107,7 @@ impl Theme {
     }
 }
 
-/// Two rows, at most 40 columns; no centering, animation or special font.
-/// The filled inlet/two hollow outlets retain the website's route motif.
+/// Four-row open-D scheduler: staggered bars, native font, no image protocol.
 pub fn signature(project: &str, width: u16, ascii: bool) -> String {
     let width = usize::from(width).min(40);
     if width == 0 {
@@ -122,17 +121,21 @@ pub fn signature(project: &str, width: u16, ascii: bool) -> String {
         }
         return lines.join("\n");
     }
-    let (top, bottom) = if ascii {
-        ("*-+-o  DISPATCH", "  +-o")
+    let rows = if ascii {
+        ["  +--+", "==   |", "===  |", "==+--+"]
     } else {
-        ("●─┬─○  DISPATCH", "  ╰─○")
+        ["  ┌──╮", "━━   ┃", "━━━  ┃", "━━└──╯"]
     };
-    let context = fit(&project, width - 7, ascii);
-    if context.is_empty() {
-        format!("{top}\n{bottom}")
-    } else {
-        format!("{top}\n{bottom}  {context}")
-    }
+    format!(
+        "{}  DISPATCH\n{}  {}\n{}  {}\n{}",
+        rows[0],
+        rows[1],
+        fit(&project, width.saturating_sub(8), ascii),
+        rows[2],
+        fit("intent → work → review", width.saturating_sub(8), ascii)
+            .replace('→', if ascii { ">" } else { "→" }),
+        rows[3]
+    )
 }
 
 fn fit(text: &str, width: usize, ascii: bool) -> String {
@@ -238,18 +241,18 @@ mod tests {
     fn compact_unicode_ascii_and_narrow_signatures() {
         assert_eq!(
             signature("raylib", 80, false),
-            "●─┬─○  DISPATCH\n  ╰─○  raylib"
+            "  ┌──╮  DISPATCH\n━━   ┃  raylib\n━━━  ┃  intent → work → review\n━━└──╯"
         );
         assert_eq!(
             signature("raylib", 80, true),
-            "*-+-o  DISPATCH\n  +-o  raylib"
+            "  +--+  DISPATCH\n==   |  raylib\n===  |  intent > work > review\n==+--+"
         );
         assert_eq!(signature("raylib", 12, false), "DISPATCH\nraylib");
         assert_eq!(signature("", 0, false), "");
         for width in [1, 8, 12, 16, 24, 40, 120] {
             for ascii in [false, true] {
                 let text = signature("very long 界 project context with spaces", width, ascii);
-                assert!(text.lines().count() <= 2);
+                assert!(text.lines().count() <= 4);
                 assert!(
                     text.lines()
                         .all(|l| Span::raw(l).width() <= usize::from(width).min(40))

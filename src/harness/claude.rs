@@ -312,6 +312,28 @@ pub async fn preflight(
         super::probe_version(executable).await?.as_deref() == Some(evidence.cli_version.as_str()),
         "Claude CLI version changed; revalidate the invocation contract"
     );
+    let identity = discover_account(executable, executor, request).await?;
+    ensure!(
+        identity == evidence.account_sha256,
+        "Claude subscription account changed; authorization must be revalidated"
+    );
+
+    // Retain only normalized nonsecret fields, never the private auth response.
+    Ok(
+        json!({"version":1,"auth_method":"claude.ai","account_sha256":identity,
+        "quota":"unknown","funding_basis":"time_bound_user_assertion",
+        "checked_at":evidence.checked_at,"valid_until":evidence.valid_until}),
+    )
+}
+
+/// Supported read-only auth discovery, shared by setup and launch preflight.
+/// The response never escapes this adapter; only a nonsecret identity digest does.
+pub(crate) async fn discover_account(
+    executable: &Path,
+    executor: &Executor,
+    request: &HarnessRunRequest,
+) -> Result<String> {
+    validate_local_settings()?;
     let temp = tempfile::tempdir()?;
     let mut args = controls();
     // --json belongs to auth status, so a misparsed command must fail rather
@@ -353,19 +375,10 @@ pub async fn preflight(
         .context("Claude organization identity unavailable")?;
     let identity = hex::encode(Sha256::digest(serde_json::to_vec(&json!([email, org]))?));
     ensure!(
-        identity == evidence.account_sha256,
-        "Claude subscription account changed; authorization must be revalidated"
-    );
-    ensure!(
         auth.get("extraUsageEnabled") != Some(&json!(true)),
-        "Claude usage credits are enabled"
+        "Claude usage credits are enabled; change them in the provider before revalidating"
     );
-    // Retain only normalized nonsecret fields, never the private auth response.
-    Ok(
-        json!({"version":1,"auth_method":"claude.ai","account_sha256":identity,
-        "quota":"unknown","funding_basis":"time_bound_user_assertion",
-        "checked_at":evidence.checked_at,"valid_until":evidence.valid_until}),
-    )
+    Ok(identity)
 }
 
 pub fn parse_output(output: &str, expected: Option<&str>) -> HarnessTelemetry {

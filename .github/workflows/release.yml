@@ -44,11 +44,10 @@ jobs:
       - run: cargo build --release --locked
       - name: Package and smoke test
         run: |
-          mkdir package smoke
-          cp target/release/dispatch package/dispatch
-          chmod 0755 package/dispatch
-          tar -czf "${{ matrix.asset }}" -C package dispatch
-          test "$(tar -tzf "${{ matrix.asset }}")" = "dispatch"
+          mkdir smoke
+          python3 scripts/package-local.py target/release/dispatch package
+          cp "package/${{ matrix.asset }}" .
+          test "$(tar -tzf "${{ matrix.asset }}" | LC_ALL=C sort | tr '\n' ' ')" = "BUILD.json INSTALL.md LICENSE dispatch "
           tar -xzf "${{ matrix.asset }}" -C smoke
           "./smoke/dispatch" version | grep -Fx "dispatch ${RELEASE_TAG#v}"
       - uses: actions/upload-artifact@v4

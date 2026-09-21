@@ -1,0 +1,7 @@
+{
+  "binary": "/private/tmp/dispatch-rc/current/target/release/dispatch",
+  "binary_sha256": "433da1f8600d2cd1e9765ad1c7e17d9e08802d5426dd199cd201f67bcfe7d144",
+  "git_head": "08fc0a7633d18c1cae39ab93cd36fc5405798cc1",
+  "fixture_only": true,
+  "platform": "darwin"
+}

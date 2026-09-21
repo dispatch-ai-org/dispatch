@@ -1,0 +1,12 @@
+{
+  "source": "fresh.funding.ansi",
+  "terminal_columns": 100,
+  "terminal_rows": 36,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 17,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "858d9100f01996e5d560dacea861fb04f39a69158f7b0eaab72a93b158a11ddd",
+  "milestone_seconds": 2.619463
+}

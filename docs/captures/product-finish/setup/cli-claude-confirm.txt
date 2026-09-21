@@ -1,0 +1,19 @@
+  Checking installed CLI and supported authentication · no model call
+  setup fixture 1
+  Account fingerprint: ed550aa988f7
+  Funding: claude-subscription · quota may be unknown
+  Executable:
+/private/var/folders/jr/8r7_n16n09l9rnqfmkj58gbr0000gp/T/dispatch-setup-pj7_ie9x/bin/claude
+
+  claude / claude-sonnet-5 / medium · Standard
+  Local runtime · standard service · included only
+  Funding assertion expires in 24 hours.
+
+  Confirm: this exact model and effort are included in my subscription.
+  I verified that paid overage / usage credits are disabled.
+  I verified controlled print mode is included and this account is unmanaged.
+
+  Type confirm to authorize and save, or cancel to keep configuration.
+  Authorize this resource? Type confirm, or cancel.
+  ›
+  Enter choose · Ctrl+C back · Ctrl+D exit

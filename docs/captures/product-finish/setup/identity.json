@@ -1,0 +1,8 @@
+{
+  "binary_sha256": "433da1f8600d2cd1e9765ad1c7e17d9e08802d5426dd199cd201f67bcfe7d144",
+  "version": "dispatch 0.1.3-rc.1",
+  "fixture_only": true,
+  "platform": "darwin",
+  "terminal_columns": 100,
+  "terminal_rows": 36
+}

@@ -1,0 +1,40 @@
+  Changes / generated.lock
+  added · generated? · column 1 · arrows pan
+  new file mode 100644
+  @@ -0,0 +1,2 @@
+  +generated
+  +xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx›
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  Preview truncated · Space next page · v full patch
+  q back  Esc files  ↑↓ scroll  ←→ pan  n/p hunk  [ ] file  e editor  v pager

@@ -1,0 +1,109 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.86s
+     Running tests/product_ux.rs (/tmp/dispatch-rc/current/target/debug/deps/product_ux-314da4ae84d43058)
+
+running 11 tests
+test default_help_leads_with_task_completion_commands ... ok
+test cold_start_routes_from_bundled_evidence_without_setup_or_network ... ok
+test comparative_subset_does_not_claim_unknown_agent_is_inferior ... ok
+test comparative_selection_preserves_router_order_and_ties ... ok
+test no_scored_agents_use_default_without_fabricated_scores ... ok
+test refreshed_public_evidence_beats_the_default_agent_order ... ok
+test latest_project_diff_accept_reject_and_explain_need_no_run_id ... ok
+test no_evidence_uses_stable_real_agent_default_and_override_wins ... ok
+test sole_available_agent_is_not_a_performance_comparison ... ok
+test one_scored_agent_cannot_determine_default_selection ... ok
+test unusable_and_unavailable_evidence_cannot_justify_comparison ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.44s
+
+     Running tests/public_priors.rs (/tmp/dispatch-rc/current/target/debug/deps/public_priors-659ef03f23fd3b4d)
+
+running 9 tests
+test invalid_public_prior_counts_and_schema_are_rejected ... ok
+test malformed_morphology_and_private_fields_are_rejected ... ok
+test malformed_refresh_keeps_bundled_priors_available ... ok
+test bundled_snapshot_is_valid_and_installs_idempotently ... ok
+test invalid_replacement_leaves_the_previous_snapshot_intact ... ok
+test public_prior_snapshot_round_trips_with_stable_bytes ... ok
+test manual_replacement_cannot_delete_the_distributed_snapshot ... ok
+test refresh_replaces_only_compact_distributed_priors ... ok
+test maintainer_export_is_byte_stable_and_excludes_distributed_rows ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/recommend.rs (/tmp/dispatch-rc/current/target/debug/deps/recommend-49c0a6b293e2707d)
+
+running 5 tests
+test recommend_does_not_invoke_configured_harnesses ... ok
+test recommend_classifies_and_displays_ranked_generic_harbor_evidence_offline ... ok
+test recommend_ties_preserve_router_harness_order ... ok
+test recommend_uses_router_specificity_instead_of_a_presentation_score ... ok
+test no_or_zero_attempt_evidence_is_a_successful_explicit_no_recommendation ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/resource_setup.rs (/tmp/dispatch-rc/current/target/debug/deps/resource_setup-e2658335a496406b)
+
+running 1 test
+test cli_and_tui_setup_auth_cancel_revalidation_and_goal_preservation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.65s
+
+     Running tests/routed_run.rs (/tmp/dispatch-rc/current/target/debug/deps/routed_run-b1a2db7653041241)
+
+running 8 tests
+test route_and_explicit_harnesses_are_mutually_exclusive ... ok
+test routed_run_preserves_the_existing_unsafe_local_acknowledgement ... ok
+test routed_run_with_evidence_but_no_eligible_adapter_fails_before_execution ... ok
+test explicit_non_routed_run_creates_no_routing_observation ... ok
+test routed_run_records_verification_failure_without_a_human_label ... ok
+test routed_run_without_compatible_evidence_uses_the_stable_default ... ok
+test routed_run_without_configured_verification_records_unknown ... ok
+test routed_run_skips_unavailable_top_prediction_and_uses_existing_execution_path ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+
+     Running tests/routing.rs (/tmp/dispatch-rc/current/target/debug/deps/routing-dcb38c89f6a0348b)
+
+running 13 tests
+test cached_prior_round_trips_with_distinct_identity_and_provenance ... ok
+test conflicting_known_dimensions_are_incompatible ... ok
+test cached_prior_upsert_replaces_observations_for_the_same_identity ... ok
+test known_task_falls_back_to_generic_evidence_with_explicit_specificity ... ok
+test evidence_selection_prefers_attempts_then_stable_provenance_without_summing ... ok
+test more_specifically_matched_dimensions_win_within_fallback_evidence ... ok
+test prior_lookup_requires_exact_task_morphology_and_harness ... ok
+test router_breaks_equal_score_ties_by_harness_identity ... ok
+test router_prefers_exact_evidence_over_better_supported_generic_evidence ... ok
+test router_reports_no_score_for_missing_or_zero_attempt_evidence ... ok
+test router_ranks_higher_observed_success_ratio_first ... ok
+test unknown_task_dimension_does_not_consume_known_prior_value ... ok
+test unknown_task_and_unknown_prior_dimensions_remain_compatible ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
+     Running tests/routing_observations.rs (/tmp/dispatch-rc/current/target/debug/deps/routing_observations-b7b4cf32ea621bec)
+
+running 5 tests
+test existing_single_candidate_evaluation_remains_separate_from_the_observation ... ok
+test routed_human_evaluation_updates_only_the_existing_observation ... ok
+test explicit_and_historical_runs_do_not_manufacture_observations ... ok
+test routed_run_creates_one_idempotent_prediction_and_outcome_snapshot ... ok
+test verification_unknown_failure_timeout_and_process_failure_remain_distinct ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/terminal_bench.rs (/tmp/dispatch-rc/current/target/debug/deps/terminal_bench-134bb494e1710332)
+
+running 8 tests
+test datasets_import_cli_caches_terminal_bench_snapshot ... ok
+test maps_only_explicitly_equivalent_harbor_agents ... ok
+test parses_minimal_real_shaped_terminal_bench_job ... ok
+test preserves_dataset_agent_version_and_model_identities ... ok
+test aggregates_trials_and_caches_the_exact_normalization_inputs ... ok
+test router_consumes_harbor_codex_and_cursor_as_generic_fallback ... ok
+test incomplete_trial_fails_without_replacing_valid_evidence ... ok
+test identical_import_is_idempotent_and_new_snapshot_replaces_it ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+

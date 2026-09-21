@@ -1,0 +1,30 @@
+[
+  {
+    "binary": "baseline",
+    "checks": "compiler",
+    "seconds_to_question": 5.229,
+    "questions": 1,
+    "launches": 2
+  },
+  {
+    "binary": "baseline",
+    "checks": "shell",
+    "seconds_to_question": 6.637,
+    "questions": 1,
+    "launches": 2
+  },
+  {
+    "binary": "candidate",
+    "checks": "compiler",
+    "seconds_to_question": 6.676,
+    "questions": 1,
+    "launches": 2
+  },
+  {
+    "binary": "candidate",
+    "checks": "shell",
+    "seconds_to_question": 6.67,
+    "questions": 1,
+    "launches": 2
+  }
+]

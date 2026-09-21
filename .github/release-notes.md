@@ -1,27 +1,21 @@
-## Experimental Developer Preview
+## Dispatch 0.1.3-rc.1 — experimental local release candidate
 
-Dispatch v0.1.2 makes agent selection the normal local workflow: tell Dispatch the task, review the proposed change, and explicitly accept or reject it.
+Describe a goal, use explicitly validated included resources, follow bounded work,
+verify configured checks, and review one exact change set. This candidate adds a
+compact open-D scheduler identity, clearer sequential-task states, native large
+review details, and one shared CLI/TUI resource setup and funding-revalidation flow.
+Historical database upgrades preserve a private rollback copy; newer schemas fail
+with an actionable message. Direct execution stays the default. Planning is opt-in.
 
-### Task-first workflow
+This file is prepared for owner review; no release is published by the finish pass.
+The release gate remains blocked by an unresolved deadline-fixture timing failure
+in the full four-thread suite, also reproduced on the unmodified baseline.
+The tested candidate scope is macOS arm64. Linux CI has not been run for this source.
+Packages are unsigned. See `docs/product-rc-validation.md` for exact build identity,
+checks, captures, provider chronology and remaining decisions. No general savings,
+universal model support or live-planner certification is claimed.
 
-- Run `dispatch run "Fix the retry race"` from your project; no init, dataset import, Cloud account, or routing flag is required.
-- Use `dispatch explain`, `dispatch diff`, `dispatch accept`, and `dispatch reject` without copying run IDs.
-- Deliberately override agent choice with `--agent codex` or `--agent cursor`.
-
-### Honest, local selection
-
-- A bundled 508-byte public-prior snapshot supports offline cold start. Optional `dispatch data refresh` retrieves compact normalized public data without authentication or raw benchmark downloads.
-- Evidence-based selection requires compatible, nonzero evidence for at least two execution-eligible agents. Missing evidence remains unknown, not zero performance.
-- Otherwise Dispatch uses its deterministic default order. A sole eligible agent is labeled "Only available agent."
-- The current bundled snapshot contains Codex-only evidence, so it does not establish comparative superiority over Cursor or Claude Code.
-- Existing isolated candidate execution, configured verification, and explicit safe apply remain the execution path. Normal runs never require Cloud or fetch benchmark data.
-- Prediction, mechanical outcome, and explicit human acceptance remain separate. Local evidence inspection does not influence routing; Cloud contribution remains explicit and opt-in.
-
-### Experimental / limitations
-
-- `--allow-unsafe-local` permits host execution; it is not a security sandbox.
-- Install and authenticate a current supported coding-agent CLI. The final hosted smoke test used Codex CLI 0.153.4.
-- Verification runs only when configured; a completed agent process is not proof of task quality.
-- The Docker execution core exists, but turnkey Cursor/Codex images and container-compatible authentication are not provided.
-- Advanced multi-candidate comparison and explicit dataset imports remain available outside the primary workflow.
-- macOS archives are unsigned and not notarized.
+Funding consent remains explicit. Setup never enables paid fallback, changes global
+provider settings, activates a private policy, or widens a machine grant. Human
+verification/review/application boundaries remain separate. Local execution is not
+a security sandbox; planned crash recovery remains unsupported.

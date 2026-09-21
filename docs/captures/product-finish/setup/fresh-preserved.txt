@@ -1,0 +1,21 @@
+  setup fixture 1
+  Account fingerprint: cc6d96611cff
+  Funding: chatgpt-plus · quota may be unknown
+  Executable:
+/private/var/folders/jr/8r7_n16n09l9rnqfmkj58gbr0000gp/T/dispatch-setup-pj7_ie9x/bin/codex
+
+  codex / fixed-codex-model / medium · Standard
+  Local runtime · standard service · included only
+  Launch checks current account and retained funding evidence.
+
+  Confirm: this exact model and effort are included in my subscription.
+  I verified that paid overage / usage credits are disabled.
+
+  Type confirm to authorize and save, or cancel to keep configuration.
+  Revalidation cancelled. Configuration unchanged.
+  Return to your goal. Submit explicitly when ready.
+  What do you want to accomplish?
+  Direct by default · /plan for sequential work
+  /resources accounts · /checks project checks
+  › Update main.c safely
+  Enter send · Alt+Enter newline · Ctrl+C cancel · Ctrl+D exit

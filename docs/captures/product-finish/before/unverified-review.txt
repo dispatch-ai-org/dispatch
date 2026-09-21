@@ -1,0 +1,15 @@
+  ●─┬─○  DISPATCH
+    ╰─○  source
+  Goal  Update a.c to return a positive value
+
+  Ready for review
+  Unverified — no checks configured
+  1 file changed · +1 / -1 lines
+
+  Preview · a.c
+  -int a(void) { return 1; }
+  +int a(void) { return 2; }
+
+  [Enter/d] Review changes   [e] Open in editor
+  [a] Accept & apply   [r] Reject
+  [n] Leave pending   [i] Details

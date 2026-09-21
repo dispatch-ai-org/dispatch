@@ -1,0 +1,12 @@
+{
+  "source": "missing.setup.ansi",
+  "terminal_columns": 120,
+  "terminal_rows": 40,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 30,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "88a246ad5f0d5257fb846c436343ff397f8d13682838e3115519db322b9406ee",
+  "milestone_seconds": 0.427963
+}

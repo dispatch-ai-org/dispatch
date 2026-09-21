@@ -1,6 +1,9 @@
 # Dispatch
 
-**Dispatch v0.1.2 — Experimental Developer Preview**
+**Dispatch 0.1.3-rc.1 — Local release candidate / experimental developer preview**
+
+Local artifacts are available for review. The publication gate remains blocked by
+an unresolved deadline-fixture failure; see the [exact validation results](docs/product-rc-validation.md).
 
 Tell Dispatch what you want changed. Dispatch chooses an available coding agent using observed performance data, runs it in an isolated candidate workspace, verifies the result when configured, and lets you review and accept it.
 
@@ -16,15 +19,17 @@ isolated execution + configured verification
 review → accept or reject
 ```
 
-Dispatch works locally and offline. A release contains a compact public-evidence snapshot, normal runs never fetch benchmark data, and Dispatch Cloud is optional.
+Dispatch keeps orchestration and evidence local. Provider execution requires the provider’s service. A release contains a compact public-evidence snapshot, normal runs never fetch benchmark data, and Dispatch Cloud is optional.
 
 ## Interactive dogfood loop
 
-With Codex authenticated and included-resource profiles already validated in
-`$DISPATCH_HOME/resources.yml`, run from a source directory:
+From a source directory, open Dispatch. Missing resources lead to guided setup
+and preserve your goal. You can also configure resources first:
 
 ```bash
-dispatch
+dispatch setup                 # provider login guidance and explicit funding consent
+dispatch setup --checks        # approve a known project check
+dispatch                      # direct goal → work → verification → review
 ```
 
 Enter the outcome, then approve local execution for that goal. Dispatch displays
@@ -47,15 +52,15 @@ Plain input is line-oriented; the integrated editor supports multiline paste.
 `dispatch --no-retry` disables automatic recovery for the interactive session.
 Bare invocation without terminal input and output prints help and exits 2.
 
-The interactive path requires `allocation_enabled: true` and explicitly validated
-included resource profiles (see **Model allocation** below and the
-[Phase 6 contract and setup guide](docs/phase6-validation.md)).
-It stops after intent if those are absent; it does not choose another provider.
-There is no automatic account authorization or subscription setup. A funding-plan
-change must be explicitly revalidated before real work can launch.
-
-Phase 4 implementation and the current release gates are recorded in
-[the first dogfood release report](docs/phase4-dogfood-release.md).
+Use `/resources` for Accounts / Resources and `/checks` for project checks.
+`dispatch resources` prints cached configuration status without a prompt or model
+call. Discovery never authorizes spending. Codex and Claude use their own supported
+CLI login; no Dispatch account is required. Confirm the exact model, effort and
+included funding. Claude assertions expire after at most 24 hours and have an
+explicit refresh path. Changed/rejected funding epochs need fresh owner consent.
+No paid fallback, credits, account switch or private-policy activation is automatic.
+See [setup and review](docs/product-guide.md), [visual system](docs/design-system.md)
+and [candidate validation](docs/product-rc-validation.md).
 
 For an explicitly multipart goal, opt in with `/plan <goal>` in the composer or
 `dispatch run /path/to/project --task 'Goal' --plan`. Planning uses one planner,
@@ -75,7 +80,7 @@ See the [protocol and standalone client guide](docs/control-protocol.md) and
 
 ## One-shot CLI
 
-Install and authenticate at least one supported coding-agent CLI: Claude Code, Codex CLI, or Cursor Agent. Then, from a repository:
+The included-resource path supports configured Codex and Claude contracts. Legacy explicit harness overrides remain advanced; they do not inherit an included-funding guarantee. From a repository or plain directory:
 
 ```bash
 cd my-project
@@ -148,50 +153,16 @@ Available benchmark evidence:
 
 After execution, Dispatch leads with the task, selected agent, selection basis, verification result, and next action. Mechanical verification, human acceptance, and the routing prediction remain separate facts. A passing check never silently accepts or applies a result.
 
-## Install
+## Install this candidate
 
-Prebuilt archives are available on the [latest GitHub Release](https://github.com/dispatch-ai-org/dispatch/releases/latest).
+Use the tested local archive and explicit executable paths in
+[install / upgrade / uninstall](docs/release-install.md). The current candidate
+has not been published. Older GitHub release downloads are not this build.
 
-### macOS Apple Silicon
-
-The macOS archive is unsigned and not notarized.
-
-```bash
-curl -LO https://github.com/dispatch-ai-org/dispatch/releases/latest/download/dispatch-macos-arm64.tar.gz
-curl -LO https://github.com/dispatch-ai-org/dispatch/releases/latest/download/SHA256SUMS
-grep 'dispatch-macos-arm64.tar.gz' SHA256SUMS | shasum -a 256 -c -
-tar -xzf dispatch-macos-arm64.tar.gz
-mkdir -p "$HOME/.local/bin"
-install -m 0755 dispatch "$HOME/.local/bin/dispatch"
-"$HOME/.local/bin/dispatch" version
-```
-
-### Linux x86_64
-
-The Linux archive targets glibc-based x86_64 systems; it is not a static musl build.
-
-```bash
-curl -LO https://github.com/dispatch-ai-org/dispatch/releases/latest/download/dispatch-linux-x86_64.tar.gz
-curl -LO https://github.com/dispatch-ai-org/dispatch/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf dispatch-linux-x86_64.tar.gz
-mkdir -p "$HOME/.local/bin"
-install -m 0755 dispatch "$HOME/.local/bin/dispatch"
-"$HOME/.local/bin/dispatch" version
-```
-
-Ensure `$HOME/.local/bin` is on `PATH`. Dispatch also requires Git and `curl` at runtime.
-
-### Install from source
-
-With a current stable Rust toolchain:
-
-```bash
-cargo install --git https://github.com/dispatch-ai-org/dispatch --locked
-dispatch version
-```
-
-Dispatch is not published to crates.io.
+The validated runtime scope for this pass is macOS arm64. Linux has an existing
+CI recipe but was not run here. The macOS package is unsigned and not notarized.
+Source builds use `cargo build --release --locked`; Git and the project’s actual
+check tools must be installed. No provider tool or font is installed by Dispatch.
 
 ## Safety and source behavior
 
@@ -203,7 +174,7 @@ Dispatch freezes the source into an internal Git baseline and gives the selected
 
 If verification is configured, the same commands run against the candidate and their output is retained. Without configured checks, Dispatch reports `Verification: Not configured`. Verification is mechanical evidence, not a universal code-quality judgment. A completed harness invocation is reported as `Ready for review`; failed checks are reported as `Verification failed`, never as completed or verified work.
 
-The local backend is the supported real-agent path in v0.1.2. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
+The local backend is the supported real-agent path in this candidate. Docker execution is advanced and experimental: users must provide a suitable image containing the agent and project toolchain.
 
 ## Core commands
 

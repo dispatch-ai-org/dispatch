@@ -1,0 +1,18 @@
+    ┌──╮  DISPATCH
+  ━━   ┃  source
+  ━━━  ┃  intent → work → review
+  ━━└──╯
+  Plain directory · local source
+  Goal  Update a.c to return a positive value
+  Setup needed · your goal is preserved.
+  Accounts / Resources
+  Local operation · no Dispatch login required
+  Included-resource allocation is not configured.
+  codex: installed · auth checked on revalidation
+  claude: installed · auth checked on revalidation
+  No resource profiles. Add Codex or Claude to begin.
+
+  [c] Add Codex   [a] Add Claude
+  [number] Revalidate profile   [l] Provider login   [b] Back
+  ›
+  Enter choose · Ctrl+C back · Ctrl+D exit

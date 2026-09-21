@@ -1,0 +1,13 @@
+    ┌──╮  DISPATCH
+  ━━   ┃  source
+  ━━━  ┃  intent → work → review
+  ━━└──╯
+  Plain directory · local source
+  Goal  Update a.c to return a positive value
+
+  Working
+  ● goal ━━ ● fixture-standard ── ○ verify ── ○ review
+  Agent running · tool activity is in private logs
+  Choice: Using standard: the task type or affected files are unknown.
+  Launches 0 recorded · 0 uncertain · limit 2
+  ◒ 2s elapsed · Ctrl+C cancel

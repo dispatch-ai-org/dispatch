@@ -155,6 +155,7 @@ def scenario(binary, name):
             f.mode.write_text('wait')
             output,result=run(f,'--timeout','2')
             assert output.returncode!=0 and f.count()<=1,(output.stdout,output.stderr)
+            assert result is not None,(output.stdout,output.stderr)
             assert len(result['attempts'])<=1
             assert f.stored(result['run_id'])['phase3']['failure']=='deadline'
             no_lease(f)

@@ -1,0 +1,12 @@
+{
+  "source": "cli-claude.confirm.ansi",
+  "terminal_columns": 100,
+  "terminal_rows": 36,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 17,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "509b84989ccedc4f18d8f784bdf2a4e0fd5032fa97a057e178e53d23af608f6a",
+  "milestone_seconds": 1.045462
+}

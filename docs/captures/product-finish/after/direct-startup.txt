@@ -1,0 +1,10 @@
+    ┌──╮  DISPATCH
+  ━━   ┃  source
+  ━━━  ┃  intent → work → review
+  ━━└──╯
+  Plain directory · local source
+  What do you want to accomplish?
+  Direct by default · /plan for sequential work
+  /resources accounts · /checks project checks
+  ›
+  Enter send · Alt+Enter newline · Ctrl+C cancel · Ctrl+D exit

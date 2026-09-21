@@ -1,0 +1,12 @@
+{
+  "source": "large.file.ansi",
+  "terminal_columns": 120,
+  "terminal_rows": 40,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 0,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "198c87c3b7ae1e1e318240f34a44fd4105331b4786a050ee79072d941b7f7b3a",
+  "milestone_seconds": 8.312995
+}

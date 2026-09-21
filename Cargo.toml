@@ -1,6 +1,6 @@
 [package]
 name = "dispatch"
-version = "0.1.2"
+version = "0.1.3-rc.1"
 edition = "2024"
 description = "Local-first execution and evaluation for coding-agent harnesses"
 license = "MIT"

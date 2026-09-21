@@ -1,0 +1,4 @@
+success: PASS; actual supervised invocations=3
+mixed: PASS; actual supervised invocations=3
+question: PASS; actual supervised invocations=4
+fidelity: PASS; actual supervised invocations=3

@@ -1,0 +1,12 @@
+{
+  "source": "revalidate.refresh.ansi",
+  "terminal_columns": 100,
+  "terminal_rows": 36,
+  "cropped_blank_rows_before": 0,
+  "cropped_blank_rows_after": 17,
+  "background_for_preview": "#070B10",
+  "native_terminal_screenshot": false,
+  "font": "Menlo.ttc",
+  "raw_sha256": "3fba4210fd10b9b0f4f77114736cb057536caa31aec9c4e60ecb1831223da75a",
+  "milestone_seconds": 0.988275
+}
