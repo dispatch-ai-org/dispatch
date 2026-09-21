@@ -3484,10 +3484,7 @@ pub fn accept_or_reject_latest(
 /// A finished, unapplied result: the only kind `check` and `refresh` act on.
 fn ensure_unapplied_ready(run: &RunRecord, action: &str) -> Result<()> {
     anyhow::ensure!(
-        run.outcome.lifecycle == LifecycleState::Finished
-            && run.outcome.work_result == WorkResult::Ready
-            && run.outcome.application != ApplicationState::Applied
-            && run.status != RunStatus::Applied,
+        crate::coherence::is_ready_unapplied(run),
         "run {} is not a ready, unapplied result; nothing to {action}",
         run.id
     );

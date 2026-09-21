@@ -374,7 +374,6 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
 // and the live `Coherence:` line in `status` all require `ready`, so they refuse
 // it ("not a ready, unapplied result") although `apply` handles it correctly.
 #[test]
-#[ignore = "bug: check/refresh/status refuse a finished legacy run whose migrated work_result is `pending`"]
 fn a_migrated_v012_run_can_be_checked() {
     let fixture = Fixture::pre_coherence();
     fixture.strip_coherence();

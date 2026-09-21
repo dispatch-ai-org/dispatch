@@ -61,15 +61,26 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
     evaluate(&world, &WorkView::of(run, candidate))
 }
 
+/// A finished, delivered result that has not been applied. Runs created before
+/// the outcome model existed migrate with `work_result: pending`, so a
+/// `ready_for_evaluation` status (what `apply` itself requires) also counts.
+pub fn is_ready_unapplied(run: &RunRecord) -> bool {
+    let delivered = (run.outcome.lifecycle == LifecycleState::Finished
+        && run.outcome.work_result == WorkResult::Ready)
+        || (matches!(
+            run.status,
+            RunStatus::ReadyForEvaluation | RunStatus::Evaluated
+        ) && run.outcome.work_result == WorkResult::Pending);
+    delivered
+        && run.outcome.application != ApplicationState::Applied
+        && run.status != RunStatus::Applied
+}
+
 /// A fresh L0+L1 verdict for a finished result that has not been applied and
 /// has exactly one candidate; `None` for any other run, or when evaluation
 /// fails. Reads only; nothing is written.
 pub fn live_validity(run: &RunRecord) -> Option<Validity> {
-    if run.outcome.lifecycle != LifecycleState::Finished
-        || run.outcome.work_result != WorkResult::Ready
-        || run.outcome.application == ApplicationState::Applied
-        || run.status == RunStatus::Applied
-    {
+    if !is_ready_unapplied(run) {
         return None;
     }
     let [candidate] = run.candidates.as_slice() else {
