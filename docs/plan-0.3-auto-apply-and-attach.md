@@ -1131,14 +1131,19 @@ reopen them. Anything not covered here is escalated to the integrator.
 ### 14.1 Run mode and migration 21
 
 - `RunMode::Attached` (`serde` name `attached`, `as_str` `"attached"`).
-- Migration `(21, "attached_work_mode", …)` rebuilds `runs` exactly as migration 13
-  did (`PRAGMA legacy_alter_table = ON; ALTER TABLE runs RENAME TO runs_v20;
-  CREATE TABLE runs (… same 27 columns …); INSERT … SELECT … FROM runs_v20; DROP TABLE
-  runs_v20; PRAGMA legacy_alter_table = OFF;`) with the one change
-  `CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached'))`.
-  The 19 foreign keys that reference `runs(id)` survived that pattern once already.
-  `schema_version` becomes 21; the pre-upgrade backup file is created by the existing
-  `backup_before_upgrade`.
+- Migration `(21, "attached_work_mode", …)` rebuilds `runs` as migration 13 did
+  (`PRAGMA legacy_alter_table = ON; ALTER TABLE runs RENAME TO runs_v20;
+  CREATE TABLE runs (… all 28 columns, including migration 17's
+  `delivery_attempt_id` …); INSERT … SELECT … FROM runs_v20; DROP TABLE runs_v20;
+  PRAGMA legacy_alter_table = OFF;`) with the one change
+  `CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached'))`,
+  then recreates migration 19's `private_runs_source_window` index and
+  `private_decision_immutable` trigger, which the rename leaves bound to `runs_v20`.
+  `migrate()` turns foreign keys off for this version exactly as it already does for
+  13, otherwise `DROP TABLE runs_v20` fails on any database with child rows. (As
+  implemented in S1; the freeze originally said 27 columns and omitted the index,
+  trigger and foreign-key toggle.) `schema_version` becomes 21; the pre-upgrade
+  backup file is created by the existing `backup_before_upgrade`.
 
 ### 14.2 `AttachmentRecord` (in `src/models.rs`)
 
