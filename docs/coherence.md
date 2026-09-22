@@ -21,7 +21,7 @@ launched or admitted. It never starts an agent by itself.
 
 | Concept | Meaning | Where it lives in the code |
 |---|---|---|
-| S0 | The snapshot the run started from. | The run's private baseline repository: `RunRecord.baseline_path`, `baseline_commit` (and `source_fingerprint`, the strict whole-tree hash). |
+| S0 | The snapshot the run started from. | The run's private baseline repository: `RunRecord.baseline_path`, `baseline_commit` (and `source_fingerprint`, the strict whole-tree hash). The baseline commit tracks only the paths the source's ignore rules include (repository `.gitignore` files and `info/exclude`); ignored files are still copied onto disk so build caches remain available, and a plain-directory source, which has no ignore rules, keeps tracking everything. |
 | Δ | The patch the agent produced. | The candidate's `diff_path` (`git diff --binary --full-index --no-renames`). Mid-run, a work-in-progress patch of the live workspace. |
 | World (S1) | The source tree now, minus what its own ignore rules exclude. | Computed on demand as `world::WorldObservation`; never stored as a snapshot. |
 | MustHold | A fact the work relied on, derived from (S0, Δ). | `MustHold` (`kind`: `Signature` or `File`; `origin`: `Modified`, `Referenced` or `FileFallback`). |
@@ -58,7 +58,10 @@ At most 20 reasons are kept in a `Validity`; result projections keep 5.
 - A Git source (or linked worktree) contributes what `git ls-files -co --exclude-standard`
   lists: tracked and untracked files that its ignore rules do not exclude. A plain
   directory contributes everything except `.git` and `.dispatch`, so it cannot honor
-  `.gitignore` and sees build output as change.
+  `.gitignore` and sees build output as change. The baseline commit (`source::create_snapshot`)
+  is built to match: for a Git source it tracks only the same non-ignored paths, so a build
+  artifact that exists at snapshot time is never force-tracked into S0 and later mistaken
+  for part of Δ.
 - Each present file is hashed as a Git blob (`hash-object --no-filters`) using the run's
   baseline repository, and compared with `git ls-tree -r` of `baseline_commit`. Symlinks
   are hashed by target text and never followed; parents that became symlinks are

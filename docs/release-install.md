@@ -85,6 +85,13 @@ persisted. Nothing changes for existing runs: a run created by 0.2.0 or earlier 
 reviewed exactly as it always was unless you explicitly opt into `--auto-apply` or
 the session toggle for the *next* run.
 
+### Upgrading to 0.3.1
+
+No migration: a new baseline no longer force-tracks files a Git source's own ignore
+rules exclude (see `docs/coherence.md`, "World observation"). Runs created before
+0.3.1 keep their old baselines untouched and may still show a `.gitignore`'d build
+artifact in their patches; only runs created by 0.3.1 or later get the fix.
+
 Uninstall by removing only the executable you installed and its archive/extraction
 directory. Keep `~/.dispatch` (or your explicit state directory), project files and
 provider accounts. State deletion and provider logout are separate owner actions.
