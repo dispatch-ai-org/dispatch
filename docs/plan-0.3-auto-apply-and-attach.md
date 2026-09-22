@@ -1054,6 +1054,30 @@ Progress log:
   the same load (its 5 s grant budget loses to host load while a sibling suite runs),
   so it is a fixture-robustness item for 0.4.1, not a regression. S3 running; S4 and
   S5 queued behind it.
+- 2026-09-22: S3 (`ee0ba96`, plus a delivered-result guard on attached review), S5
+  (`11d52e7`) and S4 (`7919f17`, plus closing the Ctrl+C window with `pre_exec`)
+  merged on `release-0.4.0`. First **real-agent attach**: `dispatch attach --auto-apply
+  -- claude -p …` in a linked worktree of the Python scratch project with `serve`
+  watching the root. Claude Code (`claude-sonnet-5`, print mode with edit tools
+  allowed) added `reverse` and its test; the wrapper stayed silent until the agent's
+  own final message; `finish` froze a two-file Δ and ran the unittest check; the
+  root had moved underneath (uncommitted edits), and auto-apply landed the change
+  after integration checks; the root's tests pass. `serve --json` showed the run
+  appear as `working`, the world move, and the run become `applied`. Two defects
+  found and fixed on the way (`77689db`): `serve` re-rendered its view only on its
+  own verdicts or applies, so runs attached by another process never appeared; and
+  `auto_apply` applied an empty Δ as "0 files changed" instead of skipping it
+  (`empty_delta`). A first attempt failed for an unrelated reason: Claude Code
+  refuses to edit files under `~/.claude/`, where the scratch project lived.
+  Inspecting the applied run then found a third defect: `explain` showed no
+  verdict because the gate took the unmoved-fingerprint shortcut. For a native run
+  the whole-tree fingerprint was taken from the tree S0 was copied from, so an
+  equal fingerprint means an unmoved world; an attached run's S0 is the merge-base
+  commit while its fingerprint is the root's working tree at attach time, so the
+  shortcut skipped evaluation and the integration checks. Fixed: attached runs
+  always evaluate (`coherence::gate`), with a regression test in
+  `tests/attach_cli.rs`. The real-agent apply above therefore ran without a
+  coherence verdict; rerun after the fix before citing it as evidence.
 
 0.3.0 (auto-apply):
 

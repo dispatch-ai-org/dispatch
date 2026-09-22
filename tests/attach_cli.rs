@@ -19,6 +19,57 @@ struct Fixture {
     state: PathBuf,
 }
 
+/// The root's working tree may already differ from S0 (the merge-base commit)
+/// when work is attached: an equal whole-tree fingerprint at apply time then
+/// says nothing about S0, so the gate must evaluate rather than take the
+/// unmoved-world shortcut, and a moved-world apply stores its validity.
+#[test]
+fn auto_apply_of_attached_work_evaluates_even_when_the_root_did_not_move_since_attach() {
+    use dispatch::{orchestrator::ApplyOutcome, state::State};
+    let fixture = Fixture::new(true);
+    // Uncommitted edit in the root, disjoint from what the worktree will touch,
+    // present before the attach: S0 (HEAD) already differs from the root.
+    fs::write(fixture.root.join("src/other.rs"), "pub fn g() {}\n").unwrap();
+    let id = fixture.attach(&["--auto-apply"]);
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    fixture.dispatch(&["finish", &id]).success();
+
+    let outcome = dispatch::orchestrator::auto_apply(
+        &State {
+            root: fixture.state.clone(),
+        },
+        &id,
+    )
+    .unwrap();
+    match outcome {
+        ApplyOutcome::Applied { validity, .. } => {
+            let validity = validity.expect("a moved world stores its validity");
+            assert!(validity.world_changed);
+            assert_eq!(validity.analysis, dispatch::AnalysisLevel::Integration);
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+    let metadata = fixture.metadata(&id);
+    assert_eq!(metadata["outcome"]["applied_by"], "auto_apply");
+    assert_eq!(
+        metadata["coherence"]["validity"]["analysis"], "integration",
+        "{}",
+        metadata["coherence"]
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    2\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("src/other.rs")).unwrap(),
+        "pub fn g() {}\n"
+    );
+}
+
 impl Fixture {
     /// `with_checks`: whether `root`'s `dispatch.yml` configures
     /// `checks.verify`. Every test but the local-authority defense-in-depth
