@@ -70,6 +70,32 @@ fn auto_apply_of_attached_work_evaluates_even_when_the_root_did_not_move_since_a
     );
 }
 
+/// `explain` on attached work has no selection to explain; it shows where S0
+/// came from, and the verdict, and never fails for the common case of an
+/// unmoved root.
+#[test]
+fn explain_shows_attachment_provenance_and_verdict() {
+    let fixture = Fixture::new(true);
+    let id = fixture.attach(&[]);
+    let assert = fixture.dispatch(&["explain", &id]).success();
+    let out = Fixture::stdout(&assert);
+    assert!(out.contains("Attached work"), "{out}");
+    assert!(out.contains("merge base"), "{out}");
+    assert!(out.contains("confidence: full"), "{out}");
+    assert!(!out.contains("no single-agent selection"), "{out}");
+
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+    fixture.dispatch(&["finish", &id]).success();
+    let assert = fixture.dispatch(&["explain", &id]).success();
+    let out = Fixture::stdout(&assert);
+    assert!(out.contains("finished: explicit"), "{out}");
+    assert!(out.contains("CONTINUE"), "{out}");
+}
+
 impl Fixture {
     /// `with_checks`: whether `root`'s `dispatch.yml` configures
     /// `checks.verify`. Every test but the local-authority defense-in-depth

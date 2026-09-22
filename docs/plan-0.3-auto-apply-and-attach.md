@@ -1093,6 +1093,14 @@ Progress log:
   other's temporary file and fail with a bare ENOENT mid-finish. Fixed with uniquely
   named temporary files and atomic renames; the scenario went from failing 30–50%
   of runs to four consecutive clean runs of both suites.
+- 2026-09-22: S7 (`1ae14a1`, `d34728f`) merged: `docs/attach.md`, guide, README,
+  claims table, control-protocol note, install page, release notes, version 0.4.0.
+  S7's audit found that `dispatch explain` errored on attached work in the common
+  case (it assumed a routing or allocation decision) and never showed S0 provenance
+  after creation; fixed: `explain` prints an "Attached work" section (workspace, root,
+  S0 line, confidence, agent, owner, capabilities, finish reason) and always a verdict
+  line. The serialized field is `mode`, not `run_mode` (that is only the SQLite column);
+  docs corrected. v0.4.0 is ready for the PR to `main`.
 
 0.3.0 (auto-apply):
 

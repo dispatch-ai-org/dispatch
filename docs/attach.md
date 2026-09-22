@@ -115,21 +115,16 @@ Next: dispatch finish <run-id> when the agent is done
 or, for a plain-directory snapshot, `S0  snapshot at attach, partial confidence`. The
 *wrapped* form prints nothing at attach (rule: Dispatch is silent in that terminal —
 see "Terminal and signals" below), so for wrapped attach the provenance line is not
-printed anywhere; it is only in the stored record and the event. Neither `dispatch
-explain` nor the `serve` view print S0 provenance for either form — `explain` shows
-the ordinary **Coherence** section when one applies (decision, analysis level,
-changed files, reasons) but has no S0/provenance line, and the `serve` view's five
-fixed columns (below) do not include it either. Reading the provenance and confidence
-programmatically means reading the run's stored record or its `attach.created` event.
-
-`dispatch explain` on an attached run is narrower still: it always tries to explain a
-routing/allocation selection first, which an attached run never has, so on the common
-case — a finished attached run whose world has not moved and whose verdict is still
-`CONTINUE` — it prints nothing and exits with an error, *"this run has no
-single-agent selection to explain."* The Coherence section only appears, ahead of that
-same error, once the run's live verdict is not `CONTINUE` or the world has moved. For
-attached work, `dispatch check` (which never touches selection) is the reliable way to
-see the verdict.
+printed at attach time; `dispatch explain <id>` shows it afterwards for either form.
+For an attached run, `explain` prints an **Attached work** section instead of a
+selection explanation (there is none): the workspace and root, the S0 line
+(`S0: commit <sha> (merge base with the root)` or `S0: snapshot of the workspace at
+attach; earlier edits are not attributed`), `confidence`, `agent`, `owner`, the
+capability flags, and `finished: <reason>` once finished. It is followed by the
+ordinary **Coherence** section when the world moved or the verdict is not `CONTINUE`,
+and by the one-line `Coherence: CONTINUE — world unchanged` verdict otherwise. The
+`serve` view's five fixed columns (below) do not include provenance. Programmatically,
+read the run's stored record or its `attach.created` event.
 
 ## Δ and "finished"
 
@@ -476,9 +471,6 @@ directory, exactly as it already refuses any newer schema.
   unchanged for this release.
 - Attached results never become routing or allocation evidence; they carry no
   observed-model or resource data (`resource: None`, every model field `None`).
-- `dispatch explain` and the `serve` view do not print S0 provenance/confidence (see
-  "Where this is visible today" above) — this is narrower than the original design
-  note for this feature; the stored record and the `attach.created` event are the
-  reliable source. `explain` also errors on an attached run with an unmoved,
-  still-`CONTINUE` verdict, since it tries a routing/allocation explanation first;
-  use `dispatch check` for the verdict itself.
+- The `serve` view does not print S0 provenance or confidence; `dispatch explain`
+  does (see "Where this is visible today" above), and the stored record and the
+  `attach.created` event carry them for programs.

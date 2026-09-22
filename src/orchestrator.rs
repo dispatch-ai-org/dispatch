@@ -3909,6 +3909,18 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
     };
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
+    if run.mode == RunMode::Attached {
+        // Attached work was neither selected nor allocated by Dispatch: there
+        // is no selection to explain, only where its S0 came from and whether
+        // the work still holds against the root.
+        print_attachment_details(&run);
+        if !print_coherence_details(&run)
+            && let Some(validity) = run.coherence.as_ref().and_then(|r| r.validity.as_ref())
+        {
+            println!("\n{}", crate::presenter::coherence_text(validity));
+        }
+        return Ok(());
+    }
     let selection = explain_selection(state, &run);
     let coherence = print_coherence_details(&run);
     match selection {
@@ -3917,6 +3929,40 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
             Ok(())
         }
         other => other,
+    }
+}
+
+/// The attachment record as `explain` shows it: provenance and confidence of
+/// S0 (the honesty rule for work Dispatch did not launch), who owns it, and
+/// what it is allowed to do.
+fn print_attachment_details(run: &RunRecord) {
+    let Some(attachment) = &run.attachment else {
+        return;
+    };
+    println!("Attached work");
+    println!("  workspace: {}", attachment.workspace.display());
+    println!("  root: {}", attachment.integration_root.display());
+    match &attachment.provenance {
+        crate::BaselineProvenance::GitMergeBase { commit } => {
+            println!("  S0: commit {commit} (merge base with the root)");
+        }
+        crate::BaselineProvenance::SnapshotAtAttach => {
+            println!("  S0: snapshot of the workspace at attach; earlier edits are not attributed");
+        }
+    }
+    println!("  confidence: {}", snake_case(&attachment.confidence));
+    println!(
+        "  agent: {}",
+        attachment.agent.as_deref().unwrap_or("external")
+    );
+    println!("  owner: {}", snake_case(&attachment.owner_state));
+    let capabilities = &attachment.capabilities;
+    println!(
+        "  may: observe={} signal={} control={} integrate={}",
+        capabilities.observe, capabilities.signal, capabilities.control, capabilities.integrate
+    );
+    if let Some(reason) = &attachment.finish_reason {
+        println!("  finished: {}", snake_case(reason));
     }
 }
 
