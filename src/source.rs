@@ -106,6 +106,126 @@ pub fn inspect_source(source: &Path) -> Result<(SourceKind, Option<String>)> {
     Ok((kind, head))
 }
 
+/// The identity of a Git repository, shared by its main worktree and every
+/// linked worktree: the common Git directory (canonical), the main worktree's
+/// path (canonical), and a key derived from the common directory so two paths
+/// of the same repository always compare equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIdentity {
+    pub common_dir: PathBuf,
+    pub main_worktree: PathBuf,
+    pub key: String,
+}
+
+/// Identify the repository a path belongs to. `None` for a plain directory
+/// (whatever `inspect_source` reports as `SourceKind::Directory`).
+pub fn repo_identity(path: &Path) -> Result<Option<RepoIdentity>> {
+    let path = resolve_source(Some(path))?;
+    let (kind, _) = inspect_source(&path)?;
+    if matches!(kind, SourceKind::Directory) {
+        return Ok(None);
+    }
+
+    let mut common_dir_command = git_command(&path);
+    common_dir_command.args(["rev-parse", "--git-common-dir"]);
+    let common_dir_output = checked_output(
+        common_dir_command,
+        "failed to locate the repository's common Git directory",
+    )?;
+    // A linked worktree already prints an absolute path here; the main
+    // worktree prints one relative to itself (typically ".git").
+    let raw_common_dir = bytes_to_path(trim_ascii(&common_dir_output.stdout));
+    let common_dir = if raw_common_dir.is_absolute() {
+        raw_common_dir
+    } else {
+        path.join(raw_common_dir)
+    };
+    let common_dir = fs::canonicalize(&common_dir).with_context(|| {
+        format!(
+            "failed to resolve the repository's common Git directory {}",
+            common_dir.display()
+        )
+    })?;
+
+    let mut worktree_list_command = git_command(&path);
+    worktree_list_command.args(["worktree", "list", "--porcelain"]);
+    let worktree_list_output = checked_output(
+        worktree_list_command,
+        "failed to list the repository's worktrees",
+    )?;
+    let main_worktree_line = worktree_list_output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(b"worktree "))
+        .context("git worktree list produced no worktree entry")?;
+    let raw_main_worktree = bytes_to_path(trim_ascii(&main_worktree_line[b"worktree ".len()..]));
+    let main_worktree = fs::canonicalize(&raw_main_worktree).with_context(|| {
+        format!(
+            "failed to resolve the repository's main worktree {}",
+            raw_main_worktree.display()
+        )
+    })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(path_bytes(&common_dir));
+    let key = hex::encode(hasher.finalize());
+
+    Ok(Some(RepoIdentity {
+        common_dir,
+        main_worktree,
+        key,
+    }))
+}
+
+/// The merge base of `root`'s `HEAD` and `workspace`'s `HEAD`, or `None` when
+/// they share no history. `root` and `workspace` must name the same
+/// repository (equal `repo_identity` keys); a workspace from an unrelated
+/// repository is refused rather than compared, since Git's answer there would
+/// be either an error or a misleading coincidence.
+pub fn merge_base(root: &Path, workspace: &Path) -> Result<Option<String>> {
+    let root = resolve_source(Some(root))?;
+    let workspace = resolve_source(Some(workspace))?;
+
+    let root_identity = repo_identity(&root)?
+        .with_context(|| format!("{} is not a Git repository", root.display()))?;
+    let workspace_identity = repo_identity(&workspace)?
+        .with_context(|| format!("{} is not a Git repository", workspace.display()))?;
+    ensure!(
+        root_identity.key == workspace_identity.key,
+        "workspace {} belongs to a different repository than {}",
+        workspace.display(),
+        root.display()
+    );
+
+    let mut head_command = git_command(&workspace);
+    head_command.args(["rev-parse", "--verify", "HEAD"]);
+    let head_output = checked_output(head_command, "failed to resolve the workspace HEAD")?;
+    let workspace_head = String::from_utf8(trim_ascii(&head_output.stdout).to_vec())
+        .context("Git returned a non-UTF-8 workspace HEAD commit")?;
+
+    let mut merge_base_command = git_command(&root);
+    merge_base_command.args(["merge-base", "HEAD", &workspace_head]);
+    let output = run_git(merge_base_command, None, "failed to compute the merge base")?;
+    if output.status.success() {
+        let commit = String::from_utf8(trim_ascii(&output.stdout).to_vec())
+            .context("Git returned a non-UTF-8 merge base commit")?;
+        Ok(Some(commit))
+    } else if output.status.code() == Some(1) {
+        // No common ancestor: the documented "no merge base" exit status.
+        Ok(None)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            bail!(
+                "failed to compute the merge base (Git exited with {})",
+                output.status
+            );
+        }
+        bail!("failed to compute the merge base: {stderr}");
+    }
+}
+
 /// Freeze the exact current source contents in a private Git repository.
 ///
 /// This deliberately snapshots the working tree rather than merely cloning
@@ -164,6 +284,54 @@ pub fn create_snapshot(source: &Path, run_dir: &Path) -> Result<SourceSnapshot> 
         kind,
         git_head,
         fingerprint: fingerprint_before,
+        baseline_path,
+        baseline_commit,
+    })
+}
+
+/// Materialize a commit's tree (not the live working tree) as the baseline
+/// for attached work: `S0` is `merge_base(root, workspace)`, a real commit
+/// that predates the agent's edits, rather than a snapshot of anything
+/// currently checked out. Follows the same staging/fingerprint/rename
+/// discipline as `create_snapshot`, and the same reasoning for honoring the
+/// source's ignore rules: the baseline must track exactly what
+/// `world::observe` considers part of the world, or a build artifact
+/// materialized at the commit gets force-tracked and mistaken for Δ. `repo`
+/// supplies both the commit's objects and, via `initialize_internal_repository`,
+/// its `info/exclude`.
+pub fn materialize_baseline_from_commit(
+    repo: &Path,
+    commit: &str,
+    run_dir: &Path,
+) -> Result<SourceSnapshot> {
+    let repo = resolve_source(Some(repo))?;
+    fs::create_dir_all(run_dir)
+        .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
+    let baseline_path = run_dir.join(BASELINE_DIRECTORY);
+    ensure!(
+        fs::symlink_metadata(&baseline_path).is_err(),
+        "baseline already exists: {}",
+        baseline_path.display()
+    );
+
+    let staging = Builder::new()
+        .prefix(".dispatch-baseline-")
+        .tempdir_in(run_dir)
+        .with_context(|| format!("failed to create a baseline in {}", run_dir.display()))?;
+    export_commit_tree(&repo, commit, staging.path())?;
+
+    initialize_internal_repository(staging.path(), &repo, true)?;
+    let baseline_commit = git_head_at(staging.path())?
+        .context("internal baseline repository did not produce a commit")?;
+    let fingerprint = fingerprint_tree(staging.path())?;
+
+    fs::rename(staging.path(), &baseline_path)
+        .with_context(|| format!("failed to finalize baseline {}", baseline_path.display()))?;
+
+    Ok(SourceSnapshot {
+        kind: SourceKind::Git,
+        git_head: Some(commit.to_owned()),
+        fingerprint,
         baseline_path,
         baseline_commit,
     })
@@ -874,6 +1042,45 @@ fn validate_candidate_tree(root: &Path) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Materialize a commit's tree as real files under `staging`, via a temporary
+/// index scoped to this call (`GIT_INDEX_FILE`) checked out into `staging`
+/// (`GIT_WORK_TREE`), rather than `repo`'s own working tree or index.
+///
+/// Chosen over `git archive --format=tar <commit> | tar -x`: it stays inside
+/// this module's hardened `git_command`/`checked_output` process wrapper (one
+/// external tool, the existing timeout and output-size safety net) instead of
+/// piping two subprocesses together and reimplementing that safety net for a
+/// second tool this codebase does not otherwise depend on. Verified
+/// empirically that it preserves symlinks and the executable bit exactly
+/// (mode 100755 and 120000 entries round-trip byte-for-byte), and that a
+/// gitlink (mode 160000, a nested repository) is left unpopulated as a bare
+/// directory rather than checked out — the same treatment `world::observe`
+/// gives nested repositories.
+fn export_commit_tree(repo: &Path, commit: &str, staging: &Path) -> Result<()> {
+    let index_directory = Builder::new()
+        .prefix("dispatch-checkout-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index_path = index_directory.path().join("index");
+
+    let mut read_tree = git_command(repo);
+    read_tree
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["read-tree", commit]);
+    checked_output(
+        read_tree,
+        "failed to read the commit tree into a temporary index",
+    )?;
+
+    let mut checkout = git_command(repo);
+    checkout
+        .env("GIT_INDEX_FILE", &index_path)
+        .env("GIT_WORK_TREE", staging)
+        .args(["checkout-index", "--all", "--force"]);
+    checked_output(checkout, "failed to materialize the commit tree")?;
     Ok(())
 }
 
@@ -2192,5 +2399,241 @@ mod tests {
         );
         let tracked: Vec<&str> = tracked.lines().collect();
         assert!(tracked.contains(&"build/out.bin"));
+    }
+
+    #[test]
+    fn repo_identity_of_a_linked_worktree_names_the_main_worktree() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        write(&repo.join("file.txt"), "content\n");
+        initialize_user_repository(&repo);
+
+        let worktree = temp.path().join("worktree");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "dispatch-identity-test",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let from_root = repo_identity(&repo).unwrap().unwrap();
+        let from_worktree = repo_identity(&worktree).unwrap().unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
+        assert_eq!(from_root.key, from_worktree.key);
+        assert_eq!(from_root.main_worktree, canonical_repo);
+        assert_eq!(from_worktree.main_worktree, canonical_repo);
+        assert_eq!(from_root.common_dir, from_worktree.common_dir);
+
+        let plain = temp.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        assert!(repo_identity(&plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_base_finds_the_fork_point_and_none_without_history() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        write(&repo.join("file.txt"), "one\n");
+        initialize_user_repository(&repo);
+        let fork_commit = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let workspace = temp.path().join("workspace");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "dispatch-merge-base-test",
+                workspace.to_str().unwrap(),
+            ],
+        );
+
+        // Diverge both sides from the fork point.
+        write(&repo.join("file.txt"), "one\nroot change\n");
+        run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["commit", "--quiet", "-m", "root change"]);
+
+        write(&workspace.join("workspace.txt"), "workspace change\n");
+        run_git(&workspace, &["add", "-A"]);
+        run_git(&workspace, &["commit", "--quiet", "-m", "workspace change"]);
+
+        assert_eq!(merge_base(&repo, &workspace).unwrap(), Some(fork_commit));
+
+        // An unrelated repository is refused rather than compared.
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        write(&unrelated.join("other.txt"), "other\n");
+        initialize_user_repository(&unrelated);
+        let error = merge_base(&repo, &unrelated).unwrap_err().to_string();
+        assert!(error.contains("different repository"), "{error}");
+
+        // An orphan branch in the workspace shares no history with root.
+        run_git(
+            &workspace,
+            &["checkout", "--quiet", "--orphan", "dispatch-orphan-test"],
+        );
+        write(&workspace.join("orphan.txt"), "orphan\n");
+        run_git(&workspace, &["add", "-A"]);
+        run_git(&workspace, &["commit", "--quiet", "-m", "orphan commit"]);
+        assert_eq!(merge_base(&repo, &workspace).unwrap(), None);
+    }
+
+    #[test]
+    fn materialized_baseline_matches_the_commit_tree() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        write(&repo.join("tracked.txt"), "tracked\n");
+        write(&repo.join("sub/nested.txt"), "nested\n");
+        write(&repo.join(".gitignore"), "build/\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let script = repo.join("run.sh");
+            write(&script, "#!/bin/sh\n");
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            symlink("run.sh", repo.join("link.sh")).unwrap();
+        }
+        initialize_user_repository(&repo);
+        let commit = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let snapshot =
+            materialize_baseline_from_commit(&repo, &commit, &temp.path().join("run")).unwrap();
+        assert_eq!(snapshot.kind, SourceKind::Git);
+        assert_eq!(snapshot.git_head.as_deref(), Some(commit.as_str()));
+
+        let commit_listing = run_git(&repo, &["ls-tree", "-r", &commit]);
+        let baseline_listing = run_git(&snapshot.baseline_path, &["ls-tree", "-r", "HEAD"]);
+        assert_eq!(commit_listing, baseline_listing);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::read_link(snapshot.baseline_path.join("link.sh")).unwrap(),
+                Path::new("run.sh")
+            );
+            assert_eq!(
+                fs::metadata(snapshot.baseline_path.join("run.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0o111
+            );
+        }
+
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+
+        let observation = crate::coherence::world::observe(
+            &repo,
+            &snapshot.baseline_path,
+            &snapshot.baseline_commit,
+            &SourceKind::Git,
+        )
+        .unwrap();
+        assert!(observation.changes.is_empty(), "{:?}", observation.changes);
+    }
+
+    #[test]
+    fn delta_from_a_linked_worktree_excludes_git_file_and_ignored_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        write(&root.join("tracked.txt"), "one\n");
+        write(&root.join(".gitignore"), "build/\n");
+        initialize_user_repository(&root);
+        let fork_commit = run_git(&root, &["rev-parse", "HEAD"]);
+
+        let workspace = temp.path().join("workspace");
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "dispatch-delta-test",
+                workspace.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            workspace.join(".git").is_file(),
+            "a linked worktree names its git directory through a file, not a directory"
+        );
+
+        // Edits since S0: a tracked-file change, a new untracked file, and
+        // ignored build output that must never appear in Δ.
+        write(&workspace.join("tracked.txt"), "one\nedited\n");
+        write(&workspace.join("new.txt"), "new\n");
+        write(&workspace.join("build/out.bin"), "artifact\n");
+
+        let baseline =
+            materialize_baseline_from_commit(&root, &fork_commit, &temp.path().join("run"))
+                .unwrap();
+
+        let live_patch = temp.path().join("live.patch");
+        snapshot_delta(&baseline.baseline_path, &workspace, &live_patch).unwrap();
+        let live_text = fs::read_to_string(&live_patch).unwrap();
+        assert!(live_text.contains("tracked.txt"));
+        assert!(live_text.contains("edited"));
+        assert!(!live_text.contains("out.bin"));
+        assert!(!live_text.contains(".git"));
+
+        let diff_path = temp.path().join("finish.patch");
+        let stats = collect_diff(&baseline.baseline_path, &workspace, &diff_path).unwrap();
+        assert_eq!(
+            stats.changed_files,
+            vec!["new.txt".to_string(), "tracked.txt".to_string()]
+        );
+        assert_eq!(stats.untracked_files, vec!["new.txt".to_string()]);
+        assert!(
+            !stats
+                .changed_files
+                .iter()
+                .any(|path| path.contains("build"))
+        );
+        assert!(!stats.changed_files.iter().any(|path| path.contains(".git")));
+        let finish_text = fs::read_to_string(&diff_path).unwrap();
+        assert!(!finish_text.contains("out.bin"));
+        assert!(!finish_text.contains(".git"));
+    }
+
+    // Performance report (run with `cargo test --lib source:: -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "perf report; prints timing only"]
+    fn validate_candidate_tree_timing_report() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = 0_u64;
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(include_entry)
+        {
+            let entry = entry.unwrap();
+            if entry.depth() > 0 && !entry.path().is_dir() {
+                files += 1;
+            }
+        }
+
+        let started = Instant::now();
+        validate_candidate_tree(root).unwrap();
+        let elapsed = started.elapsed();
+
+        println!(
+            "validate_candidate_tree on {}: {:.1} ms wall time, {files} files walked",
+            root.display(),
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 }
