@@ -54,6 +54,46 @@ pub enum ApplyOutcome {
     Failed { error: String },
 }
 
+impl ApplyOutcome {
+    /// Project this outcome into `RunResult.auto_apply` (part 5.4 and 5.6 of
+    /// the plan): the CLI's JSON/JSONL surface. Every variant already
+    /// persisted what happened; this only reshapes it for presentation.
+    pub fn summary(&self) -> crate::AutoApplySummary {
+        let coherence = |validity: &Validity| crate::CoherenceSummary {
+            decision: validity.decision,
+            reasons: validity.reasons.iter().take(5).cloned().collect(),
+            changed_files: validity.changed_files,
+            analysis: validity.analysis,
+        };
+        match self {
+            Self::Applied { report, validity } => crate::AutoApplySummary {
+                outcome: "applied".into(),
+                reason: None,
+                coherence: validity.as_ref().map(coherence),
+                files_changed: report.files_changed,
+            },
+            Self::Blocked { reason, validity } => crate::AutoApplySummary {
+                outcome: "blocked".into(),
+                reason: Some(reason.clone()),
+                coherence: validity.as_ref().map(coherence),
+                files_changed: 0,
+            },
+            Self::Skipped { reason } => crate::AutoApplySummary {
+                outcome: "skipped".into(),
+                reason: Some(reason.clone()),
+                coherence: None,
+                files_changed: 0,
+            },
+            Self::Failed { error } => crate::AutoApplySummary {
+                outcome: "failed".into(),
+                reason: Some(error.clone()),
+                coherence: None,
+                files_changed: 0,
+            },
+        }
+    }
+}
+
 /// Store the latest validity on the run, remembering when work first became
 /// invalid so that later evidence can show how long it ran on a false premise.
 pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {

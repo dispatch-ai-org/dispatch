@@ -383,6 +383,11 @@ struct RunArgs {
     /// Stream committed events followed by the final result as JSON Lines.
     #[arg(long, conflicts_with = "json")]
     jsonl: bool,
+
+    /// Apply the result automatically when verification passed and the work
+    /// is coherent with the current source. Records no human review.
+    #[arg(long)]
+    auto_apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -407,6 +412,11 @@ struct RefreshArgs {
     /// Stream committed events followed by the final result as JSON Lines.
     #[arg(long, conflicts_with = "json")]
     jsonl: bool,
+
+    /// Apply the result automatically when verification passed and the work
+    /// is coherent with the current source. Records no human review.
+    #[arg(long)]
+    auto_apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -653,6 +663,9 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Run(args) => {
+            let auto_apply = args.auto_apply;
+            let json = args.json;
+            let jsonl = args.jsonl;
             let (source, task) = read_run_input(&args)?;
             let request = orchestrator::RunRequest {
                 plan: args.plan,
@@ -676,9 +689,13 @@ async fn run() -> Result<()> {
                 },
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
-                output: if args.json {
-                    orchestrator::RunOutputMode::Json
-                } else if args.jsonl {
+                output: if json {
+                    if auto_apply {
+                        orchestrator::RunOutputMode::Silent
+                    } else {
+                        orchestrator::RunOutputMode::Json
+                    }
+                } else if jsonl {
                     orchestrator::RunOutputMode::Jsonl
                 } else {
                     orchestrator::RunOutputMode::Human
@@ -686,11 +703,7 @@ async fn run() -> Result<()> {
                 refreshed_from: None,
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
-            let exit_code = orchestrator::run_result(&run).exit_code;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
+            finish_run(&state, run, auto_apply, json, jsonl)
         }
         Command::Recommend(args) => {
             let task = read_task(args.task_input)?;
@@ -748,9 +761,16 @@ async fn run() -> Result<()> {
             orchestrator::check(&state, run_id.as_deref(), &std::env::current_dir()?, json)
         }
         Command::Refresh(args) => {
-            let output = if args.json {
-                orchestrator::RunOutputMode::Json
-            } else if args.jsonl {
+            let auto_apply = args.auto_apply;
+            let json = args.json;
+            let jsonl = args.jsonl;
+            let output = if json {
+                if auto_apply {
+                    orchestrator::RunOutputMode::Silent
+                } else {
+                    orchestrator::RunOutputMode::Json
+                }
+            } else if jsonl {
                 orchestrator::RunOutputMode::Jsonl
             } else {
                 orchestrator::RunOutputMode::Human
@@ -771,11 +791,7 @@ async fn run() -> Result<()> {
             if output == orchestrator::RunOutputMode::Human {
                 println!("Refreshed from {old}; new run {}", run.id);
             }
-            let exit_code = orchestrator::run_result(&run).exit_code;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
+            finish_run(&state, run, auto_apply, json, jsonl)
         }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
@@ -916,6 +932,93 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// After `run_dispatch` returns for `run`/`refresh`: report the result, and
+/// when `--auto-apply` was set and the run reached Ready, apply it
+/// automatically and report that outcome too, on every output mode.
+///
+/// Without the flag (or when the run is not Ready) this reproduces exactly
+/// today's behavior: the exit code from `run_result`, nothing else. `--json`
+/// only ever needed `RunOutputMode::Silent` (instead of `Json`) to defer its
+/// print until the auto-apply decision is known; the not-Ready path below
+/// prints the identical JSON itself so that deferral is invisible from the
+/// outside. `--jsonl` never changes its `run_dispatch` output mode: the
+/// auto-apply attempt's own events are streamed by the existing publisher
+/// because the global output mode set by `run_dispatch` is still JSONL.
+///
+/// Exit code: `0` when applied; `6` when the run was Ready but the outcome
+/// is skipped, blocked or failed and the run would otherwise have exited
+/// `0`; otherwise the run's own exit code, unchanged (a run that already
+/// failed for its own reason, for example verification, is not relabeled
+/// "not applied automatically").
+fn finish_run(
+    state: &State,
+    run: dispatch::RunRecord,
+    auto_apply: bool,
+    json: bool,
+    jsonl: bool,
+) -> Result<()> {
+    let result = orchestrator::run_result(&run);
+    let base_exit_code = result.exit_code;
+    if !auto_apply || run.outcome.work_result != dispatch::WorkResult::Ready {
+        if auto_apply && json {
+            println!("{}", serde_json::to_string(&result)?);
+        }
+        if base_exit_code != 0 {
+            std::process::exit(base_exit_code);
+        }
+        return Ok(());
+    }
+
+    let outcome = orchestrator::auto_apply(state, &run.id)?;
+    let exit_code = match &outcome {
+        orchestrator::ApplyOutcome::Applied { .. } => 0,
+        _ if base_exit_code == 0 => 6,
+        _ => base_exit_code,
+    };
+
+    if json {
+        let reloaded = state.load_run(&run.id)?;
+        let mut result = orchestrator::run_result(&reloaded);
+        result.auto_apply = Some(outcome.summary());
+        println!("{}", serde_json::to_string(&result)?);
+    } else if jsonl {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "auto_apply",
+                "run_id": run.id,
+                "auto_apply": outcome.summary(),
+            })
+        );
+    } else if base_exit_code == 0 {
+        match &outcome {
+            orchestrator::ApplyOutcome::Applied { report, .. } => println!(
+                "Auto-applied Candidate {} to {} ({} file(s) changed). Review not performed.",
+                report.candidate_label,
+                run.source_path.display(),
+                report.files_changed
+            ),
+            orchestrator::ApplyOutcome::Blocked { reason, .. } => println!(
+                "Not applied automatically: {reason}. Review with dispatch check {0} or dispatch accept {0}.",
+                run.id
+            ),
+            orchestrator::ApplyOutcome::Skipped { reason } => println!(
+                "Not applied automatically: {reason}. Review with dispatch check {0} or dispatch accept {0}.",
+                run.id
+            ),
+            orchestrator::ApplyOutcome::Failed { error } => println!(
+                "Not applied automatically: {error}. Review with dispatch check {0} or dispatch accept {0}.",
+                run.id
+            ),
+        }
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 fn read_task(input: TaskInput) -> Result<String> {

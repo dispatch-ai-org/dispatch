@@ -2774,6 +2774,7 @@ pub fn run_result(run: &RunRecord) -> RunResult {
                 changed_files: validity.changed_files,
                 analysis: validity.analysis,
             }),
+        auto_apply: None,
     }
 }
 

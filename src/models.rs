@@ -585,6 +585,24 @@ pub struct CoherenceSummary {
     pub analysis: AnalysisLevel,
 }
 
+/// The JSON/JSONL projection of an automatic application attempt
+/// (`orchestrator::apply::ApplyOutcome`), carried on `RunResult.auto_apply`
+/// only when `run --auto-apply`/`refresh --auto-apply` attempted one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoApplySummary {
+    /// "applied" | "blocked" | "skipped" | "failed".
+    pub outcome: String,
+    /// The skip/block reason, or the error text for a failed application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The validity the decision was made against, present only when one
+    /// exists (an unmoved world produces none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<CoherenceSummary>,
+    #[serde(default)]
+    pub files_changed: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     #[serde(default)]
@@ -917,6 +935,9 @@ pub struct RunResult {
     pub admission: Option<AdmissionSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coherence: Option<CoherenceSummary>,
+    /// Present only when `--auto-apply` attempted an automatic application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_apply: Option<AutoApplySummary>,
 }
 
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.
