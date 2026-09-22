@@ -459,7 +459,7 @@ struct AttachArgs {
     #[arg(long)]
     auto_apply: bool,
 
-    /// Wrapped form: the agent command to run after `--`. Not yet implemented.
+    /// Wrapped form: the agent command to run after `--`.
     #[arg(last = true)]
     command: Vec<String>,
 }
@@ -840,18 +840,27 @@ async fn run() -> Result<()> {
         }
         Command::Attach(args) => {
             let workspace = args.workspace.unwrap_or_else(|| PathBuf::from("."));
+            let wrapped = !args.command.is_empty();
             let request = orchestrator::attach::AttachRequest {
                 workspace,
                 root: args.root,
                 task: args.task,
                 agent: args.agent,
                 pid: args.pid,
-                command: (!args.command.is_empty()).then_some(args.command),
+                command: wrapped.then_some(args.command),
                 allow_unsafe_local: args.allow_unsafe_local,
                 auto_apply: args.auto_apply,
             };
-            orchestrator::attach::create(&state, request)?;
-            Ok(())
+            if wrapped {
+                let code = orchestrator::attach::run_wrapped(&state, request).await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            } else {
+                orchestrator::attach::create(&state, request)?;
+                Ok(())
+            }
         }
         Command::Finish {
             run_id,

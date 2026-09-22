@@ -1,15 +1,22 @@
-//! `dispatch attach` (foreign form) and `dispatch finish`: attached external
-//! work Dispatch did not select, route or execute, as a `RunRecord` with
-//! `mode: Attached`. See `docs/plan-0.3-auto-apply-and-attach.md`, parts 6.2
-//! and 14.3–14.9 (the design freeze this module implements exactly).
+//! `dispatch attach` (foreign form and wrapped form) and `dispatch finish`:
+//! attached external work Dispatch did not select or route, as a `RunRecord`
+//! with `mode: Attached`. See `docs/plan-0.3-auto-apply-and-attach.md`, parts
+//! 6.1–6.9 and 14.3–14.10 (the design freeze this module implements exactly).
 //!
-//! The wrapped form (`dispatch attach -- <command...>`) is parsed but not run
-//! yet; `create` refuses it. S4 implements that runtime.
+//! The wrapped form (`dispatch attach -- <command...>`) is the owner loop of
+//! its own Work (part 6.1): `create` it, spawn the agent under the terminal,
+//! watch the integration world while it runs, and on exit finish and,
+//! authorized, apply. `run_wrapped` is that loop.
+
+use std::process::Stdio;
+
+use tokio::signal::unix::{SignalKind, signal};
 
 use super::*;
 use crate::{
     AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail, BaselineProvenance,
     FinishReason, OwnerState, admission,
+    coherence::watch::{WatchSpec, Watcher},
 };
 
 /// Request to attach external work Dispatch did not launch. See part 14.3.
@@ -22,7 +29,8 @@ pub struct AttachRequest {
     pub task: Option<String>,
     pub agent: Option<String>,
     pub pid: Option<u32>,
-    /// `Some` selects the wrapped form, not yet implemented (S4).
+    /// `Some` selects the wrapped form (`run_wrapped`): the argv Dispatch
+    /// spawns and owns for the session.
     pub command: Option<Vec<String>>,
     pub allow_unsafe_local: bool,
     pub auto_apply: bool,
@@ -33,11 +41,7 @@ pub struct AttachRequest {
 /// spawning anything or touching the workspace. See part 14.8 for the
 /// refusal order and exact messages.
 pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
-    if request.command.is_some() {
-        bail!(
-            "wrapped attach is not available yet; use --workspace to attach an existing worktree"
-        );
-    }
+    let is_wrapped = request.command.is_some();
 
     let workspace = source::resolve_source(Some(&request.workspace))?;
     let root = match &request.root {
@@ -64,12 +68,22 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
                 root_identity.is_some_and(|root_repo| root_repo.key == workspace_repo.key),
                 "workspace belongs to a different repository than the integration root"
             );
-            source::merge_base(&root, &workspace)?
-                .context("no common history between the workspace and the integration root")?
+            Some(
+                source::merge_base(&root, &workspace)?
+                    .context("no common history between the workspace and the integration root")?,
+            )
         }
-        None => bail!("a plain directory can be attached only by wrapping the agent command"),
+        None => {
+            // Plain-directory S0 (part 6.4/14.3): the wrapped form snapshots
+            // the workspace at attach time; a foreign attach has no honest
+            // S0 for a plain directory and is refused.
+            anyhow::ensure!(
+                is_wrapped,
+                "a plain directory can be attached only by wrapping the agent command"
+            );
+            None
+        }
     };
-    let workspace_identity = workspace_identity.expect("checked above: workspace is Git");
 
     let (config, config_path) = Config::discover(&root, None)?;
     config.validate()?;
@@ -108,17 +122,33 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
-    let snapshot = match source::materialize_baseline_from_commit(&root, &commit, &run_dir) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&run_dir);
-            return Err(error.context("baseline creation failed; incomplete run state was removed"));
+    let (snapshot, provenance, confidence) = match &commit {
+        Some(commit) => {
+            let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
+                .map_err(|error| {
+                    let _ = fs::remove_dir_all(&run_dir);
+                    error.context("baseline creation failed; incomplete run state was removed")
+                })?;
+            (
+                snapshot,
+                BaselineProvenance::GitMergeBase {
+                    commit: commit.clone(),
+                },
+                AttachConfidence::Full,
+            )
+        }
+        None => {
+            let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
+                let _ = fs::remove_dir_all(&run_dir);
+                error.context("baseline creation failed; incomplete run state was removed")
+            })?;
+            (
+                snapshot,
+                BaselineProvenance::SnapshotAtAttach,
+                AttachConfidence::Partial,
+            )
         }
     };
-    let provenance = BaselineProvenance::GitMergeBase {
-        commit: commit.clone(),
-    };
-    let confidence = AttachConfidence::Full;
 
     let (source_kind, source_git_head) = source::inspect_source(&root)?;
     let source_fingerprint = source::fingerprint_tree(&root)?;
@@ -184,18 +214,22 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         version: 1,
         workspace: workspace.clone(),
         integration_root: root.clone(),
-        repo_key: Some(workspace_identity.key),
+        repo_key: workspace_identity.map(|identity| identity.key),
         provenance,
         confidence,
         agent: request.agent.clone(),
-        command: None,
-        owner: None,
+        command: request.command.clone(),
+        owner: is_wrapped.then(admission::ProcessIdentity::current),
         agent_process: request.pid.map(admission::process_identity),
-        owner_state: OwnerState::Unknown,
+        owner_state: if is_wrapped {
+            OwnerState::Live
+        } else {
+            OwnerState::Unknown
+        },
         capabilities: AttachCapabilities {
             observe: true,
             signal: true,
-            control: false,
+            control: is_wrapped,
             integrate: request.auto_apply,
         },
         attached_at: now,
@@ -287,21 +321,253 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         &mut run,
     )?;
 
-    let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
-        BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
-        BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
-    };
-    let confidence_text = match run.attachment.as_ref().unwrap().confidence {
-        AttachConfidence::Full => "full",
-        AttachConfidence::Partial => "partial",
-    };
-    println!("ATTACHED {}", run.id);
-    println!("Workspace  {}", workspace.display());
-    println!("Root       {}", root.display());
-    println!("S0         {provenance_text}, {confidence_text} confidence");
-    println!("Next: dispatch finish {} when the agent is done", run.id);
+    // The wrapped form writes nothing to the terminal while the agent runs
+    // (part 6.7): its owner loop prints its own single line only after the
+    // child exits. The foreign form prints this banner immediately, as
+    // before.
+    if !is_wrapped {
+        let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
+            BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
+            BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
+        };
+        let confidence_text = match run.attachment.as_ref().unwrap().confidence {
+            AttachConfidence::Full => "full",
+            AttachConfidence::Partial => "partial",
+        };
+        println!("ATTACHED {}", run.id);
+        println!("Workspace  {}", workspace.display());
+        println!("Root       {}", root.display());
+        println!("S0         {provenance_text}, {confidence_text} confidence");
+        println!("Next: dispatch finish {} when the agent is done", run.id);
+    }
 
     Ok(run)
+}
+
+/// `dispatch attach -- <command...>`: the wrapped form's owner loop (parts
+/// 6.1 and 6.7). `create`s the Work with `command: Some(argv)`, spawns the
+/// agent under the terminal in the wrapper's own process group, watches the
+/// integration world while it runs without ever stopping or signaling the
+/// agent because of a verdict, and on exit finishes the Work and, if
+/// `capabilities.integrate`, applies it. Returns the exit code the CLI
+/// process should use: the agent's own exit code, when the wrapper's own
+/// work (creation, then finishing) succeeded. A failure in either of those
+/// propagates as `Err`, exiting 1 (rule 6 of part 6.7): creation failures
+/// never start the agent; a finish failure after the agent exited leaves the
+/// Work `Working` for a human `dispatch finish` to retry.
+#[cfg(unix)]
+pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
+    let argv = request
+        .command
+        .clone()
+        .filter(|argv| !argv.is_empty())
+        .context("wrapped attach requires a command after --")?;
+    let allow_unsafe_local = request.allow_unsafe_local;
+    let auto_apply_requested = request.auto_apply;
+
+    let mut run = create(state, request)?;
+    let run_dir = state.run_dir(&run.id);
+    let workspace = run.candidates[0].workspace_path.clone();
+
+    // Held for the whole wrapped session: this is how `finish` and `serve`
+    // know the Work is owned (rule 1).
+    let run_lock = OperationLock::acquire(
+        &run_dir.join(".operation.lock"),
+        "attached work has a foreground owner",
+    )?;
+
+    // Rule 3: install the SIGTERM/SIGHUP forwarding handlers before the agent
+    // ever runs. A handler-based disposition always resets to default on
+    // `exec` regardless of when it is installed (unlike `SIG_IGN`, part
+    // below), so installing it this early carries no inheritance risk, and
+    // closes the race a fast-starting agent could otherwise hit: without
+    // this, a signal arriving after `spawn` but before the wrapper finished
+    // installing its handler would kill the wrapper by the default
+    // disposition, orphaning the agent instead of forwarding to it.
+    let mut sigterm = signal(SignalKind::terminate()).context("failed to watch for SIGTERM")?;
+    let mut sighup = signal(SignalKind::hangup()).context("failed to watch for SIGHUP")?;
+
+    // Rule 2: the agent inherits the wrapper's own stdio and stays in its
+    // process group (no `process_group(0)`), so terminal job control and
+    // Ctrl+C behave exactly as if the shell had started it directly. Not the
+    // `Executor` path: no piped output, no token accounting, no timeout.
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .current_dir(&workspace)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {}", argv.join(" ")))?;
+    let child_pid = child.id();
+    let agent_process = admission::process_identity(child_pid);
+
+    // Rule 3: ignore SIGINT/SIGQUIT for the wrapper's own lifetime while the
+    // child runs (as `time` does) — installed only now, after `spawn`, so the
+    // child still execs with the default disposition and stays interruptible
+    // itself: `SIG_IGN` (unlike a handler) is inherited across `exec`, so
+    // installing it before `spawn` would make the child ignore them too.
+    // Nothing is printed to the terminal while the child lives.
+    ignore_signal(libc::SIGINT);
+    ignore_signal(libc::SIGQUIT);
+
+    let mut db = Database::open(state.db_path())?;
+    if let Some(attachment) = run.attachment.as_mut() {
+        attachment.agent_process = Some(agent_process.clone());
+    }
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "attach.started".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"agent_process": agent_process}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+
+    // Rule 4: the same mid-run watcher allocation runs use, persisted through
+    // the shared `persist_verdict` step. A verdict never stops or signals
+    // the agent.
+    let config = crate::coherence::run_config(&run_dir);
+    let poll_secs = config
+        .as_ref()
+        .map_or(10, |config| config.coherence.poll_secs)
+        .max(1);
+    let mut watcher = Watcher::spawn(WatchSpec {
+        source: run.source_path.clone(),
+        kind: run.source_kind.clone(),
+        baseline: run.baseline_path.clone(),
+        baseline_commit: run.baseline_commit.clone(),
+        workspace: workspace.clone(),
+        delta_patch: run_dir.join("delta-live.patch"),
+        poll: Duration::from_secs(poll_secs),
+    });
+
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel();
+    let wait_handle = tokio::task::spawn_blocking(move || {
+        let status = child.wait();
+        let _ = exit_tx.send(status);
+    });
+
+    let exit_status = loop {
+        tokio::select! {
+            result = &mut exit_rx => {
+                let status = result.context("lost the agent process's exit status")?;
+                break status.context("failed to wait for the agent process")?;
+            }
+            _ = sigterm.recv() => forward_signal(child_pid, libc::SIGTERM),
+            _ = sighup.recv() => forward_signal(child_pid, libc::SIGHUP),
+            message = watcher.rx.recv() => {
+                if let Some(message) = message {
+                    apply::persist_verdict(state, &db, &mut run, &message.validity)?;
+                }
+            }
+        }
+    };
+    let _ = wait_handle.await;
+
+    // Rule 3: the disposition is restored before the wrapper exits.
+    restore_signal(libc::SIGINT);
+    restore_signal(libc::SIGQUIT);
+
+    // Rule 5: stop the watcher and drain whatever verdict it produced during
+    // the exit race before finishing.
+    watcher.finish().await;
+    while let Ok(message) = watcher.rx.try_recv() {
+        apply::persist_verdict(state, &db, &mut run, &message.validity)?;
+    }
+
+    let code = exit_status.code();
+    let run = finish_locked(
+        state,
+        &mut db,
+        run,
+        allow_unsafe_local,
+        FinishReason::ProcessExit { code },
+    )
+    .await?;
+    let run_id = run.id.clone();
+
+    // Rule 5: `auto_apply` takes the run lock itself.
+    drop(run_lock);
+
+    if auto_apply_requested {
+        let outcome = auto_apply(state, &run_id)?;
+        print_auto_apply_outcome(&run, &outcome);
+    } else {
+        println!("Attached work {run_id} finished; next: dispatch check {run_id}");
+    }
+
+    Ok(code.unwrap_or(1))
+}
+
+#[cfg(not(unix))]
+pub async fn run_wrapped(_state: &State, _request: AttachRequest) -> Result<i32> {
+    bail!("wrapped attach is only supported on Unix")
+}
+
+/// Send `signal` to the agent process. Best-effort: the child may already
+/// have exited (a benign race with the exit-status wait), in which case this
+/// is a no-op.
+#[cfg(unix)]
+fn forward_signal(pid: u32, signal: i32) {
+    // SAFETY: `pid` names the agent process this wrapper spawned and still
+    // owns; `signal` is always one of the fixed constants above.
+    unsafe {
+        libc::kill(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(unix)]
+fn ignore_signal(signal: i32) {
+    // SAFETY: `signal` is always one of the fixed constants above; `SIG_IGN`
+    // is always a valid disposition.
+    unsafe {
+        libc::signal(signal, libc::SIG_IGN);
+    }
+}
+
+#[cfg(unix)]
+fn restore_signal(signal: i32) {
+    // SAFETY: see `ignore_signal`.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+    }
+}
+
+/// Print `outcome` in the same words `dispatch run --auto-apply` uses (see
+/// `finish_run` in `src/main.rs`): a wrapped attach with `--auto-apply`
+/// reaches the same policy application through a different owner loop, and
+/// the two should read identically from a terminal.
+#[cfg(unix)]
+fn print_auto_apply_outcome(run: &RunRecord, outcome: &ApplyOutcome) {
+    match outcome {
+        ApplyOutcome::Applied { report, .. } => println!(
+            "Auto-applied Candidate {} to {} ({} file(s) changed). Review not performed.",
+            report.candidate_label,
+            run.source_path.display(),
+            report.files_changed
+        ),
+        ApplyOutcome::Blocked { reason, .. } => println!(
+            "Not applied automatically: {reason}. Review with dispatch check {0} or dispatch accept {0}.",
+            run.id
+        ),
+        ApplyOutcome::Skipped { reason } => println!(
+            "Not applied automatically: {reason}. Review with dispatch check {0} or dispatch accept {0}.",
+            run.id
+        ),
+        ApplyOutcome::Failed { error } => println!(
+            "Not applied automatically: {error}. Review with dispatch check {0} or dispatch accept {0}.",
+            run.id
+        ),
+    }
 }
 
 /// A `RunMode::Attached` run whose lifecycle is still `Working` for this
@@ -333,7 +599,7 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
         &state.run_dir(&resolved_run_id).join(".operation.lock"),
         "attached work has a foreground owner",
     )?;
-    let mut run = state.load_run(&resolved_run_id)?;
+    let run = state.load_run(&resolved_run_id)?;
     anyhow::ensure!(
         run.mode == RunMode::Attached && run.outcome.lifecycle == LifecycleState::Working,
         "attached work {} is not active",
@@ -346,6 +612,36 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
     );
 
     let mut db = Database::open(state.db_path())?;
+    let run = finish_locked(
+        state,
+        &mut db,
+        run,
+        allow_unsafe_local,
+        FinishReason::Explicit,
+    )
+    .await?;
+
+    print_finish_summary(&run);
+    println!("Next: dispatch check {}", run.id);
+
+    Ok(run)
+}
+
+/// The mechanics of "finished" (part 14.9), shared by `dispatch finish`
+/// (`reason: Explicit`) and the wrapped owner loop (`reason: ProcessExit`,
+/// once the agent has exited): freeze Δ, run `checks.verify` in the
+/// workspace itself, set the candidate's outcome and `exit_code` from
+/// `reason`, and commit `attach.finished` + `run.finished`. The caller holds
+/// the run's operation lock and has already checked that the run is an
+/// active, single-candidate attachment; this prints nothing, so each caller
+/// presents the result in its own words.
+pub(super) async fn finish_locked(
+    state: &State,
+    db: &mut Database,
+    mut run: RunRecord,
+    allow_unsafe_local: bool,
+    reason: FinishReason,
+) -> Result<RunRecord> {
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
     let diff_path = run.candidates[0].diff_path.clone();
@@ -358,9 +654,9 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
             refresh_outcome(&mut run);
             run.status = RunStatus::Failed;
             run.completed_at = Some(Utc::now());
-            finish_attachment(&mut run, FinishReason::Explicit);
+            finish_attachment(&mut run, reason);
             db.sync_run(&run)?;
-            persist_event(state, &db, run_finished_event(&run), &mut run)?;
+            persist_event(state, db, run_finished_event(&run), &mut run)?;
             return Ok(run);
         }
     };
@@ -394,7 +690,10 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
         .expect("attached run carries an attachment record")
         .attached_at;
     run.candidates[0].duration_ms = (Utc::now() - attached_at).num_milliseconds().max(0) as u64;
-    run.candidates[0].exit_code = None;
+    run.candidates[0].exit_code = match &reason {
+        FinishReason::ProcessExit { code } => *code,
+        FinishReason::Explicit | FinishReason::OwnerGone => None,
+    };
 
     refresh_outcome(&mut run);
     run.status = if run.outcome.work_result == WorkResult::Ready {
@@ -409,26 +708,23 @@ pub async fn finish(state: &State, run_id: &str, allow_unsafe_local: bool) -> Re
         attempt.outcome = "completed".into();
         attempt.detail.result = Some(candidate_snapshot);
     }
-    finish_attachment(&mut run, FinishReason::Explicit);
+    finish_attachment(&mut run, reason.clone());
 
     db.sync_run(&run)?;
     persist_event(
         state,
-        &db,
+        db,
         EventRecord {
             run_id: run.id.clone(),
             candidate_label: None,
             event_type: "attach.finished".into(),
             timestamp: Utc::now(),
-            payload: serde_json::json!({"reason": FinishReason::Explicit}),
+            payload: serde_json::json!({"reason": reason}),
             ..EventRecord::default()
         },
         &mut run,
     )?;
-    persist_event(state, &db, run_finished_event(&run), &mut run)?;
-
-    print_finish_summary(&run);
-    println!("Next: dispatch check {}", run.id);
+    persist_event(state, db, run_finished_event(&run), &mut run)?;
 
     Ok(run)
 }
