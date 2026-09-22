@@ -268,4 +268,4 @@ After the final gates recorded above, freeze new feature scope. The next pass is
 cohesive visual/interaction polish and release hardening using the existing selected
 scheduler mark and actual captures. No parallel execution, worker daemon, new
 provider, learned planner or Phase 9 infrastructure project is proposed. This report
-establishes readiness for opt-in planned-work dogfood, not public-release readiness.
+establishes readiness for opt-in planned-work internal use, not public-release readiness.

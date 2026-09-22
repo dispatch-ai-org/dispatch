@@ -351,4 +351,4 @@ How to read it:
 - The mid-run watcher covers allocation runs only, observes by default, and while the agent works builds a work-in-progress patch with a temporary Git index each time the signal moves (at most every `poll_secs`).
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
-- Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured.
+- Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured. What is claimed today, what is recorded during real use, and what would falsify the thesis are in [coherence-validation.md](coherence-validation.md).

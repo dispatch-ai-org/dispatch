@@ -392,7 +392,7 @@ lifetime. The live test used the repository release binary and a private resourc
 profile; it did not enable Claude in the user's global Dispatch configuration.
 
 
-CORE: **COMPLETE — READY FOR TWO-SUBSCRIPTION DOGFOOD**
+CORE: **COMPLETE — READY FOR TWO-SUBSCRIPTION INTERNAL USE**
 
 LIVE CLAUDE SUBSCRIPTION: **VERIFIED FOR Claude Code 2.1.274 / personal Pro with usage credits disabled / claude-sonnet-5 / medium effort / standard service / controlled title-disabled print mode.**
 

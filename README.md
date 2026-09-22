@@ -2,29 +2,141 @@
 
 # Dispatch
 
+**Keep autonomous software work valid while the code moves.**
+
 **Dispatch 0.2.0 — experimental developer preview**
 
-New in this version: [work coherence](#work-coherence-keeping-results-valid-while-the-code-moves).
-Finished work is checked against the source as it is now, so an unrelated edit no
-longer blocks acceptance and a change that really affects the work is reported with a reason.
-
-Tell Dispatch what you want changed. Dispatch chooses an available coding agent using observed performance data, runs it in an isolated candidate workspace, verifies the result when configured, and lets you review and accept it.
+A coding agent works from a snapshot of your source while the real source keeps
+changing: you edit files, another run is accepted, a teammate merges. Dispatch
+runs the agent in an isolated copy of that snapshot, keeps the patch it produced,
+and before applying it checks whether the work still holds against the source as
+it is now. The answer is a verdict with reasons, not a merge conflict:
 
 ```text
 task
   ↓
-available coding agents + local public performance evidence
+S0: frozen baseline + isolated candidate workspace
   ↓
-one selected agent
+one selected coding agent + configured verification
   ↓
-isolated execution + configured verification
+Δ: the patch, kept with its evidence
+  ↓
+validate(facts the work relied on, source now)
+  ↓
+CONTINUE / REFRESH / STOP, with reasons
   ↓
 review → accept or reject
 ```
 
-Dispatch keeps orchestration and evidence local. Provider execution requires the provider’s service. A release contains a compact public-evidence snapshot, normal runs never fetch benchmark data, and Dispatch Cloud is optional.
+Dispatch chooses the agent from observed performance evidence, runs it in an
+isolated workspace, verifies the result when checks are configured, and lets you
+review and accept it. Those are how Dispatch carries the work. Coherence is what
+it adds: the verdict is always recomputed from the snapshot, the patch and the
+source now, and a stale result is never applied.
 
-## Interactive dogfood loop
+Orchestration and evidence stay local. Provider execution requires the provider’s
+service. A release contains a compact public-evidence snapshot, normal runs never
+fetch benchmark data, and Dispatch Cloud is optional.
+
+## Work coherence: keeping results valid while the code moves
+
+Before 0.2.0 any difference anywhere in the tree refused `dispatch accept`, even
+an edited README, and Dispatch could not tell a harmless change from one that
+invalidates the work.
+
+Dispatch treats a run like an optimistic transaction. **S0** is the snapshot
+the run started from and **Δ** is the patch the agent produced. From S0 and Δ,
+Dispatch derives the *facts the work relied on*: the declarations the patch edits,
+the declarations its new code uses, and, for files it cannot parse, the files
+themselves. When you accept, Dispatch observes the current source (ignoring what
+`.gitignore` excludes), checks that Δ still applies, and checks that those facts
+still hold. The answer is a verdict, always recomputed from S0, Δ and the source as
+it is now. Nothing about it is trusted from an earlier moment.
+
+| Verdict | Meaning | At accept time | Mid-run (allocation runs) |
+|---|---|---|---|
+| `CONTINUE` | The source did not move, or nothing the work relied on changed. | Applies against the current source, after your `checks.verify` pass on the merged result if the source moved. | Nothing, unless it follows an earlier invalid verdict (`coherence.checked`). |
+| `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message names `dispatch refresh`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
+| `STOP` | Δ is already present in the source. | Nothing is applied; the message points to `dispatch reject`. | `coherence.invalidated` is recorded. With `mid_run: stop` the agent is stopped. |
+
+### Accept-time flow
+
+- `dispatch check [run]` evaluates the finished result now and prints the verdict,
+  analysis level, number of changed files, reasons and the next command. It is
+  read-only, stores nothing, and exits 0 for any verdict (1 if it cannot evaluate).
+  It runs the file, patch and symbol layers only; integration checks run at accept.
+- `dispatch accept [run]` records your decision and then applies. If the tree is
+  byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict
+  gates the apply. A `REFRESH` or `STOP` leaves the source untouched and the run
+  shows its application as blocked by source drift.
+- `dispatch refresh [run]` starts a **new** run of the same task against the current
+  source. The task gets a fixed note naming the earlier run and up to ten reasons it
+  went stale. The old run is not modified. It needs the same explicit flags as `run`
+  (for example `--allow-unsafe-local`) and repeats the original launch choices,
+  such as a fixed agent, model or effort. Dispatch never relaunches automatically.
+
+Worked example. A run adds a call to `auth::validate(&token)` in `src/handler.rs`.
+While it waited for review:
+
+```text
+# You edit README.md and an unrelated function in src/util.rs.
+$ dispatch check
+Run <id>
+Coherence: CONTINUE
+Analysis: files_only
+World changed files: 2
+Next: dispatch accept <id>
+$ dispatch accept          # applies onto the edited tree
+
+# Instead, someone changes validate's signature in src/auth.rs.
+$ dispatch check
+Run <id>
+Coherence: REFRESH
+Analysis: symbols
+World changed files: 1
+  fact_broken: pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>
+Next: dispatch refresh <id>  (or dispatch reject <id>)
+```
+
+All keys are optional and live in `dispatch.yml`; the values shown are the defaults.
+The block is read from the configuration frozen with each run.
+
+```yaml
+coherence:
+  accept: validate        # validate: check the moved tree; strict: refuse on any drift (0.1.x behavior)
+  mid_run: observe        # observe: record verdicts while the agent works; stop: cancel it on STOP
+  stop_on_refresh: false  # with mid_run: stop, also cancel on REFRESH
+  poll_secs: 10           # how often the mid-run watcher looks for source changes (must be > 0)
+  integration_checks: true  # when the source moved, run checks.verify on the merged tree before applying
+```
+
+### What it checks and what it does not
+
+- Symbol facts exist for **Rust and Python** only. Other languages use file-level
+  facts: any change to a file the patch edits, or mentions by path, is a `REFRESH`.
+- A referenced symbol is bound by *unique name* in the baseline, not by full name
+  resolution. Ambiguous or very common names are skipped, so some breakage is missed.
+- Integration checks run your configured `checks.verify` on the merged tree in a
+  scratch copy of the non-ignored files, with no build cache. They hold the apply
+  locks while running. On the local backend they are skipped for a run that was not
+  itself approved for local execution. A check that fails, times out or cannot run
+  produces `REFRESH`.
+- Two edits to the same symbol are reported as `REFRESH`. Python appends at the very
+  end of a function are not seen as same-symbol edits by the symbol layer; the patch
+  check and your checks still apply.
+- Transitive behavior changes (a callee's callee) are caught only if your checks
+  cover them.
+- Nested repositories and submodules are not analysed.
+- Planned (`--plan`) runs keep the strict drift stop between tasks; accepting a
+  finished planned delivery uses the same accept-time gate.
+- Mid-run verdicts are advisory by default and are computed for allocation runs only.
+
+See the [coherence reference](docs/coherence.md) for the model, rules, events and
+the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
+what is claimed today, what is measured during real use, and what would show the
+thesis to be wrong.
+
+## Interactive loop
 
 From a source directory, open Dispatch. Missing resources lead to guided setup
 and preserve your goal. You can also configure resources first:
@@ -121,7 +233,7 @@ dispatch explain
 
 No `init`, `doctor`, dataset import, Cloud account, or routing flag is required for this workflow.
 
-## What Dispatch reports
+## How Dispatch chooses an agent
 
 An evidence-based selection is described as observed benchmark performance, not as confidence or a probability of success. For example, with two compatible fixture results:
 
@@ -155,103 +267,6 @@ Available benchmark evidence:
 ```
 
 After execution, Dispatch leads with the task, selected agent, selection basis, verification result, and next action. Mechanical verification, human acceptance, and the routing prediction remain separate facts. A passing check never silently accepts or applies a result.
-
-## Work coherence: keeping results valid while the code moves
-
-An agent works from a frozen snapshot while the real source keeps changing: you
-edit files, another run is accepted, a build writes output. Before 0.2.0 any
-difference anywhere in the tree refused `dispatch accept`, even an edited README,
-and Dispatch could not tell a harmless change from one that invalidates the work.
-
-Dispatch now treats a run like an optimistic transaction. **S0** is the snapshot
-the run started from and **Δ** is the patch the agent produced. From S0 and Δ,
-Dispatch derives the *facts the work relied on*: the declarations the patch edits,
-the declarations its new code uses, and, for files it cannot parse, the files
-themselves. When you accept, Dispatch observes the current source (ignoring what
-`.gitignore` excludes), checks that Δ still applies, and checks that those facts
-still hold. The answer is a verdict, always recomputed from S0, Δ and the source as
-it is now. Nothing about it is trusted from an earlier moment.
-
-| Verdict | Meaning | At accept time | Mid-run (allocation runs) |
-|---|---|---|---|
-| `CONTINUE` | The source did not move, or nothing the work relied on changed. | Applies against the current source, after your `checks.verify` pass on the merged result if the source moved. | Nothing, unless it follows an earlier invalid verdict (`coherence.checked`). |
-| `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message names `dispatch refresh`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
-| `STOP` | Δ is already present in the source. | Nothing is applied; the message points to `dispatch reject`. | `coherence.invalidated` is recorded. With `mid_run: stop` the agent is stopped. |
-
-### Accept-time flow
-
-- `dispatch check [run]` evaluates the finished result now and prints the verdict,
-  analysis level, number of changed files, reasons and the next command. It is
-  read-only, stores nothing, and exits 0 for any verdict (1 if it cannot evaluate).
-  It runs the file, patch and symbol layers only; integration checks run at accept.
-- `dispatch accept [run]` records your decision and then applies. If the tree is
-  byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict
-  gates the apply. A `REFRESH` or `STOP` leaves the source untouched and the run
-  shows its application as blocked by source drift.
-- `dispatch refresh [run]` starts a **new** run of the same task against the current
-  source. The task gets a fixed note naming the earlier run and up to ten reasons it
-  went stale. The old run is not modified. It needs the same explicit flags as `run`
-  (for example `--allow-unsafe-local`) and repeats the original launch choices,
-  such as a fixed agent, model or effort. Dispatch never relaunches automatically.
-
-Worked example. A run adds a call to `auth::validate(&token)` in `src/handler.rs`.
-While it waited for review:
-
-```text
-# You edit README.md and an unrelated function in src/util.rs.
-$ dispatch check
-Run <id>
-Coherence: CONTINUE
-Analysis: files_only
-World changed files: 2
-Next: dispatch accept <id>
-$ dispatch accept          # applies onto the edited tree
-
-# Instead, someone changes validate's signature in src/auth.rs.
-$ dispatch check
-Run <id>
-Coherence: REFRESH
-Analysis: symbols
-World changed files: 1
-  fact_broken: pub fn validate(token: &Token) -> Result<User, AuthError> => pub fn validate(ctx: &AuthContext, token: &Token) -> Result<User, AuthError>
-Next: dispatch refresh <id>  (or dispatch reject <id>)
-```
-
-All keys are optional and live in `dispatch.yml`; the values shown are the defaults.
-The block is read from the configuration frozen with each run.
-
-```yaml
-coherence:
-  accept: validate        # validate: check the moved tree; strict: refuse on any drift (0.1.x behavior)
-  mid_run: observe        # observe: record verdicts while the agent works; stop: cancel it on STOP
-  stop_on_refresh: false  # with mid_run: stop, also cancel on REFRESH
-  poll_secs: 10           # how often the mid-run watcher looks for source changes (must be > 0)
-  integration_checks: true  # when the source moved, run checks.verify on the merged tree before applying
-```
-
-### What it checks and what it does not
-
-- Symbol facts exist for **Rust and Python** only. Other languages use file-level
-  facts: any change to a file the patch edits, or mentions by path, is a `REFRESH`.
-- A referenced symbol is bound by *unique name* in the baseline, not by full name
-  resolution. Ambiguous or very common names are skipped, so some breakage is missed.
-- Integration checks run your configured `checks.verify` on the merged tree in a
-  scratch copy of the non-ignored files, with no build cache. They hold the apply
-  locks while running. On the local backend they are skipped for a run that was not
-  itself approved for local execution. A check that fails, times out or cannot run
-  produces `REFRESH`.
-- Two edits to the same symbol are reported as `REFRESH`. Python appends at the very
-  end of a function are not seen as same-symbol edits by the symbol layer; the patch
-  check and your checks still apply.
-- Transitive behavior changes (a callee's callee) are caught only if your checks
-  cover them.
-- Nested repositories and submodules are not analysed.
-- Planned (`--plan`) runs keep the strict drift stop between tasks; accepting a
-  finished planned delivery uses the same accept-time gate.
-- Mid-run verdicts are advisory by default and are computed for allocation runs only.
-
-See the [coherence reference](docs/coherence.md) for the model, rules, events and
-the fixture matrix.
 
 ## Install
 
@@ -558,6 +573,7 @@ No Cloud service is required to create, execute, inspect, accept, or reject a ta
 - Public evidence is observational benchmark evidence, not ground truth, a quality label, confidence, or calibrated probability.
 - If no compatible public evidence exists, the deterministic fallback order is the existing real-adapter order: Claude Code, then Codex, then Cursor, restricted to agents detected as locally executable.
 - Phase 7 private evidence supports explicit owner-controlled trials; no private policy is activated automatically.
+- Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
 - Direct allocation has bounded recovery. Task decomposition is opt-in and sequential; no agent racing, learned planner, ML, embeddings, LLM judging, background refresh, daemon, or Cloud routing lookup is added. Planning effectiveness remains unmeasured.
 
 ## Development

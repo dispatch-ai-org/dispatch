@@ -1,9 +1,9 @@
-# Phase 4 / first dogfood release report
+# Phase 4 / first internal release report
 
-> **Historical: written 2026-09-17 for the first dogfood attempt; superseded by later phases and by the current README/product guide.** Its "NOT READY" status, Codex-only scope and provider statements below describe that moment, not the current product.
+> **Historical: written 2026-09-17 for the first internal-use attempt; superseded by later phases and by the current README/product guide.** Its "NOT READY" status, Codex-only scope and provider statements below describe that moment, not the current product.
 
-Date: 2026-09-17. Status: **NOT READY for the first dogfood release**.
-Phase 4 implementation and three small current-account dogfood tasks are complete;
+Date: 2026-09-17. Status: **NOT READY for the first internal release**.
+Phase 4 implementation and three small current-account internal tasks are complete;
 the full real-task and manual terminal matrices remain incomplete. No release tag, publication, Phase 5 transport, daemon,
 planner, learned routing, or second-provider execution was added.
 
@@ -163,7 +163,7 @@ safe but Phase 3 replaced the specific funding error with a generic stop reason.
 Phase 3 now preserves the candidate error when present. The concurrent fixture
 checks that the rejection reason remains visible whichever fence observes it.
 
-## I. Real dogfood results
+## I. Real internal-use results
 
 The earlier Phase 1 evidence remains on disk: Luna and Terra each completed one
 small Rust task. Resolved identities were recorded; observed model identity was
@@ -171,7 +171,7 @@ unknown, and is still not represented as known.
 
 The first Phase 4 attempt correctly refused to launch because fresh evidence reported
 `prolite` while the profiles authorized `chatgpt-plus-included`. The user then
-confirmed the subscription upgrade. The dogfood profiles now use
+confirmed the subscription upgrade. The internal-use profiles now use
 `chatgpt-prolite-included`, authorization revision 2, with the same shared pool,
 models, efforts, included-only constraint and no-overage acknowledgement. Fresh
 provider checks passed; no paid fallback was enabled.
@@ -201,7 +201,7 @@ judgments**. Observed model identities remain unknown; resolved identities are k
 | G. Drift refusal | Real: task D, edit source before in-session apply | Luna/low | Included in D | Passed; review accepted; application blocked by source drift | Correct refusal; original edit preserved |
 | H. Two local sessions | Concurrent PTY fixtures passed; real paired launch attempted | Real bug task selected standard; initial clarification task required unconfigured strong tier | 1 real task launched | Real pair did not reach shared admission; deterministic sessions did | Real contention remains unproven in this pass |
 
-Successful run evidence in `/private/tmp/dispatch-phase1-dogfood.9152ub/state/runs/`:
+Successful run evidence in `/private/tmp/dispatch-phase1-internal.9152ub/state/runs/`:
 
 - A/E: `01M2R5HYRDZ2T0W906CPE6JAR8` (35.5-second terminal session).
 - B/F: `01M2R5N2QNQ22R0923FDMCSNH3` (25.2-second terminal session).
@@ -215,7 +215,7 @@ one retained rejected revision-1 authorization and four revision-2 authorization
 Earlier zero-invocation failures are retained: `01M2R44TT80DJXF8VMJ3XQGBSM`
 (funding mismatch) and `01M2R55XXSJ7PR4M5ZEKXZW7ZK` (registration uniqueness bug).
 Timestamped terminal transcripts and the original/proposed profiles remain under
-`/private/tmp/dispatch-phase4-dogfood/`. No resets or credits were consumed and no
+`/private/tmp/dispatch-phase4-internal/`. No resets or credits were consumed and no
 fallback model/provider was run.
 
 A subsequent ordinary-use report exposed over-allocation: “Let's adjust the size
@@ -288,7 +288,7 @@ modules were reformatted or refactored.
 - The global installation now has the validated Pro Lite light/standard profiles
   in `~/.dispatch/resources.yml`. New installations still require explicit
   included-resource profile setup.
-- The confirmed funding change is now validated. The configured dogfood profiles
+- The confirmed funding change is now validated. The configured internal-use profiles
   cover light and standard only; goals requiring strong stop with an explanation.
   A strong-tier profile still needs an explicit validated resource configuration.
 - Plain input is line-oriented; multiline composition uses the integrated editor.
@@ -298,7 +298,7 @@ modules were reformatted or refactored.
 - Decorative graph animation, persistent prompt history, provider setup, and broader integrations
   were deliberately not built.
 
-## N. First dogfood release readiness
+## N. First internal release readiness
 
 The deterministic intent → allocation → bounded work/recovery/clarification →
 verification → review/apply loop is implemented. Release readiness remains blocked

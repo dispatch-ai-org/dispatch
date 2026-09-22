@@ -45,7 +45,7 @@ The original thesis survives: “OpenRouter routes prompts. Dispatch routes soft
 
 Dispatch should not become a terminal multiplexer, IDE, chat client for every model, autonomous company, benchmark dashboard, or infrastructure control plane. Optional terminal hosts and editors may own session layout and editing. Dispatch owns allocation, verified delivery and the complete human intent/clarification/review/apply loop for one software outcome at a time; no external host is required.
 
-**Recommendation: BUILD WITH CHANGES.** Establish truthful outcomes, resource identity, and a usable single-task loop first. Gate automatic decomposition and claims of capacity savings on actual dogfood evidence.
+**Recommendation: BUILD WITH CHANGES.** Establish truthful outcomes, resource identity, and a usable single-task loop first. Gate automatic decomposition and claims of capacity savings on actual evidence from internal use.
 
 ## B. Current-state audit
 
@@ -236,13 +236,13 @@ Using strong: this changes a shared interface across the project.
 Waiting: the required resource is unavailable until its allowance resets.
 ```
 
-For the first controlled dogfood version, “bounded” should require an explicit area/file or a user-confirmed small task, testable acceptance, and no cross-cutting risk flag. The current classifier alone does not establish all of those. Do not add another model call merely to classify every task. A concise clarification is often cheaper and more useful.
+For the first controlled internal-use version, “bounded” should require an explicit area/file or a user-confirmed small task, testable acceptance, and no cross-cutting risk flag. The current classifier alone does not establish all of those. Do not add another model call merely to classify every task. A concise clarification is often cheaper and more useful.
 
-Concretely, automatic light eligibility is the conjunction of `scope = explicit_known_paths`, `acceptance_check = user_or_project_selected_check_id`, `risk_class = routine` from an explicit task/project policy, and a baseline result compatible with the intended task. Record the source of each field. If scope, risk or check relevance is unknown, use standard or ask the essential clarification; do not infer routine risk from the absence of a keyword. The founder can approve a small set of routine task/check mappings during dogfood. Natural-language extraction may propose such a mapping, but cannot turn an unconfirmed guess into a strong verification claim.
+Concretely, automatic light eligibility is the conjunction of `scope = explicit_known_paths`, `acceptance_check = user_or_project_selected_check_id`, `risk_class = routine` from an explicit task/project policy, and a baseline result compatible with the intended task. Record the source of each field. If scope, risk or check relevance is unknown, use standard or ask the essential clarification; do not infer routine risk from the absence of a keyword. The founder can approve a small set of routine task/check mappings during internal use. Natural-language extraction may propose such a mapping, but cannot turn an unconfirmed guess into a strong verification claim.
 
 ### Scarcity and reset policy
 
-The first policy needs ordinal states, not a purported number of tasks remaining. Proposed starting defaults, explicitly subject to dogfood revision:
+The first policy needs ordinal states, not a purported number of tasks remaining. Proposed starting defaults, explicitly subject to revision from internal use:
 
 | State | Rule | Effect |
 |---|---|---|
@@ -765,7 +765,7 @@ truthful outcomes + attempt identity + event protocol
     → resource choices + one-harness model controls
     → optional capacity observations + fair shared local admission
     → bounded recovery + durable questions/continuation
-    → intent prompt + automatic continuation + graph/review   FIRST DOGFOOD MILESTONE
+    → intent prompt + automatic continuation + graph/review   FIRST INTERNAL-USE MILESTONE
     → agent-native Dispatch + generic stdio control + standalone client validation
     → second subscription through the same model
     → private outcome policy, first in shadow mode
@@ -774,7 +774,7 @@ truthful outcomes + attempt identity + event protocol
 
 Move the generic event/result contract **before** the TUI; otherwise the renderer will become a second state machine. Move basic prompting/review **before** decomposition; the founder needs a useful daily entry point before an ambitious planner. Bring a second real subscription ahead of a large planner to test the resource abstraction against actual differences. Capacity probing can fail to unknown without blocking the initial product. Optional host adapters follow generic Phase 5 validation and do not gate its delivery or normal terminal operation.
 
-Each phase below is a small release or several focused patches, with no parallel replacement engine. For every production patch, use the repository’s full validation, focused regressions, final diff review, and a stated production LOC delta. Use fake capability/model/capacity fixtures in automated tests; paid real-agent runs belong to explicit dogfood activity, not the test suite. Proposed migration numbers assume this plan starts after version 11; renumber if other migrations land first.
+Each phase below is a small release or several focused patches, with no parallel replacement engine. For every production patch, use the repository’s full validation, focused regressions, final diff review, and a stated production LOC delta. Use fake capability/model/capacity fixtures in automated tests; paid real-agent runs belong to explicit internal-use activity, not the test suite. Proposed migration numbers assume this plan starts after version 11; renumber if other migrations land first.
 
 ### Phase 0 — Make one attempt truthful and observable
 
@@ -796,7 +796,7 @@ Each phase below is a small release or several focused patches, with no parallel
 
 **User-visible capability:** explicitly run an available included model/effort, inspect the actual choice, and opt into a deterministic light/standard/strong routing trial. Existing `--agent` and configured fixed models retain their constraint semantics.
 
-**Architecture:** introduce `ResourceChoice`, local funding/pool references, capability snapshot and versioned allocation decision. Resolve dynamic model IDs through supported catalog data where available, otherwise explicit validated profiles. Keep the optional app-server probe adapter-scoped; preserve exec execution. Make status/explain/review allocation-aware and persist local goal feedback without a legacy routing observation, while preserving safe apply. Verify a no-overage control or account configuration before a strict subscription-only trial. Test ChatGPT+Claude-shaped fixtures now even though only Codex dogfoods initially.
+**Architecture:** introduce `ResourceChoice`, local funding/pool references, capability snapshot and versioned allocation decision. Resolve dynamic model IDs through supported catalog data where available, otherwise explicit validated profiles. Keep the optional app-server probe adapter-scoped; preserve exec execution. Make status/explain/review allocation-aware and persist local goal feedback without a legacy routing observation, while preserving safe apply. Verify a no-overage control or account configuration before a strict subscription-only trial. Test ChatGPT+Claude-shaped fixtures now even though only Codex is used internally at first.
 
 **Migration 13:** add separate local allocation-decision storage and universal local goal-feedback revisions; use the run-mode field introduced in migration 12 and preserve legacy routing JSON/observations untouched. Resource configuration is a small versioned user-level file; resolved resource snapshots live on attempts. Do not backfill absent feedback history. No provider/account enterprise tables.
 
@@ -852,7 +852,7 @@ Each phase below is a small release or several focused patches, with no parallel
 
 **Tests:** state-to-render snapshots at wide/narrow sizes; resize while typing/checking/answering; multiline paste submits once; Unicode editing; no-color/ASCII; no-TTY behavior; cancel/panic/EOF restoration; JSON remains escape-free; answer automatically continues once; cursor wait cannot miss a transition; diff review/accept from the active session; two panes cannot answer or accept each other’s work accidentally. Manual matrix: modern macOS/Linux terminal, tmux, SSH, light/dark themes.
 
-**Success:** satisfy the first dogfood milestone below. Input-to-preparation feedback is immediate; optional discovery cannot make the intent prompt feel stalled. No full-screen dashboard or graph-layout framework is required.
+**Success:** satisfy the first internal-use milestone below. Input-to-preparation feedback is immediate; optional discovery cannot make the intent prompt feel stalled. No full-screen dashboard or graph-layout framework is required.
 
 **Rollback risk:** terminal lifecycle bugs can make a good executor unusable. `--plain`/`--ui off` and the ordinary CLI remain reliable recovery paths. Remove the chosen UI layer cleanly if necessary; the core does not depend on it.
 
@@ -911,7 +911,7 @@ Each phase below is a small release or several focused patches, with no parallel
 
 **Tests:** missing review excluded; latest local revision wins; recovery/combined authorship excluded from standalone success counts; compatible model/version/verification grouping; no mixing benchmarks with acceptance labels; shadow mode leaves actual route unchanged; deterministic rollout/rollback.
 
-**Success:** a prospective dogfood comparison shows useful policy changes without increased rejection/rework. Insufficient data produces “not enough evidence,” not a confident learned score.
+**Success:** a prospective internal-use comparison shows useful policy changes without increased rejection/rework. Insufficient data produces “not enough evidence,” not a confident learned score.
 
 **Rollback risk:** selection bias and sparse cohorts. Restore the deterministic policy; preserve observations and decisions for inspection. Do not tune thresholds repeatedly on the same small set and call the result validated.
 
@@ -931,7 +931,7 @@ Each phase below is a small release or several focused patches, with no parallel
 
 **Rollback risk:** highest in the plan: context loss, dependency mistakes, large snapshots and multiplied costs. Keep decomposition opt-in until proven. Retain plan/attempt artifacts, return to single-task allocation, and delete unused scheduler machinery if the experiment does not justify it.
 
-## L. First dogfood milestone
+## L. First internal-use milestone
 
 The first milestone is **one outcome, a suitable included Codex model, visible verification, bounded recovery/clarification, and immediate safe review/apply from an intent prompt**. It ends at Phase 4, now including automatic continuation after a necessary answer and fair admission across foreground sessions. Exact capacity telemetry, a daemon, bidirectional external control, Herdr-specific integration, learned routing, full decomposition and additional providers are not prerequisites.
 
@@ -946,7 +946,7 @@ Acceptance criteria:
 5. **Verification:** known passing/failing/unconfigured states are unambiguous; required full checks still run. Failed checks cannot produce a success exit under the required-check policy. Human acceptance is never inferred.
 6. **Review:** review the diff and accept/apply without leaving the session or copying IDs. Dirty sources, plain directories and linked worktrees keep their current safety guarantees. Concurrent panes cannot change the target of acceptance.
 7. **Terminal reliability:** cancellation leaves no owned processes, restores the terminal and saves partial state; narrow/no-color/ASCII/plain and machine modes work. Tmux and SSH smoke tests pass.
-8. **Voluntary use:** across at least 20 ordinary eligible tasks over five or more working days, the founder chooses Dispatch for at least four of the last five eligible tasks without being prompted to dogfood it. Record why direct Codex was preferred for any eligible task. This is a product gate, not a statistically conclusive study.
+8. **Voluntary use:** across at least 20 ordinary eligible tasks over five or more working days, the founder chooses Dispatch for at least four of the last five eligible tasks without being prompted to use it. Record why direct Codex was preferred for any eligible task. This is a product gate, not a statistically conclusive study.
 9. **Outcome guardrail:** target at least 18 of those 20 tasks accepted with the configured verification contract satisfied, with no observed increase in serious regressions and no material increase in human repair time versus the founder’s recent direct workflow. Review every miss; task mix and small sample size limit inference. Do not select only trivial tasks after the fact.
 10. **Economics gate:** on several comparable work sessions with trustworthy allowance sampling, include all attempts and compare allowance per accepted verified goal with direct suitable-model use. Predeclare a material-improvement target (for example 20%) for the pilot; do not treat that target as a forecast. If telemetry is too contaminated/unknown, claim workflow usefulness and observed model/latency facts only. Broader savings claims and decomposition investment wait for better evidence.
 11. **Autonomous clarification:** a supported ambiguity case asks one direct, identified question in the live session, ends the current harness invocation cleanly, and continues automatically after the authorized answer. No wait/resume/retry command, duplicate launch or new capacity authorization is hidden in this interaction. A continuation counts toward the same two-invocation ceiling; insufficient remaining budget is explained.
@@ -988,7 +988,7 @@ This milestone can replace direct Codex for ordinary bounded implementation and 
 | Optimization reduces quality to a score | Cheaper work may increase rejection or human repair | Human acceptance/rework guardrails; keep automated verification separate; no synthetic quality ranking |
 | Dispatch overlaps with Herdr/native agent capabilities | Workspace duplication and double planning reduce value | Own allocation and safe delivery only; measure value over native harness subagents/planning before duplicating them |
 
-Outstanding facts requiring real dogfood or an implementation spike:
+Outstanding facts requiring real internal use or an implementation spike:
 
 - Which included Codex configurations are actually usable by this account, with which supported effort/service settings, and whether the installed structured output identifies all substitutions.
 - Whether the optional Codex metadata probe works reliably under the founder’s authentication and ordinary local process environment.
@@ -1104,7 +1104,7 @@ The repo already enables WAL and a busy timeout. Use short transactions and exis
 
 **Do not require an always-on service for the first milestone.** Shared admission, durable state and a live foreground owner solve the initial multi-pane case. The presence of several terminals or an event API alone is insufficient justification.
 
-Introduce a per-user local Rust service when real dogfood repeatedly requires one of these capabilities:
+Introduce a per-user local Rust service when real internal use repeatedly requires one of these capabilities:
 
 - Queued or waiting work must resume after every frontend/parent has disconnected.
 - A ready goal must run without any live foreground process owning its supervisor.
@@ -1264,7 +1264,7 @@ The detailed phase entries in K are updated. The focused changes are:
 | 0 | Authoritative transitions, state revision, actor provenance and attempt identity; resolve durability before promises | Correct results/events and rejected stale transitions; no unused RPC framework |
 | 2 | Shared fair admission, owner generations, crash reconciliation; release model slots before checks/review | Two foreground owners cannot double-admit; live orphan uncertainty blocks replacement |
 | 3 | Move durable questions/answers/checkpoints forward; bounded continuation uses the same attempt chain | Supported question → safe yield → authorized answer → one continuation; no budget reset |
-| 4 | Intent UI answers directly and continues; actual wait reasons and read-only semantic wait | Revised first dogfood milestone in L |
+| 4 | Intent UI answers directly and continues; actual wait reasons and read-only semantic wait | Revised first internal-use milestone in L |
 | 5 | Agent-native Dispatch and interoperability: duplex stdio, scoped authority, idempotent replies, recovery and standalone client | Complete authorized submit/await/answer/result/review/apply workflow without Herdr installed; optional adapters have separate gates |
 | 8 | Real child DAG, constrained dependency proposals, immutable artifact gates and automatic scheduling | A→B unblocks only against usable checked inputs; failure/cancel/version changes never loop |
 | Later, evidence-gated | Transfer supervision to a local Rust service only when detached ownership is required | Same core/tests; exclusive owner; frontend loss and service restart behave as declared |
@@ -1275,7 +1275,7 @@ Add fault-injection cases at the spending boundaries: owner dies before/after sp
 
 ### O13. V1 boundary and final recommendation
 
-| Required for the first dogfood milestone | Next machine-integration release | Later, after evidence |
+| Required for the first internal-use milestone | Next machine-integration release | Later, after evidence |
 |---|---|---|
 | One goal/root task, existing supervised execution | Foreground bidirectional stdio control | Small real task DAG and automatic prerequisite scheduling |
 | Typed state/command authority and explicit waiting reasons | Scoped submit/answer/cancel and correlated responses | General live worker-control channels where harnesses support them |
