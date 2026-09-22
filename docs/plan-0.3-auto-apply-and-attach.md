@@ -1120,3 +1120,162 @@ processes, cloud anything.
     authorization predicate wording), the review of every packet against parts 5 and 6,
     the tree-limit decision in S2, and the release. Lower-usage models take A1, A2 (with
     the stage tables as the spec), A3, A4, A5, A6, S1, S2, S3, S4, S5, S6, S7.
+
+---
+
+## 14. S0 design freeze for v0.4.0 (decided 2026-09-22)
+
+These decisions are final for phase S. Packets S1–S7 implement them; they do not
+reopen them. Anything not covered here is escalated to the integrator.
+
+### 14.1 Run mode and migration 21
+
+- `RunMode::Attached` (`serde` name `attached`, `as_str` `"attached"`).
+- Migration `(21, "attached_work_mode", …)` rebuilds `runs` exactly as migration 13
+  did (`PRAGMA legacy_alter_table = ON; ALTER TABLE runs RENAME TO runs_v20;
+  CREATE TABLE runs (… same 27 columns …); INSERT … SELECT … FROM runs_v20; DROP TABLE
+  runs_v20; PRAGMA legacy_alter_table = OFF;`) with the one change
+  `CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached'))`.
+  The 19 foreign keys that reference `runs(id)` survived that pattern once already.
+  `schema_version` becomes 21; the pre-upgrade backup file is created by the existing
+  `backup_before_upgrade`.
+
+### 14.2 `AttachmentRecord` (in `src/models.rs`)
+
+`RunRecord.attachment: Option<AttachmentRecord>` with
+`#[serde(default, skip_serializing_if = "Option::is_none")]`. All nested types derive
+`Debug, Clone, Serialize, Deserialize, PartialEq, Eq`, enums `rename_all = "snake_case"`.
+
+```rust
+pub struct AttachmentRecord {
+    pub version: u32,                                  // 1
+    pub workspace: PathBuf,                            // canonical external worktree
+    pub integration_root: PathBuf,                     // equals run.source_path
+    pub repo_key: Option<String>,                      // sha256(canonical git common dir); None for a plain directory
+    pub provenance: BaselineProvenance,
+    pub confidence: AttachConfidence,
+    pub agent: Option<String>,                         // "claude" | "codex" | "cursor" | other text; never guessed
+    pub command: Option<Vec<String>>,                  // wrapped: the argv; foreign: None
+    pub owner: Option<ProcessIdentity>,                // the wrapper process; None for foreign
+    pub agent_process: Option<ProcessIdentity>,        // wrapped: the child; foreign: --pid when given
+    pub owner_state: OwnerState,
+    pub capabilities: AttachCapabilities,
+    pub attached_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub finish_reason: Option<FinishReason>,
+}
+pub enum BaselineProvenance { GitMergeBase { commit: String }, SnapshotAtAttach }
+pub enum AttachConfidence { Full, Partial }             // Partial: edits before attach are invisible
+pub enum OwnerState { Live, Gone, Unknown, Adopted }    // Adopted: serve observes it now
+pub struct AttachCapabilities { pub observe: bool, pub signal: bool, pub control: bool, pub integrate: bool }
+pub enum FinishReason { ProcessExit { code: Option<i32> }, Explicit, OwnerGone }
+```
+
+`ProcessIdentity` is `crate::admission::ProcessIdentity` (already serializable).
+
+### 14.3 Record mapping (fixed)
+
+As in part 6.3, with these exact values: `candidates[0].harness_id` = `attachment.agent`
+or `"external"`; `candidates[0].label` = `"A"`; `attempts[0].role` = `"attached"`,
+`attempts[0].harness_id` the same, all model fields `None`, `resource: None`;
+`environment.execution_backend` = `"local"`, `environment.unsafe_local` = the
+`--allow-unsafe-local` acknowledgement; `task` = `--task` or
+`"attached work in <workspace basename>"`; `exact_prompt` = `task`; `phase3: None`;
+`mode: Attached`; outcome while active `lifecycle: Working, work_result: Pending,
+verification: NotRun, review: NotRequested, phase: Executing`.
+
+### 14.4 Commands (fixed names and flags)
+
+```text
+dispatch attach [--root <path>] [--workspace <path>] [--task <text>] [--agent <name>]
+                [--allow-unsafe-local] [--auto-apply] -- <command> [args...]
+dispatch attach --workspace <path> [--root <path>] [--pid <n>] [--task <text>] [--agent <name>]
+                [--allow-unsafe-local] [--auto-apply]
+dispatch finish <run-id> [--allow-unsafe-local]
+dispatch serve  [--root <path>] [--json]
+```
+
+Defaults: `--workspace` is the current directory; `--root` is the repository's main
+worktree when the workspace is a linked worktree of a Git repository, else it is
+required. `--auto-apply` sets `capabilities.integrate`. `control` is true only for the
+wrapped form. `observe` and `signal` are always true.
+
+### 14.5 Shared verdict persistence
+
+New `pub(super) fn persist_verdict(state: &State, db: &Database, run: &mut RunRecord,
+validity: &Validity) -> Result<&'static str>` in `src/orchestrator/apply.rs`: calls
+`remember_validity`, then `phase3::transition(state, db, run, kind, {"coherence": validity})`
+where `kind` is `coherence.checked` for `Continue` and `coherence.invalidated`
+otherwise; returns `kind`. `phase3::apply_watch` is rewritten to call it and keep only
+its `mid_run: stop` logic (`coherence.stopped` + cancel). Behavior of allocation runs is
+byte-identical (existing `tests/coherence_watch.rs` is the proof). The attach owner loop
+and `serve` call `persist_verdict` directly; they never implement stop.
+
+### 14.6 Review of attached work
+
+`accept_or_reject_latest` and `review_delivery` gain a third branch for
+`RunMode::Attached`: set `outcome.review` and commit `review.accepted|rejected` with
+payload `{"reasons": [...], "explanation": ...}`; no `goal_feedback_revisions` row, no
+routing evaluation (attached results never become routing evidence). Then apply
+through `apply_locked(…, ApplyAuthority::Human)` as today. `load_latest_unresolved_single`
+also returns an attached run whose review is `Pending`. `dispatch refresh` on an attached
+run is refused with "attached work has no Dispatch task to refresh; finish or reject it".
+
+### 14.7 Source-layer API (S2)
+
+```rust
+pub struct RepoIdentity { pub common_dir: PathBuf, pub main_worktree: PathBuf, pub key: String }
+pub fn repo_identity(path: &Path) -> Result<Option<RepoIdentity>>;   // None for a plain directory
+pub fn merge_base(root: &Path, workspace: &Path) -> Result<Option<String>>;
+pub fn materialize_baseline_from_commit(repo: &Path, commit: &str, run_dir: &Path) -> Result<SourceSnapshot>;
+```
+
+`materialize_baseline_from_commit` exports the commit's tree (`git archive --format=tar`
+piped into `tar -x` in a staging directory under `run_dir`, or `git read-tree` +
+`checkout-index` into it; the implementer picks the one that preserves symlinks and
+modes and reports which), then `initialize_internal_repository(staging, true)` (the
+0.3.1 signature: honor ignore rules), renames to `run_dir/baseline`, and returns
+`SourceSnapshot { kind: Git, git_head: Some(commit), fingerprint: fingerprint_tree(staging), … }`.
+Δ uses the unchanged `snapshot_delta` (live) and `collect_diff` (finish). S2 measures
+`validate_candidate_tree` on a real worktree with build output and reports numbers;
+the integrator decides.
+
+### 14.8 Attach validation rules (S3)
+
+Refuse, in this order, with these messages: workspace equals root ("attach needs a
+separate worktree; run git worktree add"); different repository ("workspace belongs to
+a different repository than the integration root"); Git workspace with no merge base
+("no common history between the workspace and the integration root"); plain-directory
+foreign attach ("a plain directory can be attached only by wrapping the agent
+command"); checks configured without `--allow-unsafe-local` ("finish runs your
+checks.verify on the host; pass --allow-unsafe-local"); an active attached run already
+exists for the workspace ("workspace already attached as <id>").
+
+### 14.9 Finish semantics (S3/S4)
+
+`finish` = `collect_diff(baseline, workspace, run_dir/delta.patch)` →
+`run_checks_with_config(workspace, checks.verify, CheckPhase::Verify, run_dir/checks/verify, execution)`
+→ candidate `checks` and `diff_stats` → `refresh_outcome` → `attachment.finished_at`,
+`finish_reason` → `run.finished`. Candidate status is `Completed` whatever the agent's
+exit code (the code is recorded in `candidate.exit_code`); `Failed` only when Δ cannot be
+collected. Wrapped attach finishes with `ProcessExit`; foreign with `Explicit`; `serve`
+never finishes anything.
+
+### 14.10 Events
+
+`attach.created {attachment}`, `attach.finished {reason}`, `attach.adopted {owner_state}`,
+plus the existing `coherence.checked | coherence.invalidated`, `result.applied`,
+`auto_apply.*`, `review.*`.
+
+### 14.11 `serve` view line
+
+`<first 8 of id> · <agent or "dispatch"> · <CONTINUE|REFRESH|STOP|—> · <working|ready|applied|blocked|finished> · <first reason detail, clipped to 60>`
+for every run whose `source_path` is the root and whose `lifecycle != Finished` or that
+finished in the last hour; native runs included. `--json` emits `{"type":"work", …}` per
+change and `{"type":"world", "digest": …}` per world movement.
+
+### 14.12 Escalate to the integrator
+
+Any change to `apply_locked`, `gate`, `world::observe`, `Watcher`, the migration text
+above, or these type definitions; any need for a socket, a daemon, `kill` of a foreign
+process, a new table, or a new dependency.
