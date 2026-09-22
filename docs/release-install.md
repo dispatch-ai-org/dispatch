@@ -1,8 +1,10 @@
-# Dispatch 0.2.0: install, upgrade, uninstall
+# Dispatch 0.3.0: install, upgrade, uninstall
 
-Dispatch 0.2.0 is an experimental developer preview. It adds
-[work coherence](coherence.md): finished work is validated against the source as it
-is now instead of being refused on any difference.
+Dispatch 0.3.0 is an experimental developer preview. It adds
+[auto-apply](product-guide.md#auto-apply): a session mode and a CLI flag that apply
+an eligible finished result automatically, on top of
+[work coherence](coherence.md), which validates finished work against the source as
+it is now instead of refusing on any difference.
 
 Runtime scope: macOS arm64 is the platform exercised interactively for this
 release. Linux x86_64 is built and smoke-tested by CI (build, package, `dispatch
@@ -30,7 +32,7 @@ cd /path/to/your/project
 /tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state
 ```
 
-The expected version is `dispatch 0.2.0`. Use `command -v dispatch` and
+The expected version is `dispatch 0.3.0`. Use `command -v dispatch` and
 `type -a dispatch` to locate older PATH installations. An explicit path is the
 reliable way to select this build. Do not replace a working binary just to try
 it. Ordinary work uses the provider's account; test-only setup must use fixture
@@ -69,6 +71,19 @@ result onto a source that changed elsewhere now validates the patch instead of
 refusing on any difference. To restore the old any-drift refusal, set
 `coherence.accept: strict` before starting the run. See the
 [coherence reference](coherence.md) for every key.
+
+### Upgrading to 0.3.0
+
+No database migration: the schema version stays 20, unchanged since 0.2.0.
+Auto-apply adds one optional field to a run's stored outcome,
+`RunOutcome.applied_by` (`human` or `auto_apply`), serialized only when a run was
+actually applied; it is omitted entirely (not `null`) on every unapplied run and on
+every run written by an older version, so old `run.json`/database records still
+deserialize with no backfill. Every TUI session still starts with auto-apply off,
+exactly as before this release, because the mode is session memory and was never
+persisted. Nothing changes for existing runs: a run created by 0.2.0 or earlier is
+reviewed exactly as it always was unless you explicitly opt into `--auto-apply` or
+the session toggle for the *next* run.
 
 Uninstall by removing only the executable you installed and its archive/extraction
 directory. Keep `~/.dispatch` (or your explicit state directory), project files and

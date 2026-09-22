@@ -408,7 +408,7 @@ fn apply_watch(
     stale: Option<&mut Option<String>>,
 ) -> Result<()> {
     let validity = message.validity;
-    remember_validity(run, &validity);
+    apply::remember_validity(run, &validity);
     let kind = if validity.decision == Decision::Continue {
         "coherence.checked"
     } else {

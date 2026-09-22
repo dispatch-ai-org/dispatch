@@ -303,6 +303,21 @@ pub struct RunOutcome {
     pub application: ApplicationState,
     pub phase: RunPhase,
     pub waiting_on: WaitingOn,
+    /// Who applied the result: a human decision or the auto-apply policy.
+    /// `None` when nothing was applied, or for records written before the
+    /// actor was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_by: Option<AppliedBy>,
+}
+
+/// The authority under which a candidate was applied to the source. It is
+/// recorded on the outcome so that an application by policy can never be
+/// mistaken for human acceptance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppliedBy {
+    Human,
+    AutoApply,
 }
 
 impl Default for RunOutcome {
@@ -316,6 +331,7 @@ impl Default for RunOutcome {
             application: ApplicationState::NotApplied,
             phase: RunPhase::Finished,
             waiting_on: WaitingOn::None,
+            applied_by: None,
         }
     }
 }
@@ -567,6 +583,24 @@ pub struct CoherenceSummary {
     #[serde(default)]
     pub changed_files: u32,
     pub analysis: AnalysisLevel,
+}
+
+/// The JSON/JSONL projection of an automatic application attempt
+/// (`orchestrator::apply::ApplyOutcome`), carried on `RunResult.auto_apply`
+/// only when `run --auto-apply`/`refresh --auto-apply` attempted one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoApplySummary {
+    /// "applied" | "blocked" | "skipped" | "failed".
+    pub outcome: String,
+    /// The skip/block reason, or the error text for a failed application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The validity the decision was made against, present only when one
+    /// exists (an unmoved world produces none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<CoherenceSummary>,
+    #[serde(default)]
+    pub files_changed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -901,6 +935,9 @@ pub struct RunResult {
     pub admission: Option<AdmissionSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coherence: Option<CoherenceSummary>,
+    /// Present only when `--auto-apply` attempted an automatic application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_apply: Option<AutoApplySummary>,
 }
 
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.

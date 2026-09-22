@@ -192,6 +192,14 @@ Reason codes are `fact_broken`, `fact_missing`, `same_symbol_edited`,
 every other `*_path`/`path` key in this projection. Acting on a verdict is a human
 step (`dispatch refresh`, `dispatch reject`); machine clients cannot review.
 
+The protocol is unchanged by auto-apply. A run applied automatically under a TUI
+session's mode or a CLI invocation's `--auto-apply` flag shows exactly that in
+`status`/`result`: `outcome.applied_by: "auto_apply"` and `outcome.review:
+"pending"`, next to `outcome.application: "applied"`. There is no `auto_apply`
+operation and no capability to trigger or configure it over this protocol; machine
+clients still cannot review or apply, whether or not the run they are observing was
+applied by policy.
+
 ### Events and semantic waits
 
 ```json

@@ -17,6 +17,8 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | Tokens, minutes or money saved | Not claimed. Only wall-clock time after the first invalid verdict is recorded, and it is not cost |
 | Works across languages | Not claimed. Symbol facts exist for `.rs` and `.py` only |
 | Scales to many concurrent tasks | Not observed |
+| Eligible results can be applied automatically under a session or invocation policy; the review stays not performed | Shipped; `tests/auto_apply.rs`, `tests/auto_apply_cli.rs` |
+| Two runs finishing against one source serialize on the source lock and the second is re-judged against the new world; an edit during integration checks is fenced and re-validated once | Shipped; `tests/auto_apply_concurrency.rs` |
 
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.
@@ -58,6 +60,13 @@ snapshot and the verdict.
   stale again.
 - **Bypasses.** Every use of `coherence.accept: strict`, every accept over a
   disagreed verdict, and every run on a path with no watcher (planned or legacy).
+- **Auto-apply outcomes and post-hoc disagreement.** Every `auto_apply.skipped` and
+  `auto_apply.blocked` reason, every `result.applied`/`application.failed` with
+  `applied_by: auto_apply`, and every later `review.rejected` on a run that was
+  already `applied_by: auto_apply` (a human disagreeing with a CONTINUE that was
+  acted on automatically). The only dogfooding so far used a scripted agent behind
+  the Codex adapter, not a real agent; treat any auto-apply numbers as fixture
+  evidence until a real-agent run is logged.
 
 ## What would falsify the positioning
 
