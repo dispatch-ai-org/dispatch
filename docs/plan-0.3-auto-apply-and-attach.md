@@ -1100,7 +1100,12 @@ Progress log:
   after creation; fixed: `explain` prints an "Attached work" section (workspace, root,
   S0 line, confidence, agent, owner, capabilities, finish reason) and always a verdict
   line. The serialized field is `mode`, not `run_mode` (that is only the SQLite column);
-  docs corrected. v0.4.0 is ready for the PR to `main`.
+  docs corrected. Final gate on the complete tree (`fb385a4`): 738 passed, 0 real
+  failures, 3 ignored; the one failure in the parallel full run,
+  `phase4_pty_intent_answer_recovery_review_and_restoration`, is the PTY spinner
+  timing scenario that passes alone and belongs with `question_deadline` on the
+  0.4.1 fixture-robustness list. fmt and clippy clean; `cargo build --locked` at
+  0.4.0. v0.4.0 is ready for the PR to `main`.
 
 0.3.0 (auto-apply):
 
