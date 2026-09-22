@@ -391,6 +391,15 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
     // process group (no `process_group(0)`), so terminal job control and
     // Ctrl+C behave exactly as if the shell had started it directly. Not the
     // `Executor` path: no piped output, no token accounting, no timeout.
+    // Rule 3: ignore SIGINT/SIGQUIT for the wrapper's own lifetime while the
+    // child runs (as `time` does). `SIG_IGN` is inherited across `exec`, so
+    // it is set before `spawn` and undone in the child between `fork` and
+    // `exec` (`pre_exec` below): the child execs with the default disposition
+    // and stays interruptible, and there is no window in which a Ctrl+C
+    // arriving right after `spawn` could kill the wrapper and orphan it.
+    // Nothing is printed to the terminal while the child lives.
+    ignore_signal(libc::SIGINT);
+    ignore_signal(libc::SIGQUIT);
     let mut command = std::process::Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -398,20 +407,31 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut child = command
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: runs in the forked child before `exec`; `signal(2)` is
+        // async-signal-safe and touches nothing shared with the parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+    }
+    let spawned = command
         .spawn()
-        .with_context(|| format!("failed to start {}", argv.join(" ")))?;
+        .with_context(|| format!("failed to start {}", argv.join(" ")));
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            restore_signal(libc::SIGINT);
+            restore_signal(libc::SIGQUIT);
+            return Err(error);
+        }
+    };
     let child_pid = child.id();
     let agent_process = admission::process_identity(child_pid);
-
-    // Rule 3: ignore SIGINT/SIGQUIT for the wrapper's own lifetime while the
-    // child runs (as `time` does) — installed only now, after `spawn`, so the
-    // child still execs with the default disposition and stays interruptible
-    // itself: `SIG_IGN` (unlike a handler) is inherited across `exec`, so
-    // installing it before `spawn` would make the child ignore them too.
-    // Nothing is printed to the terminal while the child lives.
-    ignore_signal(libc::SIGINT);
-    ignore_signal(libc::SIGQUIT);
 
     let mut db = Database::open(state.db_path())?;
     if let Some(attachment) = run.attachment.as_mut() {
