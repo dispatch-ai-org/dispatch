@@ -160,8 +160,12 @@ fn settle(mut validity: Validity) -> Validity {
 /// it describes is not the world the last message described. At most one
 /// message goes out per `MIN_MESSAGE_GAP`; a verdict held back by that limit
 /// is sent later unless a newer evaluation supersedes it.
+///
+/// `pub(crate)` so `orchestrator::serve` can reuse this exact "worth
+/// sending" rule for foreign attached Work (part 14 of
+/// `docs/plan-0.3-auto-apply-and-attach.md`), instead of forking it.
 #[derive(Default)]
-struct Policy {
+pub(crate) struct Policy {
     sent: Option<Validity>,
     sent_at: Option<Instant>,
     pending: Option<Validity>,
@@ -170,7 +174,7 @@ struct Policy {
 impl Policy {
     /// One tick: `evaluated` is the verdict computed at `now`, or `None` when
     /// nothing was evaluated. Returns the message to send, if any.
-    fn step(&mut self, now: Instant, evaluated: Option<Validity>) -> Option<Validity> {
+    pub(crate) fn step(&mut self, now: Instant, evaluated: Option<Validity>) -> Option<Validity> {
         if let Some(validity) = evaluated {
             let validity = settle(validity);
             self.pending = self.worth_sending(&validity).then_some(validity);

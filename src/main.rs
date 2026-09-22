@@ -170,6 +170,16 @@ enum Command {
         #[arg(long)]
         allow_unsafe_local: bool,
     },
+    /// One foreground process per integration root: observes attached work
+    /// with no live owner, auto-applies ready work with INTEGRATE, and
+    /// prints the project view.
+    Serve {
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
@@ -860,6 +870,7 @@ async fn run() -> Result<()> {
             orchestrator::attach::finish(&state, &run_id, allow_unsafe_local).await?;
             Ok(())
         }
+        Command::Serve { root, json } => orchestrator::serve::serve(&state, root, json).await,
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
             run_id,

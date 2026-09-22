@@ -2,6 +2,7 @@ mod apply;
 pub mod attach;
 pub(crate) mod phase3;
 mod planned;
+pub mod serve;
 pub use apply::{ApplyAuthority, ApplyOutcome, apply, auto_apply};
 pub use phase3::{QuestionCommand, answer_question, cancel_question};
 use std::{
