@@ -111,6 +111,33 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     run.coherence = Some(record);
 }
 
+/// Remember a watcher's verdict and commit it as `coherence.checked` (a
+/// `Continue` decision) or `coherence.invalidated` (anything else), returning
+/// which kind was committed. Shared by the allocation-run watcher
+/// (`phase3::apply_watch`) and the attach owner loop / `serve` (part 14.5);
+/// none of them implement `mid_run: stop` themselves.
+pub(super) fn persist_verdict(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    validity: &Validity,
+) -> Result<&'static str> {
+    remember_validity(run, validity);
+    let kind = if validity.decision == Decision::Continue {
+        "coherence.checked"
+    } else {
+        "coherence.invalidated"
+    };
+    super::phase3::transition(
+        state,
+        db,
+        run,
+        kind,
+        serde_json::json!({"coherence": validity}),
+    )?;
+    Ok(kind)
+}
+
 /// The per-source apply lock path, keyed by the run's source path. Shared by
 /// every caller that serializes against concurrent application of that
 /// source (`apply_locked`, `auto_apply`) so the key expression exists once.
