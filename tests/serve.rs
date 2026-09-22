@@ -11,8 +11,9 @@ use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -20,11 +21,37 @@ use std::{
 use assert_cmd::cargo_bin_cmd;
 use serde_json::Value;
 
+fn executable(path: &Path, text: &str) {
+    fs::write(path, text).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks whether the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The external-agent fixture for wrapped attach, as in
+/// `tests/attach_wrapped.rs`: writes a marker to `src/lib.rs`, announces
+/// itself via `$READY`, then blocks on the polled `$GATE` marker file until
+/// the test releases it (or forever, when `GATE` is unset, for the adoption
+/// scenario where the test kills the wrapper without ever releasing it).
+const WRAPPED_AGENT_SCRIPT: &str = r#"#!/bin/sh
+trap 'exit 143' TERM
+printf 'pub fn f() -> i32 {\n    2\n}\n' > src/lib.rs
+: > "$READY"
+if [ -n "$GATE" ]; then
+    while [ ! -f "$GATE" ]; do sleep 0.1; done
+fi
+exit "${EXIT_CODE:-0}"
+"#;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     workspace: PathBuf,
     state: PathBuf,
+    wrapped_agent_script: PathBuf,
 }
 
 impl Fixture {
@@ -55,13 +82,74 @@ impl Fixture {
             ],
         );
 
+        let wrapped_agent_script = temp.path().join("wrapped-agent.sh");
+        executable(&wrapped_agent_script, WRAPPED_AGENT_SCRIPT);
+
         let state = temp.path().join("state");
         Self {
             root: fs::canonicalize(&root).unwrap(),
             workspace: fs::canonicalize(&workspace).unwrap(),
             state,
+            wrapped_agent_script,
             _temp: temp,
         }
+    }
+
+    /// `dispatch attach --workspace <workspace> --root <root>
+    /// --allow-unsafe-local -- sh <wrapped_agent_script>` (wrapped form), not
+    /// yet spawned, stdio piped so the test can observe it.
+    fn attach_wrapped_command(&self, workspace: &Path) -> Command {
+        let mut command = Command::new(assert_cmd::cargo_bin!("dispatch"));
+        command
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("attach")
+            .arg("--workspace")
+            .arg(workspace)
+            .arg("--root")
+            .arg(&self.root)
+            .arg("--allow-unsafe-local")
+            .arg("--")
+            .arg("sh")
+            .arg(&self.wrapped_agent_script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Empty before the first `dispatch` invocation has created and migrated
+    /// `dispatch.db` (the state directory itself does not exist yet).
+    fn all_run_ids(&self) -> HashSet<String> {
+        let Ok(db) = rusqlite::Connection::open(self.state.join("dispatch.db")) else {
+            return HashSet::new();
+        };
+        let Ok(mut statement) = db.prepare("SELECT id FROM runs") else {
+            return HashSet::new();
+        };
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// Waits for exactly one run ID to appear beyond `before`, returning it.
+    /// Wrapped attach prints nothing while the agent runs, unlike the
+    /// foreign form's `ATTACHED <id>` banner.
+    fn wait_new_run_id(&self, before: &HashSet<String>) -> String {
+        let mut found = None;
+        wait_until(Duration::from_secs(30), || {
+            let ids = self.all_run_ids();
+            let mut diff = ids.difference(before);
+            match (diff.next(), diff.next()) {
+                (Some(id), None) => {
+                    found = Some(id.clone());
+                    true
+                }
+                _ => false,
+            }
+        });
+        found.unwrap()
     }
 
     /// A second linked worktree of the same repository, on its own branch.
@@ -251,6 +339,24 @@ impl Drop for ServeProcess {
     }
 }
 
+/// A spawned wrapped-attach process, killed on drop so a failing assertion
+/// never leaves an orphaned `dispatch attach` running.
+struct OwnedChild(Child);
+
+impl OwnedChild {
+    fn kill_and_wait(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn second_serve_on_the_same_root_is_refused() {
     let fixture = Fixture::new();
@@ -336,21 +442,67 @@ fn serve_auto_applies_ready_foreign_work_with_integrate() {
     assert_eq!(metadata2["outcome"]["application"], "not_applied");
 }
 
-/// `orchestrator::attach::create`'s `AttachRequest` (`src/orchestrator/attach.rs`)
-/// has no field for `attachment.owner` or `owner_state`: every run it creates
-/// carries `owner: None, owner_state: Unknown`, which `serve`'s adoption
-/// logic never touches (only a stored `Live` that is now `Gone` adopts; see
-/// `orchestrator::serve::adopt_orphans`). Wrapped attach (S4), which is what
-/// would actually record a live wrapper as `owner`, refuses to run on this
-/// branch ("wrapped attach is not available yet"). There is no production
-/// hook to construct a run with `owner_state: Live` short of hand-editing
-/// persisted state, which this packet's task instructions say to avoid in
-/// favor of reporting the gap. `adopt_orphans`'s pure pieces
-/// (`live_owner_state`) are covered by unit tests in
-/// `src/orchestrator/serve.rs` in the meantime.
+/// A wrapped attach (part 6.7/S4) records its own process as `attachment.owner`
+/// with `owner_state: Live`. Killing the wrapper (not the agent it spawned)
+/// leaves the agent running, orphaned, while the stored owner is now dead:
+/// `serve` must adopt that Work exactly once (`attach.adopted`,
+/// `owner_state: adopted`), and must apply or finish nothing, since adoption
+/// is observation only (part 6.9's "Active Work after `serve` restart" row).
 #[test]
-#[ignore = "no production hook constructs a run with attachment.owner_state: Live before S4 (wrapped attach) lands; see the doc comment above"]
-fn serve_adopts_work_whose_owner_is_gone() {}
+fn serve_adopts_work_whose_owner_is_gone() {
+    let fixture = Fixture::new();
+    let ready = fixture._temp.path().join("ready");
+    // Never created: the agent blocks on it forever, so it is still running,
+    // orphaned, once the wrapper is killed below.
+    let gate = fixture._temp.path().join("gate-never-released");
+    let before = fixture.all_run_ids();
+
+    let mut wrapped = OwnedChild(
+        fixture
+            .attach_wrapped_command(&fixture.workspace)
+            .env("READY", &ready)
+            .env("GATE", &gate)
+            .spawn()
+            .expect("failed to start dispatch attach"),
+    );
+    let wrapper_pid = wrapped.0.id() as i32;
+    wait_until(Duration::from_secs(30), || ready.exists());
+    let id = fixture.wait_new_run_id(&before);
+
+    // The wrapper records `attachment.agent_process` and syncs it to disk
+    // right after spawning the child, before the child could plausibly reach
+    // its own READY marker; under heavy parallel load the wrapper's own
+    // commit can still lag the child briefly, so poll rather than assume.
+    let mut agent_pid = None;
+    wait_until(Duration::from_secs(30), || {
+        agent_pid = fixture.metadata(&id)["attachment"]["agent_process"]["pid"].as_u64();
+        agent_pid.is_some()
+    });
+    let agent_pid = agent_pid.unwrap() as i32;
+
+    // Kill the wrapper only; the agent it spawned, never signaled, stays
+    // alive and blocked forever on its unset GATE.
+    assert_eq!(unsafe { libc::kill(wrapper_pid, libc::SIGKILL) }, 0);
+    wrapped.kill_and_wait();
+    assert!(alive(agent_pid), "the orphaned agent must still be running");
+
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    wait_until(Duration::from_secs(30), || {
+        fixture.event_count(&id, "attach.adopted") > 0
+    });
+    assert_eq!(fixture.event_count(&id, "attach.adopted"), 1);
+
+    let metadata = fixture.metadata(&id);
+    assert_eq!(metadata["attachment"]["owner_state"], "adopted");
+    assert_eq!(metadata["outcome"]["lifecycle"], "working");
+    assert_eq!(fixture.event_count(&id, "result.applied"), 0);
+    assert_eq!(fixture.event_count(&id, "run.finished"), 0);
+    drop(serve);
+
+    // Cleanup: the orphaned agent would otherwise block on its gate forever.
+    unsafe { libc::kill(agent_pid, libc::SIGKILL) };
+    wait_until(Duration::from_secs(10), || !alive(agent_pid));
+}
 
 #[test]
 fn serve_view_lists_native_and_attached_runs() {
