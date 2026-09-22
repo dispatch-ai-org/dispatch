@@ -3,7 +3,7 @@
 //! run's baseline and patch, so such a run must work under the current binary
 //! with no migration and no backfill. Stripping the key from a run the current
 //! code just produced reproduces what a 0.1.3-rc.1 run looks like on disk
-//! (schema 20, so the "no migration" assertions hold). A state directory made
+//! (schema 21, so the "no migration" assertions hold). A state directory made
 //! by 0.1.2 is at schema 11 and does migrate, with a `dispatch.schema-11-*`
 //! backup; that path was checked by hand and is described in the WP10b report.
 #![cfg(unix)]
@@ -220,7 +220,7 @@ fn a_run_without_coherence_data_reads_as_coherence_capable_with_no_migration() {
     let fixture = Fixture::pre_coherence();
     let entries_before = fixture.state_entries();
     let versions_before = fixture.schema_versions();
-    assert_eq!(versions_before.last(), Some(&20), "{versions_before:?}");
+    assert_eq!(versions_before.last(), Some(&21), "{versions_before:?}");
     fixture.strip_coherence();
     let source_before = fixture.source_files();
 
@@ -331,7 +331,7 @@ fn a_run_without_coherence_data_applies_after_an_unrelated_edit() {
         "someone else's work\n"
     );
     assert_eq!(fixture.metadata()["status"], "applied");
-    assert_eq!(fixture.schema_versions().last(), Some(&20));
+    assert_eq!(fixture.schema_versions().last(), Some(&21));
     assert!(
         fixture
             .state_entries()
@@ -366,7 +366,7 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
         "blocked_by_source_drift"
     );
     assert_eq!(metadata["coherence"]["validity"]["decision"], "refresh");
-    assert_eq!(fixture.schema_versions().last(), Some(&20));
+    assert_eq!(fixture.schema_versions().last(), Some(&21));
 }
 
 // Found by the manual v0.1.2 upgrade check (WP10b): a run made by 0.1.2 has
@@ -387,4 +387,64 @@ fn a_migrated_v012_run_can_be_checked() {
         "{}",
         Fixture::stdout(&check)
     );
+}
+
+// S1 (attach part 14.1/14.2): schema 21 widens `runs.run_mode`'s CHECK to
+// accept `'attached'`, and `RunRecord.attachment` is a new optional field.
+// The schema-20-to-21 rebuild itself (with rows in `attempts`, `control_runs`
+// and `planned_goals` referencing the migrated run) is proven in
+// `src/db.rs`'s own migration-fixture tests, which have direct access to the
+// private `MIGRATIONS` array this crate's tests cannot reach. These two
+// tests cover what is reachable from here: a run this (already schema-21)
+// binary produces has no `attachment` in its stored record, and the widened
+// CHECK really does accept and round-trip `run_mode = 'attached'`.
+#[test]
+fn a_run_this_binary_produces_has_no_attachment() {
+    let fixture = Fixture::pre_coherence();
+    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert!(fixture.metadata().get("attachment").is_none());
+    let projection: String = fixture
+        .db()
+        .query_row(
+            "SELECT run_projection_json FROM runs WHERE id = ?1",
+            [&fixture.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let projection: Value = serde_json::from_str(&projection).unwrap();
+    assert!(projection.get("attachment").is_none(), "{projection}");
+}
+
+#[test]
+fn a_run_mode_attached_row_can_be_inserted_after_migration_and_read_back() {
+    let fixture = Fixture::pre_coherence();
+    let db = fixture.db();
+    let source_id: i64 = db
+        .query_row(
+            "SELECT source_id FROM runs WHERE id = ?1",
+            [&fixture.run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "INSERT INTO runs(\
+            id, source_id, task, exact_prompt, baseline_path, baseline_commit, status, \
+            created_at, dispatch_version, os, architecture, execution_backend, \
+            timeout_secs, cpus, memory, max_parallel, run_mode, outcome_json\
+        ) VALUES (\
+            'attached-fixture-run', ?1, 'attached task', 'attached task', '/baseline', \
+            'commit', 'running', '2026-09-22T00:00:00Z', '0.4.0', 'test', 'test', 'local', \
+            30, 1.0, '1g', 1, 'attached', '{}'\
+        )",
+        [source_id],
+    )
+    .unwrap();
+    let stored_mode: String = db
+        .query_row(
+            "SELECT run_mode FROM runs WHERE id = 'attached-fixture-run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_mode, "attached");
 }

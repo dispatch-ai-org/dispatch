@@ -722,6 +722,72 @@ CREATE TRIGGER planned_launch_update AFTER UPDATE OF launch_lifecycle ON pool_le
 END;
 "#,
     ),
+    (
+        21,
+        "attached_work_mode",
+        r#"
+PRAGMA legacy_alter_table = ON;
+ALTER TABLE runs RENAME TO runs_v20;
+CREATE TABLE runs (
+    id                  TEXT PRIMARY KEY,
+    source_id           INTEGER NOT NULL REFERENCES sources(id),
+    task                TEXT NOT NULL,
+    exact_prompt        TEXT NOT NULL,
+    baseline_path       TEXT NOT NULL,
+    baseline_commit     TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    dispatch_version    TEXT NOT NULL,
+    os                  TEXT NOT NULL,
+    architecture        TEXT NOT NULL,
+    execution_backend   TEXT NOT NULL,
+    timeout_secs        INTEGER NOT NULL,
+    cpus                REAL NOT NULL,
+    memory              TEXT NOT NULL,
+    max_parallel        INTEGER NOT NULL,
+    applied_candidate   TEXT,
+    docker_image        TEXT,
+    resource_limits_enforced INTEGER NOT NULL DEFAULT 0,
+    unsafe_local        INTEGER NOT NULL DEFAULT 0,
+    forwarded_env_json  TEXT NOT NULL DEFAULT '[]',
+    routing_decision_json TEXT,
+    run_mode            TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached')),
+    state_revision      INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
+    outcome_json        TEXT NOT NULL,
+    run_projection_json TEXT,
+    delivery_attempt_id TEXT REFERENCES attempts(id)
+);
+INSERT INTO runs(
+    id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+    created_at, completed_at, dispatch_version, os, architecture,
+    execution_backend, timeout_secs, cpus, memory, max_parallel,
+    applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+    forwarded_env_json, routing_decision_json, run_mode, state_revision,
+    outcome_json, run_projection_json, delivery_attempt_id
+)
+SELECT id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+       created_at, completed_at, dispatch_version, os, architecture,
+       execution_backend, timeout_secs, cpus, memory, max_parallel,
+       applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+       forwarded_env_json, routing_decision_json, run_mode, state_revision,
+       outcome_json, run_projection_json, delivery_attempt_id
+FROM runs_v20;
+DROP TABLE runs_v20;
+PRAGMA legacy_alter_table = OFF;
+
+-- legacy_alter_table leaves objects still bound to runs_v20 (not renamed
+-- along with it), so DROP TABLE runs_v20 takes the index and trigger below
+-- with it; migration 13 needed neither because they did not exist until
+-- migration 19. Recreate them verbatim on the rebuilt table.
+CREATE INDEX private_runs_source_window ON runs(source_id, created_at, id);
+CREATE TRIGGER private_decision_immutable BEFORE UPDATE OF run_projection_json ON runs
+WHEN json_extract(OLD.run_projection_json,'$.allocation.private_evidence') IS NOT NULL
+ AND json_extract(NEW.run_projection_json,'$.allocation.private_evidence') IS NOT json_extract(OLD.run_projection_json,'$.allocation.private_evidence')
+BEGIN SELECT RAISE(ABORT,'private decision snapshot is immutable'); END;
+"#,
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1046,7 +1112,14 @@ impl Database {
             if applied.contains(version) {
                 continue;
             }
-            if *version == 13 {
+            // Migrations 13 and 21 rebuild `runs` (rename, recreate, copy,
+            // drop). `PRAGMA foreign_keys` is a schema-level setting that is a
+            // no-op inside a transaction, so it must be toggled here, on the
+            // connection, before the migration's transaction begins: with it
+            // left on, `DROP TABLE runs_v*` fails once any row in `attempts`,
+            // `control_runs` or `planned_goals` references a run.
+            let rebuilds_runs = *version == 13 || *version == 21;
+            if rebuilds_runs {
                 self.connection.pragma_update(None, "foreign_keys", false)?;
             }
             let transaction = self
@@ -1061,7 +1134,7 @@ impl Database {
                 .context("failed to read schema migration state")?;
             if applied {
                 transaction.commit()?;
-                if *version == 13 {
+                if rebuilds_runs {
                     self.connection.pragma_update(None, "foreign_keys", true)?;
                 }
                 continue;
@@ -1075,7 +1148,7 @@ impl Database {
                 params![version, name, timestamp(Utc::now())],
             )?;
             transaction.commit()?;
-            if *version == 13 {
+            if rebuilds_runs {
                 self.connection.pragma_update(None, "foreign_keys", true)?;
             }
         }
@@ -3172,6 +3245,7 @@ mod tests {
             coherence: None,
             evaluation: None,
             applied_candidate: None,
+            attachment: None,
         }
     }
 
@@ -3199,7 +3273,7 @@ mod tests {
         let path = temp.path().join("state.db");
         let db = Database::open(&path)?;
         db.connection.execute(
-            "INSERT INTO schema_migrations VALUES(21,'future','fixture')",
+            "INSERT INTO schema_migrations VALUES(22,'future','fixture')",
             [],
         )?;
         drop(db);
@@ -3210,7 +3284,7 @@ mod tests {
                 .to_string()
                 .contains("newer than this binary")
         );
-        assert_eq!(Database::open_read_only(&path)?.schema_version()?, 21);
+        assert_eq!(Database::open_read_only(&path)?.schema_version()?, 22);
         assert!(!fs::read_dir(temp.path())?.any(|e| {
             e.unwrap()
                 .file_name()
@@ -3248,7 +3322,7 @@ mod tests {
         )?;
         drop(connection);
         let database = Database::open(&path)?;
-        assert_eq!(database.schema_version()?, 20);
+        assert_eq!(database.schema_version()?, 21);
         let backups = fs::read_dir(tmp.path())?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -3312,10 +3386,172 @@ mod tests {
         Ok(())
     }
 
+    /// S1 (`attached_work_mode`): a schema-20 state directory with a run that
+    /// has rows in `attempts`, `control_runs` and `planned_goals` (the three
+    /// tables the migration-13-style rebuild of `runs` must not orphan)
+    /// upgrades cleanly to schema 21, keeps the index and trigger migration
+    /// 19 added on `runs`, and a fresh `run_mode = 'attached'` row can be
+    /// written and read back afterward.
+    #[test]
+    fn schema20_run_with_child_rows_survives_attached_mode_migration() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("schema20.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 20) {
+            if *version == 13 {
+                connection.pragma_update(None, "foreign_keys", false)?;
+            }
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1,?2,?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+            if *version == 13 {
+                connection.pragma_update(None, "foreign_keys", true)?;
+            }
+            if *version == 12 {
+                insert_legacy_run(&connection, "pre-attach")?;
+            }
+        }
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        connection.execute(
+            "INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,\
+             started_at,outcome,raw_telemetry_path) VALUES \
+             ('attempt-pre','pre-attach','candidate','executor',1,1,'codex',?1,'completed','telemetry')",
+            [timestamp(at(1))],
+        )?;
+        connection.execute(
+            "INSERT INTO control_grants VALUES ('grant-pre','hash-pre','{}')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO control_runs VALUES ('pre-attach','grant-pre','session-pre',0)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO planned_goals VALUES ('pre-attach','revision-pre','{}',NULL)",
+            [],
+        )?;
+        let pre_attach_projection = serde_json::to_string(&run("pre-attach"))?;
+        connection.execute(
+            "UPDATE runs SET run_projection_json=?1 WHERE id='pre-attach'",
+            [&pre_attach_projection],
+        )?;
+        drop(connection);
+
+        let mut migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, 21);
+        let backups = fs::read_dir(temp.path())?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("dispatch.schema-20-")
+            })
+            .count();
+        assert_eq!(backups, 1);
+
+        // Every foreign key into `runs`, across every referencing table,
+        // survived the rename/recreate/drop rebuild.
+        let violations: i64 = migrated.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(violations, 0);
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT outcome FROM attempts WHERE id='attempt-pre'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "completed"
+        );
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT session_id FROM control_runs WHERE run_id='pre-attach'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "session-pre"
+        );
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT revision FROM planned_goals WHERE run_id='pre-attach'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "revision-pre"
+        );
+
+        // The index and the private-evidence-immutability trigger migration
+        // 19 added on `runs` are not silently dropped by the rebuild.
+        assert!(migrated.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='private_runs_source_window')",
+            [],
+            |row| row.get::<_, bool>(0)
+        )?);
+        assert!(migrated.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='private_decision_immutable')",
+            [],
+            |row| row.get::<_, bool>(0)
+        )?);
+
+        // The pre-migration run has no attachment: an old `run.json`/
+        // projection with no `attachment` key deserializes to `None`.
+        let old_run = migrated.committed_run_projection("pre-attach")?.unwrap();
+        assert!(old_run.attachment.is_none());
+        assert_eq!(old_run.mode, RunMode::Legacy);
+
+        // A `run_mode = 'attached'` row can be written and read back through
+        // the ordinary `sync_run` path now that the CHECK is widened.
+        let mut attached = run("attached-run");
+        attached.mode = RunMode::Attached;
+        attached.source_kind = SourceKind::GitWorktree;
+        attached.attachment = Some(crate::AttachmentRecord {
+            version: 1,
+            workspace: PathBuf::from("/repo-worktree"),
+            integration_root: PathBuf::from("/repo"),
+            repo_key: Some("sha256:deadbeef".into()),
+            provenance: crate::BaselineProvenance::GitMergeBase {
+                commit: "0123456789abcdef".into(),
+            },
+            confidence: crate::AttachConfidence::Full,
+            agent: Some("claude".into()),
+            command: Some(vec!["claude".into()]),
+            owner: None,
+            agent_process: None,
+            owner_state: crate::OwnerState::Live,
+            capabilities: crate::AttachCapabilities {
+                observe: true,
+                signal: true,
+                control: true,
+                integrate: false,
+            },
+            attached_at: at(1),
+            finished_at: None,
+            finish_reason: None,
+        });
+        migrated.sync_run(&attached)?;
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT run_mode FROM runs WHERE id='attached-run'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "attached"
+        );
+        let restored = migrated.committed_run_projection("attached-run")?.unwrap();
+        assert_eq!(restored.mode, RunMode::Attached);
+        assert_eq!(restored.attachment, attached.attachment);
+        Ok(())
+    }
+
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 20);
+        assert_eq!(database.schema_version()?, 21);
         let foreign_keys: i64 =
             database
                 .connection
@@ -3536,7 +3772,7 @@ mod tests {
                     .state,
                 crate::AdmissionState::Reconciliation
             );
-            assert_eq!(Database::open(&path)?.schema_version()?, 20);
+            assert_eq!(Database::open(&path)?.schema_version()?, 21);
         }
         Ok(())
     }
@@ -3562,7 +3798,7 @@ mod tests {
         }
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 20);
+        assert_eq!(migrated.schema_version()?, 21);
         assert_eq!(
             migrated
                 .latest_goal_feedback("phase-six-history")?
@@ -3602,7 +3838,7 @@ mod tests {
             0
         );
         drop(migrated);
-        assert_eq!(Database::open(&path)?.schema_version()?, 20);
+        assert_eq!(Database::open(&path)?.schema_version()?, 21);
         Ok(())
     }
 
@@ -3628,7 +3864,7 @@ mod tests {
         connection.execute("INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,started_at,outcome,raw_telemetry_path) VALUES ('attempt','phase-two','candidate','executor',1,1,'codex',?1,'completed','telemetry')",[timestamp(at(1))])?;
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 20);
+        assert_eq!(migrated.schema_version()?, 21);
         assert_eq!(
             migrated.connection.query_row(
                 "SELECT outcome FROM attempts WHERE id='attempt'",
@@ -3680,7 +3916,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 20);
+        assert_eq!(migrated.schema_version()?, 21);
         let violations: i64 = migrated.connection.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check",
             [],
@@ -3701,7 +3937,7 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 20);
+        assert_eq!(database.schema_version()?, 21);
         assert_eq!(
             database
                 .connection
@@ -3711,7 +3947,7 @@ mod tests {
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 20);
+        assert_eq!(Database::open(&path)?.schema_version()?, 21);
         Ok(())
     }
 
@@ -3802,7 +4038,7 @@ mod tests {
         let settings = previous.sync_settings()?;
         drop(previous);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 20);
+        assert_eq!(migrated.schema_version()?, 21);
         assert_eq!(migrated.sync_settings()?, settings);
         for status in ["pending", "failed", "conflict", "synced"] {
             for record_type in ["evaluation-v1", "routing-observation-v1"] {

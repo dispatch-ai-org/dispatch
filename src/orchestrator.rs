@@ -939,6 +939,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         }),
         evaluation: None,
         applied_candidate: None,
+        // Native runs never carry attachment provenance; only `dispatch attach`
+        // (S3) sets this field.
+        attachment: None,
     };
     if run.mode == RunMode::Allocation {
         run.phase3 = Some(crate::GoalExecution {
