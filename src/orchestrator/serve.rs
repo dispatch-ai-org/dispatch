@@ -34,7 +34,7 @@ pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
     let mut last_signal: Option<world::Signal> = None;
     let mut policies: HashMap<String, Policy> = HashMap::new();
     let mut shown: HashMap<String, (Option<Decision>, &'static str, String)> = HashMap::new();
-    let mut printed_lines = 0usize;
+    let mut last_block: Vec<String> = Vec::new();
     let mut first = true;
 
     loop {
@@ -92,11 +92,13 @@ pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
             }
         }
 
-        if changed {
-            match load_source_runs(state, &root) {
-                Ok(runs) => render_view(&runs, json, &mut shown, &mut printed_lines),
-                Err(error) => errors.report(&error),
-            }
+        // Render every tick: a run attached, finished or applied by another
+        // process changes the view without any verdict or apply of our own.
+        // `render_view` prints only what differs from what is already shown.
+        let _ = changed;
+        match load_source_runs(state, &root) {
+            Ok(runs) => render_view(&runs, json, &mut shown, &mut last_block),
+            Err(error) => errors.report(&error),
         }
         let _ = io::stdout().flush();
 
@@ -482,7 +484,7 @@ fn render_view(
     runs: &[RunRecord],
     json: bool,
     shown: &mut HashMap<String, (Option<Decision>, &'static str, String)>,
-    printed_lines: &mut usize,
+    last_block: &mut Vec<String>,
 ) {
     let rows = view_rows(runs);
 
@@ -520,14 +522,18 @@ fn render_view(
         })
         .collect();
 
+    // Rendered every tick, so redraw only when the block would differ.
+    if *last_block == lines {
+        return;
+    }
     let tty = std::io::stdout().is_terminal();
-    if tty && *printed_lines > 0 {
-        print!("\x1b[{}A\x1b[0J", printed_lines);
+    if tty && !last_block.is_empty() {
+        print!("\x1b[{}A\x1b[0J", last_block.len());
     }
     for line in &lines {
         println!("{line}");
     }
-    *printed_lines = lines.len();
+    *last_block = lines;
 }
 
 #[cfg(test)]
