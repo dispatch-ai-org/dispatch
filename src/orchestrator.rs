@@ -4298,6 +4298,14 @@ fn record_attach_review_locked(
         "run {} is not attached work",
         run.id
     );
+    // A review is a judgment of a delivered result: attached work that is
+    // still active has no Δ to judge yet (`dispatch finish` produces it).
+    anyhow::ensure!(
+        run.outcome.lifecycle == LifecycleState::Finished
+            && run.outcome.work_result == WorkResult::Ready,
+        "review requires a delivered result; finish attached work {} first",
+        run.id
+    );
     sole_candidate(&run)?;
     let reasons = normalize_reasons(reasons)?;
     let database = Database::open(state.db_path())?;
