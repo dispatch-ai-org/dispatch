@@ -65,6 +65,21 @@ try:
     elif scenario=='panic': pass
     elif scenario=='eof': send(b'\x04')
     elif scenario=='signal': os.kill(int(open(os.path.join(state,'pty-'+str(pid)+'-child')).read()),signal.SIGTERM)
+    elif scenario=='auto_apply_toggle':
+        send(b'\x1b[Z');wait('auto-apply on');send(b'\x1b[Z');wait('review before apply');send(b'\x04')
+    elif scenario=='auto_apply_goal':
+        send(b'\x1b[Z');wait('auto-apply on')
+        send(b'Add tests in src/lib.rs\r');wait('[y/N]');send(b'y\r')
+        wait('Auto-applied');wait('accomplish?');send(b'\x04')
+    elif scenario=='auto_apply_aa':
+        send(b'Add tests in src/lib.rs\r');wait('[y/N]');send(b'y\r')
+        wait('Review changes');send(b'aa\r')
+        wait('Auto-apply on');wait('accomplish?');send(b'\x04')
+    elif scenario=='auto_apply_skipped':
+        send(b'\x1b[Z');wait('auto-apply on')
+        send(b'Add tests in src/lib.rs\r');wait('[y/N]');send(b'y\r')
+        wait('Auto-apply skipped: no checks configured');wait('Leave pending')
+        send(b'n\r');wait('accomplish?');send(b'\x04')
     else:
         if scenario=='natural': send(b"Let's adjust the size of the bouncing ball to make it twice as big.\r")
         elif scenario=='plain': send(b'Add tests in src/lib.rs\n')
@@ -120,7 +135,7 @@ try:
     assert not any(30<=code<=38 or 40<=code<=48 or 90<=code<=97 or 100<=code<=107 for code in sgr_codes), 'color emitted with no-color'
     if scenario=='plain':assert b'\x1b' not in transcript
     assert not any(word in clean for word in ('NotConfigured','NotRequested','NotRun')), 'internal state labels leaked'
-    if scenario not in ('eof','signal','panic','inspection-panic'):
+    if scenario not in ('eof','signal','panic','inspection-panic','auto_apply_toggle'):
         records=[r for r in runs() if r['source_path']==os.path.realpath(source)];assert len(records)==1, 'paste submitted more than one goal'
         run=records[0]
         if scenario=='natural':
@@ -133,6 +148,17 @@ try:
         if scenario in ('cancel','active-eof','hangup'):assert run['outcome']['work_result'] in ('cancelled','interrupted')
         elif scenario=='drift':assert run['outcome']['application']=='blocked_by_source_drift'
         elif scenario in ('reject','recovery','concurrent','natural'):assert run['outcome']['review']=='rejected'
+        elif scenario=='auto_apply_skipped':assert run['outcome']['application']=='not_applied'
+        elif scenario=='auto_apply_goal':
+            assert run['outcome']['application']=='applied'
+            assert run['outcome']['applied_by']=='auto_apply'
+            assert run['outcome']['review']=='pending'
+            with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
+                assert db.execute("select count(*) from events where run_id=? and event_type='review.accepted'",(run['id'],)).fetchone()[0]==0
+        elif scenario=='auto_apply_aa':
+            assert run['outcome']['application']=='applied'
+            assert run['outcome']['applied_by']=='human'
+            assert run['outcome']['review']=='accepted'
         else:assert run['outcome']['application']=='applied'
         with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
             if scenario!='concurrent': assert db.execute('select count(*) from pool_leases').fetchone()[0]==0

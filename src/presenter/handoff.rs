@@ -144,6 +144,8 @@ pub(super) async fn run_named(
             match ui.command_prompt("Close the external review document, then press Enter to return.\nReview-copy edits are not imported. Ctrl+C leaves this result pending.").await? {
                 Input::Submit(text) if text.trim().is_empty() => break,
                 Input::Submit(_) | Input::Changed => {},
+                // input_prompt intercepts the toggle itself; this is never reached.
+                Input::ToggleAutoApply => {},
                 Input::Cancel | Input::Eof => { ui.closed = true; break; },
             }
         }
