@@ -987,6 +987,27 @@ Codex worktree. Log the same fields plus provenance confidence and adoption even
 
 ## 12. Release criteria
 
+Release scope, as decided:
+
+- **v0.3.0, auto-apply and coherence-driven integration**: visible TUI auto-apply
+  mode; safe automatic application; final-boundary coherence revalidation;
+  concurrent-run behavior; preserved distinction between human review and policy
+  application; enough dogfooding to prove it works. Packets A0–A6.
+- **v0.4.0, Dispatch service and attach**: repo-scoped local service; shared view of
+  the integration world; attached Claude/Codex/other-agent work; Dispatch-native and
+  foreign Work participating in the same coherence model; serialized coherent
+  integration; restart/recovery semantics. Packets S0–S7.
+
+Progress log:
+
+- 2026-09-22: A0 (`2dc69b4`), A1 (`1d00673`), A2 (`0a1bc6e`, `ae9e984`) merged on
+  `worktree-plan-auto-apply-attach`; suite 665 passed. First dogfood of the core
+  (three concurrent runs on a Python project, scripted agent behind the Codex
+  adapter because the funding guard refused the real one): A applied on an unmoved
+  world in 121 ms, B applied after integration checks on the moved world in 753 ms,
+  C blocked as REFRESH (`patch_conflict`) with the source untouched; no review
+  evidence written.
+
 0.3.0 (auto-apply):
 
 - Existing suite green; A2/A3/A4/A5 tests green; PTY tests pass on macOS arm64; Linux CI green.
