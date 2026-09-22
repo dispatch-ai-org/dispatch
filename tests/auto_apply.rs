@@ -208,6 +208,32 @@ fn unmoved_world_verified_applies_automatically() {
 }
 
 #[test]
+fn already_applied_run_is_not_ready_and_nothing_is_persisted() {
+    let fixture = Fixture::new("checks:\n  verify: ['true']\n");
+    assert!(matches!(
+        fixture.auto_apply().unwrap(),
+        ApplyOutcome::Applied { .. }
+    ));
+    let revision = fixture.metadata()["state_revision"].as_u64().unwrap();
+
+    // A second attempt on the applied run is `not_ready` and, like `run_busy`,
+    // writes nothing: the revision and the journal are untouched.
+    let outcome = fixture.auto_apply().unwrap();
+    assert!(
+        matches!(&outcome, ApplyOutcome::Skipped { reason } if reason == "not_ready"),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        fixture.metadata()["state_revision"].as_u64().unwrap(),
+        revision
+    );
+    assert_eq!(
+        event_count(&fixture.state_dir, &fixture.run_id, "auto_apply.skipped"),
+        0
+    );
+}
+
+#[test]
 fn verification_not_configured_is_skipped() {
     let fixture = Fixture::new("");
 

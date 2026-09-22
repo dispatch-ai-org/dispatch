@@ -422,13 +422,19 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     let run = state.load_run(&resolved_run_id)?;
     let run_dir = state.run_dir(&run.id);
 
+    // A run that is not a pending, unapplied delivery may still be owned by a
+    // live loop that holds no operation lock (comparison and planned runs),
+    // or may already be applied. Writing an event would bump its revision
+    // under that owner, so this case persists nothing, like `run_busy`.
     if !(run.outcome.lifecycle == LifecycleState::Finished
         && run.outcome.work_result == WorkResult::Ready
         && run.status == RunStatus::ReadyForEvaluation
         && run.outcome.review == ReviewState::Pending
         && run.outcome.application == ApplicationState::NotApplied)
     {
-        return persist_skip(state, run, "not_ready");
+        return Ok(ApplyOutcome::Skipped {
+            reason: "not_ready".into(),
+        });
     }
     if run.candidates.len() != 1 {
         return persist_skip(state, run, "not_sole_candidate");
