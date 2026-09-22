@@ -1078,6 +1078,13 @@ Progress log:
   always evaluate (`coherence::gate`), with a regression test in
   `tests/attach_cli.rs`. The real-agent apply above therefore ran without a
   coherence verdict; rerun after the fix before citing it as evidence.
+- 2026-09-22: rerun after the fix (`248c09d`): `dispatch attach --auto-apply -- claude
+  -p …` in a fresh worktree, root four files ahead of S0, `serve --json` watching.
+  Claude Code created `mathx.py` and `test_mathx.py`; `finish` froze a two-file Δ and
+  ran the checks; auto-apply evaluated the moved world, ran the integration checks on
+  the merged tree and applied (`analysis: integration`); `serve` showed the run go
+  `working` → `applied` with verdict `continue`; the root's tests pass. This is the
+  real-agent attach evidence for 0.4.0.
 
 0.3.0 (auto-apply):
 
