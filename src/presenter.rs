@@ -1,7 +1,9 @@
 //! Foreground presentation only. Committed outcomes remain execution authority.
 use crate::{
     executor::CancellationToken,
-    orchestrator::{self, Presentation, QuestionCommand, ReviewCommand, RunOutputMode, RunRequest},
+    orchestrator::{
+        self, ApplyOutcome, Presentation, QuestionCommand, ReviewCommand, RunOutputMode, RunRequest,
+    },
     state::State,
     *,
 };
@@ -544,6 +546,9 @@ enum Input {
     Cancel,
     Eof,
     Changed,
+    /// Shift+Tab. Never submits or edits the draft; `input_prompt` flips the
+    /// mode itself and never returns this to a caller.
+    ToggleAutoApply,
 }
 struct Editor {
     text: TextArea<'static>,
@@ -566,6 +571,11 @@ impl Editor {
                 }
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => {
+                // Intercepted before the widget sees it: ratatui-textarea turns
+                // BackTab into a Tab insert otherwise.
+                if k.code == KeyCode::BackTab {
+                    return Input::ToggleAutoApply;
+                }
                 if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
                     return Input::Cancel;
                 }
@@ -649,6 +659,33 @@ fn clip(text: &str, width: u16) -> String {
 }
 fn goal_heading(task: &str, width: u16) -> String {
     format!("Goal  {}", clip(task, width.saturating_sub(6)))
+}
+/// The auto-apply mode indicator, always the hint row's first segment. Pure
+/// so both charsets and modes are unit-testable without a `Ui`.
+fn mode_hint_text(ascii: bool, auto_apply: bool) -> String {
+    if ascii {
+        if auto_apply {
+            ">> AUTO-APPLY ON - Shift+Tab to pause".into()
+        } else {
+            "[review before apply] Shift+Tab".into()
+        }
+    } else if auto_apply {
+        "⏵⏵ auto-apply on · Shift+Tab to pause".into()
+    } else {
+        "⏸ review before apply · Shift+Tab".into()
+    }
+}
+/// The goal heading with the auto-apply marker prepended when the mode is on,
+/// so a scrollback entry for a submitted goal shows the mode it ran under.
+fn goal_heading_marked(task: &str, width: u16, ascii: bool, auto_apply: bool) -> String {
+    let marker = if !auto_apply {
+        ""
+    } else if ascii {
+        ">> "
+    } else {
+        "⏵⏵ "
+    };
+    format!("{marker}{}", goal_heading(task, width))
 }
 
 fn styled_body<'a>(body: &'a str, palette: &Theme) -> Text<'a> {
@@ -736,13 +773,18 @@ fn draw_view(
     hint: &str,
     palette: &Theme,
     ascii: bool,
+    auto_apply: bool,
 ) {
     let area = content_area(frame.area());
     let input_height = editor.map_or(0, |e| {
         (e.text.lines().len().clamp(1, 3) as u16).min(area.height.saturating_sub(1))
     });
     let hints = Paragraph::new(hint)
-        .style(palette.secondary)
+        .style(if auto_apply {
+            palette.warning
+        } else {
+            palette.secondary
+        })
         .wrap(Wrap { trim: false });
     let hint_height = (hints.line_count(area.width) as u16)
         .min(3)
@@ -934,6 +976,9 @@ struct Ui {
     draft: String,
     launch_line: String,
     render_key: String,
+    /// Session-scoped only: off at every start, never persisted. See
+    /// `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
+    auto_apply: bool,
     reviewed: Option<(
         RunRecord,
         std::result::Result<crate::private_evidence::AnnotationRequest, String>,
@@ -992,6 +1037,7 @@ impl Ui {
             draft: String::new(),
             launch_line: String::new(),
             render_key: String::new(),
+            auto_apply: false,
             reviewed: None,
             #[cfg(unix)]
             term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
@@ -1002,9 +1048,24 @@ impl Ui {
     fn width(&self) -> u16 {
         terminal::size().map(|s| s.0).unwrap_or(80)
     }
+    /// Session-scoped auto-apply indicator, always the hint row's first
+    /// segment. See `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
+    fn mode_hint(&self) -> String {
+        mode_hint_text(self.options.ascii, self.auto_apply)
+    }
+    fn hint_with_mode(&self, hint: &str) -> String {
+        let mode = self.mode_hint();
+        if hint.is_empty() {
+            mode
+        } else if self.options.ascii {
+            format!("{mode} - {hint}")
+        } else {
+            format!("{mode} · {hint}")
+        }
+    }
     fn draw(&mut self, body: &str, editor: Option<&Editor>, hint: &str) -> Result<()> {
         let body = self.display_text(body);
-        let hint = self.display_text(hint);
+        let hint = self.display_text(&self.hint_with_mode(hint));
         let key = format!(
             "{body}\0{hint}\0{:?}\0{:?}",
             terminal::size(),
@@ -1025,6 +1086,7 @@ impl Ui {
                 &hint,
                 &self.palette,
                 self.options.ascii,
+                self.auto_apply,
             );
         })?;
         Ok(())
@@ -1211,6 +1273,8 @@ impl Ui {
                     self.closed = true;
                     return Ok(Input::Eof);
                 }
+                // Never submits or edits the draft; redraw shows the new hint.
+                Input::ToggleAutoApply => self.auto_apply = !self.auto_apply,
                 input => return Ok(input),
             }
         }
@@ -1344,13 +1408,54 @@ impl Ui {
                             self.closed = true;
                             body = "Terminal closed; waiting for process cleanup…".into();
                         }
+                        // Never submits or edits anything; the next redraw
+                        // shows the flipped hint while the agent keeps running.
+                        Ok(Some(Event::Key(k))) if k.code == KeyCode::BackTab => {
+                            self.auto_apply = !self.auto_apply;
+                        }
                         _ => {}
                     }
                 }
             }
         }
     }
+    /// A synchronous, not-cancellable operation (auto-apply's integration
+    /// checks) that shows a fixed body instead of a live projection.
+    /// `block_in_place` does not yield, so there is nothing for Ctrl+C to
+    /// interrupt during the call; input queued during it is discarded after.
+    async fn work_static<F: Future<Output = Result<RunRecord>>>(
+        &mut self,
+        body: &str,
+        work: F,
+    ) -> Result<RunRecord> {
+        self.draw(body, None, "")?;
+        if self.screen.is_none() {
+            self.commit(body)?;
+        }
+        let result = work.await;
+        self.discard_work_input()?;
+        result
+    }
 }
+
+/// What `/auto-apply` asked for. A pure parse, testable without a `Ui`; the
+/// caller resolves `Toggle` against the current mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoApplyCommand {
+    On,
+    Off,
+    Toggle,
+}
+fn parse_auto_apply_command(text: &str) -> Option<AutoApplyCommand> {
+    match text.trim().strip_prefix("/auto-apply")?.trim() {
+        "" => Some(AutoApplyCommand::Toggle),
+        "on" => Some(AutoApplyCommand::On),
+        "off" => Some(AutoApplyCommand::Off),
+        _ => None,
+    }
+}
+const AUTO_APPLY_ON_LINE: &str = "Auto-apply on: eligible results will be applied without review.";
+const AUTO_APPLY_OFF_LINE: &str = "Auto-apply off: results wait for your review.";
 
 pub async fn session(state: &State, mut options: Options) -> Result<()> {
     anyhow::ensure!(
@@ -1408,7 +1513,12 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
             "What do you want to accomplish?\nDirect by default · /plan for sequential work
 /resources accounts · /checks project checks"
         };
-        let task = match ui.prompt(prompt).await? {
+        let prompt = if options.plain && ui.auto_apply {
+            prompt.replacen("accomplish?", "accomplish? (auto-apply on)", 1)
+        } else {
+            prompt.to_owned()
+        };
+        let task = match ui.prompt(&prompt).await? {
             Input::Submit(task) if task.trim() == "/resources" => {
                 if let Err(e) = setup::accounts(&mut ui, state, None).await {
                     ui.commit(&format!("Resources: {e}"))?;
@@ -1418,6 +1528,22 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
             Input::Submit(task) if task.trim() == "/checks" => {
                 if let Err(e) = setup::checks(&mut ui, &source).await {
                     ui.commit(&format!("Checks unchanged: {e}"))?;
+                }
+                continue;
+            }
+            Input::Submit(task) if parse_auto_apply_command(&task).is_some() => {
+                let new_state = match parse_auto_apply_command(&task).unwrap() {
+                    AutoApplyCommand::On => true,
+                    AutoApplyCommand::Off => false,
+                    AutoApplyCommand::Toggle => !ui.auto_apply,
+                };
+                if new_state != ui.auto_apply {
+                    ui.auto_apply = new_state;
+                    ui.commit(if ui.auto_apply {
+                        AUTO_APPLY_ON_LINE
+                    } else {
+                        AUTO_APPLY_OFF_LINE
+                    })?;
                 }
                 continue;
             }
@@ -1448,7 +1574,12 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
         ui.draw(
             &format!(
                 "{}\n\nGoal received. Preparing…",
-                goal_heading(&task, ui.width().saturating_sub(3))
+                goal_heading_marked(
+                    &task,
+                    ui.width().saturating_sub(3),
+                    options.ascii,
+                    ui.auto_apply
+                )
             ),
             None,
             "",
@@ -1537,6 +1668,13 @@ async fn run_goal(
     let mut run = ui
         .work(state, orchestrator::run_dispatch(state, request))
         .await?;
+    if ui.auto_apply
+        && pending_question(&run).is_none()
+        && run.outcome.work_result == WorkResult::Ready
+        && run.outcome.review == ReviewState::Pending
+    {
+        return auto_apply_goal(ui, state, run, options).await;
+    }
     loop {
         if let Some(command) = question_command(&run) {
             let deadline = run
@@ -1605,9 +1743,86 @@ async fn run_goal(
             }
             break;
         }
-        return review_goal(ui, state, run, options).await;
+        return review_goal(ui, state, run, options, "").await;
     }
     Ok(())
+}
+
+/// The moment a goal finishes Ready under auto-apply: run `orchestrator::auto_apply`
+/// and present its outcome. Never calls a review-recording function itself;
+/// `Applied` records nothing further, and every other outcome hands off to
+/// the ordinary human review menu with a notice explaining why.
+async fn auto_apply_goal(
+    ui: &mut Ui,
+    state: &State,
+    run: RunRecord,
+    options: Options,
+) -> Result<()> {
+    let outcome_slot: std::rc::Rc<std::cell::Cell<Option<ApplyOutcome>>> = Default::default();
+    let slot = outcome_slot.clone();
+    let id = run.id.clone();
+    let future = async {
+        let outcome = tokio::task::block_in_place(|| orchestrator::auto_apply(state, &id));
+        match outcome {
+            Ok(outcome) => slot.set(Some(outcome)),
+            Err(error) => return Err(error),
+        }
+        state.load_run(&id)
+    };
+    let run = ui
+        .work_static(
+            "Auto-apply: validating against the current source… (checks on the merged tree can take as long as your verification; not interruptible)",
+            future,
+        )
+        .await?;
+    match outcome_slot
+        .take()
+        .expect("auto_apply records its outcome before the reloaded run returns")
+    {
+        ApplyOutcome::Applied { validity, .. } => {
+            let mut text = projection(&run, None, ui.width().saturating_sub(3), options.ascii);
+            text.push_str("\nAuto-applied · review not performed");
+            if let Some(validity) = &validity {
+                text.push_str(&format!("\n{}", coherence_text(validity)));
+            }
+            ui.commit(&text)?;
+            ui.reviewed = None;
+            Ok(())
+        }
+        ApplyOutcome::Skipped { reason } => {
+            let human = match reason.as_str() {
+                "verification_not_configured" => "no checks configured",
+                "verification_failed" => "verification failed",
+                "integration_checks_unavailable" => "checks cannot run on the merged tree",
+                other => other,
+            };
+            review_goal(
+                ui,
+                state,
+                run,
+                options,
+                format!("Auto-apply skipped: {human}"),
+            )
+            .await
+        }
+        ApplyOutcome::Blocked { reason, validity } => {
+            let notice = match &validity {
+                Some(validity) => format!("Auto-apply blocked: {}", coherence_text(validity)),
+                None => format!("Auto-apply blocked: {reason}"),
+            };
+            review_goal(ui, state, run, options, notice).await
+        }
+        ApplyOutcome::Failed { error } => {
+            review_goal(
+                ui,
+                state,
+                run,
+                options,
+                format!("Auto-apply failed: {}", clip(&error, 240)),
+            )
+            .await
+        }
+    }
 }
 
 async fn review_goal(
@@ -1615,6 +1830,7 @@ async fn review_goal(
     state: &State,
     mut run: RunRecord,
     options: Options,
+    notice: impl Into<String>,
 ) -> Result<()> {
     let mut target = review_command(&run)?;
     ui.draw(
@@ -1630,7 +1846,7 @@ async fn review_goal(
     .await??;
     let preview = inspection::tiny_preview(&bundle)?;
     let mut view = inspection::ReviewView::default();
-    let mut notice = String::new();
+    let mut notice = notice.into();
     ui.input_boundary().await?;
     loop {
         let Input::Submit(action) = ui.review_action(&run, &preview, &notice).await? else {
@@ -1659,19 +1875,25 @@ async fn review_goal(
                 }
             }
             "i" | "details" => ui.diagnostics(&run).await?,
-            "a" | "accept" | "r" | "reject" => {
+            "a" | "accept" | "aa" | "r" | "reject" => {
                 bundle.verify()?;
-                let accept = matches!(action.as_str(), "a" | "accept");
+                // "aa" is a real human accept, recorded exactly like "a"; the
+                // mode flips only after that acceptance is actually recorded.
+                let accept = matches!(action.as_str(), "a" | "accept" | "aa");
                 let result = orchestrator::review_delivery(state, &target, accept);
                 run = state.load_run(&target.run_id)?;
                 ui.commit(&projection(&run, None, ui.width().saturating_sub(3), options.ascii))?;
-                if let Err(error) = result {
+                if let Err(error) = &result {
                     ui.commit(&format!("{error:#}"))?;
                 }
                 if matches!(run.outcome.review, ReviewState::Accepted | ReviewState::Rejected) {
                     let request = crate::private_evidence::prepare_review_annotation(state, &run)
                         .map_err(|error| format!("{error:#}"));
                     ui.reviewed = Some((run, request));
+                }
+                if action == "aa" && result.is_ok() {
+                    ui.auto_apply = true;
+                    ui.commit(AUTO_APPLY_ON_LINE)?;
                 }
                 return Ok(());
             }
@@ -1840,6 +2062,7 @@ mod tests {
                         "Enter send",
                         &Theme::from_hints(true, None, None, None, None),
                         true,
+                        false,
                     )
                 })
                 .unwrap();
@@ -2065,6 +2288,70 @@ mod tests {
             ))),
             Input::Cancel
         );
+    }
+    #[test]
+    fn back_tab_toggles_auto_apply_and_leaves_the_draft_untouched() {
+        let mut editor = Editor::new();
+        editor.text.insert_str("keep me");
+        assert_eq!(
+            editor.event(Event::Key(event::KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::SHIFT
+            ))),
+            Input::ToggleAutoApply
+        );
+        assert_eq!(editor.text.lines(), &["keep me"]);
+        // Crossterm reports Shift+Tab as BackTab with no explicit SHIFT
+        // modifier on some terminals; either form must be intercepted.
+        assert_eq!(
+            editor.event(Event::Key(event::KeyEvent::new(
+                KeyCode::BackTab,
+                KeyModifiers::NONE
+            ))),
+            Input::ToggleAutoApply
+        );
+        assert_eq!(editor.text.lines(), &["keep me"]);
+    }
+    #[test]
+    fn mode_hint_reflects_state_in_both_charsets() {
+        assert_eq!(
+            mode_hint_text(false, false),
+            "⏸ review before apply · Shift+Tab"
+        );
+        assert_eq!(
+            mode_hint_text(false, true),
+            "⏵⏵ auto-apply on · Shift+Tab to pause"
+        );
+        assert_eq!(
+            mode_hint_text(true, false),
+            "[review before apply] Shift+Tab"
+        );
+        assert_eq!(
+            mode_hint_text(true, true),
+            ">> AUTO-APPLY ON - Shift+Tab to pause"
+        );
+    }
+    #[test]
+    fn auto_apply_command_parses_on_off_and_bare_toggle() {
+        assert_eq!(
+            parse_auto_apply_command("/auto-apply"),
+            Some(AutoApplyCommand::Toggle)
+        );
+        assert_eq!(
+            parse_auto_apply_command("  /auto-apply  "),
+            Some(AutoApplyCommand::Toggle)
+        );
+        assert_eq!(
+            parse_auto_apply_command("/auto-apply on"),
+            Some(AutoApplyCommand::On)
+        );
+        assert_eq!(
+            parse_auto_apply_command("/auto-apply off"),
+            Some(AutoApplyCommand::Off)
+        );
+        assert_eq!(parse_auto_apply_command("/auto-apply maybe"), None);
+        assert_eq!(parse_auto_apply_command("auto-apply on"), None);
+        assert_eq!(parse_auto_apply_command("Add tests"), None);
     }
     #[test]
     fn resize_work_and_question_preserves_committed_projection() {

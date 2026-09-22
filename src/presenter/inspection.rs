@@ -133,7 +133,7 @@ impl Ui {
             self.options.ascii,
         );
         summary.push_str(&format!("\n{}", self.launch_line));
-        let actions = "[Enter/d] Review changes   [e] Open in editor\n[a] Accept & apply   [r] Reject   [n] Leave pending   [i] Details";
+        let actions = "[Enter/d] Review changes   [e] Open in editor\n[a] Accept & apply   [r] Reject\n[aa] Accept & apply, then auto-apply the next results\n[n] Leave pending   [i] Details";
         if self.options.plain {
             return self
                 .command_prompt(&format!("{summary}\n{preview}\n{notice}\n{actions}"))
@@ -148,6 +148,8 @@ impl Ui {
             ));
             let preview = self.display_text(preview);
             let notice = self.display_text(notice);
+            let mode_hint = self.display_text(&self.mode_hint());
+            let auto_apply = self.auto_apply;
             let screen = self.screen.as_mut().context("terminal is unavailable")?;
             screen.terminal.draw(|frame| {
                 let area = content_area(frame.area());
@@ -169,10 +171,22 @@ impl Ui {
                 }
                 let controls = vec![
                     Line::styled(
+                        mode_hint,
+                        if auto_apply {
+                            self.palette.warning
+                        } else {
+                            self.palette.secondary
+                        },
+                    ),
+                    Line::styled(
                         "[Enter/d] Review changes   [e] Open in editor",
                         self.palette.focus,
                     ),
                     Line::styled("[a] Accept & apply   [r] Reject", self.palette.foreground),
+                    Line::styled(
+                        "[aa] Accept & apply, then auto-apply the next results",
+                        self.palette.foreground,
+                    ),
                     Line::styled("[n] Leave pending   [i] Details", self.palette.secondary),
                 ];
                 let control = Paragraph::new(Text::from(controls)).wrap(Wrap { trim: false });
@@ -233,6 +247,10 @@ impl Ui {
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         self.closed = true;
                         return Ok(Input::Eof);
+                    }
+                    // Never submits or edits the typed action; redraw shows the flip.
+                    KeyCode::BackTab => {
+                        self.auto_apply = !self.auto_apply;
                     }
                     KeyCode::Char(c) if c.is_ascii_alphabetic() && action.len() < 12 => {
                         action.push(c.to_ascii_lowercase())
