@@ -1,5 +1,7 @@
+mod apply;
 pub(crate) mod phase3;
 mod planned;
+pub use apply::{ApplyAuthority, ApplyOutcome, apply, auto_apply};
 pub use phase3::{QuestionCommand, answer_question, cancel_question};
 use std::{
     collections::{HashSet, VecDeque},
@@ -37,7 +39,6 @@ use crate::{
     },
     capacity::{authorize_observation, needs_refresh, probe_codex, supports_codex_account_probe},
     classifier::classify_task,
-    coherence::{AcceptGate, CoherenceBlocked},
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -3408,23 +3409,6 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
     Ok(patch)
 }
 
-/// Store the latest validity on the run, remembering when work first became
-/// invalid so that later evidence can show how long it ran on a false premise.
-fn remember_validity(run: &mut RunRecord, validity: &Validity) {
-    let mut record = run.coherence.take().unwrap_or(CoherenceRecord {
-        version: 1,
-        refreshed_from: None,
-        facts: Vec::new(),
-        validity: None,
-        first_invalid_at: None,
-    });
-    if validity.decision != Decision::Continue && record.first_invalid_at.is_none() {
-        record.first_invalid_at = Some(validity.evaluated_at);
-    }
-    record.validity = Some(validity.clone());
-    run.coherence = Some(record);
-}
-
 pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
     let (run, _lock) = review_target(state, command)?;
     if run.mode == RunMode::Allocation {
@@ -3442,7 +3426,13 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
     }
     let run = state.load_run(&command.run_id)?;
     if accept {
-        apply_locked(state, run, &command.candidate_id, true)?;
+        apply::apply_locked(
+            state,
+            run,
+            &command.candidate_id,
+            true,
+            ApplyAuthority::Human,
+        )?;
     }
     state.load_run(&command.run_id)
 }
@@ -4084,131 +4074,6 @@ fn record_allocation_feedback_locked(
         println!(
             "Allocation feedback recorded (revision {}).",
             feedback.revision
-        );
-    }
-    Ok(())
-}
-
-pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    apply_locked(state, run, candidate_label, false)
-}
-
-fn apply_locked(
-    state: &State,
-    mut run: RunRecord,
-    candidate_label: &str,
-    quiet: bool,
-) -> Result<()> {
-    anyhow::ensure!(
-        matches!(
-            run.status,
-            RunStatus::ReadyForEvaluation | RunStatus::Evaluated
-        ),
-        "run {} is {}; apply requires a completed, unapplied run",
-        run.id,
-        run.status.as_str()
-    );
-    crate::planning::verify_delivery(&run)?;
-    let candidate = find_candidate(&run, candidate_label)?;
-    let normalized_label = candidate.label.clone();
-    let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
-    let _source_lock = OperationLock::acquire(
-        &state
-            .root
-            .join("locks")
-            .join(format!("source-{source_key}.lock")),
-        "another apply operation is already modifying this source",
-    )?;
-    let applied = crate::coherence::gate(&run, &normalized_label, &state.run_dir(&run.id))
-        .and_then(|gate| match gate {
-            AcceptGate::Legacy => Ok((source::safe_apply(&run, &normalized_label)?, None)),
-            AcceptGate::Compatible(validity) => Ok((
-                source::apply_validated(&run, &normalized_label, &validity.world_digest)?,
-                Some(validity),
-            )),
-            AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
-                run_id: run.id.clone(),
-                validity,
-            }
-            .into()),
-        });
-    let (report, validity) = match applied {
-        Ok(applied) => applied,
-        Err(error) => {
-            let message = format!("{error:#}");
-            let blocked = error.downcast_ref::<CoherenceBlocked>();
-            run.outcome.application = if blocked.is_some()
-                || message.contains("source changed")
-                || message.contains("source has changed")
-                || message.contains("source drift")
-            {
-                ApplicationState::BlockedBySourceDrift
-            } else {
-                ApplicationState::Failed
-            };
-            run.outcome.phase = RunPhase::Finished;
-            if let Some(blocked) = blocked {
-                remember_validity(&mut run, &blocked.validity);
-            }
-            let database = Database::open(state.db_path())?;
-            persist_event(
-                state,
-                &database,
-                EventRecord {
-                    run_id: run.id.clone(),
-                    candidate_label: Some(normalized_label.clone()),
-                    event_type: "application.failed".into(),
-                    timestamp: Utc::now(),
-                    payload: serde_json::json!({
-                        "application": run.outcome.application,
-                        "error": message,
-                        "coherence": blocked.map(|blocked| &blocked.validity),
-                    }),
-                    ..EventRecord::default()
-                },
-                &mut run,
-            )?;
-            return Err(error);
-        }
-    };
-    if let Some(validity) = &validity {
-        remember_validity(&mut run, validity);
-    }
-    run.applied_candidate = Some(normalized_label.clone());
-    run.status = RunStatus::Applied;
-    run.outcome.review = ReviewState::Accepted;
-    run.outcome.application = ApplicationState::Applied;
-    run.outcome.phase = RunPhase::Finished;
-    let mut db = Database::open(state.db_path())?;
-    db.sync_run(&run)?;
-    persist_event(
-        state,
-        &db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: Some(normalized_label.clone()),
-            event_type: "result.applied".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({
-                "files_changed": report.files_changed,
-                "coherence": validity.as_ref().filter(|validity| validity.world_changed),
-            }),
-            ..EventRecord::default()
-        },
-        &mut run,
-    )?;
-    if !quiet {
-        println!(
-            "Applied Candidate {} to {} ({} file(s) changed).",
-            normalized_label,
-            run.source_path.display(),
-            report.files_changed
         );
     }
     Ok(())

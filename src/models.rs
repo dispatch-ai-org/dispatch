@@ -303,6 +303,21 @@ pub struct RunOutcome {
     pub application: ApplicationState,
     pub phase: RunPhase,
     pub waiting_on: WaitingOn,
+    /// Who applied the result: a human decision or the auto-apply policy.
+    /// `None` when nothing was applied, or for records written before the
+    /// actor was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_by: Option<AppliedBy>,
+}
+
+/// The authority under which a candidate was applied to the source. It is
+/// recorded on the outcome so that an application by policy can never be
+/// mistaken for human acceptance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppliedBy {
+    Human,
+    AutoApply,
 }
 
 impl Default for RunOutcome {
@@ -316,6 +331,7 @@ impl Default for RunOutcome {
             application: ApplicationState::NotApplied,
             phase: RunPhase::Finished,
             waiting_on: WaitingOn::None,
+            applied_by: None,
         }
     }
 }
