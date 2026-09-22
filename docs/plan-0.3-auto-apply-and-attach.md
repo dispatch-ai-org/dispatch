@@ -1025,6 +1025,26 @@ Progress log:
   in the session is covered by the four PTY scenarios in `tests/phase4_review.rs`.
   Real-agent dogfood is blocked until the Codex profiles are revalidated with
   `dispatch setup codex`.
+- 2026-09-22: v0.3.0 merged (`8526157`), tagged and released. First **real-agent**
+  dogfood with Claude Sonnet 5 (`observed_model: claude-sonnet-5`) through allocation
+  on the Python scratch project, three concurrent `run --auto-apply --json`:
+  C (`power`) finished first in 22.7 s, verification passed, auto-applied on the
+  unmoved world; A (`divide`, same files as C) blocked `verdict_refresh` /
+  `patch_conflict`; B (`reverse` in `strings.py`, disjoint files) blocked
+  `verdict_refresh` / `analysis_uncertain` ("candidate patch does not apply to the
+  merged tree"). Both blocks were caused by a **defect, not by the work**: the
+  internal baseline is staged with `git add -A -f`, so ignored build artifacts
+  present at snapshot time (`__pycache__/*.pyc`) are tracked in S0, the verify check
+  regenerates them in every candidate, and they enter Δ. C then applied bytecode into
+  the source, A conflicted on it, and B's integration check failed because the
+  scratch tree (non-ignored files only, correctly) had no bytecode to patch. B is a
+  false REFRESH in the sense of `coherence-validation.md`. Fix as **A7 / v0.3.1**:
+  S0's commit must contain exactly the path set the world observes (honor the
+  source's ignore rules when staging for Git sources; keep the files on disk for
+  build caches; copy `info/exclude`); Δ then cannot contain ignored paths. Codex
+  profiles remain unusable this week (usage exhausted) and need paid credits
+  disabled before revalidation. UX note for 0.4.1: setup prompts should be
+  arrow-key selections, not typed values (a typed model ID had a typo).
 
 0.3.0 (auto-apply):
 
