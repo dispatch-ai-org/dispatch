@@ -1007,6 +1007,24 @@ Progress log:
   world in 121 ms, B applied after integration checks on the moved world in 753 ms,
   C blocked as REFRESH (`patch_conflict`) with the source untouched; no review
   evidence written.
+- 2026-09-22: A3 (`415a81f`), A4 (`1d56631` plus `18f473c`, which moved the TUI
+  hook to the single point every Ready result reaches so a goal that answered a
+  clarification is also auto-applied), A5 (`ebfcdbe`, six process-level scenarios,
+  fence retry observed through the second `coherence-checks` directory) and A6
+  (`bc1e481`, docs and version 0.3.0) merged. Release gate on the merged tree: 685
+  passed, 0 failed, 2 ignored. Two pre-existing tests are load-sensitive and fail
+  only when another suite competes for the machine: the planned-goal deadline
+  scenarios in `tests/phase8_planning.rs` (60 s goal deadlines) and
+  `claude_control_slow_output` in `tests/phase6_portfolio.rs` (a 10 s pipe-drain
+  window); both pass in isolation on every tree. TUI dogfood in the real binary
+  through a pty: the hint row shows `[review before apply] Shift+Tab`, Shift+Tab
+  flips it to `>> AUTO-APPLY ON - Shift+Tab to pause`, the goal heading carries the
+  `>>` marker and the working hint keeps the mode; the goal itself stopped at the
+  funding guard ("paid credits are now available"), which the session's allocation
+  path revalidates independently of the account probe. The post-finish apply flow
+  in the session is covered by the four PTY scenarios in `tests/phase4_review.rs`.
+  Real-agent dogfood is blocked until the Codex profiles are revalidated with
+  `dispatch setup codex`.
 
 0.3.0 (auto-apply):
 

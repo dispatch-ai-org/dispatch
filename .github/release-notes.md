@@ -51,8 +51,8 @@ with auto-apply off.
 
 **Evidence.** The only dogfooding done for this release used a scripted fixture
 agent behind the Codex adapter, not a real coding agent: three concurrent runs on a
-Python project, gated to finish together, applied/blocked exactly as the
-authorization table predicts (one applied on an unmoved world, one applied after
-integration checks on a moved world, one blocked as REFRESH with the source
-untouched). Treat this as fixture evidence, not a claim about real-agent behavior;
+Python project, applied one after another once all three had finished, behaved
+exactly as the authorization table predicts (one applied on an unmoved world, one
+applied after integration checks on a moved world, one blocked as REFRESH with the
+source untouched). Treat this as fixture evidence, not a claim about real-agent behavior;
 see `docs/coherence-validation.md` for what is claimed and what would falsify it.
