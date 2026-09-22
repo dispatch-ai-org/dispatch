@@ -122,6 +122,15 @@ changed files, reasons) but has no S0/provenance line, and the `serve` view's fi
 fixed columns (below) do not include it either. Reading the provenance and confidence
 programmatically means reading the run's stored record or its `attach.created` event.
 
+`dispatch explain` on an attached run is narrower still: it always tries to explain a
+routing/allocation selection first, which an attached run never has, so on the common
+case — a finished attached run whose world has not moved and whose verdict is still
+`CONTINUE` — it prints nothing and exits with an error, *"this run has no
+single-agent selection to explain."* The Coherence section only appears, ahead of that
+same error, once the run's live verdict is not `CONTINUE` or the world has moved. For
+attached work, `dispatch check` (which never touches selection) is the reliable way to
+see the verdict.
+
 ## Δ and "finished"
 
 - **Live Δ**, while a Work is still active: the watcher writes `delta-live.patch` on
@@ -470,4 +479,6 @@ directory, exactly as it already refuses any newer schema.
 - `dispatch explain` and the `serve` view do not print S0 provenance/confidence (see
   "Where this is visible today" above) — this is narrower than the original design
   note for this feature; the stored record and the `attach.created` event are the
-  reliable source.
+  reliable source. `explain` also errors on an attached run with an unmoved,
+  still-`CONTINUE` verdict, since it tries a routing/allocation explanation first;
+  use `dispatch check` for the verdict itself.

@@ -310,9 +310,12 @@ redraws in place as things change, and includes your ordinary Dispatch runs on t
 same source alongside attached ones. Run it alongside a foreign attachment so it gets
 observed and, if eligible, applied; wrapped attach and the TUI need no `serve` at all.
 
-What shows in the CLI: `dispatch status`/`dispatch check`/`dispatch explain` treat an
-attached run exactly like any other single-result run once it is finished — same
-`Coherence` section, same accept/reject/apply commands. `dispatch refresh` has no
+What shows in the CLI: `dispatch status` and `dispatch check` treat an attached run
+exactly like any other single-result run once it is finished — same `Coherence`
+section, same accept/reject/apply commands. `dispatch explain` is narrower for
+attached work: it tries a routing/allocation explanation first, which attached work
+never has, so on an unmoved, still-coherent run it errors instead of showing
+anything; use `dispatch check` for the verdict. `dispatch refresh` has no
 target for attached work (there is no Dispatch task to relaunch) and is refused;
 review it and `dispatch attach` again if you want another pass. Over the [control
 protocol](control-protocol.md) and `--json`, an attached run appears with
