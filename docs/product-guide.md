@@ -100,6 +100,73 @@ that is not yet applied (`check` and the line also need exactly one candidate,
 which any single-agent run has). The verdict rules, limits and events
 are in the [coherence reference](coherence.md); the README has the short version.
 
+### Auto-apply
+
+A session mode applies eligible results automatically instead of waiting for your
+review. It is off by default in every new session and is never persisted between
+sessions. Application is not acceptance: an auto-applied result never records a
+human review, so `outcome.review` stays `pending` until you look at it.
+
+Toggle it with **Shift+Tab** on any screen (the goal prompt, while working, or the
+review menu), or with `/auto-apply on|off` (bare `/auto-apply` toggles) — the path
+for `--plain` mode, where raw keys are not readable. The current mode is always the
+first segment of the hint row:
+
+| Mode | Unicode | ASCII |
+|---|---|---|
+| Off | `⏸ review before apply · Shift+Tab` | `[review before apply] Shift+Tab` |
+| On | `⏵⏵ auto-apply on · Shift+Tab to pause` | `>> AUTO-APPLY ON - Shift+Tab to pause` |
+
+Toggling prints one line: "Auto-apply on: eligible results will be applied without
+review." or "Auto-apply off: results wait for your review." In `--plain` mode, the
+goal prompt also gets `(auto-apply on)` appended while the mode is on.
+
+The review menu carries one extra action, `[aa] Accept & apply, then auto-apply the
+next results`: it records your acceptance exactly like `a`, applies the result, and
+only then turns the mode on for later results. It never reinterprets a result you
+have not looked at.
+
+When a goal reaches a Ready, review-pending result under this mode, Dispatch
+validates it against the current source and either applies it or drops into the
+ordinary review menu with a notice explaining why:
+
+- **Applied**: the session shows "Auto-applied · review not performed" plus the
+  `Coherence:` line for a moved world, and returns to the goal prompt. No accept/reject
+  attest offer follows, because no human review happened.
+- **Skipped or blocked**: the session enters the review menu with a notice above the
+  actions — "Auto-apply skipped: `<reason>`" (for example "no checks configured",
+  "verification failed", "checks cannot run on the merged tree") or "Auto-apply
+  blocked: `<Coherence: REFRESH/STOP line>`" (or the bare reason when no verdict was
+  computed, for example a strict-mode drift).
+- **Failed** (an apply that was authorized still failed, for example a Git error):
+  "Auto-apply failed: `<error>`", also into the review menu.
+
+Ctrl+C is not honored while an auto-apply attempt is in flight: integration checks
+on the merged tree are not cancellable, the same as at accept time. The attempt is
+bounded by the checks' own timeout.
+
+**Headless.** `dispatch run --auto-apply "<task>"` and `dispatch refresh --auto-apply
+[run]` apply the result the same way immediately after the run returns Ready, and
+print one line: "Auto-applied Candidate `<label>` to `<source>` (`<n>` file(s)
+changed). Review not performed." or "Not applied automatically: `<reason>`. Review
+with dispatch check `<id>` or dispatch accept `<id>`." `--json` adds an `auto_apply`
+object to the result (`outcome`: `applied`/`blocked`/`skipped`/`failed`; `reason`;
+`coherence`; `files_changed`); `--jsonl` streams the run's own events as usual, then
+a trailing `{"type":"auto_apply", "run_id", "auto_apply": {...}}` line. Exit code
+`6` means the run finished Ready but was not applied automatically (skipped or
+blocked); it is used only when the run's own exit code would otherwise have been
+`0` — a run that already failed for its own reason (for example failed
+verification) keeps that exit code unchanged.
+
+Eligibility, in plain words: verification must be configured and must have passed;
+on a moved source, the project's own checks must pass on the merged tree; a
+`REFRESH` or `STOP` verdict is never applied. Nothing is ever refreshed
+automatically under this mode. There is no `dispatch.yml` key for it: the policy
+lives only in the process that owns the run (the TUI session or the CLI
+invocation), never on the run record and never across a restart. See
+[coherence.md](coherence.md#automatic-application-auto-apply) for the full
+eligibility and authorization rules.
+
 ### What `explain` shows
 
 `dispatch explain` prints a **Coherence** section when the run's current verdict

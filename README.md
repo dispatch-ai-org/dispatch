@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.2.0 — experimental developer preview**
+**Dispatch 0.3.0 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -130,6 +130,18 @@ coherence:
 - Planned (`--plan`) runs keep the strict drift stop between tasks; accepting a
   finished planned delivery uses the same accept-time gate.
 - Mid-run verdicts are advisory by default and are computed for allocation runs only.
+
+### Auto-apply
+
+A session mode (Shift+Tab, or `/auto-apply on`) and a CLI flag (`dispatch run
+--auto-apply`, `dispatch refresh --auto-apply`) apply an eligible result
+automatically instead of waiting for review. Auto-apply is never auto-accept: it
+applies only a verdict whose evidence is complete for the exact world it names — an
+unmoved world with passed verification, or a moved world whose merged tree passed
+your own checks — and it never records human acceptance, so review stays `pending`.
+See the [product guide](docs/product-guide.md#auto-apply) for the mode and
+[coherence reference](docs/coherence.md#automatic-application-auto-apply) for the
+full eligibility and authorization rules.
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for

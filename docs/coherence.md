@@ -195,6 +195,121 @@ When a moved-world apply succeeds, the validity is stored and the `result.applie
 event includes it under `coherence`. A typed error (`CoherenceBlocked`) replaced the
 former matching on error text for this path.
 
+## Automatic application (auto-apply)
+
+Auto-apply applies a finished result to the source under a session or invocation
+policy. It is never acceptance: acceptance is a human quality judgment, application
+is a mechanical source change, and auto-apply performs only the second. An
+auto-applied run never writes `review.accepted`; `outcome.review` stays `pending`
+until a human looks at it, and nothing about the policy itself is persisted, only
+its evidence. `orchestrator::apply::auto_apply` (`src/orchestrator/apply.rs`) is the
+one function that performs it: the TUI session mode calls it right after a goal
+reaches a Ready, review-pending result; `dispatch run --auto-apply` and
+`dispatch refresh --auto-apply` call it right after the run returns.
+
+The attempt has three stages, each recorded.
+
+### Stage 1: eligibility
+
+Checked before the source lock is taken. The run lock is acquired first (waited up
+to 5 s). Every failure below returns `Skipped`, and every one except `run_busy` and
+`not_ready` commits `auto_apply.skipped {reason}`.
+
+| Check | Skip reason |
+|---|---|
+| The run's operation lock is free within 5 s | `run_busy` (nothing persisted) |
+| `lifecycle == Finished`, `work_result == Ready`, `status == ReadyForEvaluation`, `review == Pending`, `application == NotApplied` | `not_ready` (nothing persisted) |
+| Exactly one candidate | `not_sole_candidate` |
+| `planning::verify_delivery` passes | `delivery_unverifiable` |
+| `config.snapshot.yml` is readable | `config_unreadable` |
+| `checks.verify` is non-empty | `verification_not_configured` |
+| `outcome.verification == Passed` | `verification_failed`, `verification_inconclusive`, `verification_not_run`, or `verification_not_configured` |
+| On the local backend, `environment.unsafe_local` is true | `integration_checks_unavailable` |
+| The source lock is free within the run's `execution.timeout_secs` | `source_busy` |
+
+`verification_not_configured` is never eligible: without `checks.verify` there is no
+L2, and the only evidence would be that the agent exited zero. No configuration key
+relaxes this.
+
+`run_busy` and `not_ready` persist nothing because the run may be owned by a live
+process holding no operation lock, or by a human review holding it; writing an event
+here would bump the run's `state_revision` out from under that owner.
+
+### Stage 2: the gate under both locks
+
+With both locks held, `decide()` (`src/orchestrator/apply.rs`) calls
+`coherence::gate` and applies a stricter authorization predicate than human accept:
+
+| Gate result | Authorized | Else |
+|---|---|---|
+| `Legacy`, current `fingerprint_tree(source) == source_fingerprint` (byte-identical world) | yes, via `safe_apply` | |
+| `Legacy`, fingerprint differs (strict mode with a moved world; a config that was readable in stage 1 and became unreadable here) | no | `auto_apply.blocked { reason: strict_mode_drift }` |
+| `Compatible(v)`, `!v.world_changed` | yes, via `apply_validated` | |
+| `Compatible(v)`, `v.world_changed && v.analysis == integration` | yes, via `apply_validated` | |
+| `Compatible(v)`, `v.world_changed` and analysis is `symbols` or `files_only` (L2 skipped or disabled) | no | `auto_apply.blocked { reason: integration_evidence_missing }` |
+| `Blocked(v)`, `v.decision == Stop` | no | `auto_apply.blocked { reason: verdict_stop }` |
+| `Blocked(v)`, `v.decision == Refresh` | no | `auto_apply.blocked { reason: verdict_refresh }` |
+
+A blocked outcome stores the validity (`remember_validity`), sets
+`application: blocked_by_source_drift`, commits `auto_apply.blocked {reason,
+coherence}`, and leaves `review` untouched. Nothing is applied and nothing is
+rejected automatically.
+
+This is the accept-time safety invariant plus one stricter rule: **a policy applies
+only a verdict whose evidence is complete for the exact world it names** — an
+unmoved world with passed candidate verification, or a moved world whose merged
+tree passed the project's own checks. Human accept applies a moved world on L0/L1
+evidence alone when L2 was skipped for lack of authority (see "The accept path"
+above); auto-apply refuses that case (`integration_evidence_missing`).
+
+### Stage 3: apply, and the one retry
+
+`source::safe_apply` or `source::apply_validated` runs with the gate's digest. If
+the digest fence fails — someone edited the source between authorization and the
+real `git apply` ("source changed during apply validation" or "source has changed
+since this run was created") — stage 2 is re-run exactly once against the new
+world. A second fence failure ends as `auto_apply.blocked { reason:
+world_moved_during_validation }`. There is no further loop and no sleep-and-retry.
+
+Any other apply failure (for example a Git error after authorization) commits
+`application.failed {application: "failed", error, applied_by: "auto_apply"}` and
+returns `Failed { error }`; the policy itself is unchanged for later runs — a Git
+failure is per-run, not a reason to silently stop applying.
+
+### Locks
+
+| Lock | Path | Bound |
+|---|---|---|
+| Run | `runs/<id>/.operation.lock` | 5 s |
+| Source | `locks/source-<sha256(source_path)>.lock` | the run's `execution.timeout_secs` (an L2 run by another applier can take that long) |
+
+Both are acquired with `OperationLock::acquire_wait`, a bounded poll (100 ms) of the
+existing non-blocking `flock` acquisition; the non-Unix branch polls `create_new`
+the same way. No SQLite transaction is held while either lock is held.
+
+### `RunOutcome.applied_by`
+
+`Option<AppliedBy>`: `human` or `auto_apply`
+(`#[serde(default, skip_serializing_if = "Option::is_none")]`). `None` for a run
+that was never applied, and for a record written before this field existed.
+`apply_locked` sets it once, at the moment of application, from the caller's
+`ApplyAuthority`; only `ApplyAuthority::Human` also sets `review: Accepted`, so an
+auto-applied run's review stays `pending`.
+
+### Post-hoc review
+
+A human may still accept or reject an auto-applied run afterward. This is recorded
+review only — there is no second apply, and rejection does not revert the source:
+
+- `dispatch accept <id>` on an auto-applied run prints "Result was already applied
+  by auto-apply; your review is recorded." and records `review.accepted`.
+- `dispatch reject <id>` prints "Result rejected. The source tree was not changed."
+  and "Rejection does not revert the source." and records `review.rejected`.
+
+Both leave `application: applied` and `applied_by: auto_apply` unchanged; only
+`outcome.review` moves off `pending`. This is the signal for a human later
+disagreeing with a CONTINUE verdict that was acted on automatically.
+
 ## The mid-run watcher (`watch.rs`)
 
 For runs that use included-resource allocation, `phase3` starts one `Watcher` per
@@ -255,9 +370,11 @@ also gets the run's `outcome`, as for all events.
 | `coherence.invalidated` | Watcher verdict is `Refresh` or `Stop`. | `{"coherence": <Validity>}` |
 | `coherence.checked` | Watcher verdict is `Continue` after an invalid one was sent. | `{"coherence": <Validity>}` |
 | `coherence.stopped` | `mid_run: stop` is about to cancel the attempt. | `{"coherence": <Validity>}` |
-| `application.failed` | Apply refused or failed. | `application`, `error`, and `coherence` when the gate blocked it |
-| `result.applied` | Apply succeeded. | `files_changed`, and `coherence` when the world had moved |
+| `application.failed` | Apply refused or failed. | `application`, `error`, and `coherence` when the gate blocked it; `applied_by: "auto_apply"` on the policy path only |
+| `result.applied` | Apply succeeded. | `files_changed`, and `coherence` when the world had moved; `applied_by: "auto_apply"` on the policy path only (absent, not `null`, on the human path) |
 | `run.stopped` | After a watcher stop. | `failure: "stale_work"`, `reason` |
+| `auto_apply.skipped` | An auto-apply attempt was not eligible (see "Automatic application" above). | `{"reason": <string>}` |
+| `auto_apply.blocked` | The gate, or its stricter authorization predicate, refused an auto-apply attempt. | `{"reason": <string>, "coherence": <Validity or null>}` |
 
 ## Configuration
 
@@ -283,6 +400,10 @@ digest) and `first_invalid_at`. History is in the `events` table. The `facts` fi
 exists on the record but current code does not populate it; facts are always
 recomputed from the baseline and the patch. Coherence data is not part of any sync envelope.
 
+`RunOutcome.applied_by` is also stored (`human` or `auto_apply`, `None` when
+unapplied). It is set once, at application, and never recomputed; a later post-hoc
+`review.accepted`/`review.rejected` does not change it.
+
 There is no schema migration; the schema version stays 20. Every field is
 `#[serde(default)]`, so a `run.json` written by an older version deserializes, and
 such a run gets coherence checking at accept time because everything needed
@@ -298,6 +419,18 @@ such a run gets coherence checking at accept time because everything needed
 - Nothing launches an agent except an explicit `run` or `refresh`; refresh needs the same acknowledgements again.
 - Local execution is still not a sandbox; integration checks add no authority beyond the run's own approval.
 - The original-baseline lineage, completed-attempt evidence, admission and cancellation fencing are untouched. Coherence-stopped runs are not counted as agent failures.
+- Auto-apply reuses `gate` and `apply_validated`/`safe_apply` verbatim; it adds a
+  stricter authorization predicate on top, never a weaker one, and applies through
+  the same digest and fingerprint fences as human accept.
+- Auto-apply never calls `record_allocation_feedback*` or
+  `record_routing_evaluation*`; it never writes `review.accepted` and never changes
+  `outcome.review`. Human evidence stays human.
+- A run whose operation lock is held by another owner (a live process, or a human
+  review) is left untouched by an auto-apply attempt: nothing is persisted and
+  nothing is applied out from under that owner.
+- The auto-apply policy itself is never persisted; only what happened is
+  (`applied_by`, the `auto_apply.*` events). A process restart loses the policy, and
+  no stored flag authorizes a later, unattended application.
 
 ## Fixture matrix
 
