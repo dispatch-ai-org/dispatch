@@ -209,8 +209,15 @@ pub fn gate(run: &RunRecord, candidate_label: &str, run_dir: &Path) -> Result<Ac
     let Some(config) = run_config(run_dir) else {
         return Ok(AcceptGate::Legacy);
     };
+    // For a run Dispatch launched, the whole-tree fingerprint was taken from
+    // the same tree S0 was copied from, so an equal fingerprint means an
+    // unmoved world. Attached work's S0 is a merge-base commit while its
+    // fingerprint is the root's working tree at attach time, which may already
+    // differ from S0; the shortcut would skip evaluation and the integration
+    // checks, so attached runs always evaluate.
     if config.coherence.accept == AcceptMode::Strict
-        || fingerprint_tree(&run.source_path)? == run.source_fingerprint
+        || (run.mode != crate::RunMode::Attached
+            && fingerprint_tree(&run.source_path)? == run.source_fingerprint)
     {
         return Ok(AcceptGate::Legacy);
     }

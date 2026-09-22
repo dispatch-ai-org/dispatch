@@ -176,9 +176,18 @@ the per-run and per-source locks and calls `coherence::gate`:
 - The configuration frozen with the run (`config.snapshot.yml` in the run directory)
   is read. If it cannot be read or parsed, the gate is `Legacy` (strict).
 - `coherence.accept: strict`, or a source whose whole-tree fingerprint equals the
-  snapshot's: `Legacy`. The original all-or-nothing `safe_apply` runs.
+  snapshot's: `Legacy`. The original all-or-nothing `safe_apply` runs. **Attached work
+  (`run.mode == RunMode::Attached`) never takes the fingerprint half of this
+  shortcut**: its S0 is a merge-base commit while its `source_fingerprint` is the
+  root's working tree at attach time, so an equal fingerprint does not reliably mean
+  an unmoved world the way it does for a run Dispatch launched. Attached work still
+  goes `Legacy` under `coherence.accept: strict`. See
+  [attach.md](attach.md#the-gate-rule-for-attached-runs).
 - Otherwise `evaluate_run`, then L2 if the verdict was `Continue`. `Continue` yields
   `Compatible`; `Refresh` and `Stop` yield `Blocked`.
+
+Attached runs go through this same `gate` and the same `auto_apply` as native work —
+there is no second accept path for work Dispatch did not launch.
 
 `Compatible` applies through `source::apply_validated`, which requires the current
 world digest to equal the evaluated one before the dry run and again after it, so a
@@ -228,11 +237,16 @@ to 5 s). Every failure below returns `Skipped`, and every one except `run_busy` 
 | `checks.verify` is non-empty | `verification_not_configured` |
 | `outcome.verification == Passed` | `verification_failed`, `verification_inconclusive`, `verification_not_run`, or `verification_not_configured` |
 | On the local backend, `environment.unsafe_local` is true | `integration_checks_unavailable` |
+| The sole candidate's `diff_path` is non-empty | `empty_delta` |
 | The source lock is free within the run's `execution.timeout_secs` | `source_busy` |
 
 `verification_not_configured` is never eligible: without `checks.verify` there is no
 L2, and the only evidence would be that the agent exited zero. No configuration key
 relaxes this.
+
+`empty_delta` keeps a run that produced no change — an agent (native or attached) that
+edited nothing, or touched only ignored paths — reviewable instead of recording it as
+applied with zero files changed.
 
 `run_busy` and `not_ready` persist nothing because the run may be owned by a live
 process holding no operation lock, or by a human review holding it; writing an event
@@ -318,6 +332,15 @@ disagreeing with a CONTINUE verdict that was acted on automatically.
 For runs that use included-resource allocation, `phase3` starts one `Watcher` per
 attempt (planned, legacy, routed and comparison runs have none). It stops when the
 attempt returns or the watcher is dropped.
+
+Attached work uses this same `Watcher` type, not a different mechanism: the wrapped
+attach owner loop starts one for the agent it spawned, and `serve` re-observes every
+foreign or orphaned attached run on its own tick. Both persist through the same
+`apply::persist_verdict` step described above (`remember_validity` plus
+`coherence.checked`/`coherence.invalidated`) — only `phase3::apply_watch` still
+implements `mid_run: stop`, and it never applies to attached work. See
+[attach.md](attach.md#shared-verdict-persistence) for the wrapped owner loop and
+`serve`'s reevaluation loop.
 
 - Every `coherence.poll_secs` it takes `world::signal`: for Git, `HEAD`, the hash of
   `git status --porcelain=v2 -z --untracked-files=all`, and size and modification time of

@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.3.0 — experimental developer preview**
+**Dispatch 0.4.0 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -142,6 +142,19 @@ your own checks — and it never records human acceptance, so review stays `pend
 See the [product guide](docs/product-guide.md#auto-apply) for the mode and
 [coherence reference](docs/coherence.md#automatic-application-auto-apply) for the
 full eligibility and authorization rules.
+
+### Attach your own agent
+
+`dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree:
+
+```sh
+dispatch attach --auto-apply -- claude -p "add input validation"   # wrap it
+dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
+dispatch finish <run-id>                                           # you say when it's done
+dispatch serve                                                     # keeps a foreign attachment observed and applies it
+```
+
+Dispatch is honest about what it saw: full confidence when S0 is a real Git merge-base commit, partial confidence when it had to snapshot a plain directory at attach time, since earlier edits are then invisible to the patch. See [attach.md](docs/attach.md).
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for

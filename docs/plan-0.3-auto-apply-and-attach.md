@@ -1045,6 +1045,67 @@ Progress log:
   profiles remain unusable this week (usage exhausted) and need paid credits
   disabled before revalidation. UX note for 0.4.1: setup prompts should be
   arrow-key selections, not typed values (a typed model ID had a typo).
+- 2026-09-22: v0.3.1 released (`bf3c029`, A7). Phase S integration branch
+  `release-0.4.0`: S1 (`48056be`; migration 21 as corrected in 14.1) and S2
+  (`02903e9`; `read-tree` + `checkout-index` export, no `tar`; validating this
+  repository's worktree with a 1.7 GB `target/` takes ~25 ms for 3,968 files, so the
+  tree limits stay) merged; suite 703 passed, 3 ignored. `question_deadline` in
+  `tests/phase8_planning.rs` fails in isolation on the untouched 0.2.0 checkout at
+  the same load (its 5 s grant budget loses to host load while a sibling suite runs),
+  so it is a fixture-robustness item for 0.4.1, not a regression. S3 running; S4 and
+  S5 queued behind it.
+- 2026-09-22: S3 (`ee0ba96`, plus a delivered-result guard on attached review), S5
+  (`11d52e7`) and S4 (`7919f17`, plus closing the Ctrl+C window with `pre_exec`)
+  merged on `release-0.4.0`. First **real-agent attach**: `dispatch attach --auto-apply
+  -- claude -p …` in a linked worktree of the Python scratch project with `serve`
+  watching the root. Claude Code (`claude-sonnet-5`, print mode with edit tools
+  allowed) added `reverse` and its test; the wrapper stayed silent until the agent's
+  own final message; `finish` froze a two-file Δ and ran the unittest check; the
+  root had moved underneath (uncommitted edits), and auto-apply landed the change
+  after integration checks; the root's tests pass. `serve --json` showed the run
+  appear as `working`, the world move, and the run become `applied`. Two defects
+  found and fixed on the way (`77689db`): `serve` re-rendered its view only on its
+  own verdicts or applies, so runs attached by another process never appeared; and
+  `auto_apply` applied an empty Δ as "0 files changed" instead of skipping it
+  (`empty_delta`). A first attempt failed for an unrelated reason: Claude Code
+  refuses to edit files under `~/.claude/`, where the scratch project lived.
+  Inspecting the applied run then found a third defect: `explain` showed no
+  verdict because the gate took the unmoved-fingerprint shortcut. For a native run
+  the whole-tree fingerprint was taken from the tree S0 was copied from, so an
+  equal fingerprint means an unmoved world; an attached run's S0 is the merge-base
+  commit while its fingerprint is the root's working tree at attach time, so the
+  shortcut skipped evaluation and the integration checks. Fixed: attached runs
+  always evaluate (`coherence::gate`), with a regression test in
+  `tests/attach_cli.rs`. The real-agent apply above therefore ran without a
+  coherence verdict; rerun after the fix before citing it as evidence.
+- 2026-09-22: rerun after the fix (`248c09d`): `dispatch attach --auto-apply -- claude
+  -p …` in a fresh worktree, root four files ahead of S0, `serve --json` watching.
+  Claude Code created `mathx.py` and `test_mathx.py`; `finish` froze a two-file Δ and
+  ran the checks; auto-apply evaluated the moved world, ran the integration checks on
+  the merged tree and applied (`analysis: integration`); `serve` showed the run go
+  `working` → `applied` with verdict `continue`; the root's tests pass. This is the
+  real-agent attach evidence for 0.4.0.
+- 2026-09-22: S6 (`2c0fb6a`) merged: seven end-to-end scenarios plus the adoption
+  test rewritten around the wrapped form. Its simultaneous-integration scenario
+  exposed a pre-existing race: `State::save_run` and the event-projection repair
+  wrote to fixed temporary names, and `load_run` rewrites stale projections from
+  unlocked readers (`serve`'s view, `status`), so two processes could consume each
+  other's temporary file and fail with a bare ENOENT mid-finish. Fixed with uniquely
+  named temporary files and atomic renames; the scenario went from failing 30–50%
+  of runs to four consecutive clean runs of both suites.
+- 2026-09-22: S7 (`1ae14a1`, `d34728f`) merged: `docs/attach.md`, guide, README,
+  claims table, control-protocol note, install page, release notes, version 0.4.0.
+  S7's audit found that `dispatch explain` errored on attached work in the common
+  case (it assumed a routing or allocation decision) and never showed S0 provenance
+  after creation; fixed: `explain` prints an "Attached work" section (workspace, root,
+  S0 line, confidence, agent, owner, capabilities, finish reason) and always a verdict
+  line. The serialized field is `mode`, not `run_mode` (that is only the SQLite column);
+  docs corrected. Final gate on the complete tree (`fb385a4`): 738 passed, 0 real
+  failures, 3 ignored; the one failure in the parallel full run,
+  `phase4_pty_intent_answer_recovery_review_and_restoration`, is the PTY spinner
+  timing scenario that passes alone and belongs with `question_deadline` on the
+  0.4.1 fixture-robustness list. fmt and clippy clean; `cargo build --locked` at
+  0.4.0. v0.4.0 is ready for the PR to `main`.
 
 0.3.0 (auto-apply):
 
@@ -1131,14 +1192,19 @@ reopen them. Anything not covered here is escalated to the integrator.
 ### 14.1 Run mode and migration 21
 
 - `RunMode::Attached` (`serde` name `attached`, `as_str` `"attached"`).
-- Migration `(21, "attached_work_mode", …)` rebuilds `runs` exactly as migration 13
-  did (`PRAGMA legacy_alter_table = ON; ALTER TABLE runs RENAME TO runs_v20;
-  CREATE TABLE runs (… same 27 columns …); INSERT … SELECT … FROM runs_v20; DROP TABLE
-  runs_v20; PRAGMA legacy_alter_table = OFF;`) with the one change
-  `CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached'))`.
-  The 19 foreign keys that reference `runs(id)` survived that pattern once already.
-  `schema_version` becomes 21; the pre-upgrade backup file is created by the existing
-  `backup_before_upgrade`.
+- Migration `(21, "attached_work_mode", …)` rebuilds `runs` as migration 13 did
+  (`PRAGMA legacy_alter_table = ON; ALTER TABLE runs RENAME TO runs_v20;
+  CREATE TABLE runs (… all 28 columns, including migration 17's
+  `delivery_attempt_id` …); INSERT … SELECT … FROM runs_v20; DROP TABLE runs_v20;
+  PRAGMA legacy_alter_table = OFF;`) with the one change
+  `CHECK (run_mode IN ('legacy', 'routed', 'allocation', 'comparison', 'attached'))`,
+  then recreates migration 19's `private_runs_source_window` index and
+  `private_decision_immutable` trigger, which the rename leaves bound to `runs_v20`.
+  `migrate()` turns foreign keys off for this version exactly as it already does for
+  13, otherwise `DROP TABLE runs_v20` fails on any database with child rows. (As
+  implemented in S1; the freeze originally said 27 columns and omitted the index,
+  trigger and foreign-key toggle.) `schema_version` becomes 21; the pre-upgrade
+  backup file is created by the existing `backup_before_upgrade`.
 
 ### 14.2 `AttachmentRecord` (in `src/models.rs`)
 

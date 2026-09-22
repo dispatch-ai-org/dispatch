@@ -114,6 +114,7 @@ fn run(id: &str, routing: Option<RoutingDecision>, mut candidate: CandidateRecor
         coherence: None,
         evaluation: None,
         applied_candidate: None,
+        attachment: None,
     }
 }
 

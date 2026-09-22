@@ -208,6 +208,36 @@ fn unmoved_world_verified_applies_automatically() {
 }
 
 #[test]
+fn empty_delta_is_skipped_not_applied() {
+    let fixture = Fixture::new("checks:\n  verify: ['true']\n");
+    // An agent that produced no change: the candidate's patch is empty.
+    let diff_path = fixture.metadata()["candidates"][0]["diff_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(&diff_path, b"").unwrap();
+
+    let outcome = fixture.auto_apply().unwrap();
+    assert!(
+        matches!(&outcome, ApplyOutcome::Skipped { reason } if reason == "empty_delta"),
+        "{outcome:?}"
+    );
+    let metadata = fixture.metadata();
+    assert_eq!(metadata["outcome"]["application"], "not_applied");
+    assert_eq!(metadata["outcome"]["review"], "pending");
+    assert!(metadata["outcome"].get("applied_by").is_none());
+    assert_eq!(
+        event_count(&fixture.state_dir, &fixture.run_id, "auto_apply.skipped"),
+        1
+    );
+    assert_eq!(
+        event_count(&fixture.state_dir, &fixture.run_id, "result.applied"),
+        0
+    );
+    assert!(!fixture.fake_file().exists());
+}
+
+#[test]
 fn already_applied_run_is_not_ready_and_nothing_is_persisted() {
     let fixture = Fixture::new("checks:\n  verify: ['true']\n");
     assert!(matches!(

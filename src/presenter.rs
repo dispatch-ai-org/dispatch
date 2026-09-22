@@ -96,6 +96,19 @@ pub fn sanitize(text: &str) -> String {
 
 pub fn label(run: &RunRecord, event: Option<&EventRecord>) -> &'static str {
     let o = &run.outcome;
+    if run.mode == RunMode::Attached {
+        if run
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.owner_state == OwnerState::Gone)
+            && o.lifecycle != LifecycleState::Finished
+        {
+            return "Attached agent's owner is gone; finish or reject";
+        }
+        if o.lifecycle == LifecycleState::Working {
+            return "Attached agent working";
+        }
+    }
     if o.application == ApplicationState::BlockedBySourceDrift {
         return "Application blocked: source changed";
     }
@@ -200,17 +213,23 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
     } else {
         ("●", "○", "×", "–", " ━━ ", " ── ")
     };
-    let model = run
-        .attempts
-        .last()
-        .and_then(|a| a.resolved_model.as_deref())
-        .or_else(|| {
-            run.allocation
-                .as_ref()
-                .map(|d| d.selected.resolved_model.as_str())
-        })
-        .map(model_name)
-        .unwrap_or("work");
+    let model = if run.mode == RunMode::Attached {
+        run.attachment
+            .as_ref()
+            .and_then(|attachment| attachment.agent.as_deref())
+            .unwrap_or("external")
+    } else {
+        run.attempts
+            .last()
+            .and_then(|a| a.resolved_model.as_deref())
+            .or_else(|| {
+                run.allocation
+                    .as_ref()
+                    .map(|d| d.selected.resolved_model.as_str())
+            })
+            .map(model_name)
+            .unwrap_or("work")
+    };
     let work_mark = if run.attempts.is_empty() {
         pending
     } else {
@@ -1995,6 +2014,71 @@ mod tests {
         r.outcome.application = ApplicationState::BlockedBySourceDrift;
         assert_eq!(label(&r, None), "Application blocked: source changed");
     }
+
+    fn attachment() -> AttachmentRecord {
+        AttachmentRecord {
+            version: 1,
+            workspace: std::path::PathBuf::from("/repo-worktree"),
+            integration_root: std::path::PathBuf::from("/repo"),
+            repo_key: Some("sha256:deadbeef".into()),
+            provenance: BaselineProvenance::GitMergeBase {
+                commit: "0123456789abcdef".into(),
+            },
+            confidence: AttachConfidence::Full,
+            agent: Some("claude".into()),
+            command: Some(vec!["claude".into()]),
+            owner: None,
+            agent_process: None,
+            owner_state: OwnerState::Live,
+            capabilities: AttachCapabilities {
+                observe: true,
+                signal: true,
+                control: true,
+                integrate: false,
+            },
+            attached_at: chrono::Utc::now(),
+            finished_at: None,
+            finish_reason: None,
+        }
+    }
+
+    /// S1 (attach part 14): the label and graph-line text an attached run
+    /// gets while its agent is working, and when its owner has gone away.
+    /// No other run's label or graph-line model name changes (see the
+    /// unaffected snapshots above and below, which stay on `mode: Legacy`).
+    #[test]
+    fn attached_run_working_and_owner_gone_labels_and_graph_model_name() {
+        let mut r = run();
+        r.mode = RunMode::Attached;
+        r.attachment = Some(attachment());
+        r.outcome.lifecycle = LifecycleState::Working;
+        r.outcome.phase = RunPhase::Executing;
+        r.outcome.work_result = WorkResult::Pending;
+        assert_eq!(label(&r, None), "Attached agent working");
+        let text = projection(&r, None, 90, false);
+        assert!(text.contains("Attached agent working"), "{text}");
+        assert!(text.contains("claude"), "{text}");
+
+        // No attachment agent name: the graph line falls back to "external".
+        r.attachment.as_mut().unwrap().agent = None;
+        assert!(projection(&r, None, 90, false).contains("external"));
+
+        // The owner is gone and the run has not finished: a distinct label,
+        // higher priority than "working".
+        r.attachment.as_mut().unwrap().owner_state = OwnerState::Gone;
+        assert_eq!(
+            label(&r, None),
+            "Attached agent's owner is gone; finish or reject"
+        );
+
+        // Once finished, the owner-gone label no longer applies.
+        r.outcome.lifecycle = LifecycleState::Finished;
+        assert_ne!(
+            label(&r, None),
+            "Attached agent's owner is gone; finish or reject"
+        );
+    }
+
     #[test]
     fn planned_review_keeps_verification_visible_before_long_task_list() {
         let mut r = run();

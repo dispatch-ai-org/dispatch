@@ -111,6 +111,33 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     run.coherence = Some(record);
 }
 
+/// Remember a watcher's verdict and commit it as `coherence.checked` (a
+/// `Continue` decision) or `coherence.invalidated` (anything else), returning
+/// which kind was committed. Shared by the allocation-run watcher
+/// (`phase3::apply_watch`) and the attach owner loop / `serve` (part 14.5);
+/// none of them implement `mid_run: stop` themselves.
+pub(super) fn persist_verdict(
+    state: &State,
+    db: &Database,
+    run: &mut RunRecord,
+    validity: &Validity,
+) -> Result<&'static str> {
+    remember_validity(run, validity);
+    let kind = if validity.decision == Decision::Continue {
+        "coherence.checked"
+    } else {
+        "coherence.invalidated"
+    };
+    super::phase3::transition(
+        state,
+        db,
+        run,
+        kind,
+        serde_json::json!({"coherence": validity}),
+    )?;
+    Ok(kind)
+}
+
 /// The per-source apply lock path, keyed by the run's source path. Shared by
 /// every caller that serializes against concurrent application of that
 /// source (`apply_locked`, `auto_apply`) so the key expression exists once.
@@ -502,8 +529,19 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if config.execution.backend == "local" && !run.environment.unsafe_local {
         return persist_skip(state, run, "integration_checks_unavailable");
     }
-
-    let candidate_label = sole_candidate(&run)?.label.clone();
+    // Nothing to apply is not an application: an agent that produced no
+    // change (or an attached workspace with no edits) stays reviewable
+    // instead of being recorded as applied with zero files.
+    let (candidate_label, empty_delta) = {
+        let candidate = sole_candidate(&run)?;
+        (
+            candidate.label.clone(),
+            fs::metadata(&candidate.diff_path).is_ok_and(|metadata| metadata.len() == 0),
+        )
+    };
+    if empty_delta {
+        return persist_skip(state, run, "empty_delta");
+    }
     let source_lock = OperationLock::acquire_wait(
         &source_lock_path(state, &run),
         "another apply operation is already modifying this source",

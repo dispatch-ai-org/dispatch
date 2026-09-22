@@ -252,3 +252,75 @@ One-shot JSON/JSONL and [machine control](control-protocol.md) use the existing
 foreground core independently of the renderer. Machine clients cannot issue human
 acceptance or funding attestations through this setup surface. Disconnect triggers
 cleanup; no daemon or detached work is introduced.
+
+## Using your own agent
+
+`dispatch attach` puts work an external coding agent produces — Claude Code, Codex,
+Cursor, a script, anything with a terminal — under the same coherence checking as a
+run Dispatch launched itself, without Dispatch ever driving that agent. Full details,
+every flag and every refusal message are in [attach.md](attach.md); this is what you
+see day to day.
+
+There are two forms.
+
+**Wrap the agent**, when you are about to start it: Dispatch becomes the thing you
+type instead of the agent, stays completely silent in your terminal while the agent
+runs, and does its own work only once the agent exits.
+
+```sh
+dispatch attach --auto-apply -- claude -p "add input validation to the parser"
+```
+
+Ctrl+C, terminal resize and everything else behave exactly as if you had typed
+`claude -p ...` yourself — the wrapper only ignores Ctrl+C/Ctrl+\ for its own process
+while the agent runs (so they reach the agent, not it) and forwards a `kill`/hangup it
+receives to the agent. When the agent exits, Dispatch freezes the patch, runs your
+configured checks in that same worktree, and — only with `--auto-apply` — applies it
+if the checks pass and the source coherence gate allows it. Either way it prints one
+line: what happened, and the next command (`dispatch check`/`dispatch accept`) if
+anything is still waiting on you.
+
+**Attach an already-running agent**, when it is already working in its own worktree
+and you did not start it through Dispatch:
+
+```sh
+dispatch attach --workspace ../scratch-worktree --agent codex --auto-apply
+dispatch finish <run-id>          # once you know the agent is done
+```
+
+`finish` is the only thing that decides a foreign attachment is done — there is no
+timeout or idle heuristic. Until you run it, or until the agent's own driving script
+does, the work stays observed but not judged.
+
+Both forms need a **separate worktree**: attaching your own checkout in place is
+refused (`attach needs a separate worktree; run git worktree add`), because Dispatch
+cannot tell your edits from the agent's inside one tree. The snapshot Dispatch starts
+from (S0) is the Git merge base of your worktree and the root's `HEAD` whenever both
+are Git — full confidence, edits made before you ran `attach` are still counted. For a
+plain (non-Git) directory, only the wrapped form works, and S0 is a snapshot taken at
+the moment of attach — partial confidence: anything already changed before that moment
+is invisible to the patch Dispatch judges.
+
+**`dispatch serve [--root <path>]`** is a foreground process, one per repository, that
+watches every attached run with no live owner (a foreign attachment, or a wrapped
+attach whose wrapper process died) and applies the ones you marked `--auto-apply` once
+they are ready and coherent. It also prints a one-line-per-run project view —
+`<id> · agent · CONTINUE/REFRESH/STOP · working/ready/applied/blocked · reason` — that
+redraws in place as things change, and includes your ordinary Dispatch runs on the
+same source alongside attached ones. Run it alongside a foreign attachment so it gets
+observed and, if eligible, applied; wrapped attach and the TUI need no `serve` at all.
+
+What shows in the CLI: `dispatch status` and `dispatch check` treat an attached run
+exactly like any other single-result run once it is finished — same `Coherence`
+section, same accept/reject/apply commands. `dispatch explain` shows an **Attached
+work** section (workspace, root, where S0 came from and with what confidence, the
+agent, who owns the work, what it may do) in place of a selection explanation, then
+the verdict. `dispatch refresh` has no
+target for attached work (there is no Dispatch task to relaunch) and is refused;
+review it and `dispatch attach` again if you want another pass. Over the [control
+protocol](control-protocol.md) and `--json`, an attached run appears with
+`mode: "attached"` like any other run; there is no attach operation for a machine
+client, because attach is always something a human types.
+
+No foreign process is ever signaled or killed by Dispatch, and a `REFRESH`/`STOP`
+verdict on attached work is only ever recorded, never enforced against the agent.

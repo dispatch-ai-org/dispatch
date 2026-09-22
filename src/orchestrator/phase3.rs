@@ -408,14 +408,7 @@ fn apply_watch(
     stale: Option<&mut Option<String>>,
 ) -> Result<()> {
     let validity = message.validity;
-    apply::remember_validity(run, &validity);
-    let kind = if validity.decision == Decision::Continue {
-        "coherence.checked"
-    } else {
-        "coherence.invalidated"
-    };
-    let payload = serde_json::json!({"coherence": validity});
-    transition(state, db, run, kind, payload.clone())?;
+    apply::persist_verdict(state, db, run, &validity)?;
     let policy = &config.coherence;
     let stops = validity.decision == Decision::Stop
         || (validity.decision == Decision::Refresh && policy.stop_on_refresh);
@@ -423,7 +416,13 @@ fn apply_watch(
         && policy.mid_run == MidRunMode::Stop
         && stops
     {
-        transition(state, db, run, "coherence.stopped", payload)?;
+        transition(
+            state,
+            db,
+            run,
+            "coherence.stopped",
+            serde_json::json!({"coherence": validity}),
+        )?;
         *stale = Some(
             validity
                 .reasons

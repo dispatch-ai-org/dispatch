@@ -1,10 +1,10 @@
-# Dispatch 0.3.0: install, upgrade, uninstall
+# Dispatch 0.4.0: install, upgrade, uninstall
 
-Dispatch 0.3.0 is an experimental developer preview. It adds
-[auto-apply](product-guide.md#auto-apply): a session mode and a CLI flag that apply
-an eligible finished result automatically, on top of
-[work coherence](coherence.md), which validates finished work against the source as
-it is now instead of refusing on any difference.
+Dispatch 0.4.0 is an experimental developer preview. It adds
+[attached work and `dispatch serve`](attach.md): observing and, if you ask, applying
+work an external agent (Claude Code, Codex, Cursor or anything else) produced in its
+own worktree, under the same [work coherence](coherence.md) model as work Dispatch
+launched itself, on top of [auto-apply](product-guide.md#auto-apply) from 0.3.0.
 
 Runtime scope: macOS arm64 is the platform exercised interactively for this
 release. Linux x86_64 is built and smoke-tested by CI (build, package, `dispatch
@@ -32,7 +32,7 @@ cd /path/to/your/project
 /tmp/dispatch-install/dispatch --state-dir /path/to/private/dispatch-state
 ```
 
-The expected version is `dispatch 0.3.0`. Use `command -v dispatch` and
+The expected version is `dispatch 0.4.0`. Use `command -v dispatch` and
 `type -a dispatch` to locate older PATH installations. An explicit path is the
 reliable way to select this build. Do not replace a working binary just to try
 it. Ordinary work uses the provider's account; test-only setup must use fixture
@@ -44,7 +44,8 @@ Stop all Dispatch sessions before upgrading. Back up the complete private state
 directory and keep the matching binary. SQLite migrations now preserve a consistent
 600-permission `dispatch.schema-N-*.db` backup beside the database before upgrading
 historical schemas. These backups preserve database state, not artifact files; keep
-a full state-directory copy as well. Schema remains 20. Newer schemas are refused.
+a full state-directory copy as well. Schema is 21 as of 0.4.0. Newer schemas are
+refused.
 
 To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
@@ -91,6 +92,27 @@ No migration: a new baseline no longer force-tracks files a Git source's own ign
 rules exclude (see `docs/coherence.md`, "World observation"). Runs created before
 0.3.1 keep their old baselines untouched and may still show a `.gitignore`'d build
 artifact in their patches; only runs created by 0.3.1 or later get the fix.
+
+### Upgrading to 0.4.0
+
+**Migration 21** (`attached_work_mode`) rebuilds the `runs` table the same way
+migration 13 did: rename to `runs_v20`, recreate `runs` with the same columns plus a
+widened `CHECK (run_mode IN (..., 'attached'))`, copy every row across, drop
+`runs_v20`, then recreate the index and trigger migration 19 added on `runs` (the
+rename leaves them bound to the old table name). Foreign keys are turned off for the
+duration of this migration only, exactly as for migration 13, so the drop does not
+fail on a database with rows in `attempts`, `control_runs` or `planned_goals` that
+reference a run. Opening a schema-20 state directory creates a
+`dispatch.schema-20-*.db` backup first, like any other historical-schema upgrade (see
+above); schema becomes 21. An older 0.3.x or earlier binary refuses a schema-21 state
+directory, exactly as it already refuses any newer schema — do not point it at
+upgraded state.
+
+Nothing changes for a run that already existed before the upgrade: `attach`,
+`finish` and `serve` are new commands that only ever create `RunMode::Attached` runs
+going forward; no existing run's stored record, outcome or events are rewritten by
+this migration beyond the table rebuild itself. See [attach.md](attach.md) for what
+the new commands do.
 
 Uninstall by removing only the executable you installed and its archive/extraction
 directory. Keep `~/.dispatch` (or your explicit state directory), project files and
