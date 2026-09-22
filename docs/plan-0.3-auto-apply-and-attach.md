@@ -1045,6 +1045,15 @@ Progress log:
   profiles remain unusable this week (usage exhausted) and need paid credits
   disabled before revalidation. UX note for 0.4.1: setup prompts should be
   arrow-key selections, not typed values (a typed model ID had a typo).
+- 2026-09-22: v0.3.1 released (`bf3c029`, A7). Phase S integration branch
+  `release-0.4.0`: S1 (`48056be`; migration 21 as corrected in 14.1) and S2
+  (`02903e9`; `read-tree` + `checkout-index` export, no `tar`; validating this
+  repository's worktree with a 1.7 GB `target/` takes ~25 ms for 3,968 files, so the
+  tree limits stay) merged; suite 703 passed, 3 ignored. `question_deadline` in
+  `tests/phase8_planning.rs` fails in isolation on the untouched 0.2.0 checkout at
+  the same load (its 5 s grant budget loses to host load while a sibling suite runs),
+  so it is a fixture-robustness item for 0.4.1, not a regression. S3 running; S4 and
+  S5 queued behind it.
 
 0.3.0 (auto-apply):
 
