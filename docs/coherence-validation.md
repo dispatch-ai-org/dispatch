@@ -19,6 +19,8 @@ of the product. The technical reference is [coherence.md](coherence.md).
 | Scales to many concurrent tasks | Not observed |
 | Eligible results can be applied automatically under a session or invocation policy; the review stays not performed | Shipped; `tests/auto_apply.rs`, `tests/auto_apply_cli.rs` |
 | Two runs finishing against one source serialize on the source lock and the second is re-judged against the new world; an edit during integration checks is fenced and re-validated once | Shipped; `tests/auto_apply_concurrency.rs` |
+| Work done by an external agent in its own worktree is judged by the same coherence model as Dispatch-launched work; S0 is the Git merge base with full confidence, or a snapshot at attach with partial confidence | Shipped; `tests/attach_cli.rs`, `tests/attach_wrapped.rs`, `tests/attach_scenarios.rs`; real-agent attach with Claude Code (`claude-sonnet-5`) on 2026-09-22 (`248c09d`) |
+| A repo-scoped foreground loop re-evaluates foreign attached work when the root moves and applies eligible work through the same auto-apply path | Shipped; `tests/serve.rs`, `tests/attach_scenarios.rs` |
 
 Every public statement must fit this table. When a row changes, change the
 README and the website in the same release.
@@ -67,6 +69,12 @@ snapshot and the verdict.
   acted on automatically). The only dogfooding so far used a scripted agent behind
   the Codex adapter, not a real agent; treat any auto-apply numbers as fixture
   evidence until a real-agent run is logged.
+- **Attached versus native Work.** The run's `mode` field (`attached` versus the
+  native modes) separates work Dispatch launched from work it only observed, so every
+  metric above can be split by the two. Record `attach.created`/`attach.finished`/
+  `attach.adopted` events separately: how often a `serve`-adopted run (owner gone,
+  `owner_state: adopted`) occurs versus a live wrapper finishing its own Work, and the
+  S0 confidence (`full`/`partial`) attached results were judged under.
 
 ## What would falsify the positioning
 

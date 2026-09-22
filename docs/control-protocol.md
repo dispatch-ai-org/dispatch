@@ -200,6 +200,14 @@ operation and no capability to trigger or configure it over this protocol; machi
 clients still cannot review or apply, whether or not the run they are observing was
 applied by policy.
 
+Attached work (`dispatch attach`/`dispatch finish`/`dispatch serve`; see
+[attach.md](attach.md)) is likewise unchanged by this protocol: a run Dispatch only
+observed, rather than launched, appears in `status`/`result` like any other run, with
+`mode: "attached"` and its own `outcome`/`coherence` fields computed exactly the
+same way. There is no attach operation, no operation to finish or serve a run, and no
+capability to submit one over this protocol — attach is always a foreground,
+human-typed command, never something a machine client can trigger.
+
 ### Events and semantic waits
 
 ```json
