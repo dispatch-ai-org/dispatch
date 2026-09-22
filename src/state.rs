@@ -76,13 +76,7 @@ impl State {
 
     pub fn save_run(&self, run: &RunRecord) -> Result<()> {
         let path = self.metadata_path(&run.id);
-        let parent = path.parent().context("metadata path has no parent")?;
-        fs::create_dir_all(parent)?;
-        let tmp = parent.join("metadata.json.tmp");
-        let bytes = serde_json::to_vec_pretty(run)?;
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        write_atomically(&path, &serde_json::to_vec_pretty(run)?)
     }
 
     pub fn append_event(&self, event: &EventRecord) -> Result<()> {
@@ -159,12 +153,7 @@ impl State {
         if fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
             return Ok(());
         }
-        let parent = path.parent().context("events path has no parent")?;
-        fs::create_dir_all(parent)?;
-        let temporary = parent.join("events.jsonl.tmp");
-        fs::write(&temporary, bytes)?;
-        fs::rename(temporary, path)?;
-        Ok(())
+        write_atomically(&path, &bytes)
     }
 
     pub fn resolve_run_id(&self, id_or_prefix: &str) -> Result<String> {
@@ -216,6 +205,32 @@ impl State {
         paths.reverse();
         Ok(paths)
     }
+}
+
+/// Replace `path` with `bytes` through a uniquely named temporary file in the
+/// same directory and an atomic rename. Several processes rewrite a run's
+/// projections concurrently (an owner loop under its lock, `serve` and every
+/// `load_run` reader repairing a stale copy), and a shared temporary name let
+/// one rename consume the other's file. Every writer produces the committed
+/// projection, so whichever rename lands last leaves a complete, current file.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("projection path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("projection");
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to stage {}", path.display()))?;
+    temporary.write_all(bytes)?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 pub fn write_text(path: &Path, value: &str) -> Result<()> {
