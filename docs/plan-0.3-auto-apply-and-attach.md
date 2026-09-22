@@ -1085,6 +1085,14 @@ Progress log:
   the merged tree and applied (`analysis: integration`); `serve` showed the run go
   `working` → `applied` with verdict `continue`; the root's tests pass. This is the
   real-agent attach evidence for 0.4.0.
+- 2026-09-22: S6 (`2c0fb6a`) merged: seven end-to-end scenarios plus the adoption
+  test rewritten around the wrapped form. Its simultaneous-integration scenario
+  exposed a pre-existing race: `State::save_run` and the event-projection repair
+  wrote to fixed temporary names, and `load_run` rewrites stale projections from
+  unlocked readers (`serve`'s view, `status`), so two processes could consume each
+  other's temporary file and fail with a bare ENOENT mid-finish. Fixed with uniquely
+  named temporary files and atomic renames; the scenario went from failing 30–50%
+  of runs to four consecutive clean runs of both suites.
 
 0.3.0 (auto-apply):
 
