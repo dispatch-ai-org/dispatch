@@ -161,6 +161,15 @@ enum Command {
     },
     /// Redo a stale result as a new run on the current source (a new agent launch).
     Refresh(RefreshArgs),
+    /// Attach external work Dispatch did not launch (an existing worktree).
+    Attach(AttachArgs),
+    /// Finish attached external work: freeze the delta, verify, become ready.
+    Finish {
+        run_id: String,
+        /// Required when the integration root configures checks.verify.
+        #[arg(long)]
+        allow_unsafe_local: bool,
+    },
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
@@ -417,6 +426,42 @@ struct RefreshArgs {
     /// is coherent with the current source. Records no human review.
     #[arg(long)]
     auto_apply: bool,
+}
+
+#[derive(Debug, Args)]
+struct AttachArgs {
+    /// Existing worktree to observe. Defaults to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+
+    /// The integration root. Defaults to the repository's main worktree when
+    /// `--workspace` is a linked Git worktree; required for a plain directory.
+    #[arg(long)]
+    root: Option<PathBuf>,
+
+    /// Describes the attached work; never sent to the agent.
+    #[arg(long)]
+    task: Option<String>,
+
+    /// Free-text label for the external agent; never guessed.
+    #[arg(long)]
+    agent: Option<String>,
+
+    /// The external agent's process ID, for liveness only; never signaled.
+    #[arg(long)]
+    pid: Option<u32>,
+
+    /// Explicitly allow `dispatch finish` to run checks.verify on the host.
+    #[arg(long)]
+    allow_unsafe_local: bool,
+
+    /// Apply automatically once the work is ready and coherent.
+    #[arg(long)]
+    auto_apply: bool,
+
+    /// Wrapped form: the agent command to run after `--`. Not yet implemented.
+    #[arg(last = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -792,6 +837,28 @@ async fn run() -> Result<()> {
                 println!("Refreshed from {old}; new run {}", run.id);
             }
             finish_run(&state, run, auto_apply, json, jsonl)
+        }
+        Command::Attach(args) => {
+            let workspace = args.workspace.unwrap_or_else(|| PathBuf::from("."));
+            let request = orchestrator::attach::AttachRequest {
+                workspace,
+                root: args.root,
+                task: args.task,
+                agent: args.agent,
+                pid: args.pid,
+                command: (!args.command.is_empty()).then_some(args.command),
+                allow_unsafe_local: args.allow_unsafe_local,
+                auto_apply: args.auto_apply,
+            };
+            orchestrator::attach::create(&state, request)?;
+            Ok(())
+        }
+        Command::Finish {
+            run_id,
+            allow_unsafe_local,
+        } => {
+            orchestrator::attach::finish(&state, &run_id, allow_unsafe_local).await?;
+            Ok(())
         }
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {

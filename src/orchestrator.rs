@@ -1,4 +1,5 @@
 mod apply;
+pub mod attach;
 pub(crate) mod phase3;
 mod planned;
 pub use apply::{ApplyAuthority, ApplyOutcome, apply, auto_apply};
@@ -3579,6 +3580,8 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     if run.mode == RunMode::Allocation {
         record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
+    } else if run.mode == RunMode::Attached {
+        record_attach_review_locked(state, run, accept, vec![], None)?;
     } else {
         record_routing_evaluation_locked(
             state,
@@ -3623,6 +3626,8 @@ pub fn accept_or_reject_latest(
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     if run.mode == RunMode::Allocation {
         record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
+    } else if run.mode == RunMode::Attached {
+        record_attach_review(state, &run.id, accept, reasons, explanation)?;
     } else {
         record_routing_evaluation(
             state,
@@ -3749,6 +3754,10 @@ pub fn refresh_request(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_for_source(state, source_path, true)?,
     };
+    anyhow::ensure!(
+        run.mode != RunMode::Attached,
+        "attached work has no Dispatch task to refresh; finish or reject it"
+    );
     ensure_unapplied_ready(&run, "refresh")?;
     let mut missing = Vec::new();
     if run.environment.unsafe_local && !options.allow_unsafe_local {
@@ -4257,6 +4266,70 @@ fn record_allocation_feedback_locked(
     Ok(())
 }
 
+/// Record review of attached work (part 14.6): only `outcome.review` and a
+/// `review.accepted|rejected` event, on the run's own operation lock. Never a
+/// `goal_feedback_revisions` row, never routing evidence: attached results
+/// were not selected, routed or executed by Dispatch.
+fn record_attach_review(
+    state: &State,
+    run_id: &str,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+) -> Result<()> {
+    let resolved_run_id = state.resolve_run_id(run_id)?;
+    let _run_lock = OperationLock::acquire(
+        &state.run_dir(&resolved_run_id).join(".operation.lock"),
+        "another compare/apply/evaluate operation is already using this run",
+    )?;
+    let run = state.load_run(&resolved_run_id)?;
+    record_attach_review_locked(state, run, accept, reasons, explanation)
+}
+
+fn record_attach_review_locked(
+    state: &State,
+    mut run: RunRecord,
+    accept: bool,
+    reasons: Vec<String>,
+    explanation: Option<String>,
+) -> Result<()> {
+    anyhow::ensure!(
+        run.mode == RunMode::Attached,
+        "run {} is not attached work",
+        run.id
+    );
+    sole_candidate(&run)?;
+    let reasons = normalize_reasons(reasons)?;
+    let database = Database::open(state.db_path())?;
+    run.outcome.review = if accept {
+        ReviewState::Accepted
+    } else {
+        ReviewState::Rejected
+    };
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run
+                .candidates
+                .first()
+                .map(|candidate| candidate.label.clone()),
+            event_type: if accept {
+                "review.accepted"
+            } else {
+                "review.rejected"
+            }
+            .into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"reasons": reasons, "explanation": explanation}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(())
+}
+
 pub fn read_verbatim(path: &Path) -> Result<String> {
     if path == Path::new("-") {
         let mut value = String::new();
@@ -4383,11 +4456,14 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
         let run = state.load_run(&projected.id)?;
         if run.source_path != source_path
             || run.candidates.len() != 1
-            || (run.routing.is_none() && run.allocation.is_none())
+            || (run.routing.is_none() && run.allocation.is_none() && run.mode != RunMode::Attached)
         {
             continue;
         }
         if run.mode == RunMode::Allocation && database.latest_goal_feedback(&run.id)?.is_none() {
+            return Ok(run);
+        }
+        if run.mode == RunMode::Attached && run.outcome.review == ReviewState::Pending {
             return Ok(run);
         }
         if database
