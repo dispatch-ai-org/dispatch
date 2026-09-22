@@ -100,6 +100,13 @@ pub fn label(run: &RunRecord, event: Option<&EventRecord>) -> &'static str {
     if o.application == ApplicationState::Failed {
         return "Application failed";
     }
+    if o.application == ApplicationState::Applied && o.applied_by == Some(AppliedBy::AutoApply) {
+        return match o.review {
+            ReviewState::Accepted => "Auto-applied; reviewed: accepted",
+            ReviewState::Rejected => "Auto-applied; reviewed: rejected",
+            _ => "Auto-applied; review pending",
+        };
+    }
     if o.application == ApplicationState::Applied {
         return "Accepted and applied";
     }

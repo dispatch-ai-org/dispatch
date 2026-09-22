@@ -27,9 +27,9 @@ use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
-    AdmissionState, AllocationDecision, ApplicationState, AttemptRecord, CandidateRecord,
-    CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
+    AdmissionState, AllocationDecision, ApplicationState, AppliedBy, AttemptRecord,
+    CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision,
+    DiffStats, EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
     ReviewState, RoutingAlternative, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome,
     RoutingObservation, RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus,
     SelectionBasis, VERSION, Validity, VerificationState, WaitingOn, WorkResult,
@@ -2900,11 +2900,10 @@ impl OperationLock {
 
     /// Like `acquire`, but wait up to `timeout` for the lock, retrying every
     /// 100 ms. On expiry the error is the same busy message with the wait
-    /// appended, so callers and tests can recognize both cases.
-    ///
-    /// Not yet wired to a caller (planned for a follow-up work package); only
-    /// exercised by `operation_lock_tests` for now.
-    #[allow(dead_code)]
+    /// appended, so callers and tests can recognize both cases. Used by
+    /// `auto_apply` for the run and source locks, where a bounded wait lets a
+    /// finishing owner queue behind a human review or another applier instead
+    /// of failing immediately.
     pub(crate) fn acquire_wait(path: &Path, busy_message: &str, timeout: Duration) -> Result<Self> {
         let start = std::time::Instant::now();
         loop {
@@ -3572,6 +3571,8 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
 
 pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
     let (run, _lock) = review_target(state, command)?;
+    let already_auto_applied = run.outcome.application == ApplicationState::Applied
+        && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     if run.mode == RunMode::Allocation {
         record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
     } else {
@@ -3585,8 +3586,11 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
             },
         )?;
     }
-    let run = state.load_run(&command.run_id)?;
-    if accept {
+    // A run already applied by the auto-apply policy only has its human
+    // review recorded here; applying again would be a second, redundant
+    // application and rejection must never revert the source.
+    if accept && !already_auto_applied {
+        let run = state.load_run(&command.run_id)?;
         apply::apply_locked(
             state,
             run,
@@ -3611,6 +3615,8 @@ pub fn accept_or_reject_latest(
         None => load_latest_unresolved_single(state, source_path)?,
     };
     let candidate = sole_candidate(&run)?.label.clone();
+    let already_auto_applied = run.outcome.application == ApplicationState::Applied
+        && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     if run.mode == RunMode::Allocation {
         record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
     } else {
@@ -3625,9 +3631,16 @@ pub fn accept_or_reject_latest(
         )?;
     }
     if accept {
-        apply(state, &run.id, &candidate)?;
+        if already_auto_applied {
+            println!("Result was already applied by auto-apply; your review is recorded.");
+        } else {
+            apply(state, &run.id, &candidate)?;
+        }
     } else {
         println!("Result rejected. The source tree was not changed.");
+        if already_auto_applied {
+            println!("Rejection does not revert the source.");
+        }
     }
     Ok(())
 }

@@ -8,8 +8,8 @@
 
 use super::*;
 use crate::{
-    AppliedBy,
-    coherence::{AcceptGate, CoherenceBlocked},
+    AnalysisLevel, AppliedBy,
+    coherence::{AcceptGate, CoherenceBlocked, run_config},
     source::ApplyReport,
 };
 
@@ -71,6 +71,97 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     run.coherence = Some(record);
 }
 
+/// The per-source apply lock path, keyed by the run's source path. Shared by
+/// every caller that serializes against concurrent application of that
+/// source (`apply_locked`, `auto_apply`) so the key expression exists once.
+fn source_lock_path(state: &State, run: &RunRecord) -> PathBuf {
+    let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
+    state
+        .root
+        .join("locks")
+        .join(format!("source-{source_key}.lock"))
+}
+
+/// Set the shared "applied" outcome fields and commit `result.applied`.
+/// Shared by the human path (`apply_locked`) and the policy path
+/// (`auto_apply`); only the authority, and whether a validity is present,
+/// differ. `applied_by` is added to the payload only for a policy
+/// application, so the human path's event stays byte-for-byte what it was
+/// before auto-apply existed.
+fn persist_applied(
+    state: &State,
+    mut run: RunRecord,
+    candidate_label: &str,
+    report: &ApplyReport,
+    validity: Option<&Validity>,
+    authority: ApplyAuthority,
+) -> Result<RunRecord> {
+    if let Some(validity) = validity {
+        remember_validity(&mut run, validity);
+    }
+    run.applied_candidate = Some(candidate_label.to_owned());
+    run.status = RunStatus::Applied;
+    if authority == ApplyAuthority::Human {
+        run.outcome.review = ReviewState::Accepted;
+    }
+    run.outcome.application = ApplicationState::Applied;
+    run.outcome.applied_by = Some(authority.applied_by());
+    run.outcome.phase = RunPhase::Finished;
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    let mut payload = serde_json::json!({
+        "files_changed": report.files_changed,
+        "coherence": validity.filter(|validity| validity.world_changed),
+    });
+    if authority == ApplyAuthority::AutoApply {
+        payload["applied_by"] = serde_json::json!("auto_apply");
+    }
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: Some(candidate_label.to_owned()),
+            event_type: "result.applied".into(),
+            timestamp: Utc::now(),
+            payload,
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(run)
+}
+
+/// Set `application` and commit `application.failed` with `payload`. Shared
+/// mechanics only: the payload shape differs between the human path (always
+/// carries a `coherence` key, `null` when there is none) and the policy path
+/// (carries `applied_by` instead), so each caller builds its own payload.
+fn persist_application_failed(
+    state: &State,
+    mut run: RunRecord,
+    candidate_label: &str,
+    application: ApplicationState,
+    payload: serde_json::Value,
+) -> Result<RunRecord> {
+    run.outcome.application = application;
+    run.outcome.phase = RunPhase::Finished;
+    let database = Database::open(state.db_path())?;
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: Some(candidate_label.to_owned()),
+            event_type: "application.failed".into(),
+            timestamp: Utc::now(),
+            payload,
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(run)
+}
+
 pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     let _run_lock = OperationLock::acquire(
@@ -104,12 +195,8 @@ pub(super) fn apply_locked(
     crate::planning::verify_delivery(&run)?;
     let candidate = find_candidate(&run, candidate_label)?;
     let normalized_label = candidate.label.clone();
-    let source_key = hex::encode(Sha256::digest(run.source_path.to_string_lossy().as_bytes()));
     let _source_lock = OperationLock::acquire(
-        &state
-            .root
-            .join("locks")
-            .join(format!("source-{source_key}.lock")),
+        &source_lock_path(state, &run),
         "another apply operation is already modifying this source",
     )?;
     let applied = crate::coherence::gate(&run, &normalized_label, &state.run_dir(&run.id))
@@ -130,7 +217,7 @@ pub(super) fn apply_locked(
         Err(error) => {
             let message = format!("{error:#}");
             let blocked = error.downcast_ref::<CoherenceBlocked>();
-            run.outcome.application = if blocked.is_some()
+            let application = if blocked.is_some()
                 || message.contains("source changed")
                 || message.contains("source has changed")
                 || message.contains("source drift")
@@ -139,59 +226,25 @@ pub(super) fn apply_locked(
             } else {
                 ApplicationState::Failed
             };
-            run.outcome.phase = RunPhase::Finished;
             if let Some(blocked) = blocked {
                 remember_validity(&mut run, &blocked.validity);
             }
-            let database = Database::open(state.db_path())?;
-            persist_event(
-                state,
-                &database,
-                EventRecord {
-                    run_id: run.id.clone(),
-                    candidate_label: Some(normalized_label.clone()),
-                    event_type: "application.failed".into(),
-                    timestamp: Utc::now(),
-                    payload: serde_json::json!({
-                        "application": run.outcome.application,
-                        "error": message,
-                        "coherence": blocked.map(|blocked| &blocked.validity),
-                    }),
-                    ..EventRecord::default()
-                },
-                &mut run,
-            )?;
+            let payload = serde_json::json!({
+                "application": application,
+                "error": message,
+                "coherence": blocked.map(|blocked| &blocked.validity),
+            });
+            persist_application_failed(state, run, &normalized_label, application, payload)?;
             return Err(error);
         }
     };
-    if let Some(validity) = &validity {
-        remember_validity(&mut run, validity);
-    }
-    run.applied_candidate = Some(normalized_label.clone());
-    run.status = RunStatus::Applied;
-    if authority == ApplyAuthority::Human {
-        run.outcome.review = ReviewState::Accepted;
-    }
-    run.outcome.application = ApplicationState::Applied;
-    run.outcome.applied_by = Some(authority.applied_by());
-    run.outcome.phase = RunPhase::Finished;
-    let mut db = Database::open(state.db_path())?;
-    db.sync_run(&run)?;
-    persist_event(
+    let run = persist_applied(
         state,
-        &db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: Some(normalized_label.clone()),
-            event_type: "result.applied".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({
-                "files_changed": report.files_changed,
-                "coherence": validity.as_ref().filter(|validity| validity.world_changed),
-            }),
-            ..EventRecord::default()
-        },
-        &mut run,
+        run,
+        &normalized_label,
+        &report,
+        validity.as_ref(),
+        authority,
     )?;
     if !quiet {
         println!(
@@ -204,14 +257,260 @@ pub(super) fn apply_locked(
     Ok(())
 }
 
+/// Commit `auto_apply.skipped {reason}`. Nothing about the outcome changes:
+/// the run stays exactly as ready and unapplied as it was.
+fn persist_skip(state: &State, mut run: RunRecord, reason: &str) -> Result<ApplyOutcome> {
+    let database = Database::open(state.db_path())?;
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run
+                .candidates
+                .first()
+                .map(|candidate| candidate.label.clone()),
+            event_type: "auto_apply.skipped".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"reason": reason}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(ApplyOutcome::Skipped {
+        reason: reason.into(),
+    })
+}
+
+/// Commit `auto_apply.blocked {reason, coherence}`: the gate, or the
+/// authorization predicate on top of it, refused. The source stays
+/// untouched and the run remains reviewable.
+fn persist_blocked(
+    state: &State,
+    mut run: RunRecord,
+    reason: String,
+    validity: Option<Validity>,
+) -> Result<ApplyOutcome> {
+    if let Some(validity) = &validity {
+        remember_validity(&mut run, validity);
+    }
+    run.outcome.application = ApplicationState::BlockedBySourceDrift;
+    run.outcome.phase = RunPhase::Finished;
+    let database = Database::open(state.db_path())?;
+    persist_event(
+        state,
+        &database,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: run
+                .candidates
+                .first()
+                .map(|candidate| candidate.label.clone()),
+            event_type: "auto_apply.blocked".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({
+                "reason": reason.clone(),
+                "coherence": validity.clone(),
+            }),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(ApplyOutcome::Blocked { reason, validity })
+}
+
+/// Commit `application.failed {application, error, applied_by}` for the
+/// policy path: an apply that was authorized still failed (for example Git).
+fn persist_apply_failed(
+    state: &State,
+    run: RunRecord,
+    candidate_label: &str,
+    error: String,
+) -> Result<ApplyOutcome> {
+    let payload = serde_json::json!({
+        "application": ApplicationState::Failed,
+        "error": error.clone(),
+        "applied_by": "auto_apply",
+    });
+    persist_application_failed(
+        state,
+        run,
+        candidate_label,
+        ApplicationState::Failed,
+        payload,
+    )?;
+    Ok(ApplyOutcome::Failed { error })
+}
+
+/// What the gate authorizes, ahead of the actual `git apply`. Kept separate
+/// from the apply call itself so a fence failure during the apply can be
+/// re-decided against a fresh gate rather than reusing a stale digest.
+enum Authorization {
+    /// Byte-identical world: the fingerprint fence applies.
+    Fingerprint,
+    /// A moved world whose evidence is complete for this run's exact digest.
+    Digest(Validity),
+}
+
+/// Stage 2: `coherence::gate` plus the stricter authorization predicate for
+/// automatic application (part 5.2 of the plan). Runs no external work beyond
+/// what `gate` itself does (L2 only when the world moved and L0/L1 pass).
+fn decide(
+    run: &RunRecord,
+    candidate_label: &str,
+    run_dir: &Path,
+) -> Result<Result<Authorization, (String, Option<Validity>)>> {
+    Ok(
+        match crate::coherence::gate(run, candidate_label, run_dir)? {
+            // `config_unreadable` was already ruled out in stage 1: a config
+            // that was readable there and is unreadable here would be an
+            // extraordinary race, not a case this predicate distinguishes.
+            AcceptGate::Legacy => {
+                if source::fingerprint_tree(&run.source_path)? == run.source_fingerprint {
+                    Ok(Authorization::Fingerprint)
+                } else {
+                    Err(("strict_mode_drift".into(), None))
+                }
+            }
+            AcceptGate::Compatible(validity) => {
+                if !validity.world_changed || validity.analysis == AnalysisLevel::Integration {
+                    Ok(Authorization::Digest(validity))
+                } else {
+                    Err(("integration_evidence_missing".into(), Some(validity)))
+                }
+            }
+            AcceptGate::Blocked(validity) => {
+                let reason = if validity.decision == Decision::Stop {
+                    "verdict_stop"
+                } else {
+                    "verdict_refresh"
+                };
+                Err((reason.into(), Some(validity)))
+            }
+        },
+    )
+}
+
+/// The typed fence texts `source::apply_checked` raises when the world moves
+/// between authorization and the real `git apply`. Matched by text because
+/// the fence is inside `anyhow::ensure!`, same as `apply_locked` already does
+/// for the human path.
+fn is_fence_failure(message: &str) -> bool {
+    message.contains("source changed during apply validation")
+        || message.contains("source has changed since this run was created")
+}
+
 /// Apply `run_id`'s sole candidate under the auto-apply policy, if and only if
 /// the evidence is complete for the exact world being modified (see
-/// `docs/plan-0.3-auto-apply-and-attach.md`, part 5.2). This skeleton is not
-/// yet wired to any surface: it reports the run as not ready and does nothing.
+/// `docs/plan-0.3-auto-apply-and-attach.md`, part 5.2). Every returned
+/// variant has already been persisted; the caller only presents it.
 pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run = state.load_run(&resolved_run_id)?;
-    Ok(ApplyOutcome::Skipped {
-        reason: "not_ready".into(),
-    })
+    let run_lock = OperationLock::acquire_wait(
+        &state.run_dir(&resolved_run_id).join(".operation.lock"),
+        "run has a foreground owner",
+        Duration::from_secs(5),
+    );
+    // A human review may hold this lock; writing anything here would bump
+    // the run's revision under them, so a busy run lock persists nothing.
+    let Ok(_run_lock) = run_lock else {
+        return Ok(ApplyOutcome::Skipped {
+            reason: "run_busy".into(),
+        });
+    };
+
+    let run = state.load_run(&resolved_run_id)?;
+    let run_dir = state.run_dir(&run.id);
+
+    if !(run.outcome.lifecycle == LifecycleState::Finished
+        && run.outcome.work_result == WorkResult::Ready
+        && run.status == RunStatus::ReadyForEvaluation
+        && run.outcome.review == ReviewState::Pending
+        && run.outcome.application == ApplicationState::NotApplied)
+    {
+        return persist_skip(state, run, "not_ready");
+    }
+    if run.candidates.len() != 1 {
+        return persist_skip(state, run, "not_sole_candidate");
+    }
+    if crate::planning::verify_delivery(&run).is_err() {
+        return persist_skip(state, run, "delivery_unverifiable");
+    }
+    let Some(config) = run_config(&run_dir) else {
+        return persist_skip(state, run, "config_unreadable");
+    };
+    if config.checks.verify.is_empty() {
+        return persist_skip(state, run, "verification_not_configured");
+    }
+    match run.outcome.verification {
+        VerificationState::Passed => {}
+        VerificationState::Failed => return persist_skip(state, run, "verification_failed"),
+        VerificationState::Inconclusive => {
+            return persist_skip(state, run, "verification_inconclusive");
+        }
+        VerificationState::NotRun => return persist_skip(state, run, "verification_not_run"),
+        VerificationState::NotConfigured => {
+            return persist_skip(state, run, "verification_not_configured");
+        }
+    }
+    if config.execution.backend == "local" && !run.environment.unsafe_local {
+        return persist_skip(state, run, "integration_checks_unavailable");
+    }
+
+    let candidate_label = sole_candidate(&run)?.label.clone();
+    let source_lock = OperationLock::acquire_wait(
+        &source_lock_path(state, &run),
+        "another apply operation is already modifying this source",
+        Duration::from_secs(run.environment.timeout_secs),
+    );
+    let Ok(_source_lock) = source_lock else {
+        return persist_skip(state, run, "source_busy");
+    };
+
+    let mut retried = false;
+    loop {
+        let authorization = match decide(&run, &candidate_label, &run_dir)? {
+            Ok(authorization) => authorization,
+            Err((reason, validity)) => return persist_blocked(state, run, reason, validity),
+        };
+        let validity = match &authorization {
+            Authorization::Fingerprint => None,
+            Authorization::Digest(validity) => Some(validity.clone()),
+        };
+        let applied = match &authorization {
+            Authorization::Fingerprint => source::safe_apply(&run, &candidate_label),
+            Authorization::Digest(validity) => {
+                source::apply_validated(&run, &candidate_label, &validity.world_digest)
+            }
+        };
+        match applied {
+            Ok(report) => {
+                persist_applied(
+                    state,
+                    run,
+                    &candidate_label,
+                    &report,
+                    validity.as_ref(),
+                    ApplyAuthority::AutoApply,
+                )?;
+                return Ok(ApplyOutcome::Applied { report, validity });
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if is_fence_failure(&message) {
+                    if !retried {
+                        retried = true;
+                        continue;
+                    }
+                    return persist_blocked(
+                        state,
+                        run,
+                        "world_moved_during_validation".into(),
+                        validity,
+                    );
+                }
+                return persist_apply_failed(state, run, &candidate_label, message);
+            }
+        }
+    }
 }
