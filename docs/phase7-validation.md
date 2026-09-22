@@ -310,7 +310,7 @@ state, credentials, account evidence, grants and unrelated files are not include
 The staged diff and a credential-pattern/artifact scan are checked before committing.
 No push, tag, publication, version change, or Phase 8 work is authorized or performed.
 
-## C-project dogfood maintenance (2026-09-18)
+## C-project maintenance (2026-09-18)
 
 After the committed Phase 7 validation above, an owner-requested inspection of
 raylib run `01M2TH0CGFPXKV9BF1AMM971QK` confirmed frozen unknown language,
@@ -379,7 +379,7 @@ The previous installed binary is backed up at
 `/private/tmp/dispatch-c-cohort-fix/dispatch-before-c-fix`. This maintenance patch
 is uncommitted; the earlier Phase 7 implementation commit remains unchanged.
 
-## Raylib dogfood follow-up: runs A and B
+## Raylib follow-up: runs A and B
 
 This follow-up concerns the C application `/Users/jese/bin/raylib_bouncing_ball`,
 not work performed on Dispatch. The target is a plain directory, not a Git checkout;
@@ -431,7 +431,7 @@ C application passes after the fix. PTY coverage checks two distinct deliveries,
 one initial transition each, unchanged completion events, Details/diff navigation,
 plain and TERM=dumb/no-color behavior, invocation bounds and terminal restoration.
 
-Focused regressions: `recorded_dogfood_prompts_preserve_independent_kind_and_scope`,
+Focused regressions: `recorded_real_prompts_preserve_independent_kind_and_scope`,
 `additive_wording_does_not_infer_locality_or_confuse_tests_with_features`,
 `vague_and_cross_cutting_intent_stays_unknown`,
 `c_test_and_feature_mappings_do_not_infer_unknown_scope`, and
@@ -499,7 +499,7 @@ failure subtypes cannot be reconstructed from unclassified errors. The implement
 uses one fixed rule and one active preference per project, with base-policy rollback,
 not a general policy framework.
 
-CORE: COMPLETE — READY FOR PRIVATE-EVIDENCE/SHADOW DOGFOOD
+CORE: COMPLETE — READY FOR PRIVATE-EVIDENCE/SHADOW INTERNAL USE
 
 LIVE POLICY: UNCHANGED — no real proposal activated
 

@@ -312,7 +312,7 @@ fn weak_ambiguous_and_generated_c_evidence_stays_unknown() -> anyhow::Result<()>
 }
 
 #[test]
-fn recorded_dogfood_prompts_preserve_independent_kind_and_scope() -> anyhow::Result<()> {
+fn recorded_real_prompts_preserve_independent_kind_and_scope() -> anyhow::Result<()> {
     // Original pre-execution source inventory, not the delivered diff.
     let source = repository(&[
         "main.c",

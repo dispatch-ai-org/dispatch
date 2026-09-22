@@ -234,7 +234,7 @@ advanced detail. Scoped machine results omit private evidence, including embedde
 attempt-decision copies; they receive no other goals' IDs, paths, notes, or aggregates.
 Existing run/artifact/event scope remains decisive. Nothing is added to Cloud ingestion.
 
-## Prospective dogfood
+## Prospective internal use
 
 Start with ordinary eligible work and shadow only. Preserve task mix and note why
 a direct harness was used for an otherwise eligible task. Use normal human review;

@@ -4,24 +4,37 @@ These instructions apply to the entire repository.
 
 ## Product thesis
 
-Dispatch gives a software task to the best available coding agent using observed
-performance evidence, runs that agent through the existing isolated execution
-path, and explains the choice:
+Dispatch keeps autonomous software work valid while the code moves. An agent
+works from a frozen snapshot while the real source keeps changing. Dispatch
+records the snapshot the work began against and the patch it produced, derives
+the facts the work relied on, and decides whether the result still holds against
+the source as it is now:
 
 ```text
 task
-→ deterministic task features
-→ eligible local harnesses + cached public evidence
-→ one selected harness
-→ isolated execution and verification
-→ human review
-→ durable data
+→ S0: frozen baseline, isolated candidate workspace
+→ one selected agent executes and configured verification runs
+→ Δ: the patch, retained with its evidence
+→ validate(facts of (S0, Δ), source now)
+→ CONTINUE / REFRESH / STOP, with reasons
+→ human review, accept or reject
+→ durable local data
 ```
 
-Predictive routing is the normal product path. Keep selection local and
+Work coherence is the center of the product and the public story. Agent
+selection, allocation, isolated execution, verification, planning, machine
+control and cost accounting are how Dispatch carries the work; they support the
+promise and are not separate product theses. Keep selection local and
 evidence-based, do not present public priors as ground truth, and feed the
 selected harness into the same execution core used by deliberate overrides.
 Multi-harness comparison remains an advanced evaluation workflow.
+
+Public claims about coherence must match what is shipped and measured. Today
+that is an accept-time gate with symbol-level facts for Rust and Python, file-level
+facts elsewhere, and an advisory mid-run watcher on allocation runs. Do not claim
+tokens, minutes or money saved until a real run was stopped and the attempt
+timestamps show it. The metrics that decide whether the thesis holds, and what
+would falsify it, are in `docs/coherence-validation.md`.
 
 ## Architectural ownership
 
@@ -129,8 +142,8 @@ for symbol extraction in that layer. Unless explicitly requested, do not add:
 - a persistent symbol or reference graph, index, or LSP integration;
 - additional languages or a plugin framework for them.
 
-Additional languages, or any graph or index, need evidence from dogfood failures
-first. Keep facts derived from (S0, Δ), the run's baseline and its patch, so that
+Additional languages, or any graph or index, need evidence from failures observed in real
+use first. Keep facts derived from (S0, Δ), the run's baseline and its patch, so that
 they are always recomputable and need no stored index.
 
 ## Working method

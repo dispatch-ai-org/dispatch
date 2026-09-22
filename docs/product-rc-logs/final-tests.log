@@ -218,7 +218,7 @@ test clear_repair_text_is_a_bug_fix ... ok
 test clear_test_writing_text_is_tests ... ok
 test explicit_known_file_paths_support_conservative_scope ... ok
 test scope_remains_unknown_without_explicit_known_files ... ok
-test recorded_dogfood_prompts_preserve_independent_kind_and_scope ... ok
+test recorded_real_prompts_preserve_independent_kind_and_scope ... ok
 test vague_and_cross_cutting_intent_stays_unknown ... ok
 test weak_ambiguous_and_generated_c_evidence_stays_unknown ... ok
 test classified_features_feed_the_router_and_prefer_specific_evidence ... ok
