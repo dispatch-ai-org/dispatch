@@ -1668,13 +1668,6 @@ async fn run_goal(
     let mut run = ui
         .work(state, orchestrator::run_dispatch(state, request))
         .await?;
-    if ui.auto_apply
-        && pending_question(&run).is_none()
-        && run.outcome.work_result == WorkResult::Ready
-        && run.outcome.review == ReviewState::Pending
-    {
-        return auto_apply_goal(ui, state, run, options).await;
-    }
     loop {
         if let Some(command) = question_command(&run) {
             let deadline = run
@@ -1742,6 +1735,12 @@ async fn run_goal(
                 continue;
             }
             break;
+        }
+        // The one point every Ready, review-pending result reaches, whether
+        // it came straight from the work call or after a clarification was
+        // answered: the mode in force at this moment decides.
+        if ui.auto_apply {
+            return auto_apply_goal(ui, state, run, options).await;
         }
         return review_goal(ui, state, run, options, "").await;
     }
