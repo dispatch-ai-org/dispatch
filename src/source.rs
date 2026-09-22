@@ -1761,6 +1761,7 @@ mod tests {
             coherence: None,
             evaluation: None,
             applied_candidate: None,
+            attachment: None,
         }
     }
 

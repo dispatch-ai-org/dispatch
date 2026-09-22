@@ -483,6 +483,16 @@ fn queue_all(state: &State, database: &Database, settings: &SyncSettings) -> Res
 
 fn queue_evaluation(database: &Database, settings: &SyncSettings, run: &RunRecord) -> Result<bool> {
     anyhow::ensure!(settings.enabled, "evaluation sync is disabled");
+    // Attached work is observed, not selected or routed, by design (part 6.3,
+    // 6.6, 14.6 of the attach plan): it is reviewed through `review.*`
+    // events, never through `EvaluationRecord`, and never becomes routing or
+    // evaluation evidence. This is a backstop, not the only guard: nothing in
+    // this packet can set `evaluation` on an attached run in the first place.
+    anyhow::ensure!(
+        run.mode != crate::RunMode::Attached,
+        "attached work (run {}) is never queued for evaluation upload",
+        run.id
+    );
     anyhow::ensure!(run.evaluation.is_some(), "run {} has no evaluation", run.id);
     let evaluation_id = database
         .evaluation_id(&run.id)?
@@ -1162,6 +1172,7 @@ mod tests {
                 blind: true,
             }),
             applied_candidate: None,
+            attachment: None,
         }
     }
 
@@ -2113,6 +2124,46 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+        Ok(())
+    }
+
+    /// S1 (attach part 6.3/6.6/14.6): attached work is observed, not
+    /// selected or routed, and never becomes evaluation or routing evidence.
+    /// Even if something upstream ever set `evaluation` on an attached-mode
+    /// run, `queue_evaluation` refuses to enqueue it for upload.
+    #[test]
+    fn attached_runs_are_never_queued_for_evaluation_upload() -> Result<()> {
+        let mut run = evaluated_run("attached-run");
+        run.mode = crate::RunMode::Attached;
+        let settings = SyncSettings {
+            enabled: true,
+            contributor_id: Some("contributor".into()),
+            enabled_at: Some(at(6).to_rfc3339()),
+            consent_version: 2,
+            routing_observation_enabled_at: Some(at(6).to_rfc3339()),
+        };
+        let database = Database::open_in_memory()?;
+        let error = queue_evaluation(&database, &settings, &run)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is never queued for evaluation upload"),
+            "{error}"
+        );
+
+        // A legacy-mode run with the same evaluation is unaffected by the
+        // guard (it still requires a persisted evaluation, which this
+        // in-memory database was never given): the mode guard is not simply
+        // rejecting every run.
+        run.mode = crate::RunMode::Legacy;
+        let error = queue_evaluation(&database, &settings, &run)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("is never queued for evaluation upload"),
+            "{error}"
+        );
+        assert!(error.contains("no persisted evaluation"), "{error}");
         Ok(())
     }
 

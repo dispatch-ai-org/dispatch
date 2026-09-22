@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::admission::ProcessIdentity;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -199,6 +201,9 @@ pub enum RunMode {
     Routed,
     Allocation,
     Comparison,
+    /// External work Dispatch observes and can apply, but did not select,
+    /// route or execute. See `AttachmentRecord`.
+    Attached,
 }
 
 impl RunMode {
@@ -208,6 +213,7 @@ impl RunMode {
             Self::Routed => "routed",
             Self::Allocation => "allocation",
             Self::Comparison => "comparison",
+            Self::Attached => "attached",
         }
     }
 }
@@ -644,6 +650,85 @@ pub struct RunRecord {
     pub coherence: Option<CoherenceRecord>,
     pub evaluation: Option<EvaluationRecord>,
     pub applied_candidate: Option<String>,
+    /// Present only for `mode: Attached` work: provenance, capabilities,
+    /// process identities and timestamps for external work Dispatch observes
+    /// rather than executes. `None` for every run made before this field
+    /// existed and for every run Dispatch itself selected and ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<AttachmentRecord>,
+}
+
+/// Provenance, capabilities, process identities and timestamps for a
+/// `RunMode::Attached` run: a `RunRecord` that Dispatch observes and can
+/// apply, but did not select, route or execute. See
+/// `docs/plan-0.3-auto-apply-and-attach.md` part 14.2/14.3.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRecord {
+    pub version: u32,
+    /// Canonical external worktree the agent runs in.
+    pub workspace: PathBuf,
+    /// Equals `run.source_path`: the checkout the attachment targets.
+    pub integration_root: PathBuf,
+    /// `sha256(canonical git-common-dir)`; `None` for a plain directory.
+    pub repo_key: Option<String>,
+    pub provenance: BaselineProvenance,
+    pub confidence: AttachConfidence,
+    /// `"claude" | "codex" | "cursor"` or other free text; never guessed.
+    pub agent: Option<String>,
+    /// Wrapped attach: the argv. Foreign attach: `None`.
+    pub command: Option<Vec<String>>,
+    /// The wrapper process. `None` for a foreign attachment.
+    pub owner: Option<ProcessIdentity>,
+    /// Wrapped: the child. Foreign: `--pid` when given.
+    pub agent_process: Option<ProcessIdentity>,
+    pub owner_state: OwnerState,
+    pub capabilities: AttachCapabilities,
+    pub attached_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineProvenance {
+    GitMergeBase { commit: String },
+    SnapshotAtAttach,
+}
+
+/// `Partial`: edits made before attach are invisible to Δ and the record
+/// says so.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachConfidence {
+    Full,
+    Partial,
+}
+
+/// `Adopted`: `serve` observes this attachment now (its original owner is
+/// not the process observing it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerState {
+    Live,
+    Gone,
+    Unknown,
+    Adopted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachCapabilities {
+    pub observe: bool,
+    pub signal: bool,
+    pub control: bool,
+    pub integrate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    ProcessExit { code: Option<i32> },
+    Explicit,
+    OwnerGone,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1040,4 +1125,129 @@ pub struct Clarification {
     pub actor_uid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment() -> AttachmentRecord {
+        AttachmentRecord {
+            version: 1,
+            workspace: PathBuf::from("/repo-worktree"),
+            integration_root: PathBuf::from("/repo"),
+            repo_key: Some("sha256:deadbeef".to_owned()),
+            provenance: BaselineProvenance::GitMergeBase {
+                commit: "0123456789abcdef".to_owned(),
+            },
+            confidence: AttachConfidence::Full,
+            agent: Some("claude".to_owned()),
+            command: Some(vec!["claude".to_owned(), "--dangerously...".to_owned()]),
+            owner: Some(ProcessIdentity {
+                pid: 4242,
+                start: Some("123456".to_owned()),
+                boot: Some("789".to_owned()),
+                process_group: Some(4242),
+            }),
+            agent_process: Some(ProcessIdentity {
+                pid: 4243,
+                start: None,
+                boot: None,
+                process_group: None,
+            }),
+            owner_state: OwnerState::Live,
+            capabilities: AttachCapabilities {
+                observe: true,
+                signal: true,
+                control: true,
+                integrate: false,
+            },
+            attached_at: DateTime::parse_from_rfc3339("2026-09-22T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            finished_at: None,
+            finish_reason: None,
+        }
+    }
+
+    #[test]
+    fn attachment_record_round_trips_through_json() {
+        let original = attachment();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: AttachmentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+        assert!(json.contains("\"owner_state\":\"live\""), "{json}");
+        assert!(
+            json.contains("\"provenance\":{\"git_merge_base\":{\"commit\":\"0123456789abcdef\"}}"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn finish_reason_variants_serialize_as_expected() {
+        assert_eq!(
+            serde_json::to_string(&FinishReason::ProcessExit { code: Some(0) }).unwrap(),
+            r#"{"process_exit":{"code":0}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&FinishReason::Explicit).unwrap(),
+            "\"explicit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FinishReason::OwnerGone).unwrap(),
+            "\"owner_gone\""
+        );
+    }
+
+    /// A `run.json` written before attach existed has no `attachment` key.
+    /// Such a run must still deserialize, with `attachment: None`.
+    #[test]
+    fn old_run_json_without_attachment_deserializes_to_none() {
+        let old_run_json = r#"{
+            "id":"01TEST", "task":"Fix cache", "exact_prompt":"Fix cache",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"baseline", "baseline_path":"/baseline", "baseline_commit":"abc",
+            "status":"running", "created_at":"2026-09-17T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }"#;
+        let run: RunRecord = serde_json::from_str(old_run_json).unwrap();
+        assert!(run.attachment.is_none());
+        assert_eq!(run.mode, RunMode::Legacy);
+    }
+
+    #[test]
+    fn run_mode_attached_serializes_as_attached() {
+        assert_eq!(RunMode::Attached.as_str(), "attached");
+        assert_eq!(
+            serde_json::to_string(&RunMode::Attached).unwrap(),
+            "\"attached\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RunMode>("\"attached\"").unwrap(),
+            RunMode::Attached
+        );
+    }
+
+    /// A run with an attachment round-trips it through `run.json`.
+    #[test]
+    fn run_record_carries_attachment_through_json() {
+        let mut run: RunRecord = serde_json::from_str(
+            r#"{
+            "id":"01ATTACHED", "task":"attached work in worktree", "exact_prompt":"attached work in worktree",
+            "source_path":"/source", "source_kind":"git_worktree", "source_git_head":"abc123",
+            "source_fingerprint":"baseline", "baseline_path":"/baseline", "baseline_commit":"abc",
+            "status":"running", "mode":"attached", "created_at":"2026-09-22T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(run.mode, RunMode::Attached);
+        assert!(run.attachment.is_none());
+        run.attachment = Some(attachment());
+        let json = serde_json::to_string(&run).unwrap();
+        let restored: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.attachment, run.attachment);
+    }
 }
