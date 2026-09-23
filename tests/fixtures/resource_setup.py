@@ -70,4 +70,13 @@ for line in sys.stdin:
     calls=[json.loads(l) for l in (root/'probe-args').read_text().splitlines()]
     assert all('--version' in c or 'app-server' in c or 'status' in c or 'login' in c for c in calls)
     assert not (state/'dispatch.db').exists(), 'setup acquired execution authority'
+    # A state that has already been used has a database; setup must still save.
+    used=root/'used-state'
+    subprocess.run([binary,'--state-dir',str(used),'history'],check=True,capture_output=True,env={k:v for k,v in env.items() if v is not None})
+    before=(used/'dispatch.db').read_bytes()
+    with Session([binary,'--state-dir',str(used),'setup','codex'],source,captures,'with-database',env=env,width=100,height=36) as ui:
+        ui.wait('Exact included model ID');ui.send('claude-sonnet-5\r');ui.wait('Effort');ui.send('\r');ui.wait('light / standard / strong');ui.send('\r')
+        ui.wait('Type confirm');ui.send('confirm\r');ui.wait('Resource saved');ui.wait('Add Codex');ui.send('b\r');ui.finish()
+    assert 'provider: openai' in (used/'resources.yml').read_text()
+    assert (used/'dispatch.db').read_bytes()==before, 'setup wrote to the database'
     print('CLI/TUI setup journeys passed; zero model calls; no database or grants created')

@@ -185,17 +185,11 @@ impl Proposal {
             .map(|p| p.authorization_revision)
             .max()
             .unwrap_or(0);
+        // A new revision must be above every refused one: a funding refusal
+        // is sticky per revision, so reusing a refused revision would leave
+        // the re-authorized profile refused.
         let retained: u64 = if state.db_path().exists() {
-            let db = crate::db::Database::open_read_only(state.db_path())?;
-            if db.schema_version()? >= 15 {
-                db.connection().query_row(
-                    "SELECT COALESCE(MAX(authorization_revision),0) FROM capacity_authorizations",
-                    [],
-                    |r| r.get(0),
-                )?
-            } else {
-                0
-            }
+            crate::db::Database::open_read_only(state.db_path())?.max_refused_revision()?
         } else {
             0
         };
@@ -538,6 +532,37 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+    /// Setup against a state that already has a database, at the current
+    /// schema. A new authorization revision is above every refused revision,
+    /// so a refused funding identity is never re-authorized under a revision
+    /// that is still refused.
+    #[test]
+    fn setup_with_an_existing_database_authorizes_above_refused_revisions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let state = State {
+            root: temp.path().into(),
+        };
+        state.initialize()?;
+        crate::db::Database::open(state.db_path())?.record_funding_refusal(
+            "codex:plus:account",
+            4,
+            "fixture refusal",
+        )?;
+        let proposal = proposal(&state);
+        assert_eq!(proposal.config.profiles[0].authorization_revision, 5);
+        proposal.confirm(&state)?;
+        let update = Proposal::prepare(
+            &state,
+            discovery(),
+            "codex",
+            Some(0),
+            "".into(),
+            "".into(),
+            ResourceTier::Standard,
+        )?;
+        assert_eq!(update.config.profiles[0].authorization_revision, 6);
         Ok(())
     }
     #[test]

@@ -1163,6 +1163,24 @@ impl Database {
             .optional()?)
     }
 
+    /// The highest authorization revision any funding identity was refused
+    /// under; 0 when none was, or when the database predates refusals.
+    pub fn max_refused_revision(&self) -> Result<u64> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='funding_refusals')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(0);
+        }
+        Ok(self.connection.query_row(
+            "SELECT COALESCE(MAX(authorization_revision), 0) FROM funding_refusals",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn questions_for_run(&self, run_id: &str) -> Result<Vec<crate::Clarification>> {
         let mut statement = self
             .connection
