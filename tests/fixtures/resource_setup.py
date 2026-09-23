@@ -64,8 +64,13 @@ for line in sys.stdin:
         ui.wait('Add Codex');ui.send('l\r');ui.wait('Choose codex');ui.send('codex\r');ui.wait('Type login');ui.send('login\r');ui.wait('Fixture device login');ui.send('\r');ui.wait('Add Codex');ui.mark('return');ui.send('b\r');ui.finish()
     assert (state/'resources.yml').read_bytes()==refreshed
     (source/'verify.sh').write_text('exit 0\n')
-    with session('checks',['setup','--checks']) as ui:
-        ui.wait('Choose checks');ui.mark('choices');ui.send('1\r');ui.finish()
+    # Checks are chosen, never typed: arrows move, Enter chooses the focused row.
+    with session('checks-skip',['setup','--checks']) as ui:
+        ui.wait('Continue without checks');ui.mark('choices');ui.send('\x1b[B');ui.pump(.3);ui.send('\r');ui.finish()
+    assert not (source/'dispatch.yml').exists()
+    # Plain mode numbers the same rows; an empty line chooses the focused row.
+    with session('checks-plain',['--plain','setup','--checks']) as ui:
+        ui.wait('1) sh ./verify.sh');ui.wait('[1] >');ui.send('\r');ui.wait('Approved check saved');ui.finish()
     assert '- sh ./verify.sh' in (source/'dispatch.yml').read_text()
     calls=[json.loads(l) for l in (root/'probe-args').read_text().splitlines()]
     assert all('--version' in c or 'app-server' in c or 'status' in c or 'login' in c for c in calls)

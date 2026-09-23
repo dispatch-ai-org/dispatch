@@ -382,3 +382,12 @@ decided). New languages for symbol facts.
   `no such table: capacity_authorizations`. By hand: the real `dispatch setup`
   against the migrated schema-24 dogfood state reached the consent screen for the
   Claude profile; it was cancelled, and `resources.yml` was unchanged.
+- 2026-09-23 — Stage 1. `Ui::select` in `src/presenter.rs` implements the menu
+  rules from section 3: ↑/↓ or j/k move, a digit moves focus, Enter chooses the
+  focused row, Esc or Ctrl+C backs out, focus starts on the caller's initial row,
+  and disabled rows cannot be chosen. Plain mode prints numbered rows, and an
+  empty line chooses the focused row. The checks menu uses it: detected commands,
+  *Continue without checks*, *Back*. Tests: the setup journeys choose checks with
+  an arrow and Enter (nothing saved) and in plain mode with an empty line (the
+  focused command saved). A PTY capture repaints only changed cells, so tests
+  assert outcomes, not the drawn marker. `cargo test`: 428 passed, 0 failed.

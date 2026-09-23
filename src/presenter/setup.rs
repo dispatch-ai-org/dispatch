@@ -190,24 +190,17 @@ async fn login(ui: &mut Ui, provider: &str) -> Result<()> {
 
 pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> {
     let expected = setup::project_config_bytes(source)?;
-    let choices = setup::check_choices(source);
-    let list = choices
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("[{}] {c}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Input::Submit(answer)=ui.command_prompt(&format!("Choose checks\n{list}\n[n] Continue unverified   [b] Back\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.")).await? else{anyhow::bail!("check selection cancelled")};
-    if answer.trim() == "n" {
-        return Ok(());
+    let commands = setup::check_choices(source);
+    let mut choices = commands.iter().map(|c| Choice::new(*c)).collect::<Vec<_>>();
+    choices.push(Choice::new("Continue without checks"));
+    choices.push(Choice::new("Back"));
+    let body = "Choose checks\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.";
+    match ui.select(body, &choices, 0).await? {
+        Some(i) if i < commands.len() => {
+            setup::save_checks(source, commands[i], expected)?;
+            ui.commit(&format!("Approved check saved: {}", commands[i]))
+        }
+        Some(i) if i == commands.len() => Ok(()),
+        _ => anyhow::bail!("check selection cancelled"),
     }
-    let command = answer
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| n.checked_sub(1))
-        .and_then(|n| choices.get(n))
-        .context("check selection cancelled")?;
-    setup::save_checks(source, command, expected)?;
-    ui.commit(&format!("Approved check saved: {command}"))
 }
