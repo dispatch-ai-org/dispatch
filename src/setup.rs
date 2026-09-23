@@ -20,6 +20,7 @@ pub struct Discovery {
     pub funding: String,
     pub account: String,
     pub claude: Option<crate::harness::claude::SubscriptionEvidence>,
+    pub codex: Option<crate::harness::codex::AccountEvidence>,
 }
 impl Discovery {
     pub fn summary(&self) -> String {
@@ -76,6 +77,7 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
             funding: "claude-subscription".into(),
             account,
             claude: Some(evidence),
+            codex: None,
         })
     } else {
         ensure!(provider == "codex", "unsupported provider");
@@ -103,11 +105,16 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
         let CapacityValue::Reported { value: account } = observed.funding_identity else {
             anyhow::bail!("account identity is unknown; no profile was authorized")
         };
+        let account = account.trim_start_matches("sha256:").to_owned();
         Ok(Discovery {
             executable,
             version,
             funding,
-            account: account.trim_start_matches("sha256:").into(),
+            codex: Some(crate::harness::codex::AccountEvidence {
+                account_sha256: account.clone(),
+                checked_at: Utc::now(),
+            }),
+            account,
             claude: None,
         })
     }
@@ -230,12 +237,19 @@ impl Proposal {
                     "account changed: add a new resource explicitly; existing account scope was preserved"
                 );
             }
+            if let Some(old) = &profile.codex_account {
+                ensure!(
+                    old.account_sha256 == discovery.account,
+                    "account changed: add a new resource explicitly; existing account scope was preserved"
+                );
+            }
             ensure!(
                 profile.funding_source == discovery.funding || provider == "claude",
                 "subscription plan changed: add a new resource explicitly"
             );
             profile.authorization_revision = revision;
             profile.claude_subscription = discovery.claude.clone();
+            profile.codex_account = discovery.codex.clone();
             profile
         } else {
             let shared = config.profiles.iter().find(|p| {
@@ -274,6 +288,7 @@ impl Proposal {
                 no_overage_verified: false,
                 authorization_revision: revision,
                 claude_subscription: discovery.claude.clone(),
+                codex_account: discovery.codex.clone(),
             }
         };
         ensure!(
@@ -432,6 +447,10 @@ mod tests {
             funding: "chatgpt-plus".into(),
             account: "a".repeat(64),
             claude: None,
+            codex: Some(crate::harness::codex::AccountEvidence {
+                account_sha256: "a".repeat(64),
+                checked_at: Utc::now(),
+            }),
         }
     }
     fn proposal(state: &State) -> Proposal {

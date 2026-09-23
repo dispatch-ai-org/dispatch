@@ -238,6 +238,10 @@ mod allocation_tests {
     fn profile(tier: ResourceTier, model: &str, effort: &str) -> ResourceProfile {
         ResourceProfile {
             enabled: true,
+            codex_account: Some(crate::harness::codex::AccountEvidence {
+                account_sha256: "a".repeat(64),
+                checked_at: chrono::Utc::now(),
+            }),
             claude_subscription: None,
             provider: "openai".into(),
             funding_source: "chatgpt-plus".into(),

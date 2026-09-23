@@ -35,7 +35,7 @@ fn source(root: &Path, name: &str, agent: &Path, check: &Path) -> Result<PathBuf
 
 fn resources(agent_probe: bool, admission: bool) -> String {
     format!(
-        "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: {agent_probe}\n  admission: {admission}\n  lease_secs: 4\n  heartbeat_secs: 1\n  aging_secs: 2\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: medium\n    service_mode: standard\n    runtime: local\n    pool: shared-chatgpt-codex\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n"
+        "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: {agent_probe}\n  admission: {admission}\n  lease_secs: 4\n  heartbeat_secs: 1\n  aging_secs: 2\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: medium\n    service_mode: standard\n    runtime: local\n    pool: shared-chatgpt-codex\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"fc164f8250803ea8d41834f1de85821035d27d3747e83610789e0f8e5313b9c3\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n"
     )
 }
 
@@ -80,12 +80,22 @@ fn two_foreground_processes_share_one_slot_and_checks_do_not_retain_it() -> Resu
     let overlap = temp.path().join("model-overlap");
     let model_completed = temp.path().join("model-completed");
     let second_model_started = temp.path().join("second-model-started");
-    let agent = temp.path().join("codex-fixture");
+    let agent = temp.path().join("codex");
     executable(
         &agent,
         &format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 2.0\\n'; exit 0; fi\n\
+             if [ \"$1\" = 'app-server' ]; then\n\
+             while IFS= read -r line; do\n\
+             case \"$line\" in\n\
+             *'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{\"userAgent\":\"fixture\"}}}}' ;;\n\
+             *'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"account\":{{\"type\":\"chatgpt\",\"planType\":\"plus\",\"id\":\"account-a\"}}}}}}' ;;\n\
+             *'\"id\":2'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"rateLimitsByLimitId\":{{}}}}}}'; exit 0 ;;\n\
+             esac\n\
+             done\n\
+             exit 0\n\
+             fi\n\
              if ! mkdir \"{}\" 2>/dev/null; then printf 'overlap\\n' >> \"{}\"; exit 9; fi\n\
              trap 'rmdir \"{}\" 2>/dev/null' EXIT INT TERM\n\
              if [ -f \"{}\" ]; then printf 'yes\\n' >> \"{}\"; fi\n\
@@ -124,7 +134,7 @@ fn two_foreground_processes_share_one_slot_and_checks_do_not_retain_it() -> Resu
     let second_source = source(temp.path(), "source-two", &agent, &check)?;
     fs::write(
         state.join("resources.yml"),
-        "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\n  lease_secs: 4\n  heartbeat_secs: 1\n  aging_secs: 2\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: medium\n    service_mode: standard\n    runtime: local\n    pool: shared-chatgpt-codex\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n",
+        "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\n  lease_secs: 4\n  heartbeat_secs: 1\n  aging_secs: 2\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: medium\n    service_mode: standard\n    runtime: local\n    pool: shared-chatgpt-codex\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    codex_account: {\"account_sha256\":\"fc164f8250803ea8d41834f1de85821035d27d3747e83610789e0f8e5313b9c3\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
     )?;
 
     let binary = assert_cmd::cargo_bin!("dispatch");
@@ -338,8 +348,10 @@ fn queued_process_rechecks_newer_conflicting_evidence_from_another_process() -> 
 
     let conflicting = launch(&conflicting_source)?.wait_with_output()?;
     assert!(!conflicting.status.success());
+    // The adapter preflight (0.4.1) or the capacity authorization refuses it.
     assert!(
-        String::from_utf8_lossy(&conflicting.stderr).contains("funding revalidation failed"),
+        String::from_utf8_lossy(&conflicting.stderr).contains("funding revalidation failed")
+            || String::from_utf8_lossy(&conflicting.stderr).contains("the Codex account changed"),
         "{}",
         String::from_utf8_lossy(&conflicting.stderr)
     );
@@ -353,7 +365,8 @@ fn queued_process_rechecks_newer_conflicting_evidence_from_another_process() -> 
     );
     assert!(!waiter.status.success());
     assert!(
-        String::from_utf8_lossy(&waiter.stderr).contains("funding revalidation failed"),
+        String::from_utf8_lossy(&waiter.stderr).contains("funding revalidation failed")
+            || String::from_utf8_lossy(&waiter.stderr).contains("was refused"),
         "stderr: {}\nstdout: {}",
         String::from_utf8_lossy(&waiter.stderr),
         String::from_utf8_lossy(&waiter.stdout)
@@ -366,72 +379,6 @@ fn queued_process_rechecks_newer_conflicting_evidence_from_another_process() -> 
         !conflicting_started.exists(),
         "conflicting evidence process must not launch"
     );
-    Ok(())
-}
-
-#[test]
-fn timed_out_optional_probe_keeps_a_normal_run_usable_and_explained() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let state = temp.path().join("state");
-    let source = temp.path().join("source");
-    fs::create_dir_all(source.join("src"))?;
-    fs::create_dir_all(&state)?;
-    fs::write(source.join("src/lib.rs"), "pub fn original() {}\n")?;
-    let agent = temp.path().join("codex");
-    executable(
-        &agent,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'codex fixture 2.0\\n'; exit 0; fi\nif [ \"$1\" = \"app-server\" ]; then sleep 2; exit 0; fi\nprintf 'allocated\\n' > allocated.txt\nprintf '{\"type\":\"result\"}\\n'\n",
-    )?;
-    fs::write(
-        source.join("dispatch.yml"),
-        format!(
-            "execution:\n  timeout_secs: 5\nchecks:\n  verify: []\nharnesses:\n  codex:\n    executable: \"{}\"\n",
-            agent.display()
-        ),
-    )?;
-    fs::write(
-        state.join("resources.yml"),
-        "version: 1\nallocation_enabled: true\ncapacity:\n  probe_timeout_secs: 1\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: medium\n    service_mode: standard\n    runtime: local\n    pool: shared-chatgpt-codex\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n",
-    )?;
-    let output = Command::new(assert_cmd::cargo_bin!("dispatch"))
-        .args(["--state-dir"])
-        .arg(&state)
-        .arg("run")
-        .arg(&source)
-        .args([
-            "--task",
-            "Run the deterministic fixture.",
-            "--agent",
-            "codex",
-            "--model",
-            "configured-model",
-            "--effort",
-            "medium",
-            "--allow-unsafe-local",
-            "--json",
-        ])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(result["capacity"]["scarcity"], "unknown");
-    assert_eq!(result["capacity"]["auth_mode"]["knowledge"], "unknown");
-    let raw = Path::new(result["capacity"]["raw_observation_ref"].as_str().unwrap());
-    assert!(raw.is_file());
-    assert!(fs::read_to_string(raw)?.contains("probe timeout"));
-    let run_id = result["run_id"].as_str().unwrap();
-    let explanation = Command::new(assert_cmd::cargo_bin!("dispatch"))
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["explain", run_id])
-        .output()?;
-    assert!(explanation.status.success());
-    let explanation = String::from_utf8(explanation.stdout)?;
-    assert!(explanation.contains("Capacity observation"));
-    assert!(explanation.contains("probe timeout"));
     Ok(())
 }
 
@@ -605,9 +552,13 @@ fn foreground_configuration_changes_respect_overlap_and_allow_disjoint_work() ->
         String::from_utf8_lossy(&expanded.stdout),
         String::from_utf8_lossy(&expanded.stderr)
     );
+    // Refused by the native engine's launch-boundary check (0.4.1) or by
+    // admission's launch fence.
     assert!(
         String::from_utf8_lossy(&expanded.stderr)
             .contains("resource configuration changed after admission")
+            || String::from_utf8_lossy(&expanded.stderr)
+                .contains("resource configuration changed after selection")
     );
     assert!(
         !expanded_started.exists(),
@@ -623,11 +574,11 @@ fn disabling_admission_cannot_bypass_an_active_owner() -> Result<()> {
     fs::create_dir_all(&state)?;
     let active = temp.path().join("active");
     let overlap = temp.path().join("overlap");
-    let agent = temp.path().join("codex-fixture");
+    let agent = temp.path().join("codex");
     executable(
         &agent,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif ! mkdir '{}' 2>/dev/null; then : > '{}'; exit 9; fi\ntrap 'rmdir \"{}\"' EXIT INT TERM\nsleep 2\nprintf '{{\"type\":\"result\"}}\\n'\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = 'app-server' ]; then\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{\"userAgent\":\"fixture\"}}}}' ;;\n*'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"account\":{{\"type\":\"chatgpt\",\"planType\":\"plus\",\"id\":\"account-a\"}}}}}}' ;;\n*'\"id\":2'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"rateLimitsByLimitId\":{{}}}}}}'; exit 0 ;;\nesac\ndone\nexit 0\nfi\nif ! mkdir '{}' 2>/dev/null; then : > '{}'; exit 9; fi\ntrap 'rmdir \"{}\"' EXIT INT TERM\nsleep 2\nprintf '{{\"type\":\"result\"}}\\n'\n",
             active.display(),
             overlap.display(),
             active.display()

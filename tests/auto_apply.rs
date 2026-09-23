@@ -462,11 +462,21 @@ impl AllocationFixture {
         fs::create_dir_all(source.join("src")).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(source.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
-        let agent = temp.path().join("codex-fixture");
+        let agent = temp.path().join("codex");
         fs::write(
             &agent,
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 1.0\\n'; exit 0; fi\n\
+             if [ \"$1\" = 'app-server' ]; then\n\
+             while IFS= read -r line; do\n\
+             case \"$line\" in\n\
+             *'\"id\":0'*) printf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"fixture\"}}' ;;\n\
+             *'\"id\":1'*) printf '%s\\n' '{\"id\":1,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}' ;;\n\
+             *'\"id\":2'*) printf '%s\\n' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'; exit 0 ;;\n\
+             esac\n\
+             done\n\
+             exit 0\n\
+             fi\n\
              printf 'delivered\\n' > delivered.txt\n\
              printf '{\"type\":\"result\",\"model\":\"observed-model\"}\\n'\n",
         )
@@ -482,7 +492,7 @@ impl AllocationFixture {
         .unwrap();
         fs::write(
             state_dir.join("resources.yml"),
-            "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: fixture\n    tier: strong\n    included: true\n    no_overage_verified: true\n",
+            "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: fixture\n    tier: strong\n    included: true\n    no_overage_verified: true\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
         )
         .unwrap();
         Self {

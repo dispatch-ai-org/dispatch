@@ -41,6 +41,33 @@ import json, pathlib, sys, os
 root=pathlib.Path(''' + repr(str(self.root)) + ''')
 if '--version' in sys.argv:
     print('codex phase5 fixture');sys.exit()
+if 'app-server' in sys.argv:
+    # The account probe. Tests steer it through files beside the fixture:
+    # codex-account.json / codex-limits.json replace the responses,
+    # codex-probe=exit makes the probe fail, codex-switch-at=N reports
+    # another account from the N-th probe on, and codex-mutate-resources-at=N
+    # edits the bound profile during the N-th probe.
+    probes=root/'codex-probes'
+    n=int(probes.read_text())+1 if probes.exists() else 1
+    probes.write_text(str(n))
+    if (root/'codex-probe').exists() and (root/'codex-probe').read_text()=='exit': sys.exit(1)
+    account=json.loads((root/'codex-account.json').read_text()) if (root/'codex-account.json').exists() else {'type':'chatgpt','planType':'plus','email':'fixture@example.invalid'}
+    switch=root/'codex-switch-at'
+    if switch.exists() and n>=int(switch.read_text()): account=dict(account,email='other@example.invalid')
+    mutate=root/'codex-mutate-resources-at'
+    if mutate.exists() and n==int(mutate.read_text()):
+        resources=root/'state'/'resources.yml'
+        resources.write_text(resources.read_text().replace('effort: low','effort: medium'))
+    limits=json.loads((root/'codex-limits.json').read_text()) if (root/'codex-limits.json').exists() else {'rateLimitsByLimitId':{}}
+    for line in sys.stdin:
+        if '"id":0' in line:
+            print(json.dumps({'id':0,'result':{'userAgent':'fixture'}}), flush=True)
+        elif '"id":1' in line:
+            print(json.dumps({'id':1,'result':{'account':account}}), flush=True)
+        elif '"id":2' in line:
+            print(json.dumps({'id':2,'result':limits}), flush=True)
+            break
+    raise SystemExit(0)
 prompt=sys.stdin.read()
 with (root/'invocations').open('a') as f: f.write('invocation\\n')
 count=len((root/'invocations').read_text().splitlines())
@@ -128,6 +155,9 @@ profiles:
     no_overage_verified: true
     authorization_revision: 1
 ''')
+        if self.provider == 'codex':
+            with (self.state / 'resources.yml').open('a') as resources:
+                resources.write('    codex_account: {"account_sha256":"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b","checked_at":"2026-01-01T00:00:00Z"}\n')
         if self.provider == 'claude':
             path = self.state/'resources.yml'
             text = path.read_text().replace('provider: openai','provider: anthropic').replace('funding_source: chatgpt-plus','funding_source: claude-fixture').replace('harness: codex','harness: claude')

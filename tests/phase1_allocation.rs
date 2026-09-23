@@ -13,11 +13,21 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
     fs::create_dir_all(&state)?;
     fs::write(source.join("src/lib.rs"), "pub fn original() {}\n")?;
     fs::write(source.join("src/main.rs"), "fn main() {}\n")?;
-    let agent = root.join("codex-fixture");
+    let agent = root.join("codex");
     fs::write(
         &agent,
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 1.0\\n'; exit 0; fi\n\
+         if [ \"$1\" = 'app-server' ]; then\n\
+         while IFS= read -r line; do\n\
+         case \"$line\" in\n\
+         *'\"id\":0'*) printf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"fixture\"}}' ;;\n\
+         *'\"id\":1'*) printf '%s\\n' '{\"id\":1,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}' ;;\n\
+         *'\"id\":2'*) printf '%s\\n' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'; exit 0 ;;\n\
+         esac\n\
+         done\n\
+         exit 0\n\
+         fi\n\
          printf '%s\\n' \"$@\" > invoked-argv.txt\n\
          printf 'allocated\\n' > allocated.txt\n\
          printf '{\"type\":\"result\",\"model\":\"observed-model\",\"reasoning_effort\":\"high\"}\\n'\n",
@@ -32,7 +42,7 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
     )?;
     fs::write(
         state.join("resources.yml"),
-        "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: chatgpt-codex\n    tier: strong\n    included: true\n    no_overage_verified: true\n",
+        "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: chatgpt-codex\n    tier: strong\n    included: true\n    no_overage_verified: true\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
     )?;
     Ok((source, state))
 }
@@ -284,11 +294,21 @@ fn unknown_model_and_invalid_effort_are_rejected_without_substitution() -> anyho
 fn quota_failure_mid_attempt_stops_without_a_paid_or_model_fallback() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let (source, state) = fixture(temp.path())?;
-    let agent = temp.path().join("codex-fixture");
+    let agent = temp.path().join("codex");
     fs::write(
         &agent,
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 1.0\\n'; exit 0; fi\n\
+         if [ \"$1\" = 'app-server' ]; then\n\
+         while IFS= read -r line; do\n\
+         case \"$line\" in\n\
+         *'\"id\":0'*) printf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"fixture\"}}' ;;\n\
+         *'\"id\":1'*) printf '%s\\n' '{\"id\":1,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}' ;;\n\
+         *'\"id\":2'*) printf '%s\\n' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'; exit 0 ;;\n\
+         esac\n\
+         done\n\
+         exit 0\n\
+         fi\n\
          printf '{\"type\":\"turn.failed\",\"message\":\"usage limit exceeded\",\"model\":\"configured-model\"}\\n'\n",
     )?;
     fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;

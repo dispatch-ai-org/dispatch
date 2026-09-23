@@ -1,19 +1,15 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-};
 use ulid::Ulid;
 
 use crate::{
     CapacityConstraint, CapacityMapping, CapacityObservation, CapacityValue, ScarcityState,
-    config::CapacityConfig, db::Database, executor::safe_local_environment,
+    config::CapacityConfig, db::Database,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,8 +319,11 @@ pub async fn probe_codex(
     config: &CapacityConfig,
 ) -> CapacityProbeResult {
     let sampled_at = Utc::now();
-    let result =
-        read_codex_account(executable, Duration::from_secs(config.probe_timeout_secs)).await;
+    let result = crate::harness::codex::read_account(
+        executable,
+        Duration::from_secs(config.probe_timeout_secs),
+    )
+    .await;
     match result {
         Ok(raw) => CapacityProbeResult {
             observation: normalize_codex(
@@ -401,7 +400,7 @@ fn normalize_codex(
     _service_tier: &str,
     sampled_at: DateTime<Utc>,
     freshness_secs: u64,
-    raw: ProbeResponse,
+    raw: crate::harness::codex::ProbeResponse,
 ) -> CapacityObservation {
     let auth_mode = raw
         .account
@@ -650,98 +649,6 @@ fn normalize_codex(
     }
 }
 
-#[derive(Clone)]
-struct ProbeResponse {
-    account: Value,
-    limits: Option<Value>,
-    limits_error: Option<String>,
-    source_version: String,
-}
-
-async fn read_codex_account(executable: &Path, stage_timeout: Duration) -> Result<ProbeResponse> {
-    let mut command = Command::new(executable);
-    command
-        .args(["app-server", "--listen", "stdio://"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .env_clear()
-        .kill_on_drop(true);
-    for (name, value) in safe_local_environment() {
-        command.env(name, value);
-    }
-    let mut child = command
-        .spawn()
-        .context("failed to start Codex app-server")?;
-    let mut stdin = child.stdin.take().context("probe stdin unavailable")?;
-    let stdout = child.stdout.take().context("probe stdout unavailable")?;
-    let mut lines = BufReader::new(stdout).lines();
-    let account_stage = async {
-        send(&mut stdin, json!({"method":"initialize","id":0,"params":{"clientInfo":{"name":"dispatch","title":"Dispatch","version":crate::VERSION}}})).await?;
-        let initialized = response(&mut lines, 0).await?;
-        send(&mut stdin, json!({"method":"initialized","params":{}})).await?;
-        send(
-            &mut stdin,
-            json!({"method":"account/read","id":1,"params":{"refreshToken":false}}),
-        )
-        .await?;
-        let account = response(&mut lines, 1).await?;
-        Ok::<_, anyhow::Error>((initialized, account))
-    };
-    let (initialized, account) = tokio::time::timeout(stage_timeout, account_stage)
-        .await
-        .map_err(|_| anyhow::anyhow!("probe timeout before account response"))??;
-    let source_version = initialized
-        .pointer("/result/userAgent")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let limits_result = async {
-        send(
-            &mut stdin,
-            json!({"method":"account/rateLimits/read","id":2,"params":{}}),
-        )
-        .await?;
-        response(&mut lines, 2).await
-    };
-    let (limits, limits_error) = match tokio::time::timeout(stage_timeout, limits_result).await {
-        Ok(Ok(value)) => (Some(value), None),
-        Ok(Err(error)) => (None, Some(format!("rate-limit probe failure: {error:#}"))),
-        Err(_) => (None, Some("rate-limit probe timeout".into())),
-    };
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    Ok(ProbeResponse {
-        account,
-        limits,
-        limits_error,
-        source_version,
-    })
-}
-
-async fn send(stdin: &mut tokio::process::ChildStdin, message: Value) -> Result<()> {
-    stdin.write_all(message.to_string().as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn response(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    id: i64,
-) -> Result<Value> {
-    while let Some(line) = lines.next_line().await? {
-        let value: Value = serde_json::from_str(&line).context("invalid app-server JSON")?;
-        if value.get("id").and_then(Value::as_i64) == Some(id) {
-            if let Some(error) = value.get("error") {
-                bail!("app-server request {id} failed: {error}");
-            }
-            return Ok(value);
-        }
-    }
-    bail!("app-server closed before response {id}")
-}
-
 pub fn funding_change(observation: &CapacityObservation, funding_source: &str) -> Option<String> {
     if let CapacityValue::Reported { value } = &observation.auth_mode
         && !(value == "chatgpt"
@@ -831,8 +738,8 @@ pub fn needs_refresh(observation: &CapacityObservation, now: DateTime<Utc>) -> b
 mod tests {
     use super::*;
 
-    fn response(limits: Value) -> ProbeResponse {
-        ProbeResponse {
+    fn response(limits: Value) -> crate::harness::codex::ProbeResponse {
+        crate::harness::codex::ProbeResponse {
             account: json!({"result":{"account":{"type":"chatgpt","planType":"plus"}}}),
             limits: Some(json!({"result":limits})),
             limits_error: None,

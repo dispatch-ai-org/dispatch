@@ -72,6 +72,108 @@ the progress log.
 - **Crash repair (gate for S6b).** A run is never closed while an agent child
   it launched may still be alive.
 
+## S5a specification: funding refusals the replacement must reproduce
+
+Enumerated from `v0.4.0` + S1–S4 (`capacity.rs`, `admission.rs::authorize_launch`,
+`orchestrator.rs::{select_available_resource, admit_attempt}`, `setup.rs`,
+`harness/claude.rs`). Every refusal below happens before any agent child is
+spawned. The capacity and authorization path stays active until S6b.
+
+### Codex (`codex app-server` `account/read` + rate limits, `normalize_codex`)
+
+| # | Refusal today | Input |
+|---|---|---|
+| C1 | Authentication reported as anything but `chatgpt` (e.g. an API key) | `account.type` |
+| C2 | Paid credits reported available on any allowance bucket | `credits.hasCredits` |
+| C3 | Service tier reported as anything but `standard`/`default` | `serviceTier` |
+| C4 | Plan reported differs from the profile's `chatgpt-<plan>` funding source | `account.planType` |
+| C5 | Account identity (sha256 of email or id) reported and different from the authorized identity. Today the authorized identity is the **first observation under the profile's `authorization_revision`**, not the setup probe | `account.email`/`id` |
+| C6 | Allowance-window identity changed for an explicitly mapped pool (`provider_buckets`) | rate-limit ids |
+| C7 | **Sticky**: any conflict writes a `rejected` authorization; that revision stays refused, even if the account switches back, until setup re-authorizes (increments `authorization_revision`) | `capacity_authorizations` |
+| C8 | Newest evidence expired at the launch boundary | `valid_until` |
+| C9 | The bound profile changed in `resources.yml` between selection and spawn | `resources.yml` |
+
+An **unknown** field (probe unsupported or failed, `codex_probe: false`, field
+absent) is not a refusal today. Quota gating (exhausted/reserve) is not funding
+safety; it is removed with admission in S6b.
+
+### Claude (adapter-local already: `claude::preflight`, `discover_account`, `validate_executable`)
+
+| # | Refusal today |
+|---|---|
+| L1 | Subscription evidence expired or its contract fields not affirmed |
+| L2 | Executable hash differs from the evidence |
+| L3 | CLI version differs from the evidence |
+| L4 | Unsafe effective local settings |
+| L5 | Not logged in as a `claude.ai` first-party subscription |
+| L6 | Extra usage (paid credits) enabled |
+| L7 | Account identity (sha256 of email + org) differs from the evidence |
+| L8 | Forwarded environment variables configured |
+| L9 | **Sticky** as C7: a failed preflight during capacity observation becomes a `rejected` authorization for that revision |
+
+Claude's preflight runs at selection and, through the capacity observation,
+again at admission. After S6b it must run immediately before spawn.
+
+### Replacement (S5a, additive)
+
+- `src/harness/codex.rs`: the `account/read` probe and C1–C4 move into a Codex
+  adapter preflight; setup records the Codex account identity on the profile
+  (as Claude's evidence already does) and C5 compares against it (stricter
+  than today's first-sample baseline).
+- C8 is satisfied by running the preflight immediately before spawn; C9 by
+  re-checking the bound profile against `resources.yml` at the same point.
+- Proof suite: one test per row, each run against the new preflight alone,
+  plus a differential test that fixture observations refuse under both paths.
+- Decisions (2026-09-22):
+  - **Stickiness is preserved (C7/L9).** Any funding refusal records a durable
+    refusal for that profile and `authorization_revision`; the profile stays
+    refused until setup re-authorizes it, as in 0.4.0.
+  - **Unknown Codex identity refuses.** Stricter than 0.4.0: a Codex profile
+    marked `no_overage_verified` never launches unless the adapter observes the
+    authorized identity (a probe that is unsupported, fails or omits the
+    identity refuses).
+  - **C6 is dropped with pools** in S6b; C1–C5 still refuse.
+
+### S5a as built
+
+- `src/harness/codex.rs` owns the `app-server` account probe (moved from
+  `capacity.rs`, which now calls it) and the refusal rule `codex::refusal`
+  (C1–C5, missing evidence, unobservable identity). Only an executable named
+  `codex` is ever started with `app-server`; any other configured program
+  refuses rather than being run as a probe.
+- Setup records `codex_account` (account digest) on Codex profiles, as it
+  already recorded Claude's evidence. A Codex profile without it is not
+  eligible ("run `dispatch setup codex` to revalidate").
+- The Codex adapter preflight runs at selection and, through `run_harness`,
+  immediately before spawn. A refused preflight is a typed `PreflightRefused`.
+- Migration 22 adds `funding_refusals(funding_key, authorization_revision)`.
+  A refusal at selection or at the spawn boundary is recorded; selection
+  excludes a refused profile, and the native engine checks the record both
+  before admission and again after admission, just before execution.
+- After admission the native engine re-reads `resources.yml` and refuses when
+  the bound profile changed (C9). The narrower window between the spawn-time
+  preflight and the spawn itself is still held by admission's launch fence;
+  S6a's launch observer takes it over before S6b.
+- Proof suite: `tests/funding_safety.rs` (13 cases: authorized, C1–C5,
+  unobservable identity, unreadable account, missing evidence, a change at
+  the spawn boundary, C9, Codex and Claude stickiness), plus the pure-rule
+  tests in `harness::codex`. Codex cases run with `codex_probe: false`, so the
+  capacity path never probes and every refusal comes from the new path.
+  Claude's L1–L8 are one function (`claude::preflight`) called by both paths;
+  the unchanged phase6 `funding` scenarios prove them at the S6b gate.
+- **Pre-existing 0.4.0 defect found:** after a single selection-time
+  preflight rejection, the capacity path keeps refusing the profile even after
+  re-authorization, because selection judges the new revision against the
+  stored rejected observation and setup records no fresh one (Claude always;
+  Codex with `codex_probe: false`). The new path clears on re-authorization;
+  the defect disappears with the capacity path in S6b, which also adds the
+  "launches after re-authorization" tests.
+- Test fixtures: every fake Codex answers the account probe and every Codex
+  profile carries evidence; `timed_out_optional_probe_keeps_a_normal_run_usable_and_explained`
+  was deleted because the unknown-identity decision reverses exactly that
+  behavior (its inverse is `codex_unreadable_account_is_refused`); two phase2
+  message assertions accept the new path's refusal text.
+
 ## Progress log
 
 - 2026-09-22 — S0: branch `release-0.4.1` from `v0.4.0`. Baseline `cargo test`:
@@ -123,3 +225,11 @@ the progress log.
   `src/lock.rs`; the event helper `transition` moved next to `persist_event`;
   `attach`, `serve` and `apply` import named items instead of `super::*`.
   `cargo test`: 489 passed, 0 failed.
+- 2026-09-22 — S5a (additive; the capacity and admission path is untouched and
+  still active): Codex adapter preflight with setup-recorded account evidence,
+  durable sticky funding refusals (migration 22), refusal checks at selection,
+  before admission and at the launch boundary, and the launch-boundary
+  re-read of `resources.yml`. Proof suite `tests/funding_safety.rs` (13) plus
+  `harness::codex` unit tests (11). Found and recorded a pre-existing 0.4.0
+  defect (a rejected profile stays refused after re-authorization in the
+  capacity path). `cargo test`: 512 passed, 0 failed.

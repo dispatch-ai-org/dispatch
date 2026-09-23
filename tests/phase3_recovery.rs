@@ -40,6 +40,16 @@ impl Fixture {
             &format!(
                 r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo 'codex fixture'; exit 0; fi
+if [ "$1" = 'app-server' ]; then
+while IFS= read -r line; do
+case "$line" in
+*'"id":0'*) printf '%s\n' '{{"id":0,"result":{{"userAgent":"fixture"}}}}' ;;
+*'"id":1'*) printf '%s\n' '{{"id":1,"result":{{"account":{{"type":"chatgpt","planType":"plus","email":"fixture@example.invalid"}}}}}}' ;;
+*'"id":2'*) printf '%s\n' '{{"id":2,"result":{{"rateLimitsByLimitId":{{}}}}}}'; exit 0 ;;
+esac
+done
+exit 0
+fi
 model=''; previous=''
 for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previous="$arg"; done
 printf '%s\n' "$model" >> '{root}/invocations'
@@ -89,7 +99,7 @@ test "$(cat result.txt)" = 'ok'
                 agent.display()
             ),
         )?;
-        let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n")).concat();
+        let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")).concat();
         fs::write(
             state.join("resources.yml"),
             format!(
@@ -967,7 +977,7 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
         executable(
             &f.root.join("codex"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo fixture; exit 0; fi\necho call >> '{}'\n{reports}exit {exit}\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo fixture; exit 0; fi\nif [ \"$1\" = 'app-server' ]; then\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{\"userAgent\":\"fixture\"}}}}' ;;\n*'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"account\":{{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}}}}' ;;\n*'\"id\":2'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"rateLimitsByLimitId\":{{}}}}}}'; exit 0 ;;\nesac\ndone\nexit 0\nfi\necho call >> '{}'\n{reports}exit {exit}\n",
                 f.root.join("invocations").display()
             ),
         )?;

@@ -220,7 +220,11 @@ fn a_run_without_coherence_data_reads_as_coherence_capable_with_no_migration() {
     let fixture = Fixture::pre_coherence();
     let entries_before = fixture.state_entries();
     let versions_before = fixture.schema_versions();
-    assert_eq!(versions_before.last(), Some(&21), "{versions_before:?}");
+    assert_eq!(
+        versions_before.last(),
+        Some(&current_schema()),
+        "{versions_before:?}"
+    );
     fixture.strip_coherence();
     let source_before = fixture.source_files();
 
@@ -331,7 +335,7 @@ fn a_run_without_coherence_data_applies_after_an_unrelated_edit() {
         "someone else's work\n"
     );
     assert_eq!(fixture.metadata()["status"], "applied");
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
     assert!(
         fixture
             .state_entries()
@@ -366,7 +370,7 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
         "blocked_by_source_drift"
     );
     assert_eq!(metadata["coherence"]["validity"]["decision"], "refresh");
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
 }
 
 // Found by the manual v0.1.2 upgrade check (WP10b): a run made by 0.1.2 has
@@ -401,7 +405,7 @@ fn a_migrated_v012_run_can_be_checked() {
 #[test]
 fn a_run_this_binary_produces_has_no_attachment() {
     let fixture = Fixture::pre_coherence();
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
     assert!(fixture.metadata().get("attachment").is_none());
     let projection: String = fixture
         .db()
@@ -447,4 +451,12 @@ fn a_run_mode_attached_row_can_be_inserted_after_migration_and_read_back() {
         )
         .unwrap();
     assert_eq!(stored_mode, "attached");
+}
+
+/// The schema version this binary creates; a run it produced needs no migration.
+fn current_schema() -> i64 {
+    dispatch::db::Database::open_in_memory()
+        .unwrap()
+        .schema_version()
+        .unwrap()
 }

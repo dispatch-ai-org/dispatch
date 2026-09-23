@@ -450,6 +450,15 @@ fn print_allocation_decision(decision: &AllocationDecision) {
     println!("Why:\n  {}\n", decision.reason);
 }
 
+/// Why a profile whose funding was refused cannot launch until setup
+/// re-authorizes it (a new `authorization_revision`).
+fn funding_refused_message(profile: &crate::config::ResourceProfile, reason: &str) -> String {
+    format!(
+        "funding authorization revision {} of this {} profile was refused ({reason}); run `dispatch setup {}` to revalidate",
+        profile.authorization_revision, profile.harness, profile.harness
+    )
+}
+
 /// Canonical digest of a resource profile, recorded with capacity
 /// authorizations. serde_json's default map is sorted, so the round-trip
 /// canonicalizes struct and map key order.
@@ -1815,6 +1824,8 @@ struct CandidateExecution {
     checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
     admission_released: bool,
     failure: Option<crate::FailureKind>,
+    /// The adapter preflight refused the launch; nothing was spawned.
+    preflight_refusal: Option<String>,
     candidate: CandidateRecord,
     requested_model: Option<String>,
     resolved_model: Option<String>,
@@ -1875,6 +1886,10 @@ async fn select_available_resource(
                 Some(format!("{} executable unavailable", profile.harness))
             } else if let Err(error) = profile.eligibility() {
                 Some(error.to_string())
+            } else if let Some(refusal) =
+                db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
+            {
+                Some(funding_refused_message(profile, &refusal))
             } else {
                 let mut harnesses = config.harnesses.clone();
                 harnesses.bind_profile(profile);
@@ -1886,6 +1901,11 @@ async fn select_available_resource(
                 {
                     Ok(()) => None,
                     Err(error) => {
+                        db.record_funding_refusal(
+                            &profile.funding_key(),
+                            profile.authorization_revision,
+                            &format!("{error:#}"),
+                        )?;
                         let pool = coordinator.register_pool(
                             &profile.pool,
                             &profile.provider,
@@ -2094,6 +2114,7 @@ async fn execute_candidate(
     let mut checkpoint = None;
     let mut usage_categories = std::collections::BTreeMap::new();
     let mut failure;
+    let mut preflight_refusal = None;
     let mut identities = (None, None, None, None, None, None);
     match execution {
         Ok(result) => {
@@ -2167,9 +2188,14 @@ async fn execute_candidate(
             }
         }
         Err(error) => {
+            preflight_refusal = error
+                .downcast_ref::<crate::harness::PreflightRefused>()
+                .map(|refusal| refusal.0.clone());
             failure = Some(if error.downcast_ref::<rusqlite::Error>().is_some() {
                 crate::FailureKind::InternalState
-            } else if error.to_string().contains("funding revalidation") {
+            } else if preflight_refusal.is_some()
+                || error.to_string().contains("funding revalidation")
+            {
                 crate::FailureKind::Authorization
             } else if error.to_string().contains("launch deferred:") {
                 crate::FailureKind::CapacityAdmission
@@ -2208,6 +2234,7 @@ async fn execute_candidate(
         usage_categories,
         checkpoint,
         admission_released,
+        preflight_refusal,
         failure,
         candidate,
         requested_model: identities.0,
@@ -4402,7 +4429,7 @@ mod tests {
             fs::write(
                 &agent,
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fixture; exit 0; fi\ntouch '{}'\n",
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fixture; exit 0; fi\nif [ \"$1\" = 'app-server' ]; then\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{\"userAgent\":\"fixture\"}}}}' ;;\n*'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"account\":{{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}}}}' ;;\n*'\"id\":2'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"rateLimitsByLimitId\":{{}}}}}}'; exit 0 ;;\nesac\ndone\nexit 0\nfi\ntouch '{}'\n",
                     marker.display()
                 ),
             )?;
@@ -4416,7 +4443,7 @@ mod tests {
             )?;
             fs::write(
                 state.root.join("resources.yml"),
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n",
+                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
             )?;
             let db = Database::open(state.db_path())?;
             if point == 3 {

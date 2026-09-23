@@ -784,6 +784,22 @@ WHEN json_extract(OLD.run_projection_json,'$.allocation.private_evidence') IS NO
 BEGIN SELECT RAISE(ABORT,'private decision snapshot is immutable'); END;
 "#,
     ),
+    (
+        22,
+        "funding_refusals",
+        r#"
+-- A funding refusal is sticky: once an adapter preflight refuses a profile's
+-- funding identity, that authorization revision stays refused until setup
+-- re-authorizes the profile with a new revision.
+CREATE TABLE funding_refusals (
+    funding_key            TEXT NOT NULL,
+    authorization_revision INTEGER NOT NULL,
+    reason                 TEXT NOT NULL,
+    created_at             TEXT NOT NULL,
+    PRIMARY KEY (funding_key, authorization_revision)
+);
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -1097,6 +1113,46 @@ impl Database {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Record that `funding_key` was refused under `authorization_revision`.
+    /// The first reason is kept; later refusals of the same revision add nothing.
+    pub fn record_funding_refusal(
+        &self,
+        funding_key: &str,
+        authorization_revision: u64,
+        reason: &str,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO funding_refusals(funding_key, authorization_revision, reason, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                funding_key,
+                unsigned(authorization_revision, "authorization revision")?,
+                reason,
+                timestamp(Utc::now())
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded refusal of `funding_key` under `authorization_revision`.
+    pub fn funding_refusal(
+        &self,
+        funding_key: &str,
+        authorization_revision: u64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT reason FROM funding_refusals WHERE funding_key = ?1 AND authorization_revision = ?2",
+                params![
+                    funding_key,
+                    unsigned(authorization_revision, "authorization revision")?
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn latest_capacity_observation(
@@ -2425,7 +2481,7 @@ mod tests {
         let path = temp.path().join("state.db");
         let db = Database::open(&path)?;
         db.connection.execute(
-            "INSERT INTO schema_migrations VALUES(22,'future','fixture')",
+            "INSERT INTO schema_migrations VALUES(99,'future','fixture')",
             [],
         )?;
         drop(db);
@@ -2436,7 +2492,7 @@ mod tests {
                 .to_string()
                 .contains("newer than this binary")
         );
-        assert_eq!(Database::open_read_only(&path)?.schema_version()?, 22);
+        assert_eq!(Database::open_read_only(&path)?.schema_version()?, 99);
         assert!(!fs::read_dir(temp.path())?.any(|e| {
             e.unwrap()
                 .file_name()
@@ -2474,7 +2530,7 @@ mod tests {
         )?;
         drop(connection);
         let database = Database::open(&path)?;
-        assert_eq!(database.schema_version()?, 21);
+        assert_eq!(database.schema_version()?, MIGRATIONS.last().unwrap().0);
         let backups = fs::read_dir(tmp.path())?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -2591,7 +2647,7 @@ mod tests {
         drop(connection);
 
         let mut migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 21);
+        assert_eq!(migrated.schema_version()?, MIGRATIONS.last().unwrap().0);
         let backups = fs::read_dir(temp.path())?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -2701,7 +2757,7 @@ mod tests {
     #[test]
     fn applies_migration_and_enables_foreign_keys() -> Result<()> {
         let database = Database::open_in_memory()?;
-        assert_eq!(database.schema_version()?, 21);
+        assert_eq!(database.schema_version()?, MIGRATIONS.last().unwrap().0);
         let foreign_keys: i64 =
             database
                 .connection
@@ -2922,7 +2978,10 @@ mod tests {
                     .state,
                 crate::AdmissionState::Reconciliation
             );
-            assert_eq!(Database::open(&path)?.schema_version()?, 21);
+            assert_eq!(
+                Database::open(&path)?.schema_version()?,
+                MIGRATIONS.last().unwrap().0
+            );
         }
         Ok(())
     }
@@ -2948,7 +3007,7 @@ mod tests {
         }
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 21);
+        assert_eq!(migrated.schema_version()?, MIGRATIONS.last().unwrap().0);
         assert_eq!(
             migrated
                 .latest_goal_feedback("phase-six-history")?
@@ -2988,7 +3047,10 @@ mod tests {
             0
         );
         drop(migrated);
-        assert_eq!(Database::open(&path)?.schema_version()?, 21);
+        assert_eq!(
+            Database::open(&path)?.schema_version()?,
+            MIGRATIONS.last().unwrap().0
+        );
         Ok(())
     }
 
@@ -3014,7 +3076,7 @@ mod tests {
         connection.execute("INSERT INTO attempts(id,run_id,candidate_id,role,ordinal,generation,harness_id,started_at,outcome,raw_telemetry_path) VALUES ('attempt','phase-two','candidate','executor',1,1,'codex',?1,'completed','telemetry')",[timestamp(at(1))])?;
         drop(connection);
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 21);
+        assert_eq!(migrated.schema_version()?, MIGRATIONS.last().unwrap().0);
         assert_eq!(
             migrated.connection.query_row(
                 "SELECT outcome FROM attempts WHERE id='attempt'",
@@ -3066,7 +3128,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 21);
+        assert_eq!(migrated.schema_version()?, MIGRATIONS.last().unwrap().0);
         let violations: i64 = migrated.connection.query_row(
             "SELECT COUNT(*) FROM pragma_foreign_key_check",
             [],
@@ -3087,7 +3149,7 @@ mod tests {
         let path = temp.path().join("nested/state/dispatch.db");
         let database = Database::open(&path)?;
         assert!(path.is_file());
-        assert_eq!(database.schema_version()?, 21);
+        assert_eq!(database.schema_version()?, MIGRATIONS.last().unwrap().0);
         assert_eq!(
             database
                 .connection
@@ -3097,7 +3159,10 @@ mod tests {
         drop(database);
 
         // Opening an already-migrated database is idempotent.
-        assert_eq!(Database::open(&path)?.schema_version()?, 21);
+        assert_eq!(
+            Database::open(&path)?.schema_version()?,
+            MIGRATIONS.last().unwrap().0
+        );
         Ok(())
     }
 

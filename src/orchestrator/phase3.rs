@@ -716,7 +716,7 @@ async fn drive_inner(
             break;
         }
         let selected = &decision.selected;
-        if !resources.profiles.iter().any(|p| {
+        let Some(profile) = resources.profiles.iter().find(|p| {
             p.provider == selected.provider
                 && p.funding_source == selected.funding_source
                 && p.pool == selected.pool
@@ -728,7 +728,7 @@ async fn drive_inner(
                 && p.service_mode == selected.service_mode
                 && p.included
                 && p.no_overage_verified
-        }) {
+        }) else {
             stop(
                 state,
                 db,
@@ -736,6 +736,14 @@ async fn drive_inner(
                 FailureKind::Authorization,
                 "selected route is no longer authorized by the current resource configuration",
             )?;
+            break;
+        };
+        let profile = profile.clone();
+        if let Some(refusal) =
+            db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
+        {
+            let message = super::funding_refused_message(&profile, &refusal);
+            stop(state, db, &mut run, FailureKind::Authorization, &message)?;
             break;
         }
         config.harnesses.bind(&decision.selected, &resources);
@@ -800,6 +808,25 @@ async fn drive_inner(
             let failure = interrupted(&run);
             stop(state, db, &mut run, failure, "cancelled before handoff")?;
             bail!("cancelled before handoff");
+        }
+        // At the launch boundary the bound profile must still be configured
+        // exactly as selected, and its funding must not have been refused by
+        // another process while this attempt waited for admission.
+        let current = crate::config::ResourceConfig::load(&state.root)?;
+        let unchanged = current.profiles.iter().any(|p| {
+            p.enabled && serde_json::to_value(p).ok() == serde_json::to_value(&profile).ok()
+        });
+        let refusal = if unchanged {
+            db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
+                .map(|refusal| super::funding_refused_message(&profile, &refusal))
+        } else {
+            Some("resource configuration changed after selection; stale launch refused".into())
+        };
+        if let Some(message) = refusal {
+            drop(guard);
+            run.admission = db.admission_summary_for_run(&run.id)?;
+            stop(state, db, &mut run, FailureKind::Authorization, &message)?;
+            break;
         }
         let attempt_id = update_attempt_started(&mut run, &candidate.id);
         run.attempts.last_mut().unwrap().detail.admission =
@@ -868,6 +895,14 @@ async fn drive_inner(
         if let Some(capacity) = &run.capacity {
             run.capacity = db.latest_capacity_observation(&capacity.pool_id)?;
             run.attempts.last_mut().unwrap().detail.capacity = run.capacity.clone();
+        }
+        // A refused preflight is sticky for this authorization revision.
+        if let Some(reason) = &execution.preflight_refusal {
+            db.record_funding_refusal(
+                &profile.funding_key(),
+                profile.authorization_revision,
+                reason,
+            )?;
         }
         let candidate = execution.candidate.clone();
         run.candidates = vec![candidate.clone()];

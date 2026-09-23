@@ -118,6 +118,12 @@ pub struct HarnessConfig {
     pub allocation_service_mode: Option<String>,
     #[serde(skip)]
     pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
+    /// Bound from the selected profile: the authorized Codex account and the
+    /// funding source the adapter preflight must observe. Never from YAML.
+    #[serde(skip)]
+    pub codex_account: Option<crate::harness::codex::AccountEvidence>,
+    #[serde(skip)]
+    pub funding_source: Option<String>,
 }
 
 impl HarnessesConfig {
@@ -137,6 +143,8 @@ impl HarnessesConfig {
         config.effort = profile.effort.clone();
         config.allocation_service_mode = Some(profile.service_mode.clone());
         config.claude_subscription = profile.claude_subscription.clone();
+        config.codex_account = profile.codex_account.clone();
+        config.funding_source = Some(profile.funding_source.clone());
     }
     pub fn bind(&mut self, choice: &crate::ResourceChoice, resources: &ResourceConfig) {
         if let Some(profile) = resources.profiles.iter().find(|p| {
@@ -280,6 +288,10 @@ pub struct ResourceProfile {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
+    /// The Codex account authorized at setup; the adapter preflight refuses to
+    /// launch when it observes any other account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_account: Option<crate::harness::codex::AccountEvidence>,
     pub provider: String,
     pub funding_source: String,
     pub harness: String,
@@ -330,7 +342,32 @@ impl ResourceProfile {
         if self.harness == "claude" {
             crate::harness::claude::eligibility(self)?;
         }
+        if self.harness == "codex" {
+            anyhow::ensure!(
+                self.codex_account.is_some(),
+                "Codex account evidence missing; run `dispatch setup codex` to revalidate"
+            );
+        }
         Ok(())
+    }
+
+    /// The funding identity a refusal is recorded against: provider, plan and
+    /// authorized account. With `authorization_revision` it keys the durable
+    /// funding refusals that setup clears by re-authorizing.
+    pub fn funding_key(&self) -> String {
+        let account = self
+            .claude_subscription
+            .as_ref()
+            .map(|e| e.account_sha256.as_str())
+            .or(self
+                .codex_account
+                .as_ref()
+                .map(|e| e.account_sha256.as_str()))
+            .unwrap_or("");
+        format!(
+            "{}/{}/{}/{account}",
+            self.provider, self.harness, self.funding_source
+        )
     }
 }
 
