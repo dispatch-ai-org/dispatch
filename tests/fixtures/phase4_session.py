@@ -104,7 +104,7 @@ try:
             if scenario=='clarify':
                 wait('Which');resize(35,16)
                 with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
-                    assert db.execute('select count(*) from pool_leases').fetchone()[0]==0
+                    assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
                 send(b'\x1b[200~blue\x1b[201~');resize(100,28);send(b'\r')
             wait('Review changes');diff_start=len(clean);send(b'd\r');wait('delivered');pump(.2)
             if scenario!='plain': assert 'index ' not in clean[diff_start:], 'visual diff leaked index hashes'
@@ -160,7 +160,7 @@ try:
             assert run['outcome']['review']=='accepted'
         else:assert run['outcome']['application']=='applied'
         with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
-            if scenario!='concurrent': assert db.execute('select count(*) from pool_leases').fetchone()[0]==0
+            if scenario!='concurrent': assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
     print('PTY passed:',scenario)
 finally:
     try:os.killpg(pid,signal.SIGKILL)

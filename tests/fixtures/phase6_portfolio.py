@@ -33,9 +33,9 @@ def run(f, *args):
     return output,result
 
 
-def no_lease(f):
+def no_live_launch(f):
     with sqlite3.connect(f.state/'dispatch.db') as db:
-        assert db.execute('SELECT COUNT(*) FROM pool_leases').fetchone()[0]==0
+        assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
 
 
 def add_peer(f, binary, first='claude'):
@@ -79,9 +79,7 @@ def scenario(binary, name):
             assert stored['candidates'][0]['tokens']==22 and stored['candidates'][0]['cost_usd'] is None
             assert (f.source/'src/lib.rs').read_text()=='// baseline\n'
             assert f.count()==1
-            no_lease(f)
-            with sqlite3.connect(f.state/'dispatch.db') as db:
-                assert db.execute('SELECT COUNT(*) FROM sync_outbox').fetchone()[0]==0
+            no_live_launch(f)
         elif name in ('selection','missing'):
             peer=add_peer(f,binary,'codex')
             output,result=run(f)
@@ -153,7 +151,7 @@ def scenario(binary, name):
             assert result is not None,(output.stdout,output.stderr)
             assert len(result['attempts'])<=1
             assert f.stored(result['run_id'])['execution']['failure']=='deadline'
-            no_lease(f)
+            no_live_launch(f)
         elif name=='protocol':
             agent=f.root/'claude';original=agent.read_text()
             cases=["print('{broken')", "print(json.dumps({'type':'assistant','message':{'model':'fixture-model'}}))",
@@ -173,7 +171,7 @@ def scenario(binary, name):
                 assert f.count()==before+1
                 assert len(result['attempts'])==1 and result['outcome']['work_result']=='failed'
                 assert not f.stored(result['run_id'])['execution']['questions']
-                no_lease(f)
+                no_live_launch(f)
         elif name=='launch_change':
             # Account checks: selection, then the preflight at the spawn boundary.
             (f.root/'auth-boundary').write_text('2')
@@ -185,7 +183,7 @@ def scenario(binary, name):
             # Restoring credentials alone must not renew the invalidated epoch.
             auth=f.root/'auth.json';value=json.loads(auth.read_text());value['email']='fixture@example.invalid';auth.write_text(json.dumps(value))
             output,_=run(f);assert output.returncode!=0 and f.count()==0
-            no_lease(f)
+            no_live_launch(f)
         elif name=='settings':
             directory=f.source/'.claude';directory.mkdir()
             (directory/'settings.json').write_text(json.dumps({'hooks':{'SessionStart':[{'command':'must-not-run'}]},'apiKeyHelper':'must-not-run','fastMode':True,'fallbackModel':['credit-model']}))

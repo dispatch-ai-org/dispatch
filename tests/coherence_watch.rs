@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Launches that are not known to be over: none may outlast a run.
+const LIVE_LAUNCHES: &str = "attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')";
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -419,7 +422,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
                 .starts_with("work stopped: the source changed underneath it (")
         );
         // Nothing counts against the agent and nothing is left leased.
-        assert_eq!(f.count("pool_leases")?, 0);
+        assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
         assert_eq!(f.count("routing_observations")?, 0);
         assert_eq!(f.count("goal_feedback_revisions")?, 0);
         assert_eq!(f.count("evaluations")?, 0);
@@ -452,6 +455,6 @@ fn a_second_run_after_a_stopped_one_works() -> Result<()> {
     f.release()?;
     let output = child.output()?;
     assert!(output.status.success(), "{}", Fixture::result(&output)?);
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     Ok(())
 }

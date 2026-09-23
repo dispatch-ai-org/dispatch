@@ -400,7 +400,6 @@ fn choose_profile(
         "The first available configured profile was selected."
     };
     Ok(crate::AllocationDecision {
-        private_evidence: None,
         version: 1,
         policy_version: "first-available-profile-v1".into(),
         selected,
@@ -581,7 +580,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
         status: RunStatus::Preparing,
-        mode: RunMode::Allocation,
+        mode: RunMode::Native,
         state_revision: 0,
         outcome: RunOutcome {
             lifecycle: LifecycleState::Preparing,
@@ -1884,7 +1883,8 @@ pub fn refresh_request(
     let agent = goal
         .and_then(|goal| goal.fixed_harness.clone())
         .or_else(|| {
-            (run.mode != RunMode::Allocation)
+            run.allocation
+                .is_none()
                 .then(|| run.candidates.first().map(|c| c.harness_id.clone()))
                 .flatten()
         });

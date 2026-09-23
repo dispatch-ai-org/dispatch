@@ -70,7 +70,7 @@ fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_s
         .clone();
     let result: Value = serde_json::from_slice(&output)?;
     let run_id = result["run_id"].as_str().unwrap();
-    assert_eq!(result["mode"], "allocation");
+    assert_eq!(result["mode"], "native");
     assert_eq!(
         result["allocation"]["selected"]["requested_model"],
         "configured-model"
@@ -103,9 +103,7 @@ fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_s
         [run_id],
         |row| row.get(0),
     )?;
-    let outbox: i64 =
-        database.query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))?;
-    assert_eq!((routing, allocation, outbox), (0, 1, 0));
+    assert_eq!((routing, allocation), (0, 1));
 
     let status: Value = serde_json::from_slice(
         &cargo_bin_cmd!("dispatch")
@@ -330,7 +328,7 @@ fn quota_failure_mid_attempt_stops_without_a_paid_or_model_fallback() -> anyhow:
         .stdout
         .clone();
     let result: Value = serde_json::from_slice(&output)?;
-    assert_eq!(result["mode"], "allocation");
+    assert_eq!(result["mode"], "native");
     assert_eq!(result["outcome"]["work_result"], "failed");
     assert_eq!(result["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(result["attempts"][0]["outcome"], "failed");

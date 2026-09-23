@@ -380,15 +380,14 @@ fn a_migrated_v012_run_can_be_checked() {
     );
 }
 
-// S1 (attach part 14.1/14.2): schema 21 widens `runs.run_mode`'s CHECK to
-// accept `'attached'`, and `RunRecord.attachment` is a new optional field.
-// The schema-20-to-21 rebuild itself (with rows in `attempts`, `control_runs`
-// and `planned_goals` referencing the migrated run) is proven in
-// `src/db.rs`'s own migration-fixture tests, which have direct access to the
-// private `MIGRATIONS` array this crate's tests cannot reach. These two
-// tests cover what is reachable from here: a run this (already schema-21)
-// binary produces has no `attachment` in its stored record, and the widened
-// CHECK really does accept and round-trip `run_mode = 'attached'`.
+// `runs.run_mode` accepts `'native'` and `'attached'`, and
+// `RunRecord.attachment` is optional. The rebuilds of `runs` themselves
+// (migrations 21 and 24, with child rows referencing the migrated run) are
+// proven in `src/db.rs`'s own migration-fixture tests, which have direct
+// access to the private `MIGRATIONS` array this crate's tests cannot reach.
+// These two tests cover what is reachable from here: a run this binary
+// produces has no `attachment` in its stored record, and the CHECK really
+// does accept and round-trip `run_mode = 'attached'`.
 #[test]
 fn a_run_this_binary_produces_has_no_attachment() {
     let fixture = Fixture::pre_coherence();

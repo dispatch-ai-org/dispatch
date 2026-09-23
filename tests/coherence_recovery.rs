@@ -124,6 +124,9 @@ impl Drop for OrphanGuard {
 }
 
 /// A Git source whose `codex` agent blocks on a FIFO mid-run.
+/// Launches that are not known to be over: none may outlast a run.
+const LIVE_LAUNCHES: &str = "attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')";
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -354,17 +357,12 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     drop(db);
     assert_eq!(f.count("evaluations")?, 0);
 
-    // Cleanup per the existing helpers: the orphaned agent is stopped, and once
-    // the dead owner's lease has expired the next admission reclaims it.
+    // Cleanup: the orphaned agent is stopped before the next run starts.
     assert!(alive(pid), "kill -9 of the supervisor leaves the agent");
     // SAFETY: the pid is the fixture agent recorded in `agent.pid`.
     unsafe { libc::kill(pid, libc::SIGKILL) };
     orphan.0 = None;
     wait_until(|| Ok(!alive(pid)))?;
-    rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute(
-        "UPDATE pool_leases SET expires_at = '2000-01-01T00:00:00Z'",
-        [],
-    )?;
     fs::remove_file(f.root.join("started"))?;
     git(&f.source, &["checkout", "--quiet", "--", "src/lib.rs"])?;
     let mut next = f.start()?;
@@ -372,7 +370,6 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     f.release()?;
     let output = next.output()?;
     assert!(output.status.success(), "{}", Fixture::result(&output)?);
-    assert_eq!(f.count("pool_leases")?, 0, "no lease is left behind");
     // The interrupted run is still not acceptable, and is still loadable.
     assert!(!f.command().args(["accept", &id]).output()?.status.success());
     assert!(f.loaded(&id).is_ok());
@@ -521,7 +518,7 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
     );
     assert_eq!(f.count("runs")?, runs_before, "no run may be created");
     assert_eq!(f.count("attempts")?, 1);
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     assert_eq!(tree(&f.source), source_before);
     let check = f.command().args(["check", &old]).output()?;
     assert!(Fixture::stderr(&check).contains("not a ready, unapplied result"));
@@ -548,6 +545,6 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&checked.stdout)
     );
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     Ok(())
 }

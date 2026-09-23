@@ -819,6 +819,97 @@ CREATE TABLE attempt_launches (
 CREATE INDEX attempt_launches_run_idx ON attempt_launches(run_id);
 "#,
     ),
+    (
+        24,
+        "native_and_attached_only",
+        r#"
+-- 0.4.1 removed sync, public priors, routing, capacity, admission, the
+-- control protocol, private evidence and planning. Their tables and triggers
+-- go; the pre-upgrade backup keeps every row. Human judgments stay:
+-- `goal_feedback_revisions`, and the blind `evaluations` and routed-run
+-- `routing_observations`/`routing_feedback_events` recorded before 0.4.1.
+DROP TRIGGER IF EXISTS private_decision_immutable;
+DROP TRIGGER IF EXISTS private_launch_insert;
+DROP TRIGGER IF EXISTS private_launch_update;
+DROP TRIGGER IF EXISTS planned_launch_update;
+DROP TABLE IF EXISTS sync_outbox;
+DROP TABLE IF EXISTS sync_settings;
+DROP TABLE IF EXISTS benchmark_priors;
+DROP TABLE IF EXISTS distributed_public_prior_snapshot;
+DROP TABLE IF EXISTS admission_requests;
+DROP TABLE IF EXISTS pool_leases;
+DROP TABLE IF EXISTS resource_pools;
+DROP TABLE IF EXISTS capacity_observation_constraints;
+DROP TABLE IF EXISTS capacity_observations;
+DROP TABLE IF EXISTS capacity_authorizations;
+DROP TABLE IF EXISTS control_grants;
+DROP TABLE IF EXISTS control_runs;
+DROP TABLE IF EXISTS command_receipts;
+DROP TABLE IF EXISTS private_annotations;
+DROP TABLE IF EXISTS private_fixture_domain;
+DROP TABLE IF EXISTS private_policy_transitions;
+DROP TABLE IF EXISTS private_proposals;
+DROP TABLE IF EXISTS planned_artifacts;
+DROP TABLE IF EXISTS planned_invocations;
+DROP TABLE IF EXISTS planned_snapshots;
+DROP TABLE IF EXISTS planned_tasks;
+DROP TABLE IF EXISTS planned_goals;
+DROP INDEX IF EXISTS private_source_path;
+
+-- Every run Dispatch executes is `native`; earlier modes map onto it. The
+-- routing decision now lives only in the run's own projection.
+PRAGMA legacy_alter_table = ON;
+ALTER TABLE runs RENAME TO runs_v23;
+CREATE TABLE runs (
+    id                  TEXT PRIMARY KEY,
+    source_id           INTEGER NOT NULL REFERENCES sources(id),
+    task                TEXT NOT NULL,
+    exact_prompt        TEXT NOT NULL,
+    baseline_path       TEXT NOT NULL,
+    baseline_commit     TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    completed_at        TEXT,
+    dispatch_version    TEXT NOT NULL,
+    os                  TEXT NOT NULL,
+    architecture        TEXT NOT NULL,
+    execution_backend   TEXT NOT NULL,
+    timeout_secs        INTEGER NOT NULL,
+    cpus                REAL NOT NULL,
+    memory              TEXT NOT NULL,
+    max_parallel        INTEGER NOT NULL,
+    applied_candidate   TEXT,
+    docker_image        TEXT,
+    resource_limits_enforced INTEGER NOT NULL DEFAULT 0,
+    unsafe_local        INTEGER NOT NULL DEFAULT 0,
+    forwarded_env_json  TEXT NOT NULL DEFAULT '[]',
+    run_mode            TEXT NOT NULL DEFAULT 'native'
+        CHECK (run_mode IN ('native', 'attached')),
+    state_revision      INTEGER NOT NULL DEFAULT 0 CHECK (state_revision >= 0),
+    outcome_json        TEXT NOT NULL,
+    run_projection_json TEXT,
+    delivery_attempt_id TEXT REFERENCES attempts(id)
+);
+INSERT INTO runs(
+    id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+    created_at, completed_at, dispatch_version, os, architecture,
+    execution_backend, timeout_secs, cpus, memory, max_parallel,
+    applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+    forwarded_env_json, run_mode, state_revision,
+    outcome_json, run_projection_json, delivery_attempt_id
+)
+SELECT id, source_id, task, exact_prompt, baseline_path, baseline_commit, status,
+       created_at, completed_at, dispatch_version, os, architecture,
+       execution_backend, timeout_secs, cpus, memory, max_parallel,
+       applied_candidate, docker_image, resource_limits_enforced, unsafe_local,
+       forwarded_env_json,
+       CASE run_mode WHEN 'attached' THEN 'attached' ELSE 'native' END,
+       state_revision, outcome_json, run_projection_json, delivery_attempt_id
+FROM runs_v23;
+DROP TABLE runs_v23;
+PRAGMA legacy_alter_table = OFF;
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.
@@ -854,12 +945,6 @@ impl Database {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         Ok(Self { connection })
-    }
-
-    /// Authoritative control and admission writes share the ordinary durable
-    /// connection. Model execution never owns a database write transaction.
-    pub fn open_control(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(path)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -995,13 +1080,13 @@ impl Database {
             if applied.contains(version) {
                 continue;
             }
-            // Migrations 13 and 21 rebuild `runs` (rename, recreate, copy,
+            // Migrations 13, 21 and 24 rebuild `runs` (rename, recreate, copy,
             // drop). `PRAGMA foreign_keys` is a schema-level setting that is a
             // no-op inside a transaction, so it must be toggled here, on the
             // connection, before the migration's transaction begins: with it
             // left on, `DROP TABLE runs_v*` fails once any row in `attempts`,
             // `control_runs` or `planned_goals` references a run.
-            let rebuilds_runs = *version == 13 || *version == 21;
+            let rebuilds_runs = matches!(*version, 13 | 21 | 24);
             if rebuilds_runs {
                 self.connection.pragma_update(None, "foreign_keys", false)?;
             }
@@ -1701,7 +1786,10 @@ fn insert_attempt(transaction: &Transaction<'_>, attempt: &AttemptRecord) -> Res
         .optional()?
         .flatten();
     if let Some(old) = old {
-        anyhow::ensure!(old == details, "completed attempt evidence is immutable");
+        anyhow::ensure!(
+            same_attempt(&old, attempt)?,
+            "completed attempt evidence is immutable"
+        );
         return Ok(());
     }
     transaction.execute(
@@ -1865,6 +1953,16 @@ fn timestamp_from_sql(column: usize, value: String) -> rusqlite::Result<DateTime
     })
 }
 
+/// Whether `attempt` is the completed attempt recorded as `stored`. Both are
+/// read through the current type, so a field an earlier version wrote and
+/// this one no longer reads is not a change; the stored row is never
+/// rewritten, so it keeps that field.
+fn same_attempt(stored: &str, attempt: &AttemptRecord) -> Result<bool> {
+    let stored: AttemptRecord =
+        serde_json::from_str(stored).context("invalid recorded attempt evidence")?;
+    Ok(serde_json::to_value(stored)? == serde_json::to_value(attempt)?)
+}
+
 fn unsigned(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value).with_context(|| format!("{field} is too large for SQLite"))
 }
@@ -1890,7 +1988,7 @@ fn validate_terminal_write(
                 .find(|a| a.id == id)
                 .context("completed attempt cannot be removed")?;
             anyhow::ensure!(
-                serde_json::to_string(attempt)? == original,
+                same_attempt(&original, attempt)?,
                 "completed attempt evidence is immutable"
             );
         }
@@ -2098,7 +2196,7 @@ mod tests {
             baseline_path: PathBuf::from(format!("/state/{id}/baseline")),
             baseline_commit: "0123456789abcdef".to_owned(),
             status: RunStatus::ReadyForEvaluation,
-            mode: crate::RunMode::Legacy,
+            mode: crate::RunMode::Native,
             state_revision: 0,
             outcome: crate::RunOutcome::default(),
             created_at: at(1),
@@ -2146,6 +2244,145 @@ mod tests {
                           30, 1.0, '1g', 1)"#,
             params![id, timestamp(at(1))],
         )?;
+        Ok(())
+    }
+
+    /// A 0.4.0 state directory (schema 21): a routed run whose projection
+    /// still carries `phase3` and `routing`, with a blind evaluation and a
+    /// routing observation. Migration 24 keeps the run and the human judgments, maps
+    /// the mode to `native`, and the run can be rewritten afterwards.
+    #[test]
+    fn schema21_run_upgrades_to_native_and_stays_writable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("v040.db");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL);")?;
+        for (version, name, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 21) {
+            if *version == 13 || *version == 21 {
+                connection.pragma_update(None, "foreign_keys", false)?;
+            }
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?1,?2,?3)",
+                params![version, name, timestamp(at(1))],
+            )?;
+            if *version == 12 {
+                insert_legacy_run(&connection, "routed-040")?;
+            }
+        }
+        let mut projection = serde_json::to_value(run("routed-040"))?;
+        let object = projection.as_object_mut().unwrap();
+        object.insert("mode".into(), json!("routed"));
+        object.remove("execution");
+        object.insert(
+            "phase3".into(),
+            json!({
+                "max_invocations": 2, "deadline_at": timestamp(at(3)),
+                "fixed_model": null, "fixed_effort": null, "owner_uid": 501,
+                "final_attempt_id": null, "contributing_attempts": [],
+                "provenance": "goal", "failure": null, "questions": []
+            }),
+        );
+        object.insert("routing".into(), json!({"selected_harness": "codex"}));
+        // A completed attempt as 0.4.0 recorded it, with detail fields this
+        // version no longer reads.
+        let attempt = json!({
+            "detail": {
+                "task_id": "task-1", "usage_categories": {}, "parent_attempt_id": null,
+                "reason": null, "input_baseline": null, "decision": null,
+                "admission": {"request_id": "request-1"}, "capacity": null,
+                "result": null, "failure": null
+            },
+            "id": "attempt-040", "run_id": "routed-040", "candidate_id": "candidate",
+            "role": "executor", "ordinal": 1, "generation": 1, "harness_id": "codex",
+            "harness_version": null, "requested_model": null, "resolved_model": null,
+            "observed_model": null, "requested_effort": null, "resolved_effort": null,
+            "observed_effort": null, "started_at": timestamp(at(1)),
+            "completed_at": timestamp(at(2)), "outcome": "completed",
+            "raw_telemetry_path": "telemetry", "resource": null
+        });
+        object.insert("attempts".into(), json!([attempt]));
+        connection.execute(
+            "INSERT INTO attempts(id, run_id, candidate_id, role, ordinal, generation, harness_id, \
+             started_at, completed_at, outcome, raw_telemetry_path, details_json) VALUES \
+             ('attempt-040', 'routed-040', 'candidate', 'executor', 1, 1, 'codex', ?1, ?2, \
+              'completed', 'telemetry', ?3)",
+            params![timestamp(at(1)), timestamp(at(2)), attempt.to_string()],
+        )?;
+        connection.execute(
+            "UPDATE runs SET run_mode='routed', routing_decision_json='{}', \
+             run_projection_json=?1 WHERE id='routed-040'",
+            [projection.to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO evaluations(run_id, outcome, explanation, created_at, blind, public_id) \
+             VALUES ('routed-040', 'tie', 'both fine', ?1, 1, 'evaluation-routed-040')",
+            [timestamp(at(2))],
+        )?;
+        connection.execute(
+            "INSERT INTO routing_observations VALUES ('observation', 'routed-040', 'candidate', ?1, ?1, '{}')",
+            [timestamp(at(2))],
+        )?;
+        drop(connection);
+
+        let mut migrated = Database::open(&path)?;
+        assert_eq!(migrated.schema_version()?, MIGRATIONS.last().unwrap().0);
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT run_mode FROM runs WHERE id='routed-040'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "native"
+        );
+        let mut loaded = migrated.committed_run_projection("routed-040")?.unwrap();
+        assert_eq!(loaded.mode, RunMode::Native);
+        assert!(loaded.execution.is_some());
+        assert_eq!(loaded.historical["routing"]["selected_harness"], "codex");
+        // An ordinary rewrite keeps the historical fields.
+        loaded.state_revision += 1;
+        migrated.sync_run(&loaded)?;
+        let rewritten: serde_json::Value = serde_json::from_str(&migrated.connection.query_row(
+            "SELECT run_projection_json FROM runs WHERE id='routed-040'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        assert_eq!(rewritten["mode"], "native");
+        assert_eq!(rewritten["routing"]["selected_harness"], "codex");
+        // The completed attempt is the same evidence; its row keeps what
+        // 0.4.0 recorded.
+        let details: serde_json::Value = serde_json::from_str(&migrated.connection.query_row(
+            "SELECT details_json FROM attempts WHERE id='attempt-040'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?)?;
+        assert_eq!(details["detail"]["admission"]["request_id"], "request-1");
+        let mut changed = loaded.clone();
+        changed.attempts[0].outcome = "failed".into();
+        changed.state_revision += 1;
+        assert!(
+            migrated.sync_run(&changed).is_err(),
+            "a completed attempt still cannot change"
+        );
+        for table in ["evaluations", "routing_observations"] {
+            assert_eq!(
+                migrated.connection.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id='routed-040'"),
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )?,
+                1,
+                "{table} keeps the human judgment"
+            );
+        }
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get::<_, u32>(0)
+            )?,
+            0
+        );
         Ok(())
     }
 
@@ -2256,22 +2493,27 @@ mod tests {
                 .execution
                 .is_none()
         );
+        // The grant is in the backup; the control tables themselves are gone.
         assert_eq!(
-            database
-                .connection
-                .query_row("SELECT COUNT(*) FROM planned_goals", [], |r| r
-                    .get::<_, u32>(0))?,
-            0
+            backup_grants(&backups[0].path())?,
+            1,
+            "the pre-upgrade backup keeps the removed control grant"
         );
         Ok(())
     }
 
-    /// S1 (`attached_work_mode`): a schema-20 state directory with a run that
-    /// has rows in `attempts`, `control_runs` and `planned_goals` (the three
-    /// tables the migration-13-style rebuild of `runs` must not orphan)
-    /// upgrades cleanly to schema 21, keeps the index and trigger migration
-    /// 19 added on `runs`, and a fresh `run_mode = 'attached'` row can be
-    /// written and read back afterward.
+    fn backup_grants(path: &Path) -> Result<u32> {
+        Ok(Database::open_read_only(path)?.connection.query_row(
+            "SELECT COUNT(*) FROM control_grants",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A schema-20 state directory with a run that has rows in `attempts`,
+    /// `control_runs` and `planned_goals` upgrades through both rebuilds of
+    /// `runs` (migrations 21 and 24) without orphaning a foreign key, and a
+    /// fresh `run_mode = 'attached'` row can be written and read back.
     #[test]
     fn schema20_run_with_child_rows_survives_attached_mode_migration() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -2348,41 +2590,29 @@ mod tests {
             )?,
             "completed"
         );
-        assert_eq!(
-            migrated.connection.query_row(
-                "SELECT session_id FROM control_runs WHERE run_id='pre-attach'",
-                [],
-                |row| row.get::<_, String>(0)
-            )?,
-            "session-pre"
-        );
-        assert_eq!(
-            migrated.connection.query_row(
-                "SELECT revision FROM planned_goals WHERE run_id='pre-attach'",
-                [],
-                |row| row.get::<_, String>(0)
-            )?,
-            "revision-pre"
-        );
-
-        // The index and the private-evidence-immutability trigger migration
-        // 19 added on `runs` are not silently dropped by the rebuild.
-        assert!(migrated.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='private_runs_source_window')",
+        // Migration 24 removed the control and planning tables that held
+        // this run's other child rows, and the private-evidence index and
+        // trigger on `runs`, and mapped the legacy mode onto `native`.
+        assert!(!migrated.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name IN \
+             ('control_runs','planned_goals','private_runs_source_window','private_decision_immutable'))",
             [],
             |row| row.get::<_, bool>(0)
         )?);
-        assert!(migrated.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='private_decision_immutable')",
-            [],
-            |row| row.get::<_, bool>(0)
-        )?);
+        assert_eq!(
+            migrated.connection.query_row(
+                "SELECT run_mode FROM runs WHERE id='pre-attach'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "native"
+        );
 
         // The pre-migration run has no attachment: an old `run.json`/
         // projection with no `attachment` key deserializes to `None`.
         let old_run = migrated.committed_run_projection("pre-attach")?.unwrap();
         assert!(old_run.attachment.is_none());
-        assert_eq!(old_run.mode, RunMode::Legacy);
+        assert_eq!(old_run.mode, RunMode::Native);
 
         // A `run_mode = 'attached'` row can be written and read back through
         // the ordinary `sync_run` path now that the CHECK is widened.
@@ -2448,21 +2678,14 @@ mod tests {
             "events",
             "evaluations",
             "evaluation_reasons",
-            "sync_settings",
-            "sync_outbox",
-            "benchmark_priors",
             "routing_observations",
             "routing_feedback_events",
             "attempts",
             "allocation_decisions",
             "goal_feedback_revisions",
-            "resource_pools",
-            "capacity_observations",
-            "capacity_authorizations",
-            "capacity_observation_constraints",
-            "admission_requests",
-            "pool_leases",
             "clarifications",
+            "funding_refusals",
+            "attempt_launches",
         ] {
             let exists: bool = database.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -2471,6 +2694,18 @@ mod tests {
             )?;
             assert!(exists, "missing {table} table");
         }
+        let removed: i64 = database.connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'sync_%' OR name LIKE 'capacity_%' \
+             OR name LIKE 'private_%' OR name LIKE 'planned_%' OR name LIKE 'control_%' \
+             OR name IN ('admission_requests', 'pool_leases', 'resource_pools', \
+                         'benchmark_priors', 'command_receipts')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            removed, 0,
+            "0.4.1 removed these tables, indexes and triggers"
+        );
         database.health_check()
     }
 
@@ -2526,21 +2761,6 @@ mod tests {
                 |r| r.get::<_, u64>(0)
             )?,
             2
-        );
-        assert_eq!(
-            migrated
-                .connection
-                .query_row("SELECT COUNT(*) FROM private_annotations", [], |r| r
-                    .get::<_, u64>(0))?,
-            0
-        );
-        assert_eq!(
-            migrated.connection.query_row(
-                "SELECT COUNT(*) FROM private_policy_transitions",
-                [],
-                |r| r.get::<_, u64>(0)
-            )?,
-            0
         );
         assert_eq!(
             migrated.connection.query_row(

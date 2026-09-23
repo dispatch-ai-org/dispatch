@@ -55,11 +55,16 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
+    /// Work Dispatch selected an agent for and executed. Runs made before
+    /// 0.4.1 recorded `legacy`, `routed`, `allocation` or `comparison`.
     #[default]
-    Legacy,
-    Routed,
-    Allocation,
-    Comparison,
+    #[serde(
+        alias = "legacy",
+        alias = "routed",
+        alias = "allocation",
+        alias = "comparison"
+    )]
+    Native,
     /// External work Dispatch observes and can apply, but did not select,
     /// route or execute. See `AttachmentRecord`.
     Attached,
@@ -68,10 +73,7 @@ pub enum RunMode {
 impl RunMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Legacy => "legacy",
-            Self::Routed => "routed",
-            Self::Allocation => "allocation",
-            Self::Comparison => "comparison",
+            Self::Native => "native",
             Self::Attached => "attached",
         }
     }
@@ -699,12 +701,6 @@ pub struct AllocationAlternative {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocationDecision {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Opaque decision-time evidence written by the removed private-evidence
-    /// policy (0.4.0 and earlier). Kept verbatim so older run projections
-    /// round-trip: the `private_decision_immutable` trigger refuses any rewrite
-    /// that changes it, until migration 22 drops that trigger.
-    pub private_evidence: Option<serde_json::Value>,
     pub version: u32,
     pub policy_version: String,
     pub selected: ResourceChoice,
@@ -920,7 +916,7 @@ mod tests {
         }"#;
         let run: RunRecord = serde_json::from_str(old_run_json).unwrap();
         assert!(run.attachment.is_none());
-        assert_eq!(run.mode, RunMode::Legacy);
+        assert_eq!(run.mode, RunMode::Native);
     }
 
     #[test]

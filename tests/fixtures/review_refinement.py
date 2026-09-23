@@ -227,7 +227,7 @@ def run_fixture(binary, source, state, scenario):
         fingerprints = [path.read_bytes() for path in immutable]
         assert run["outcome"]["review"] == "pending"
         with sqlite3.connect(state / "dispatch.db") as connection:
-            assert connection.execute("select count(*) from pool_leases").fetchone()[0] == 0
+            assert connection.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0] == 0
         if scenario == "unverified":
             assert "Unverified" in session.clean and "no checks configured" in session.clean
         if scenario in ("editor-return", "editor-cancel"):

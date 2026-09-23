@@ -201,13 +201,16 @@ test "$(cat result.txt)" = 'ok'
             );
         }
         assert_eq!(self.count(), 1);
-        self.no_leases()
+        self.no_live_launches()
     }
-    fn no_leases(&self) -> Result<()> {
+    fn no_live_launches(&self) -> Result<()> {
         let db = rusqlite::Connection::open(self.state.join("dispatch.db"))?;
         assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM pool_leases", [], |r| r
-                .get::<_, i64>(0))?,
+            db.query_row(
+                "SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
             0
         );
         Ok(())
@@ -224,7 +227,7 @@ fn initial_success_selects_first_without_recovery() -> Result<()> {
     assert_eq!(r["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(r["execution"]["final_attempt_id"], r["attempts"][0]["id"]);
     assert_eq!(r["outcome"]["verification"], "passed");
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -283,7 +286,7 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     assert_eq!(o.status.code(), Some(4));
     assert_eq!(r["outcome"]["lifecycle"], "waiting");
     assert_eq!(r["outcome"]["waiting_on"], "human");
-    f.no_leases()?;
+    f.no_live_launches()?;
     let before = f.loaded(r["run_id"].as_str().unwrap())?;
     assert_eq!(
         serde_json::to_value(before.execution.as_ref().unwrap().questions.clone())?,
@@ -309,7 +312,7 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     assert_eq!(launches, 2);
     assert!(!f.answer(&r, "1")?.status.success());
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -349,7 +352,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
         dispatch::WorkResult::Cancelled
     );
     assert_eq!(f.count(), 1);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -366,7 +369,7 @@ fn checkpoint_continuation_cannot_create_third_invocation_and_malformed_stops() 
             assert_eq!(f.count(), 2);
             assert_ne!(second["outcome"]["waiting_on"], "human");
         }
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -421,14 +424,14 @@ fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     let r = Fixture::result(&f.run(&["--timeout", "5"])?)?;
     assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
-    f.no_leases()?;
+    f.no_live_launches()?;
     let g = Fixture::new("clarify")?;
     let r = Fixture::result(&g.run(&["--timeout", "5"])?)?;
     thread::sleep(Duration::from_secs(5));
     let answer = Fixture::result(&g.answer(&r, "1")?)?;
     assert_eq!(answer["execution"]["failure"], "deadline");
     assert_eq!(g.count(), 1);
-    g.no_leases()
+    g.no_live_launches()
 }
 
 #[test]
@@ -472,7 +475,7 @@ fn question_commands_reject_wrong_identity_generation_and_local_actor() -> Resul
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("unauthorized local caller"));
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -504,7 +507,7 @@ fn continuation_rechecks_configuration_and_shared_funding() -> Result<()> {
         assert_eq!(f.count(), 1);
         assert_eq!(result["execution"]["failure"], "authorization");
         assert_eq!(result["execution"]["questions"][0]["state"], "answered");
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -537,7 +540,7 @@ fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() 
         assert_eq!(status["execution"], result["execution"]);
         assert_eq!(status["outcome"], result["outcome"]);
         assert_eq!(f.count(), if mode == "recovery" { 2 } else { 1 });
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -585,15 +588,10 @@ fn completed_attempt_evidence_and_rejection_cannot_be_rewritten() -> Result<()> 
         .is_err()
     );
     assert_eq!(f.count(), 1);
-    // Review remains local; accepting/rejecting creates no legacy observation/upload.
+    // Review creates no legacy routing observation.
     let conn = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM routing_observations", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r
             .get::<_, i64>(0))?,
         0
     );
@@ -617,7 +615,7 @@ fn verification_infrastructure_failure_does_not_trigger_recovery() -> Result<()>
         result["attempts"][0]["detail"]["failure"],
         "verification_infrastructure"
     );
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -663,7 +661,7 @@ fn unavailable_baseline_tool_stops_before_model_invocation() -> Result<()> {
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 0);
     assert_eq!(result["execution"]["failure"], "baseline_infrastructure");
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -688,7 +686,7 @@ fn checkpoint_requires_clean_exit_and_a_final_agent_report() -> Result<()> {
                 "unsupported_checkpoint"
             }
         );
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -708,7 +706,7 @@ fn signal_killed_verification_is_unknown_and_never_recovers() -> Result<()> {
     let checks = &result["attempts"][0]["detail"]["result"]["checks"];
     assert_eq!(checks[0]["status"], "failed");
     assert!(checks[0]["exit_code"].is_null());
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -733,7 +731,7 @@ fn any_infrastructure_or_unknown_check_blocks_other_target_failures() -> Result<
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0]["exit_code"], 1);
         assert_eq!(checks[1]["status"], "failed");
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -781,7 +779,7 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
             );
         }
         assert_eq!(f.count(), 1);
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -892,7 +890,7 @@ fn dead_owner_after_attempt_finish_is_repaired_but_live_owner_is_not() -> Result
     assert_eq!(before.outcome.lifecycle, dispatch::LifecycleState::Working);
     assert!(child.0.try_wait()?.is_none());
     assert!(before.attempts.iter().all(|a| a.completed_at.is_some()));
-    f.no_leases()?;
+    f.no_live_launches()?;
     child.0.kill()?;
     child.0.wait()?;
     f.assert_interrupted(&before)
@@ -923,7 +921,7 @@ fn dead_owner_after_answer_commit_is_repaired_without_replaying_or_reopening() -
         dispatch::LifecycleState::Preparing
     );
     assert!(child.0.try_wait()?.is_none());
-    f.no_leases()?;
+    f.no_live_launches()?;
     child.0.kill()?;
     child.0.wait()?;
     f.assert_interrupted(&before)?;
@@ -1029,7 +1027,7 @@ fn phase4_natural_goal_reaches_review_with_light_and_standard_profiles_only() ->
         fs::read_to_string(f.source.join("main.c"))?,
         "int ballRadius = 20;\n"
     );
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -1184,7 +1182,7 @@ fn phase4_two_foreground_sessions_keep_their_own_deliveries() -> Result<()> {
         );
     }
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[tokio::test]

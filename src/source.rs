@@ -1676,7 +1676,7 @@ mod tests {
             baseline_path: snapshot.baseline_path.clone(),
             baseline_commit: snapshot.baseline_commit.clone(),
             status: RunStatus::Evaluated,
-            mode: crate::RunMode::Legacy,
+            mode: crate::RunMode::Native,
             state_revision: 0,
             outcome: crate::RunOutcome::default(),
             created_at: Utc::now(),

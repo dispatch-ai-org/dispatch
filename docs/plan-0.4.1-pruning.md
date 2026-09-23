@@ -40,7 +40,7 @@ the progress log.
 | S6b | **Gated on S5a + S6a.** Delete admission and capacity; the S5a/S6a suites are not modified |
 | S7a | Every native run goes through the one native engine; migrate tests from `--harnesses fake-* … apply <id> A` to `--agent fake-* … accept <id>` |
 | S7b | Delete the inline Routed/Comparison loop, `compare`, `evaluate`, `inspect`, hidden `apply`; rename `phase3.rs` to `native.rs` |
-| S8 | `RunMode` → `{Native, Attached}`; one human-review record; single-lock accept; migration 22 drops the obsolete tables |
+| S8 | `RunMode` → `{Native, Attached}`; one human-review record; single-lock accept; migration 24 drops the obsolete tables |
 | S9 | Shared Work constructor and delivery step; watcher and serve share one observe/settle step |
 | S10 | CLI, config and docs tightening; release notes; real-agent dogfood; release |
 
@@ -356,3 +356,33 @@ again at admission. After S6b it must run immediately before spawn.
   which remain as historical human judgments; `show`/`status` lost the
   routed-run and blind-evaluation displays. `cargo test`: 428 passed,
   0 failed.
+- 2026-09-23 — S8b: `RunMode` is `{Native, Attached}`; `legacy`, `routed`,
+  `allocation` and `comparison` load as `native`. Migration 24 drops the sync,
+  public-prior, capacity, admission, control, private-evidence and planning
+  tables and triggers (the automatic pre-upgrade backup keeps every row) and
+  rebuilds `runs` with `run_mode IN ('native','attached')` and without
+  `routing_decision_json`. Human judgments stay: `goal_feedback_revisions`,
+  and the blind `evaluations` and routed `routing_observations`/
+  `routing_feedback_events` recorded before 0.4.1. `AllocationDecision`
+  loses `private_evidence` now that its trigger is gone. Tests that asserted
+  "no lease left" now assert that no launch record is still live (intent,
+  spawned or uncertain). Upgrade evidence: a new unit test upgrades a
+  schema-21 (v0.4.0) database with a routed run, a completed attempt, a blind
+  evaluation and a routing observation; by hand, a state directory made by
+  the real v0.4.0 binary (a two-candidate comparison with a blind
+  evaluation, a single-candidate run) upgraded to schema 24 with a
+  `dispatch.schema-21-*` backup, and `accept` applied and recorded the
+  review. That hand check found a defect introduced in S8a: a completed
+  attempt's evidence was compared byte for byte with its re-serialization,
+  so any attempt recorded before the attempt types shrank was "changed" and
+  every older run became unwritable (the source was modified, then recording
+  the application failed). Completed attempts are now compared through the
+  current type and their stored rows are never rewritten; the unit test
+  fails without the fix. Not done: runs still queued or executing under
+  0.4.0 at upgrade are not interrupted by the migration. Crash repair never
+  closes a run whose attempt is unfinished, so such a run stays open rather
+  than being closed while an agent may be alive; release notes will say to
+  finish in-flight work before upgrading. Observation for S9: `accept`
+  records the review before applying, so a failed apply leaves an accepted
+  review on an unapplied result (0.4.0 did the same). `cargo test`: 429
+  passed, 0 failed.
