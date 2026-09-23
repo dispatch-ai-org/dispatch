@@ -161,8 +161,8 @@ impl std::fmt::Display for LaunchRefused {
 
 impl std::error::Error for LaunchRefused {}
 
-/// Records one attempt's launch; an optional inner observer (admission,
-/// until it is removed) is consulted first at every step.
+/// Records one attempt's launch; an optional inner observer is consulted
+/// first at every step.
 #[derive(Debug)]
 pub struct LaunchObserver {
     db_path: PathBuf,

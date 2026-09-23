@@ -135,9 +135,6 @@ impl State {
             if let Some(policy) = &mut run.phase3 {
                 policy.questions = database.questions_for_run(&id)?;
             }
-            if let Some(admission) = database.admission_summary_for_run(&id)? {
-                run.admission = Some(admission);
-            }
             self.repair_event_projection(&id, &database.events_for_run(&id)?)?;
         }
         Ok(run)

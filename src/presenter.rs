@@ -438,7 +438,18 @@ fn launch_accounting(state: &State, run: &RunRecord) -> String {
     let counts = (|| -> Result<(u32, u32)> {
         let db = crate::db::Database::open_read_only(state.db_path())?;
         db.connection().busy_timeout(Duration::from_millis(10))?;
-        Ok(db.connection().query_row("SELECT COALESCE(SUM(launch_knowledge IN ('child_recorded','cleanup_confirmed')),0), COALESCE(SUM(launch_knowledge NOT IN ('child_recorded','cleanup_confirmed','launch_intent_committed','launch_not_started')),0) FROM admission_requests WHERE run_id=?1",[&run.id],|r|Ok((r.get(0)?,r.get(1)?)))?)
+        let launches = crate::launch::launches_for_run(&db, &run.id)?;
+        let known = launches.iter().filter(|l| l.child.is_some()).count();
+        let uncertain = launches
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.state,
+                    crate::launch::LaunchState::Intent | crate::launch::LaunchState::Uncertain
+                )
+            })
+            .count();
+        Ok((u32::try_from(known)?, u32::try_from(uncertain)?))
     })();
     match counts {
         Ok((known, uncertain)) => {
@@ -1568,7 +1579,6 @@ async fn run_goal(
         backend: None,
         timeout_secs: None,
         max_parallel: None,
-        priority: 0,
         allow_unsafe_local: local,
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,

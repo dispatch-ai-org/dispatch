@@ -141,20 +141,6 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn identity_from_row(
-    pid: Option<u32>,
-    start: Option<String>,
-    boot: Option<String>,
-    group: Option<i32>,
-) -> Option<ProcessIdentity> {
-    pid.map(|pid| ProcessIdentity {
-        pid,
-        start,
-        boot,
-        process_group: group,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

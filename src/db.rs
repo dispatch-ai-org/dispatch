@@ -12,9 +12,9 @@ use rusqlite::{
 };
 
 use crate::models::{
-    AdmissionState, AdmissionSummary, AttemptRecord, CandidateRecord, CapacityObservation,
-    CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord, GoalFeedbackRevision,
-    RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunMode, RunRecord,
+    AttemptRecord, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
+    GoalFeedbackRevision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunMode,
+    RunRecord,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -848,81 +848,6 @@ fn sqlite_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// A missing mapping overlaps only within the same provider/funding identity.
-/// Bucket sets need not be equal: any shared allowance implies exclusion.
-pub(crate) fn overlapping_pools(connection: &Connection, pool_id: &str) -> Result<Vec<String>> {
-    let mut statement = connection.prepare(
-        "SELECT p.id FROM resource_pools p JOIN resource_pools q ON q.id=?1
-         WHERE p.provider=q.provider AND p.funding_source=q.funding_source
-         AND (json_array_length(p.provider_buckets_json)=0 OR json_array_length(q.provider_buckets_json)=0
-              OR EXISTS(SELECT 1 FROM json_each(p.provider_buckets_json) a
-                        JOIN json_each(q.provider_buckets_json) b ON a.value=b.value)) ORDER BY p.id",
-    )?;
-    Ok(statement
-        .query_map([pool_id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-
-pub(crate) fn shared_capacity_history(
-    connection: &Connection,
-    pool_id: &str,
-) -> Result<Vec<CapacityObservation>> {
-    let mut history = Vec::new();
-    for id in overlapping_pools(connection, pool_id)? {
-        let mut statement = connection
-            .prepare("SELECT payload_json FROM capacity_observations WHERE pool_id=?1")?;
-        for row in statement.query_map([id], |row| row.get::<_, String>(0))? {
-            history.push(serde_json::from_str::<CapacityObservation>(&row?)?);
-        }
-    }
-    history.sort_by(|a, b| (a.sampled_at, &a.id).cmp(&(b.sampled_at, &b.id)));
-    Ok(history)
-}
-
-fn authoritative_admission(
-    connection: &Connection,
-    run_id: &str,
-) -> Result<Option<AdmissionSummary>> {
-    connection
-        .query_row(
-            "SELECT r.id,r.pool_id,COALESCE(r.attempt_id,''),COALESCE(r.route_snapshot_json,''),COALESCE(r.configuration_revision,''),COALESCE(r.canonical_pool_identity,''),COALESCE(r.authorization_id,''),COALESCE(r.authorization_revision,0),r.owner_session,r.generation,r.priority,r.status,COALESCE(r.fence,l.fence),r.enqueued_at,r.released_at FROM admission_requests r LEFT JOIN pool_leases l ON l.request_id=r.id AND l.owner_session=r.owner_session AND l.generation=r.generation WHERE r.run_id=?1 ORDER BY r.enqueued_at DESC,r.id DESC LIMIT 1",
-            [run_id],
-            |row| {
-                let status: String = row.get(11)?;
-                let state = match status.as_str() {
-                    "queued" => AdmissionState::Queued,
-                    "admitted" => AdmissionState::Admitted,
-                    "reconciliation" => AdmissionState::Reconciliation,
-                    _ => AdmissionState::Released,
-                };
-                Ok(AdmissionSummary {
-                    request_id: row.get(0)?,
-                    pool_id: row.get(1)?,
-                    attempt_id: row.get(2)?,
-                    route_snapshot_json: row.get(3)?,
-                    configuration_revision: row.get(4)?,
-                    canonical_pool_identity: row.get(5)?,
-                    authorization_id: row.get(6)?,
-                    authorization_revision: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
-                    owner_session: row.get(8)?,
-                    generation: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
-                    priority: row.get(10)?,
-                    state,
-                    fence: row
-                        .get::<_, Option<i64>>(12)?
-                        .and_then(|value| u64::try_from(value).ok()),
-                    enqueued_at: timestamp_from_sql(13, row.get(13)?)?,
-                    released_at: row
-                        .get::<_, Option<String>>(14)?
-                        .map(|value| timestamp_from_sql(14, value))
-                        .transpose()?,
-                })
-            },
-        )
-        .optional()
-        .context("failed to read authoritative admission state")
-}
-
 impl Database {
     /// Event followers never migrate, repair projections, or acquire execution authority.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
@@ -1009,10 +934,6 @@ impl Database {
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
-    }
-
-    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.connection
     }
 
     fn configure(&self, in_memory: bool) -> Result<()> {
@@ -1118,23 +1039,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn append_capacity_observation(&self, observation: &CapacityObservation) -> Result<()> {
-        let payload = serde_json::to_string(observation)?;
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO capacity_observations(id,pool_id,source,source_version,provider_bucket_id,window_identity,sampled_at,valid_until,payload_json) VALUES(?1,?2,?3,?4,NULL,NULL,?5,?6,?7)",
-            params![observation.id, observation.pool_id, observation.source, observation.source_version, timestamp(observation.sampled_at), timestamp(observation.valid_until), payload],
-        )?;
-        for (ordinal, constraint) in observation.constraints.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO capacity_observation_constraints(observation_id,ordinal,provider_bucket_id,window_identity,constraint_json) VALUES(?1,?2,?3,?4,?5)",
-                params![observation.id, ordinal, constraint.provider_bucket_id, constraint.window_id, serde_json::to_string(constraint)?],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     /// Record that `funding_key` was refused under `authorization_revision`.
     /// The first reason is kept; later refusals of the same revision add nothing.
     pub fn record_funding_refusal(
@@ -1175,21 +1079,6 @@ impl Database {
             .optional()?)
     }
 
-    pub fn latest_capacity_observation(
-        &self,
-        pool_id: &str,
-    ) -> Result<Option<CapacityObservation>> {
-        self.connection
-            .query_row(
-                "SELECT payload_json FROM capacity_observations WHERE pool_id=?1 ORDER BY sampled_at DESC,id DESC LIMIT 1",
-                [pool_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|payload| serde_json::from_str(&payload).context("invalid capacity observation"))
-            .transpose()
-    }
-
     pub fn questions_for_run(&self, run_id: &str) -> Result<Vec<crate::Clarification>> {
         let mut statement = self
             .connection
@@ -1198,10 +1087,6 @@ impl Database {
             .query_map([run_id], |row| row.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
-    }
-
-    pub fn admission_summary_for_run(&self, run_id: &str) -> Result<Option<AdmissionSummary>> {
-        authoritative_admission(&self.connection, run_id)
     }
 
     /// Replace all structured state for a run in one transaction. Events are an
@@ -1242,9 +1127,9 @@ impl Database {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Admission binds immutably to an attempt. The legacy projection
-        // writer replaces attempt rows within this same transaction, so defer
-        // that foreign-key check until the replacement is complete.
+        // Older rows (admission requests from 0.4.0) reference attempts. The
+        // projection writer replaces attempt rows within this transaction, so
+        // defer that foreign-key check until the replacement is complete.
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
 
         let stored_revision = transaction
@@ -1263,11 +1148,7 @@ impl Database {
             );
         }
         validate_terminal_write(&transaction, run, false)?;
-        let mut projection = run.clone();
-        if let Some(admission) = authoritative_admission(&transaction, &run.id)? {
-            projection.admission = Some(admission);
-        }
-        let run_projection_json = serde_json::to_string(&projection)
+        let run_projection_json = serde_json::to_string(run)
             .context("failed to serialize authoritative run projection")?;
 
         let existing_source_id = transaction
@@ -1616,11 +1497,7 @@ impl Database {
         persist_questions(transaction, run)?;
         let outcome_json = serde_json::to_string(&run.outcome)?;
         validate_terminal_write(transaction, run, event.event_type == "review.accepted")?;
-        let mut projection = run.clone();
-        if let Some(admission) = authoritative_admission(transaction, &run.id)? {
-            projection.admission = Some(admission);
-        }
-        let projection_json = serde_json::to_string(&projection)?;
+        let projection_json = serde_json::to_string(&*run)?;
         transaction.execute(
             "UPDATE runs SET state_revision = ?2, outcome_json = ?3, run_projection_json = ?4, \
                              run_mode = ?5, status = ?6, completed_at = ?7, applied_candidate = ?8 \
@@ -1654,9 +1531,6 @@ impl Database {
                 event.actor,
             ],
         )?;
-        // Keep immediate JSON/results and the file projection consistent with
-        // the same admission authority used by subsequent status reads.
-        run.admission = projection.admission;
         Ok(event)
     }
 
@@ -2344,10 +2218,10 @@ fn persist_questions(connection: &Connection, run: &RunRecord) -> Result<()> {
                 question.state == crate::QuestionState::Pending && question.revision == 1,
                 "new question must be pending"
             );
-            let active: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM admission_requests WHERE run_id=?1 AND status IN ('queued','admitted','reconciliation'))",[&run.id],|r|r.get(0))?;
+            let running: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM attempt_launches WHERE run_id=?1 AND state IN ('intent','spawned','uncertain'))",[&run.id],|r|r.get(0))?;
             anyhow::ensure!(
-                !active,
-                "cannot wait on a human while admission is unresolved"
+                !running,
+                "cannot wait on a human while a launched agent may still be running"
             );
             connection.execute(
                 "INSERT INTO clarifications VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -2821,121 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn capacity_observations_append_without_replacing_prior_samples() -> Result<()> {
-        let database = Database::open_in_memory()?;
-        database.connection.execute(
-            "INSERT INTO resource_pools(id,provider,funding_source,provider_buckets_json,max_active,next_fence,created_at,updated_at) VALUES('pool','openai','chatgpt-plus','[\"codex\"]',1,0,?1,?1)",
-            [timestamp(at(1))],
-        )?;
-        let first = crate::capacity::unknown_observation("pool", "default", at(2), 300, "first");
-        let second = crate::capacity::unknown_observation("pool", "default", at(3), 300, "second");
-        database.append_capacity_observation(&first)?;
-        database.append_capacity_observation(&second)?;
-        let rows: i64 = database.connection.query_row(
-            "SELECT COUNT(*) FROM capacity_observations WHERE pool_id='pool'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(rows, 2);
-        assert_eq!(
-            database.latest_capacity_observation("pool")?.unwrap().id,
-            second.id
-        );
-        assert!(database.append_capacity_observation(&first).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn uncertain_cleanup_and_release_survive_equal_and_stale_projection_writes() -> Result<()> {
-        for uncertain in [false, true] {
-            let temp = tempfile::tempdir()?;
-            let state = crate::state::State::discover(Some(temp.path().join("state")))?;
-            state.initialize()?;
-            let mut database = Database::open(state.db_path())?;
-            let mut current = run(&ulid::Ulid::new().to_string());
-            current.state_revision = 3;
-            database.sync_run(&current)?;
-            let coordinator = crate::admission::AdmissionCoordinator::new(
-                state.db_path(),
-                Duration::from_secs(20),
-                Duration::from_secs(1),
-            );
-            coordinator.register_pool("pool", "openai", "chatgpt-plus", &["codex".into()])?;
-            let request = coordinator.enqueue(&current.id, "pool", "owner", 1, 0)?;
-            let crate::admission::AcquireResult::Acquired(token) =
-                coordinator.try_acquire(&request)?
-            else {
-                panic!("not admitted")
-            };
-            current.admission = database.admission_summary_for_run(&current.id)?;
-            database.sync_run(&current)?;
-            let stale = current.clone();
-            let expected = if uncertain {
-                database.connection.execute("UPDATE pool_leases SET launch_lifecycle='spawn_may_have_occurred' WHERE pool_id='pool'",[])?;
-                coordinator.cleanup_after_unrecorded_spawn(
-                    &token,
-                    &crate::process::ProcessIdentity::current(),
-                    None,
-                    false,
-                )?;
-                let states:(String,String)=database.connection.query_row("SELECT l.state,r.status FROM pool_leases l JOIN admission_requests r ON r.id=l.request_id",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-                assert_eq!(states, ("reconciliation".into(), "reconciliation".into()));
-                assert!(!coordinator.release_not_launched(&token)?);
-                crate::AdmissionState::Reconciliation
-            } else {
-                assert!(coordinator.release(&token)?);
-                crate::AdmissionState::Released
-            };
-            // Real production projection writer must overlay SQL authority,
-            // even when handed an equal-revision stale in-memory snapshot.
-            database.sync_run(&stale)?;
-            assert_eq!(
-                database
-                    .committed_run_projection(&current.id)?
-                    .unwrap()
-                    .admission
-                    .unwrap()
-                    .state,
-                expected
-            );
-            database.commit_transition(
-                &mut current,
-                EventRecord {
-                    run_id: stale.id.clone(),
-                    event_type: "projection.test".into(),
-                    timestamp: Utc::now(),
-                    ..EventRecord::default()
-                },
-            )?;
-            assert_eq!(
-                crate::orchestrator::run_result(&current)
-                    .admission
-                    .as_ref()
-                    .unwrap()
-                    .state,
-                expected
-            );
-            for revision in [3, 4, 5] {
-                let mut stale_file = stale.clone();
-                stale_file.state_revision = revision;
-                state.save_run(&stale_file)?;
-                let public = state.load_run(&current.id)?;
-                assert_eq!(public.admission.as_ref().unwrap().state, expected);
-                let json = serde_json::to_value(public)?;
-                assert_eq!(
-                    json["admission"]["state"],
-                    if uncertain {
-                        "reconciliation"
-                    } else {
-                        "released"
-                    }
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn stale_run_projection_cannot_overwrite_newer_revision() -> Result<()> {
         let mut database = Database::open_in_memory()?;
         let mut current = run("projection-fence");
@@ -2948,61 +2707,6 @@ mod tests {
         let stored = database.committed_run_projection(&current.id)?.unwrap();
         assert_eq!(stored.state_revision, 2);
         assert_eq!(stored.status, RunStatus::Failed);
-        Ok(())
-    }
-
-    #[test]
-    fn migration_preserves_live_orphans_from_schema_14_and_already_applied_15() -> Result<()> {
-        for version in [14, 15] {
-            let temp = tempfile::tempdir()?;
-            let path = temp.path().join("old.db");
-            let connection = Connection::open(&path)?;
-            connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);")?;
-            for (number, name, sql) in MIGRATIONS.iter().take(12) {
-                connection.execute_batch(sql)?;
-                connection.execute(
-                    "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
-                    params![number, name, timestamp(at(1))],
-                )?;
-            }
-            insert_legacy_run(&connection, "old-run")?;
-            for (number, name, sql) in MIGRATIONS.iter().take(version).skip(12) {
-                connection.execute_batch(sql)?;
-                connection.execute(
-                    "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
-                    params![number, name, timestamp(at(1))],
-                )?;
-            }
-            connection.execute_batch("INSERT INTO resource_pools(id,provider,funding_source,provider_buckets_json,max_active,next_fence,created_at,updated_at) VALUES('pool','openai','chatgpt-plus','[\"codex\"]',1,1,'2020-01-01','2020-01-01');
-                INSERT INTO admission_requests(id,run_id,pool_id,owner_session,generation,priority,enqueued_at,heartbeat_at,expires_at,status) VALUES('request','old-run','pool','dead-owner',1,0,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','admitted');")?;
-            let child = crate::process::ProcessIdentity::current();
-            connection.execute("INSERT INTO pool_leases(pool_id,request_id,owner_session,generation,fence,state,start_intent_at,heartbeat_at,expires_at,owner_pid,child_pid,child_start_identity,child_boot_identity,child_process_group) VALUES('pool','request','dead-owner',1,1,'running',?1,?1,?1,4294967295,?2,?3,?4,?5)",params![timestamp(at(1)),child.pid,child.start,child.boot,child.process_group])?;
-            drop(connection);
-            let migrated = Database::open(&path)?;
-            crate::admission::AdmissionCoordinator::new(
-                &path,
-                Duration::from_secs(10),
-                Duration::from_secs(1),
-            )
-            .reconcile_expired("pool")?;
-            let lifecycle: String = migrated.connection.query_row(
-                "SELECT launch_lifecycle FROM pool_leases WHERE pool_id='pool'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(lifecycle, "cleanup_uncertain");
-            assert_eq!(
-                migrated
-                    .admission_summary_for_run("old-run")?
-                    .unwrap()
-                    .state,
-                crate::AdmissionState::Reconciliation
-            );
-            assert_eq!(
-                Database::open(&path)?.schema_version()?,
-                MIGRATIONS.last().unwrap().0
-            );
-        }
         Ok(())
     }
 

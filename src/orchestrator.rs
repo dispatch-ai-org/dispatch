@@ -24,21 +24,15 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use futures::{StreamExt, stream::FuturesUnordered};
 use rand::seq::SliceRandom;
-use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use crate::{
-    AdmissionState, AllocationDecision, ApplicationState, AppliedBy, AttemptRecord,
-    CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision,
-    DiffStats, EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
+    AllocationDecision, ApplicationState, AppliedBy, AttemptRecord, CandidateRecord,
+    CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
+    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
     ReviewState, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation,
     RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, SelectionBasis, VERSION,
     VerificationState, WaitingOn, WorkResult,
-    admission::{
-        AcquireResult, AdmissionBinding, AdmissionCoordinator, AdmissionLeaseObserver, LeaseToken,
-        canonical_pool_identity,
-    },
-    capacity::{authorize_observation, needs_refresh, probe_codex, supports_codex_account_probe},
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -123,7 +117,6 @@ pub struct RunRequest {
     pub backend: Option<String>,
     pub timeout_secs: Option<u64>,
     pub max_parallel: Option<usize>,
-    pub priority: i32,
     pub allow_unsafe_local: bool,
     pub allow_forwarded_env: bool,
     pub output: RunOutputMode,
@@ -557,15 +550,6 @@ fn funding_refused_message(profile: &crate::config::ResourceProfile, reason: &st
     )
 }
 
-/// Canonical digest of a resource profile, recorded with capacity
-/// authorizations. serde_json's default map is sorted, so the round-trip
-/// canonicalizes struct and map key order.
-fn digest(value: &impl serde::Serialize) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let value = serde_json::to_value(value)?;
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&value)?)))
-}
-
 fn harness_name(id: &str) -> &str {
     match id {
         "claude" => "Claude Code",
@@ -847,7 +831,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             fixed_harness,
             fixed_model,
             fixed_effort,
-            priority: request.priority,
             owner_uid: phase3::local_uid(),
             supervisor: Some(crate::process::ProcessIdentity::current()),
             final_attempt_id: None,
@@ -1102,8 +1085,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         );
     }
 
-    let mut admitted_lease: Option<crate::admission::AcquiredLeaseGuard> = None;
-
     type CandidateFuture = Pin<Box<dyn Future<Output = CandidateExecution> + Send>>;
     let mut running: FuturesUnordered<CandidateFuture> = FuturesUnordered::new();
     let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1117,7 +1098,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let mut orchestration_error = None;
     'candidate_loop: while !pending.is_empty() || !running.is_empty() {
         if cancellation.is_cancelled() {
-            drop(admitted_lease.take());
             interrupted = true;
             break;
         }
@@ -1164,11 +1144,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             let baseline_path = run.baseline_path.clone();
             let candidate_cancellation = cancellation.clone();
             let candidate_check_tx = check_tx.clone();
-            let heartbeat_secs = resources.capacity.heartbeat_secs;
-            let candidate_admission = admitted_lease.take().map(|guard| {
-                let (coordinator, token) = guard.handoff();
-                (coordinator, token, heartbeat_secs)
-            });
             running.push(Box::pin(async move {
                 execute_candidate(
                     candidate,
@@ -1177,7 +1152,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                     baseline_path,
                     candidate_cancellation,
                     (candidate_check_tx, attempt_id),
-                    candidate_admission,
                     None,
                 )
                 .await
@@ -1249,8 +1223,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         }
     }
 
-    // Also covers cancellation between the outer and inner loop checks.
-    drop(admitted_lease.take());
     if interrupted || orchestration_error.is_some() {
         cancellation.cancel();
         while let Some(execution) = running.next().await {
@@ -1383,446 +1355,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     Ok(run)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn admit_attempt(
-    state: &State,
-    db: &mut Database,
-    run: &mut RunRecord,
-    config: &Config,
-    resources: &crate::config::ResourceConfig,
-    cancellation: &CancellationToken,
-    output: RunOutputMode,
-    priority: i32,
-) -> Result<Option<crate::admission::AcquiredLeaseGuard>> {
-    let run_dir = state.run_dir(&run.id);
-    let mut admitted_lease: Option<crate::admission::AcquiredLeaseGuard> = None;
-    if let Some(selected) = run
-        .attempts
-        .last()
-        .and_then(|attempt| attempt.detail.decision.as_ref())
-        .or(run.allocation.as_ref())
-        .map(|value| value.selected.clone())
-    {
-        let profile = resources
-            .profiles
-            .iter()
-            .find(|profile| {
-                profile.enabled
-                    && profile.pool == selected.pool
-                    && profile.provider == selected.provider
-                    && profile.funding_source == selected.funding_source
-                    && profile.model == selected.resolved_model
-                    && profile.effort == selected.effort
-            })
-            .context("selected resource profile disappeared before admission")?;
-        let coordinator = AdmissionCoordinator::new(
-            state.db_path(),
-            Duration::from_secs(resources.capacity.lease_secs),
-            Duration::from_secs(resources.capacity.aging_secs),
-        );
-        let canonical_identity = canonical_pool_identity(
-            &selected.provider,
-            &profile.funding_scope(),
-            &profile.admission_buckets(),
-        );
-        let coordinated_pool = coordinator.register_pool(
-            &selected.pool,
-            &selected.provider,
-            &profile.funding_scope(),
-            &profile.admission_buckets(),
-        )?;
-        if !resources.capacity.admission {
-            let message = "shared admission cannot be disabled for allocation execution; drain/reconcile coordinated work and disable allocation instead";
-            finish_failed(state, db, run, message)?;
-            bail!(message);
-        }
-        let executable = config
-            .harnesses
-            .get(&selected.harness)
-            .executable
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(&selected.harness));
-        let mut observation = observe_capacity(
-            &executable,
-            &selected,
-            &coordinated_pool,
-            profile,
-            &resources.capacity,
-            &run_dir,
-            db,
-        )
-        .await?;
-        run.capacity = Some(observation.clone());
-        db.sync_run(run)?;
-        let route_snapshot_json = serde_json::to_string(&serde_json::json!({
-            "resource": selected,
-            "provider_buckets": profile.admission_buckets(),
-            "resource_profile": profile,
-            "resources_path": state.root.join("resources.yml"),
-        }))?;
-        let configuration_revision = format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(route_snapshot_json.as_bytes()))
-        );
-        let authorization = match authorize_observation(
-            db,
-            &coordinated_pool,
-            &observation,
-            &configuration_revision,
-            profile.authorization_revision,
-            &selected.funding_source,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                if let Some(policy) = &mut run.phase3 {
-                    policy.failure = Some(crate::FailureKind::Authorization);
-                }
-                let message = format!(
-                    "subscription-only funding revalidation failed before launch: {error:#}"
-                );
-                finish_failed(state, db, run, &message)?;
-                bail!(message);
-            }
-        };
-        if output == RunOutputMode::Human {
-            match observation.scarcity {
-                crate::ScarcityState::Constrained | crate::ScarcityState::Reserve => {
-                    println!("Allowance appears constrained; Dispatch will serialize model work.");
-                }
-                crate::ScarcityState::Unknown => {
-                    println!("Capacity currently unknown; using conservative shared admission.");
-                }
-                _ => {}
-            }
-        }
-        let mut announced_capacity_wait = false;
-        while crate::capacity::resolved_scarcity(db.connection(), &coordinated_pool, Utc::now())?
-            == crate::ScarcityState::Exhausted
-        {
-            if cancellation.is_cancelled() {
-                finish_interrupted(state, db, run)?;
-                bail!(
-                    "run {} interrupted while waiting for subscription capacity",
-                    run.id
-                );
-            }
-            run.outcome.lifecycle = LifecycleState::Waiting;
-            run.outcome.waiting_on = WaitingOn::Capacity;
-            db.sync_run(run)?;
-            if !announced_capacity_wait && output == RunOutputMode::Human {
-                println!("Subscription allowance is exhausted; waiting to refresh capacity...");
-                announced_capacity_wait = true;
-            }
-            if needs_refresh(&observation, Utc::now()) {
-                observation = observe_capacity(
-                    &executable,
-                    &selected,
-                    &coordinated_pool,
-                    profile,
-                    &resources.capacity,
-                    &run_dir,
-                    db,
-                )
-                .await?;
-                run.capacity = Some(observation.clone());
-                db.sync_run(run)?;
-                if let Err(error) = authorize_observation(
-                    db,
-                    &coordinated_pool,
-                    &observation,
-                    &configuration_revision,
-                    profile.authorization_revision,
-                    &selected.funding_source,
-                ) {
-                    if let Some(policy) = &mut run.phase3 {
-                        policy.failure = Some(crate::FailureKind::Authorization);
-                    }
-                    let message = format!(
-                        "subscription-only funding revalidation failed before launch: {error:#}"
-                    );
-                    finish_failed(state, db, run, &message)?;
-                    bail!(message);
-                }
-                continue;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = cancellation.cancelled() => {}
-            }
-        }
-        if crate::capacity::resolved_scarcity(db.connection(), &coordinated_pool, Utc::now())?
-            == crate::ScarcityState::Reserve
-            && priority < 1
-        {
-            let message = "allowance is in reserve; non-urgent work was deferred without launching a model (use --priority urgent only when the work is explicitly urgent)";
-            finish_deferred(state, db, run, message)?;
-
-            return Ok(None);
-        }
-        run.outcome.lifecycle = LifecycleState::Working;
-        run.outcome.waiting_on = WaitingOn::None;
-        if resources.capacity.admission {
-            let owner_session = Ulid::new().to_string();
-            let attempt_id = run
-                .attempts
-                .last()
-                .context("allocation attempt missing before admission")?
-                .id
-                .clone();
-            let mut summary = coordinator.enqueue_bound(
-                &run.id,
-                &coordinated_pool,
-                &owner_session,
-                1,
-                priority,
-                &AdmissionBinding {
-                    attempt_id,
-                    route_snapshot_json: route_snapshot_json.clone(),
-                    configuration_revision: configuration_revision.clone(),
-                    canonical_pool_identity: canonical_identity.clone(),
-                    authorization_id: authorization.id.clone(),
-                    authorization_revision: authorization.revision,
-                },
-            )?;
-            run.admission = Some(summary.clone());
-            run.outcome.lifecycle = LifecycleState::Waiting;
-            run.outcome.waiting_on = WaitingOn::Admission;
-            db.sync_run(run)?;
-            persist_event(
-                state,
-                db,
-                EventRecord {
-                    run_id: run.id.clone(),
-                    event_type: "admission.queued".into(),
-                    timestamp: Utc::now(),
-                    payload: serde_json::json!({"request_id": summary.request_id, "pool": summary.pool_id, "priority": summary.priority}),
-                    generation: 1,
-                    ..EventRecord::default()
-                },
-                run,
-            )?;
-            let mut announced_wait = false;
-            loop {
-                if cancellation.is_cancelled() {
-                    coordinator.cancel_queued(&summary)?;
-                    finish_interrupted(state, db, run)?;
-                    bail!(
-                        "run {} interrupted while waiting for shared subscription capacity",
-                        run.id
-                    );
-                }
-                if let Some(shared) = db.latest_capacity_observation(&coordinated_pool)?
-                    && run.capacity.as_ref().map(|value| &value.id) != Some(&shared.id)
-                {
-                    run.capacity = Some(shared.clone());
-                    db.sync_run(run)?;
-                    match authorize_observation(
-                        db,
-                        &coordinated_pool,
-                        &shared,
-                        &configuration_revision,
-                        profile.authorization_revision,
-                        &selected.funding_source,
-                    ) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            coordinator.cancel_queued(&summary)?;
-                            if let Some(policy) = &mut run.phase3 {
-                                policy.failure = Some(crate::FailureKind::Authorization);
-                            }
-                            let message = format!(
-                                "subscription-only funding revalidation failed before launch: {error:#}"
-                            );
-                            finish_failed(state, db, run, &message)?;
-                            bail!(message);
-                        }
-                    }
-                    if crate::capacity::resolved_scarcity(
-                        db.connection(),
-                        &coordinated_pool,
-                        Utc::now(),
-                    )? == crate::ScarcityState::Exhausted
-                    {
-                        coordinator.cancel_queued(&summary)?;
-                        let message = "newer shared evidence reports exhausted subscription capacity; no model invocation was launched";
-                        finish_failed(state, db, run, message)?;
-                        bail!(message);
-                    }
-                    if crate::capacity::resolved_scarcity(
-                        db.connection(),
-                        &coordinated_pool,
-                        Utc::now(),
-                    )? == crate::ScarcityState::Reserve
-                        && priority < 1
-                    {
-                        coordinator.cancel_queued(&summary)?;
-                        let message = "allowance entered reserve while queued; non-urgent work was deferred without launching a model";
-                        finish_deferred(state, db, run, message)?;
-
-                        return Ok(None);
-                    }
-                }
-                if run
-                    .capacity
-                    .as_ref()
-                    .is_some_and(|value| needs_refresh(value, Utc::now()))
-                {
-                    let refreshed = observe_capacity(
-                        &executable,
-                        &selected,
-                        &coordinated_pool,
-                        profile,
-                        &resources.capacity,
-                        &run_dir,
-                        db,
-                    )
-                    .await?;
-                    run.capacity = Some(refreshed.clone());
-                    db.sync_run(run)?;
-                    match authorize_observation(
-                        db,
-                        &coordinated_pool,
-                        &refreshed,
-                        &configuration_revision,
-                        profile.authorization_revision,
-                        &selected.funding_source,
-                    ) {
-                        Ok(_) => {}
-                        Err(error) => {
-                            coordinator.cancel_queued(&summary)?;
-                            if let Some(policy) = &mut run.phase3 {
-                                policy.failure = Some(crate::FailureKind::Authorization);
-                            }
-                            let message = format!(
-                                "subscription-only funding revalidation failed before launch: {error:#}"
-                            );
-                            finish_failed(state, db, run, &message)?;
-                            bail!(message);
-                        }
-                    }
-                    if crate::capacity::resolved_scarcity(
-                        db.connection(),
-                        &coordinated_pool,
-                        Utc::now(),
-                    )? == crate::ScarcityState::Exhausted
-                    {
-                        coordinator.cancel_queued(&summary)?;
-                        let message = "subscription capacity became exhausted while awaiting local admission; no model invocation was launched";
-                        finish_failed(state, db, run, message)?;
-                        bail!(message);
-                    }
-                    if crate::capacity::resolved_scarcity(
-                        db.connection(),
-                        &coordinated_pool,
-                        Utc::now(),
-                    )? == crate::ScarcityState::Reserve
-                        && priority < 1
-                    {
-                        coordinator.cancel_queued(&summary)?;
-                        let message = "allowance entered reserve while queued; non-urgent work was deferred without launching a model";
-                        finish_deferred(state, db, run, message)?;
-
-                        return Ok(None);
-                    }
-                }
-                match coordinator.try_acquire(&summary)? {
-                    AcquireResult::Acquired(token) => {
-                        let token = *token;
-                        admitted_lease = Some(crate::admission::AcquiredLeaseGuard::new(
-                            coordinator.clone(),
-                            token.clone(),
-                        ));
-                        #[cfg(test)]
-                        if CANCEL_AT_HANDOFF
-                            .try_with(|point| *point == 1)
-                            .unwrap_or(false)
-                        {
-                            cancellation.cancel();
-                        }
-                        summary.state = AdmissionState::Admitted;
-                        summary.fence = Some(token.fence);
-                        run.admission = Some(summary);
-                        run.outcome.lifecycle = LifecycleState::Working;
-                        run.outcome.waiting_on = WaitingOn::None;
-                        db.sync_run(run)?;
-                        persist_event(
-                            state,
-                            db,
-                            EventRecord {
-                                run_id: run.id.clone(),
-                                event_type: "admission.acquired".into(),
-                                timestamp: Utc::now(),
-                                payload: serde_json::json!({"pool": token.pool_id, "fence": token.fence}),
-                                generation: u32::try_from(token.generation).unwrap_or(u32::MAX),
-                                ..EventRecord::default()
-                            },
-                            run,
-                        )?;
-                        break;
-                    }
-                    AcquireResult::Waiting => {
-                        if run.outcome.waiting_on != WaitingOn::Admission {
-                            run.outcome.waiting_on = WaitingOn::Admission;
-                            persist_event(
-                                state,
-                                db,
-                                EventRecord {
-                                    run_id: run.id.clone(),
-                                    event_type: "admission.waiting".into(),
-                                    timestamp: Utc::now(),
-                                    payload: serde_json::json!({"request_id": summary.request_id}),
-                                    ..EventRecord::default()
-                                },
-                                run,
-                            )?;
-                        }
-                        if !announced_wait && output == RunOutputMode::Human {
-                            println!("Waiting for shared subscription capacity...");
-                            announced_wait = true;
-                        }
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-                            _ = cancellation.cancelled() => {}
-                        }
-                    }
-                    AcquireResult::Reconciliation => {
-                        if run.outcome.waiting_on != WaitingOn::Reconciliation {
-                            run.outcome.waiting_on = WaitingOn::Reconciliation;
-                            if let Some(admission) = &mut run.admission {
-                                admission.state = AdmissionState::Reconciliation;
-                            }
-                            persist_event(
-                                state,
-                                db,
-                                EventRecord {
-                                    run_id: run.id.clone(),
-                                    event_type: "admission.reconciliation".into(),
-                                    timestamp: Utc::now(),
-                                    payload: serde_json::json!({"request_id": summary.request_id}),
-                                    ..EventRecord::default()
-                                },
-                                run,
-                            )?;
-                        }
-                        if !announced_wait && output == RunOutputMode::Human {
-                            println!(
-                                "Waiting for reconciliation of a possibly live model process..."
-                            );
-                            announced_wait = true;
-                        }
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                            _ = cancellation.cancelled() => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(admitted_lease)
-}
-
 fn result_verification(candidate: &CandidateRecord) -> &'static str {
     if candidate.checks.is_empty() {
         if candidate.status == CandidateStatus::TimedOut {
@@ -1917,7 +1449,7 @@ fn print_single_result_summary(
 struct CandidateExecution {
     usage_categories: std::collections::BTreeMap<String, u64>,
     checkpoint: Option<std::result::Result<crate::CheckpointReport, String>>,
-    admission_released: bool,
+    cleanup_confirmed: bool,
     failure: Option<crate::FailureKind>,
     /// The adapter preflight refused the launch; nothing was spawned.
     preflight_refusal: Option<String>,
@@ -1944,11 +1476,6 @@ async fn select_available_resource(
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
     let db = Database::open(state.db_path())?;
-    let coordinator = AdmissionCoordinator::new(
-        state.db_path(),
-        Duration::from_secs(resources.capacity.lease_secs),
-        Duration::from_secs(resources.capacity.aging_secs),
-    );
     for profile in &resources.profiles {
         let harness = config.harnesses.get(&profile.harness);
         if profile.enabled && agent.is_none_or(|a| a == profile.harness) {
@@ -1999,90 +1526,12 @@ async fn select_available_resource(
                             profile.authorization_revision,
                             &format!("{error:#}"),
                         )?;
-                        let pool = coordinator.register_pool(
-                            &profile.pool,
-                            &profile.provider,
-                            &profile.funding_scope(),
-                            &profile.admission_buckets(),
-                        )?;
-                        let mut observation = crate::capacity::unknown_observation(
-                            &pool,
-                            &profile.service_mode,
-                            Utc::now(),
-                            resources.capacity.freshness_secs,
-                            "adapter preflight rejected the resource",
-                        );
-                        observation.auth_mode = crate::CapacityValue::Reported {
-                            value: "adapter_preflight_rejected".into(),
-                        };
-                        db.append_capacity_observation(&observation)?;
-                        let revision = digest(profile)?;
-                        let _ = authorize_observation(
-                            &db,
-                            &pool,
-                            &observation,
-                            &revision,
-                            profile.authorization_revision,
-                            &profile.funding_source,
-                        );
                         Some(error.to_string())
                     }
                 }
             }
         };
-        let reason = if reason.is_none() && profile.included && profile.no_overage_verified {
-            let pool = coordinator.register_pool(
-                &profile.pool,
-                &profile.provider,
-                &profile.funding_scope(),
-                &profile.admission_buckets(),
-            )?;
-            // Provider-owned observations precede selection; no alternative is leased.
-            if profile.harness == "codex" && resources.capacity.codex_probe {
-                let executable = harness
-                    .executable
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(&profile.harness));
-                if supports_codex_account_probe(&executable) {
-                    let probe = probe_codex(
-                        &executable,
-                        &pool,
-                        &profile.provider_buckets,
-                        &profile.service_mode,
-                        &resources.capacity,
-                    )
-                    .await;
-                    db.append_capacity_observation(&probe.observation)?;
-                }
-            }
-            if matches!(
-                crate::capacity::resolved_scarcity(db.connection(), &pool, Utc::now())?,
-                crate::ScarcityState::Exhausted | crate::ScarcityState::Reserve
-            ) {
-                Some("retained capacity restriction excludes this pool".into())
-            } else if let Some(observation) = db.latest_capacity_observation(&pool)? {
-                crate::capacity::retained_authorization_conflict(
-                    db.connection(),
-                    &pool,
-                    i64::try_from(profile.authorization_revision)?,
-                    &observation,
-                    &profile.funding_source,
-                )?
-                .map(|reason| format!("funding revalidation failed: {reason}"))
-            } else {
-                None
-            }
-        } else {
-            reason
-        };
         exclusions.push(reason);
-    }
-    if exclusions.iter().all(Option::is_some) {
-        for exclusion in &mut exclusions {
-            if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
-                *exclusion = None;
-            }
-        }
     }
     choose_profile(
         resources,
@@ -2103,34 +1552,6 @@ async fn select_available_resource(
     })
 }
 
-async fn observe_capacity(
-    executable: &Path,
-    selected: &crate::ResourceChoice,
-    coordinated_pool: &str,
-    profile: &crate::config::ResourceProfile,
-    config: &crate::config::CapacityConfig,
-    run_dir: &Path,
-    db: &Database,
-) -> Result<crate::CapacityObservation> {
-    let probe = crate::harness::observe_resource(
-        executable,
-        selected,
-        coordinated_pool,
-        profile,
-        config,
-        run_dir,
-    )
-    .await;
-    let mut observation = probe.observation;
-    let capacity_dir = run_dir.join("capacity");
-    fs::create_dir_all(&capacity_dir)?;
-    let capacity_path = capacity_dir.join(format!("{}.raw.json", observation.id));
-    write_text(&capacity_path, &serde_json::to_string_pretty(&probe.raw)?)?;
-    observation.raw_observation_ref = Some(capacity_path);
-    db.append_capacity_observation(&observation)?;
-    Ok(observation)
-}
-
 /// Where and for which run an attempt's launch is recorded, and the profile
 /// re-checked at the launch boundary.
 pub(super) struct LaunchContext {
@@ -2139,8 +1560,6 @@ pub(super) struct LaunchContext {
     pub guard: Option<crate::launch::LaunchGuard>,
 }
 
-// The admission argument goes away with admission (0.4.1 S6b).
-#[allow(clippy::too_many_arguments)]
 async fn execute_candidate(
     mut candidate: CandidateRecord,
     prompt: String,
@@ -2151,7 +1570,6 @@ async fn execute_candidate(
         tokio::sync::mpsc::UnboundedSender<CheckLifecycleEvent>,
         String,
     ),
-    admission: Option<(AdmissionCoordinator, LeaseToken, u64)>,
     launch: Option<LaunchContext>,
 ) -> CandidateExecution {
     let (check_observer, attempt_id) = verification;
@@ -2162,29 +1580,8 @@ async fn execute_candidate(
         .unwrap_or_else(|| candidate.workspace_path.clone());
     let timeout = Duration::from_secs(config.execution.timeout_secs);
 
-    let heartbeat_stop = CancellationToken::new();
-    let heartbeat_task = admission
-        .as_ref()
-        .map(|(coordinator, token, heartbeat_secs)| {
-            let coordinator = coordinator.clone();
-            let token = token.clone();
-            let heartbeat_secs = *heartbeat_secs;
-            let stop = heartbeat_stop.clone();
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
-                loop {
-                    tokio::select! {
-                        _ = interval.tick() => {
-                            if coordinator.heartbeat(&token).ok() == Some(false) {
-                                break;
-                            }
-                        }
-                        _ = stop.cancelled() => break,
-                    }
-                }
-            })
-        });
+    // The native engine records its launches and may deliver a clarification.
+    let native = launch.is_some();
     let execution = async {
         let adapter = adapter_for(&candidate.harness_id, &config.harnesses)?;
         let executor = Executor::new(config.execution.clone());
@@ -2192,38 +1589,23 @@ async fn execute_candidate(
             .with_timeout(timeout)
             .with_cancellation(cancellation.clone());
         request.read_only = config.harnesses.get(&candidate.harness_id).read_only;
-        let admission_observer = admission.as_ref().map(|(coordinator, token, _)| {
-            Arc::new(AdmissionLeaseObserver::new(
-                coordinator.clone(),
-                token.clone(),
-            )) as Arc<dyn crate::executor::ExecutionObserver>
-        });
-        let observer = match launch {
-            Some(launch) => Some(Arc::new(crate::launch::LaunchObserver::new(
+        if let Some(launch) = launch {
+            request = request.with_observer(Arc::new(crate::launch::LaunchObserver::new(
                 &launch.db_path,
                 &launch.run_id,
                 &attempt_id,
                 launch.guard,
-                admission_observer,
-            ))
-                as Arc<dyn crate::executor::ExecutionObserver>),
-            None => admission_observer,
-        };
-        if let Some(observer) = observer {
-            request = request.with_observer(observer);
+                None,
+            )));
         }
         run_harness(adapter.as_ref(), &executor, request).await
     }
     .await;
-    heartbeat_stop.cancel();
-    if let Some(task) = heartbeat_task {
-        let _ = task.await;
-    }
-
-    let admission_released = match (&admission, &execution) {
-        (Some((coordinator, token, _)), _) => coordinator.release(token).unwrap_or(false),
-        (None, _) => true,
-    };
+    // Work may be verified or delivered only once the agent is known stopped.
+    let cleanup_confirmed = execution
+        .as_ref()
+        .is_ok_and(|result| result.execution.cleanup_confirmed)
+        || execution.is_err();
 
     let mut checkpoint = None;
     let mut usage_categories = std::collections::BTreeMap::new();
@@ -2234,9 +1616,7 @@ async fn execute_candidate(
         Ok(result) => {
             usage_categories = result.usage_categories;
             failure = result.failure;
-            if admission.is_some()
-                && result.execution.status == ExecutionStatus::Succeeded
-                && admission_released
+            if native && result.execution.status == ExecutionStatus::Succeeded && cleanup_confirmed
             {
                 checkpoint = result.checkpoint;
             }
@@ -2271,11 +1651,11 @@ async fn execute_candidate(
             };
 
             if candidate.status == CandidateStatus::Verifying
-                && admission_released
+                && cleanup_confirmed
                 && checkpoint.is_some()
             {
                 candidate.status = CandidateStatus::Completed;
-            } else if candidate.status == CandidateStatus::Verifying && admission_released {
+            } else if candidate.status == CandidateStatus::Verifying && cleanup_confirmed {
                 candidate.checks = run_checks_with_observer(
                     &candidate.workspace_path,
                     &config.checks.verify,
@@ -2296,7 +1676,7 @@ async fn execute_candidate(
                 candidate.status = CandidateStatus::Failed;
                 append_candidate_error(
                     &mut candidate,
-                    "model process cleanup could not be confirmed; pool awaits reconciliation"
+                    "model process cleanup could not be confirmed; its work is not delivered"
                         .into(),
                 );
             }
@@ -2314,8 +1694,6 @@ async fn execute_candidate(
                 || error.to_string().contains("funding revalidation")
             {
                 crate::FailureKind::Authorization
-            } else if error.to_string().contains("launch deferred:") {
-                crate::FailureKind::CapacityAdmission
             } else {
                 crate::FailureKind::HarnessProcess
             });
@@ -2350,7 +1728,7 @@ async fn execute_candidate(
     CandidateExecution {
         usage_categories,
         checkpoint,
-        admission_released,
+        cleanup_confirmed,
         preflight_refusal,
         failure,
         candidate,
@@ -2680,35 +2058,6 @@ fn finish_interrupted(state: &State, db: &mut Database, run: &mut RunRecord) -> 
             event_type: "run.interrupted".into(),
             timestamp: Utc::now(),
             payload: serde_json::json!({"candidate_count": run.candidates.len()}),
-            ..EventRecord::default()
-        },
-        run,
-    )
-}
-
-fn finish_deferred(
-    state: &State,
-    db: &mut Database,
-    run: &mut RunRecord,
-    message: &str,
-) -> Result<()> {
-    run.status = RunStatus::Deferred;
-    run.outcome.lifecycle = LifecycleState::Finished;
-    run.outcome.work_result = WorkResult::Deferred;
-    run.outcome.verification = VerificationState::NotRun;
-    run.outcome.review = ReviewState::NotRequested;
-    run.outcome.phase = RunPhase::Finished;
-    run.outcome.waiting_on = WaitingOn::None;
-    run.completed_at = Some(Utc::now());
-    db.sync_run(run)?;
-    persist_event(
-        state,
-        db,
-        EventRecord {
-            run_id: run.id.clone(),
-            event_type: "run.deferred".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"reason": message}),
             ..EventRecord::default()
         },
         run,
@@ -3393,7 +2742,6 @@ pub fn refresh_request(
         backend: Some(run.environment.execution_backend.clone()),
         timeout_secs: Some(run.environment.timeout_secs),
         max_parallel: Some(run.environment.max_parallel),
-        priority: goal.map_or(0, |goal| goal.priority),
         allow_unsafe_local: options.allow_unsafe_local,
         allow_forwarded_env: options.allow_forwarded_env,
         output: options.output,
@@ -3560,7 +2908,6 @@ fn print_attachment_details(run: &RunRecord) {
 fn explain_selection(run: &RunRecord) -> Result<()> {
     if let Some(decision) = &run.allocation {
         print_allocation_details(decision);
-        print_capacity_details(run.capacity.as_ref(), run.admission.as_ref());
         return Ok(());
     }
     let decision = run
@@ -3690,130 +3037,6 @@ fn print_allocation_details(decision: &AllocationDecision) {
                 .unwrap_or("eligible and selected")
         );
     }
-}
-
-fn print_capacity_details(
-    observation: Option<&crate::CapacityObservation>,
-    admission: Option<&crate::AdmissionSummary>,
-) {
-    let Some(observation) = observation else {
-        return;
-    };
-    println!("\nCapacity observation");
-    println!(
-        "  source: {} ({})",
-        observation.source, observation.source_version
-    );
-    println!("  sampled: {}", observation.sampled_at);
-    println!("  valid until: {}", observation.valid_until);
-    println!("  mapping: {}", enum_text(&observation.mapping));
-    println!("  scarcity: {}", enum_text(&observation.scarcity));
-    println!(
-        "  authentication: {}",
-        knowledge_text(&observation.auth_mode)
-    );
-    println!(
-        "  funding identity: {}",
-        knowledge_text(&observation.funding_identity)
-    );
-    println!("  plan: {}", knowledge_text(&observation.plan_type));
-    println!(
-        "  paid credits available: {}",
-        knowledge_text(&observation.credits_available)
-    );
-    println!(
-        "  service tier: {}",
-        knowledge_text(&observation.service_tier)
-    );
-    let funding_unknown = [
-        knowledge_is_unknown(&observation.auth_mode),
-        knowledge_is_unknown(&observation.funding_identity),
-        knowledge_is_unknown(&observation.plan_type),
-        knowledge_is_unknown(&observation.credits_available),
-        knowledge_is_unknown(&observation.service_tier),
-    ]
-    .into_iter()
-    .any(|value| value);
-    println!(
-        "  current funding evidence: {}",
-        if needs_refresh(observation, Utc::now()) {
-            "expired; Dispatch must refresh it before another launch"
-        } else if funding_unknown {
-            "no conflicting change reported; one or more facts remain unknown"
-        } else {
-            "fresh reported facts are consistent with the configured included route"
-        }
-    );
-    println!("  attribution: {}", observation.attribution);
-    println!("  windows:");
-    for constraint in &observation.constraints {
-        println!(
-            "    {} / {}: used={}, remaining={}, reset={}, duration={}",
-            constraint
-                .provider_bucket_id
-                .as_deref()
-                .unwrap_or("unknown-bucket"),
-            constraint.window_id.as_deref().unwrap_or("unknown-window"),
-            constraint
-                .reported_used_percent
-                .map(|value| format!("{value}%"))
-                .unwrap_or_else(|| "unknown".into()),
-            knowledge_text(&constraint.remaining),
-            knowledge_text(&constraint.reset_at),
-            knowledge_text(&constraint.window_duration_secs),
-        );
-    }
-    if let Some(reference) = &observation.raw_observation_ref {
-        println!("  raw observation: {}", reference.display());
-    }
-    if let Some(admission) = admission {
-        println!("\nShared admission");
-        println!("  pool: {}", admission.pool_id);
-        println!("  state: {}", enum_text(&admission.state));
-        println!(
-            "  fence: {}",
-            admission
-                .fence
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        );
-        println!("  generation: {}", admission.generation);
-        println!("  enqueued: {}", admission.enqueued_at);
-    }
-}
-
-fn knowledge_text<T: serde::Serialize>(value: &crate::CapacityValue<T>) -> String {
-    match value {
-        crate::CapacityValue::Reported { value } => {
-            serde_json::to_value(value).map_or_else(|_| "reported".into(), display_json_value)
-        }
-        crate::CapacityValue::Estimated {
-            lower,
-            upper,
-            method,
-            samples,
-        } => format!(
-            "estimated {}..{} ({method}, {samples} samples)",
-            serde_json::to_value(lower).map_or_else(|_| "?".into(), display_json_value),
-            serde_json::to_value(upper).map_or_else(|_| "?".into(), display_json_value),
-        ),
-        crate::CapacityValue::Unknown { reason } => format!("unknown ({reason})"),
-    }
-}
-
-fn knowledge_is_unknown<T>(value: &crate::CapacityValue<T>) -> bool {
-    matches!(value, crate::CapacityValue::Unknown { .. })
-}
-
-fn display_json_value(value: serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(value) => value,
-        value => value.to_string(),
-    }
-}
-
-fn enum_text<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value).map_or_else(|_| "unknown".into(), display_json_value)
 }
 
 fn record_allocation_feedback(
@@ -4530,10 +3753,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cancellation_and_persistence_faults_dispose_acquired_intent_before_handoff()
-    -> Result<()> {
+    async fn cancellation_before_handoff_spawns_nothing() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        for point in [1, 2, 3] {
+        for point in [2] {
             let temp = tempfile::tempdir()?;
             let state = State::discover(Some(temp.path().join("state")))?;
             state.initialize()?;
@@ -4562,9 +3784,6 @@ mod tests {
                 "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
             )?;
             let db = Database::open(state.db_path())?;
-            if point == 3 {
-                db.connection().execute_batch("CREATE TRIGGER fail_acquired_event BEFORE INSERT ON events WHEN NEW.event_type='admission.acquired' BEGIN SELECT RAISE(ABORT,'injected acquired-event persistence failure'); END;")?;
-            }
             let result = CANCEL_AT_HANDOFF
                 .scope(
                     point,
@@ -4581,7 +3800,6 @@ mod tests {
                             backend: None,
                             timeout_secs: None,
                             max_parallel: None,
-                            priority: 0,
                             allow_unsafe_local: true,
                             allow_forwarded_env: false,
                             output: RunOutputMode::Json,
@@ -4595,8 +3813,10 @@ mod tests {
                 "fault point {point} must interrupt the run"
             );
             assert!(!marker.exists(), "fault point {point} spawned a model");
-            let (requests,leases):(i64,i64)=db.connection().query_row("SELECT (SELECT COUNT(*) FROM admission_requests WHERE status='released'),(SELECT COUNT(*) FROM pool_leases)",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            assert_eq!((requests, leases), (1, 0), "fault point {point}");
+            let launches: i64 =
+                db.connection()
+                    .query_row("SELECT COUNT(*) FROM attempt_launches", [], |r| r.get(0))?;
+            assert_eq!(launches, 0, "fault point {point} recorded a launch");
         }
         Ok(())
     }

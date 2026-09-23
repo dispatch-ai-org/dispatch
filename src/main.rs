@@ -227,10 +227,6 @@ struct RunArgs {
     #[arg(long, hide = true)]
     max_parallel: Option<usize>,
 
-    /// Admission priority within the shared local subscription pool.
-    #[arg(long, value_parser = ["background", "normal", "urgent"], default_value = "normal", hide = true)]
-    priority: String,
-
     /// Explicitly allow real agents or project checks to execute on the host.
     #[arg(long, hide = true)]
     allow_unsafe_local: bool,
@@ -528,11 +524,6 @@ async fn run() -> Result<()> {
                 backend: args.backend,
                 timeout_secs: args.timeout,
                 max_parallel: args.max_parallel,
-                priority: match args.priority.as_str() {
-                    "background" => -1,
-                    "urgent" => 1,
-                    _ => 0,
-                },
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
                 output: if json {

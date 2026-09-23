@@ -252,34 +252,7 @@ pub fn validate_effort(effort: Option<&str>) -> Result<()> {
 pub struct ResourceConfig {
     pub version: u32,
     pub allocation_enabled: bool,
-    pub capacity: CapacityConfig,
     pub profiles: Vec<ResourceProfile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CapacityConfig {
-    pub codex_probe: bool,
-    pub probe_timeout_secs: u64,
-    pub freshness_secs: u64,
-    pub admission: bool,
-    pub lease_secs: u64,
-    pub heartbeat_secs: u64,
-    pub aging_secs: u64,
-}
-
-impl Default for CapacityConfig {
-    fn default() -> Self {
-        Self {
-            codex_probe: true,
-            probe_timeout_secs: 5,
-            freshness_secs: 300,
-            admission: true,
-            lease_secs: 20,
-            heartbeat_secs: 5,
-            aging_secs: 60,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,15 +296,6 @@ impl ResourceProfile {
             .filter(|_| self.harness == "claude")
             .map(|e| format!("claude-account:{}", e.account_sha256))
             .unwrap_or_else(|| self.funding_source.clone())
-    }
-    pub fn admission_buckets(&self) -> Vec<String> {
-        // Claude v1 has no authoritative preflight bucket mapping. All choices
-        // for the authenticated account conservatively share one allowance.
-        if self.harness == "claude" {
-            Vec::new()
-        } else {
-            self.provider_buckets.clone()
-        }
     }
     pub fn eligibility(&self) -> Result<()> {
         anyhow::ensure!(self.enabled, "resource profile disabled");
@@ -401,30 +365,6 @@ impl ResourceConfig {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.version == 1, "resources.yml version must be 1");
-        anyhow::ensure!(
-            self.capacity.probe_timeout_secs > 0,
-            "capacity probe timeout must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.freshness_secs > 0,
-            "capacity freshness must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.lease_secs > 0,
-            "capacity lease duration must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.heartbeat_secs > 0,
-            "capacity heartbeat must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.heartbeat_secs < self.capacity.lease_secs,
-            "capacity heartbeat must be shorter than the lease duration"
-        );
-        anyhow::ensure!(
-            self.capacity.aging_secs > 0,
-            "capacity aging must be positive"
-        );
         for profile in &self.profiles {
             if !profile.enabled {
                 continue;
@@ -469,36 +409,6 @@ impl ResourceConfig {
                     .all(|bucket| !bucket.trim().is_empty()),
                 "provider bucket IDs must not be empty"
             );
-        }
-        for (index, left) in self.profiles.iter().enumerate() {
-            for right in &self.profiles[index + 1..] {
-                if !left.enabled || !right.enabled {
-                    continue;
-                }
-                if left.pool == right.pool {
-                    anyhow::ensure!(
-                        left.provider == right.provider
-                            && left.funding_scope() == right.funding_scope()
-                            && left.provider_buckets == right.provider_buckets,
-                        "profiles in one resource pool must share provider, funding source, and provider bucket mapping"
-                    );
-                }
-                let overlapping_buckets = left.admission_buckets().is_empty()
-                    || right.provider_buckets.is_empty()
-                    || left
-                        .provider_buckets
-                        .iter()
-                        .any(|bucket| right.provider_buckets.contains(bucket));
-                if left.provider == right.provider
-                    && left.funding_scope() == right.funding_scope()
-                    && overlapping_buckets
-                {
-                    anyhow::ensure!(
-                        left.pool == right.pool,
-                        "profiles sharing a funding source and allowance bucket must use one resource pool"
-                    );
-                }
-            }
         }
         Ok(())
     }
@@ -584,18 +494,4 @@ mod tests {
         assert_eq!(config.profiles[1].provider, "anthropic");
     }
 
-    #[test]
-    fn shared_allowance_cannot_be_split_into_per_model_tanks() {
-        let config: ResourceConfig = serde_yaml::from_str(
-            "version: 1\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light\n    effort: low\n    service_mode: standard\n    runtime: local\n    pool: light-only\n    provider_buckets: [codex]\n    tier: light\n    included: true\n    no_overage_verified: true\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: strong\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: strong-only\n    provider_buckets: [codex]\n    tier: strong\n    included: true\n    no_overage_verified: true\n",
-        )
-        .unwrap();
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("one resource pool")
-        );
-    }
 }

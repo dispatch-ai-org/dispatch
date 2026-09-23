@@ -4,7 +4,6 @@ use crate::{
     coherence::watch::{WatchMsg, WatchSpec, Watcher},
     config::MidRunMode,
 };
-use rusqlite::OptionalExtension;
 
 pub(crate) fn local_uid() -> u32 {
     #[cfg(unix)]
@@ -44,13 +43,6 @@ fn expects_execution(run: &RunRecord) -> bool {
         && run.outcome.review != ReviewState::Rejected
 }
 
-fn unresolved_admission(db: &Database, id: &str) -> Result<bool> {
-    Ok(db.connection().query_row(
-        "SELECT EXISTS(SELECT 1 FROM admission_requests WHERE run_id=?1 AND status IN ('queued','admitted','reconciliation')) OR EXISTS(SELECT 1 FROM pool_leases l JOIN admission_requests r ON r.id=l.request_id WHERE r.run_id=?1)",
-        [id], |row| row.get(0),
-    )?)
-}
-
 /// Whether any agent this run launched may still be running.
 fn any_launch_alive(db: &Database, id: &str) -> Result<bool> {
     Ok(crate::launch::launches_for_run(db, id)?
@@ -64,8 +56,7 @@ fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str
     run.outcome.lifecycle = LifecycleState::Finished;
     run.outcome.work_result = WorkResult::Interrupted;
     run.outcome.phase = RunPhase::Finished;
-    run.outcome.waiting_on = if unresolved_admission(db, &run.id)? || any_launch_alive(db, &run.id)?
-    {
+    run.outcome.waiting_on = if any_launch_alive(db, &run.id)? {
         WaitingOn::Reconciliation
     } else {
         WaitingOn::None
@@ -134,17 +125,8 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
         return Ok(());
     };
     *run = current;
-    let mut supervisor = run.phase3.as_ref().and_then(|p| p.supervisor.clone());
-    // Existing Phase 3 records already have an admission-owner identity.
-    // A new answer owner holds the run lock, even for these older records.
-    if supervisor.is_none() {
-        supervisor = db.connection().query_row(
-            "SELECT owner_pid,owner_start_identity,owner_boot_identity FROM admission_requests WHERE run_id=?1 ORDER BY enqueued_at DESC,id DESC LIMIT 1",
-            [&run.id], |row| {
-                Ok(crate::process::identity_from_row(row.get(0)?, row.get(1)?, row.get(2)?, None))
-            },
-        ).optional()?.flatten();
-    }
+    // A run recorded without a supervisor is never presumed abandoned.
+    let supervisor = run.phase3.as_ref().and_then(|p| p.supervisor.clone());
     let gone = supervisor.as_ref().is_some_and(|owner| {
         matches!(
             crate::process::identity_state(owner),
@@ -154,21 +136,9 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
     // Completed attempts affirm that verification has also returned. An
     // unfinished attempt, or a launch that may still be alive, can still be
     // writing; leave that uncertainty to supervision and reconciliation.
-    // Until admission is removed, both the admission lease and the launch
-    // record must agree that nothing can still be running.
     let completed =
         !run.attempts.is_empty() && run.attempts.iter().all(|a| a.completed_at.is_some());
-    let admission_settled = !unresolved_admission(db, &run.id)?;
-    let launches_settled = !any_launch_alive(db, &run.id)?;
-    if gone && completed && admission_settled != launches_settled {
-        tracing::info!(
-            run = %run.id,
-            admission_settled,
-            launches_settled,
-            "admission and launch records disagree about abandoned work"
-        );
-    }
-    if expects_execution(run) && gone && completed && admission_settled && launches_settled {
+    if expects_execution(run) && gone && completed && !any_launch_alive(db, &run.id)? {
         interrupt_run(
             state,
             db,
@@ -289,30 +259,26 @@ pub(super) fn stop(
     };
     run.outcome.phase = RunPhase::Finished;
     run.outcome.review = ReviewState::NotRequested;
-    run.outcome.waiting_on = if run
-        .admission
-        .as_ref()
-        .is_some_and(|a| a.state == AdmissionState::Reconciliation)
-    {
+    run.outcome.waiting_on = if any_launch_alive(db, &run.id)? {
         WaitingOn::Reconciliation
     } else {
         WaitingOn::None
     };
     if let Some(attempt) = run.attempts.last_mut().filter(|a| a.completed_at.is_none()) {
         attempt.completed_at = run.completed_at;
-        let knowledge: Option<String> = db.connection().query_row("SELECT launch_knowledge FROM admission_requests WHERE attempt_id=?1 ORDER BY enqueued_at DESC LIMIT 1",[&attempt.id],|r|r.get(0)).optional()?;
-        attempt.outcome = if knowledge
-            .as_deref()
-            .is_none_or(|k| matches!(k, "launch_intent_committed" | "launch_not_started"))
-        {
+        let launched = crate::launch::launches_for_run(db, &attempt.run_id)?
+            .iter()
+            .any(|launch| {
+                launch.attempt_id == attempt.id
+                    && launch.state != crate::launch::LaunchState::SpawnFailed
+            });
+        attempt.outcome = if !launched {
             "not_launched"
         } else {
             "interrupted"
         }
         .into();
         attempt.detail.failure = Some(failure);
-        attempt.detail.capacity = run.capacity.clone();
-        attempt.detail.admission = run.admission.clone().filter(|a| a.attempt_id == attempt.id);
     }
     sync_transition(
         state,
@@ -686,85 +652,21 @@ async fn drive_inner(
         run.outcome.verification = VerificationState::NotRun;
         run.outcome.phase = RunPhase::Executing;
         db.sync_run(&run)?;
-        let priority = run.phase3.as_ref().unwrap().priority;
-        let permission = admit_attempt(
-            state,
-            db,
-            &mut run,
-            &config,
-            &resources,
-            &cancellation,
-            output,
-            priority,
-        )
-        .await;
-        let guard = match permission {
-            Ok(Some(guard)) => guard,
-            other => {
-                run.admission = db.admission_summary_for_run(&run.id)?;
-                let failure =
-                    if cancellation.is_cancelled() {
-                        interrupted(&run)
-                    } else {
-                        run.phase3.as_ref().unwrap().failure.unwrap_or(
-                            if matches!(other, Ok(None)) {
-                                FailureKind::CapacityAdmission
-                            } else {
-                                FailureKind::InternalState
-                            },
-                        )
-                    };
-                let message = match other {
-                    Err(e) => format!("{e:#}"),
-                    _ => "capacity deferred".into(),
-                };
-                stop(state, db, &mut run, failure, &message)?;
-                if failure == FailureKind::InternalState {
-                    bail!(message);
-                }
-                break 'attempt;
-            }
-        };
         #[cfg(test)]
         if CANCEL_AT_HANDOFF.try_with(|p| *p == 2).unwrap_or(false) {
             cancellation.cancel();
         }
         if cancellation.is_cancelled() {
-            drop(guard);
-            run.admission = db.admission_summary_for_run(&run.id)?;
             let failure = interrupted(&run);
             stop(state, db, &mut run, failure, "cancelled before handoff")?;
             bail!("cancelled before handoff");
         }
-        // At the launch boundary the bound profile must still be configured
-        // exactly as selected, and its funding must not have been refused by
-        // another process while this attempt waited for admission.
-        let current = crate::config::ResourceConfig::load(&state.root)?;
-        let unchanged = current.profiles.iter().any(|p| {
-            p.enabled && serde_json::to_value(p).ok() == serde_json::to_value(&profile).ok()
-        });
-        let refusal = if unchanged {
-            db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
-                .map(|refusal| super::funding_refused_message(&profile, &refusal))
-        } else {
-            Some("resource configuration changed after selection; stale launch refused".into())
-        };
-        if let Some(message) = refusal {
-            drop(guard);
-            run.admission = db.admission_summary_for_run(&run.id)?;
-            stop(state, db, &mut run, FailureKind::Authorization, &message)?;
-            break 'attempt;
-        }
         let attempt_id = update_attempt_started(&mut run, &candidate.id);
-        run.attempts.last_mut().unwrap().detail.admission =
-            db.admission_summary_for_run(&run.id)?;
-        run.attempts.last_mut().unwrap().detail.capacity = run.capacity.clone();
         db.sync_run(&run)?;
         let payload = serde_json::json!({"reason":run.attempts.last().unwrap().detail.reason});
         transition(state, db, &mut run, "attempt.started", payload)?;
         let prompt = fs::read_to_string(&candidate.prompt_path)?;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (coordinator, token) = guard.handoff();
         // The watcher lives exactly as long as this attempt: it is finished
         // below when the attempt returns, and aborted if an error leaves early.
         let mut watcher = candidate.prompt_path.parent().map(|dir| {
@@ -786,7 +688,6 @@ async fn drive_inner(
             run.baseline_path.clone(),
             cancellation.clone(),
             (tx, attempt_id),
-            Some((coordinator, token, resources.capacity.heartbeat_secs)),
             Some(super::LaunchContext {
                 db_path: state.db_path(),
                 run_id: run.id.clone(),
@@ -826,11 +727,6 @@ async fn drive_inner(
         while let Ok(event) = rx.try_recv() {
             persist_check_lifecycle(state, db, &mut run, event)?;
         }
-        run.admission = db.admission_summary_for_run(&run.id)?;
-        if let Some(capacity) = &run.capacity {
-            run.capacity = db.latest_capacity_observation(&capacity.pool_id)?;
-            run.attempts.last_mut().unwrap().detail.capacity = run.capacity.clone();
-        }
         // A refused preflight is sticky for this authorization revision.
         if let Some(reason) = &execution.preflight_refusal {
             db.record_funding_refusal(
@@ -848,7 +744,7 @@ async fn drive_inner(
         update_attempt_finished(&mut run, &candidate, &execution);
         let failure = if cancellation.is_cancelled() {
             Some(interrupted_by(&run, stale.is_some()))
-        } else if !execution.admission_released {
+        } else if !execution.cleanup_confirmed {
             Some(FailureKind::InternalState)
         } else if candidate.status != CandidateStatus::Completed {
             Some(execution.failure.unwrap_or(FailureKind::HarnessProcess))
@@ -863,7 +759,6 @@ async fn drive_inner(
         };
         let last = run.attempts.last_mut().unwrap();
         last.detail.result = Some(candidate.clone());
-        last.detail.admission = run.admission.clone();
         last.detail.failure = failure;
         let final_id = last.id.clone();
         // Persist completed evidence before any new attempt or question.

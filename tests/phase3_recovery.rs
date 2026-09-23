@@ -1,7 +1,6 @@
 #![cfg(unix)]
 use anyhow::{Context, Result};
-use chrono::Utc;
-use dispatch::{CapacityValue, capacity::unknown_observation, db::Database, state::State};
+use dispatch::{db::Database, state::State};
 use serde_json::Value;
 use std::{
     fs,
@@ -301,10 +300,13 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
         result["attempts"][1]["detail"]["reason"],
         "clarification_answer"
     );
-    assert_ne!(
-        result["attempts"][0]["detail"]["admission"]["fence"],
-        result["attempts"][1]["detail"]["admission"]["fence"]
-    );
+    // Each attempt has its own launch record, cleaned up before the next.
+    let launches: i64 = rusqlite::Connection::open(f.state.join("dispatch.db"))?.query_row(
+        "SELECT COUNT(DISTINCT attempt_id) FROM attempt_launches WHERE run_id=?1 AND state='cleaned'",
+        [result["run_id"].as_str().unwrap()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(launches, 2);
     assert!(!f.answer(&r, "1")?.status.success());
     assert_eq!(f.count(), 2);
     f.no_leases()
@@ -486,16 +488,15 @@ fn continuation_rechecks_configuration_and_shared_funding() -> Result<()> {
                     .replace("no_overage_verified: true", "no_overage_verified: false"),
             )?;
         } else {
-            let db = Database::open(f.state.join("dispatch.db"))?;
-            let mut observation = unknown_observation(
-                "shared",
-                "standard",
-                Utc::now(),
-                300,
-                "funding changed while waiting",
-            );
-            observation.credits_available = CapacityValue::Reported { value: true };
-            db.append_capacity_observation(&observation)?;
+            // The provider starts reporting paid credits while the question waits.
+            let agent = f.root.join("codex");
+            fs::write(
+                &agent,
+                fs::read_to_string(&agent)?.replace(
+                    r#"{"rateLimitsByLimitId":{}}"#,
+                    r#"{"rateLimitsByLimitId":{"codex":{"credits":{"hasCredits":true}}}}"#,
+                ),
+            )?;
         }
         let output = f.answer(&first, "1")?;
         let result = Fixture::result(&output)?;
@@ -967,16 +968,16 @@ fn reload_requires_positive_owner_and_cleanup_evidence() -> Result<()> {
         };
         let mut db = Database::open(f.state.join("dispatch.db"))?;
         db.sync_run(&run)?;
-        if evidence == "missing" {
-            rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute("UPDATE admission_requests SET owner_pid=NULL,owner_start_identity=NULL,owner_boot_identity=NULL WHERE run_id=?1", [id])?;
-        }
         if evidence == "unresolved" {
+            // The agent's cleanup was never confirmed and it is still alive.
+            let live = serde_json::to_string(&dispatch::process::ProcessIdentity::current())?;
             rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute(
-                "UPDATE admission_requests SET status='reconciliation' WHERE run_id=?1",
-                [id],
+                "UPDATE attempt_launches SET state='uncertain', child_json=?2 WHERE run_id=?1",
+                rusqlite::params![id, live],
             )?;
         }
-        if matches!(evidence, "unlocked-dead" | "legacy") {
+        // Without a recorded supervisor, work is never presumed abandoned.
+        if evidence == "unlocked-dead" {
             f.assert_interrupted(&run)?;
         } else {
             assert_eq!(

@@ -284,3 +284,24 @@ again at admission. After S6b it must run immediately before spawn.
     later (its output pipe was gone); the record then reads not alive. The run
     stays open because its attempt never completed, as in 0.4.0. No
     disagreement logged; the source was untouched.
+- 2026-09-23 — S6b (gate met: S5a and S6a proof suites green, real-agent
+  dogfood recorded): deleted `admission.rs` and `capacity.rs` (the admission
+  queue, pool leases, heartbeats, capacity observations, scarcity and
+  authorization epochs), `admit_attempt`, `observe_capacity`, `--priority`
+  and the `capacity:` section of `resources.yml` (still parsed and ignored).
+  Invariants carried over: work whose agent cleanup is unconfirmed is still
+  failed rather than verified (`ExecutionResult.cleanup_confirmed` replaces the
+  lease release); a run cannot wait on a human while a launched agent may be
+  running (launch records replace the admission check); crash repair decides
+  from launch records alone; interrupted attempts are marked `not_launched`
+  from the launch record; Codex setup discovery uses the adapter probe and
+  refusal rule. A run recorded without a supervisor is no longer presumed
+  abandoned through admission's owner row (conservative). Test changes: the
+  phase2 suite and admission/capacity unit tests are removed with their
+  behavior; the portfolio `capacity` scenario is removed; `launch_change` now
+  targets the spawn-boundary preflight (two account checks, not three);
+  admission-specific assertions became launch-record assertions. New:
+  `tests/reauthorization.rs` (Codex and Claude launch again after
+  re-authorization), confirming the 0.4.0 stuck-profile defect is gone. The
+  S5a/S6a proof files are unchanged. `cargo test`: 437 passed, 0 failed after
+  the pool-split config test was removed with its validation.

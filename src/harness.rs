@@ -21,48 +21,6 @@ use crate::{
     },
 };
 
-pub(crate) async fn observe_resource(
-    executable: &Path,
-    selected: &crate::ResourceChoice,
-    coordinated_pool: &str,
-    profile: &crate::config::ResourceProfile,
-    config: &crate::config::CapacityConfig,
-    run_dir: &Path,
-) -> crate::capacity::CapacityProbeResult {
-    if selected.harness == "claude" {
-        crate::harness::claude::observe(executable, profile, coordinated_pool, run_dir, config)
-            .await
-    } else if selected.harness == "codex"
-        && config.codex_probe
-        && crate::capacity::supports_codex_account_probe(executable)
-    {
-        crate::capacity::probe_codex(
-            executable,
-            coordinated_pool,
-            &profile.provider_buckets,
-            &selected.service_mode,
-            config,
-        )
-        .await
-    } else {
-        let reason = if config.codex_probe {
-            "Codex account probe unavailable for this configured executable"
-        } else {
-            "capacity probe disabled"
-        };
-        crate::capacity::CapacityProbeResult {
-            observation: crate::capacity::unknown_observation(
-                coordinated_pool,
-                &selected.service_mode,
-                chrono::Utc::now(),
-                config.freshness_secs,
-                reason,
-            ),
-            raw: serde_json::json!({"unavailable": reason}),
-        }
-    }
-}
-
 pub const SUPPORTED_HARNESSES: &[&str] = &[
     "claude",
     "codex",
@@ -335,7 +293,7 @@ pub async fn run_harness(
         token_semantics: telemetry.token_semantics,
         cost_usd: telemetry.cost_usd,
         // A provider rejection after spawn is a failed invocation, not a
-        // pre-launch admission deferral. Its restriction is persisted above.
+        // pre-launch deferral.
         failure: telemetry.failure.map(|failure| {
             if failure == crate::FailureKind::CapacityAdmission {
                 crate::FailureKind::HarnessProcess

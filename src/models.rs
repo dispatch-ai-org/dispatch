@@ -1023,7 +1023,6 @@ pub struct GoalExecution {
     pub fixed_harness: Option<String>,
     pub fixed_model: Option<String>,
     pub fixed_effort: Option<String>,
-    pub priority: i32,
     pub owner_uid: u32,
     #[serde(default)]
     pub supervisor: Option<crate::process::ProcessIdentity>,

@@ -28,7 +28,6 @@ portfolio! {
     portfolio_missing_optional_and_explicit_failure => "missing",
     claude_funding_hazards_before_launch => "funding",
     claude_protocol_failures_do_not_recover => "protocol",
-    portfolio_retained_capacity_routes_to_other_provider => "capacity",
     claude_profile_lifecycle_preserves_history => "lifecycle",
     claude_final_preflight_invalidates_epoch => "launch_change",
     claude_effective_settings_preserve_context_without_hooks => "settings",

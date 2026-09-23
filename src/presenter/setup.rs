@@ -118,7 +118,9 @@ async fn configure(ui: &mut Ui, state: &State, provider: &str, index: Option<usi
     if matches!(ui.command_prompt("Authorize this resource? Type confirm, or cancel.").await?,Input::Submit(v) if v.trim()=="confirm")
     {
         proposal.confirm(state)?;
-        ui.commit("Resource saved. Current account, funding and shared admission are checked again before launch.")?;
+        ui.commit(
+            "Resource saved. The current account and funding are checked again before launch.",
+        )?;
     } else {
         ui.commit("Revalidation cancelled. Configuration unchanged.")?;
     }

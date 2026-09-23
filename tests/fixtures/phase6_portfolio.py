@@ -77,7 +77,6 @@ def scenario(binary, name):
             assert a['requested_effort']=='low' and a['observed_effort'] is None
             stored=f.stored(result['run_id'])
             assert stored['candidates'][0]['tokens']==22 and stored['candidates'][0]['cost_usd'] is None
-            assert stored['capacity']['scarcity']=='unknown'
             assert (f.source/'src/lib.rs').read_text()=='// baseline\n'
             assert f.count()==1
             no_lease(f)
@@ -176,12 +175,13 @@ def scenario(binary, name):
                 assert not f.stored(result['run_id'])['phase3']['questions']
                 no_lease(f)
         elif name=='launch_change':
-            (f.root/'auth-boundary').write_text('3')
+            # Account checks: selection, then the preflight at the spawn boundary.
+            (f.root/'auth-boundary').write_text('2')
             output,result=run(f)
             assert output.returncode!=0 and f.count()==0,(output.stdout,output.stderr)
             assert len(result['attempts'])==1
             with sqlite3.connect(f.state/'dispatch.db') as db:
-                assert db.execute("SELECT COUNT(*) FROM capacity_authorizations WHERE status='rejected'").fetchone()[0]>0
+                assert db.execute("SELECT COUNT(*) FROM funding_refusals").fetchone()[0]>0
             # Restoring credentials alone must not renew the invalidated epoch.
             auth=f.root/'auth.json';value=json.loads(auth.read_text());value['email']='fixture@example.invalid';auth.write_text(json.dumps(value))
             output,_=run(f);assert output.returncode!=0 and f.count()==0
@@ -197,26 +197,6 @@ def scenario(binary, name):
             (Path(os.environ['HOME'])/'.claude').mkdir()
             (Path(os.environ['HOME'])/'.claude/managed-settings.json').write_text('{}')
             output,_=run(f);assert output.returncode!=0 and f.count()==1
-        elif name=='capacity':
-            peer=add_peer(f,binary)
-            output,result=run(f);checked(output,result)
-            pool=result['capacity']['pool_id']
-            with sqlite3.connect(f.state/'dispatch.db') as db:
-                obs=json.loads(db.execute('SELECT payload_json FROM capacity_observations WHERE pool_id=? ORDER BY sampled_at DESC LIMIT 1',(pool,)).fetchone()[0])
-                obs['id']='phase6-exhausted';obs['sampled_at']=datetime.now(timezone.utc).isoformat();obs['scarcity']='exhausted'
-                obs['constraints'][0].update(provider_bucket_id='codex',window_id='weekly',scope={'knowledge':'reported','value':'included_subscription'},remaining={'knowledge':'reported','value':0.0})
-                obs['mapping']='mapped'
-                db.execute('INSERT INTO capacity_observations(id,pool_id,source,source_version,sampled_at,valid_until,payload_json) VALUES(?,?,?,?,?,?,?)',
-                    (obs['id'],pool,obs['source'],obs['source_version'],obs['sampled_at'],obs['valid_until'],json.dumps(obs)))
-                constraint=obs['constraints'][0]
-                db.execute('INSERT INTO capacity_observation_constraints VALUES(?,?,?,?,?)',(obs['id'],0,'codex','weekly',json.dumps(constraint)))
-            output,result=run(f);checked(output,result)
-            assert result['allocation']['selected']['harness']=='codex'
-            assert f.count()==1 and peer.count()==1
-            path=f.state/'resources.yml'
-            path.write_text(path.read_text().replace('pool: claude-pool','pool: renamed-claude').replace('funding_source: claude-fixture','funding_source: renamed-funding').replace('provider_buckets: [codex]','provider_buckets: [codex, additional]',1))
-            output,result=run(f);checked(output,result)
-            assert result['allocation']['selected']['harness']=='codex' and f.count()==1
         elif name=='lifecycle':
             output,result=run(f);checked(output,result)
             path=f.state/'resources.yml';original=path.read_text()

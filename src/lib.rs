@@ -1,5 +1,3 @@
-pub mod admission;
-pub mod capacity;
 pub mod coherence;
 pub mod config;
 pub mod db;
