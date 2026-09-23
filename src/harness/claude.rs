@@ -79,10 +79,10 @@ pub fn validate_profile(profile: &ResourceProfile) -> Result<()> {
         "Claude requires a validated fixed model ID; aliases, context suffixes and compositions are unsupported"
     );
     ensure!(
-        matches!(
-            profile.effort.as_deref(),
-            None | Some("low" | "medium" | "high" | "xhigh")
-        ),
+        profile
+            .effort
+            .as_deref()
+            .is_none_or(|e| EFFORTS.contains(&e)),
         "unsupported Claude effort; no substitution is permitted"
     );
     ensure!(
@@ -102,6 +102,29 @@ pub fn eligibility(profile: &ResourceProfile) -> Result<()> {
 }
 
 const TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep";
+
+/// Efforts Claude Code accepts with `--effort`.
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// Fixed model IDs setup offers. Claude Code cannot list models, so this is
+/// a suggestion; setup always also offers typing another fixed ID.
+const MODELS: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-haiku-4-5-20251001",
+];
+
+pub fn models() -> Vec<super::ModelOption> {
+    MODELS
+        .iter()
+        .map(|id| super::ModelOption {
+            id: (*id).to_owned(),
+            efforts: EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
+            default_effort: Some("medium".into()),
+        })
+        .collect()
+}
 
 fn controls() -> Vec<String> {
     ["--setting-sources", "", "--settings",
@@ -278,7 +301,7 @@ pub fn command(
     }
     if let Some(effort) = &config.effort {
         ensure!(
-            matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh"),
+            EFFORTS.contains(&effort.as_str()),
             "unsupported Claude effort"
         );
         args.extend(["--effort".into(), effort.clone()]);

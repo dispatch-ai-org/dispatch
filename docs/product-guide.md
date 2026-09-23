@@ -7,28 +7,39 @@ an essential clarification question.
 ## Setup and resources
 
 `dispatch setup` and the session's `/resources` action share the same handlers.
-`dispatch setup codex` or `dispatch setup claude` starts a new resource; choose an
-existing profile number to revalidate it without retyping hashes or epochs.
-`dispatch resources` is noninteractive, does not probe accounts, and reports
-configuration eligibility separately from launch-time validation.
+Every step is a menu: ↑/↓ (or j/k) move, a digit moves to that row, Enter chooses,
+Esc goes back. `dispatch setup codex` or `dispatch setup claude` starts a new
+resource; choosing an existing profile's row revalidates it without retyping
+anything. Each profile row shows whether it is ready and, for Claude, when its
+authorization expires. `dispatch resources` is noninteractive, does not probe
+accounts, and reports configuration eligibility separately from launch-time
+validation.
 
 1. Install the provider CLI yourself. Setup resolves the named tool on PATH, not
    a repository-supplied harness override. Existing advanced overrides still work
-   through the execution core; guided setup does not silently run them.
+   through the execution core; guided setup does not silently run them. A
+   provider that is not on PATH is shown but cannot be chosen.
 2. Choose a provider. Read-only discovery uses Codex account/read and rate-limit
    data, or Claude's controlled `auth status --json`. Unknown auth fails closed;
    unknown quota is not an invented balance. No model prompt is sent.
-3. If login is needed, choose Login and explicitly confirm the provider login.
+3. If login is needed, choose *Provider login…*, the provider, then *Open login*.
    Codex uses `login --device-auth`; Claude uses `auth login`. These can require a
    browser and can change the provider's saved account. Terminal ownership is
    restored on return. No OAuth token is extracted or stored by Dispatch.
-4. Choose the exact model/effort/tier you intend to include. Suggested defaults
-   are examples, never proof of availability or plan coverage. The final screen
-   identifies the CLI, opaque account fingerprint, model, effort, service and
-   funding assertion. Type `confirm` only after checking these with your provider.
-5. Claude additionally requires explicit controlled-print inclusion, disabled
-   usage credits and an unmanaged account. Its evidence expires within 24 hours.
-   Revalidate a numbered profile after expiry; cancelling leaves it expired.
+4. Choose the model and effort. Codex lists its models itself (`model/list`), and
+   setup offers only the efforts both Codex and Dispatch accept. Claude Code cannot
+   list models, so setup suggests fixed model IDs. Models your profiles already use
+   come first. *Other model ID…* takes an exact ID, which is validated and shown
+   verbatim before you authorize. A listed model is never proof that your plan
+   includes it.
+5. Authorize. The authorization screen lists the CLI, the account fingerprint, the
+   model, the effort, the service and every funding assertion you are making.
+   Focus starts on *Cancel*, so Enter alone never authorizes; move to *Authorize
+   and save* to save.
+6. Claude additionally requires you to confirm that controlled print mode is
+   included, usage credits are disabled and the account is unmanaged. Its
+   authorization expires within 24 hours. Revalidate its row after expiry;
+   cancelling leaves it expired.
 
 The service writes `resources.yml` atomically, with mode 600, under a short
 cooperating-writer lock. A changed file invalidates the displayed proposal.
@@ -39,8 +50,9 @@ unsupported service modes and changed Claude account scope require deliberate
 advanced configuration or a separately confirmed new resource. Setup does not
 change global provider settings.
 
-`--plain`, `--ascii`, `--no-color` and `TERM=dumb` apply to setup too. Non-TTY setup
-refuses to prompt. There is no Dispatch login for ordinary local work.
+`--plain`, `--ascii`, `--no-color` and `TERM=dumb` apply to setup too. In plain mode
+each menu is a numbered list; type a number, or press Enter for the focused row
+(Cancel on the authorization screen). Non-TTY setup refuses to prompt. There is no Dispatch login for ordinary local work.
 
 ## Checks and direct work
 

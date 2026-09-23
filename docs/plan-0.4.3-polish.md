@@ -391,3 +391,26 @@ decided). New languages for symbol facts.
   an arrow and Enter (nothing saved) and in plain mode with an empty line (the
   focused command saved). A PTY capture repaints only changed cells, so tests
   assert outcomes, not the drawn marker. `cargo test`: 428 passed, 0 failed.
+- 2026-09-23 — Stage 2. Every setup step is a menu.
+  - The main menu has *Add Claude Code* and *Add Codex* (unselectable, with a
+    reason, when not on PATH), one row per profile showing readiness and Claude's
+    expiry, *Provider login…* and *Back*.
+  - Login is chosen, then *Open login*.
+  - Models: Codex's own list from `model/list`. This was probed on codex-cli
+    0.155.1, which lists `gpt-6-*` models with supported and default efforts;
+    hidden models are dropped. Claude uses suggested fixed IDs. Configured models
+    come first; *Other model ID…* is validated and shown verbatim before consent.
+  - Efforts come from the chosen model: those Codex supports and Dispatch accepts
+    (`max` and `ultra` are not offered), or Claude's `EFFORTS`.
+  - Consent is the full assertion in scrollback, then *Authorize and save* /
+    *Cancel* with focus on Cancel.
+  - Tier is no longer asked (written as `standard` for rollback), and the
+    explicit-bucket refusal is gone.
+  - The Codex app-server handshake is shared by the account probe and
+    `list_models`; the funding preflight's checks are unchanged.
+  - Tests: `parse_models`, plus setup journeys for Enter-cancels-consent,
+    Authorize, revalidation with expiry, account change, login, Other model ID
+    (rejected, then verbatim), plain mode, and a state with a database. By hand,
+    with the real Claude Code CLI on a copy of the dogfood state: menu, model,
+    effort, and Enter cancelled; `resources.yml` unchanged.
+  - `cargo test`: 429 passed, 0 failed.

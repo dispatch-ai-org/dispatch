@@ -501,6 +501,12 @@ impl Choice {
             disabled: None,
         }
     }
+    fn disabled(label: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            disabled: Some(reason.into()),
+        }
+    }
     fn row(&self) -> String {
         match &self.disabled {
             None => self.label.clone(),

@@ -161,9 +161,20 @@ pub struct ProbeResponse {
     pub source_version: String,
 }
 
-/// Read the Codex account and its rate limits through the supported
-/// `codex app-server` JSON-RPC interface. No model is invoked.
-pub async fn read_account(executable: &Path, stage_timeout: Duration) -> Result<ProbeResponse> {
+type AppServerLines = tokio::io::Lines<BufReader<tokio::process::ChildStdout>>;
+
+/// Start `codex app-server` and complete its `initialize` handshake within
+/// `stage_timeout`. Returns the child, its stdin and stdout lines, and the
+/// `initialize` response.
+async fn start_app_server(
+    executable: &Path,
+    stage_timeout: Duration,
+) -> Result<(
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    AppServerLines,
+    Value,
+)> {
     let mut command = Command::new(executable);
     command
         .args(["app-server", "--listen", "stdio://"])
@@ -181,19 +192,32 @@ pub async fn read_account(executable: &Path, stage_timeout: Duration) -> Result<
     let mut stdin = child.stdin.take().context("probe stdin unavailable")?;
     let stdout = child.stdout.take().context("probe stdout unavailable")?;
     let mut lines = BufReader::new(stdout).lines();
-    let account_stage = async {
+    let handshake = async {
         send(&mut stdin, json!({"method":"initialize","id":0,"params":{"clientInfo":{"name":"dispatch","title":"Dispatch","version":crate::VERSION}}})).await?;
         let initialized = response(&mut lines, 0).await?;
         send(&mut stdin, json!({"method":"initialized","params":{}})).await?;
+        Ok::<_, anyhow::Error>(initialized)
+    };
+    let initialized = tokio::time::timeout(stage_timeout, handshake)
+        .await
+        .map_err(|_| anyhow::anyhow!("probe timeout before initialize response"))??;
+    Ok((child, stdin, lines, initialized))
+}
+
+/// Read the Codex account and its rate limits through the supported
+/// `codex app-server` JSON-RPC interface. No model is invoked.
+pub async fn read_account(executable: &Path, stage_timeout: Duration) -> Result<ProbeResponse> {
+    let (mut child, mut stdin, mut lines, initialized) =
+        start_app_server(executable, stage_timeout).await?;
+    let account_stage = async {
         send(
             &mut stdin,
             json!({"method":"account/read","id":1,"params":{"refreshToken":false}}),
         )
         .await?;
-        let account = response(&mut lines, 1).await?;
-        Ok::<_, anyhow::Error>((initialized, account))
+        response(&mut lines, 1).await
     };
-    let (initialized, account) = tokio::time::timeout(stage_timeout, account_stage)
+    let account = tokio::time::timeout(stage_timeout, account_stage)
         .await
         .map_err(|_| anyhow::anyhow!("probe timeout before account response"))??;
     let source_version = initialized
@@ -224,6 +248,69 @@ pub async fn read_account(executable: &Path, stage_timeout: Duration) -> Result<
     })
 }
 
+/// The models the installed Codex offers through `model/list`, visible ones
+/// only, the default first, each with the efforts both Codex and Dispatch
+/// accept. Setup offers these for selection; no model is invoked.
+pub async fn list_models(
+    executable: &Path,
+    stage_timeout: Duration,
+) -> Result<Vec<super::ModelOption>> {
+    let (mut child, mut stdin, mut lines, _) = start_app_server(executable, stage_timeout).await?;
+    let listed = async {
+        send(
+            &mut stdin,
+            json!({"method":"model/list","id":1,"params":{}}),
+        )
+        .await?;
+        response(&mut lines, 1).await
+    };
+    let listed = tokio::time::timeout(stage_timeout, listed).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let listed = listed.map_err(|_| anyhow::anyhow!("model list timeout"))??;
+    Ok(parse_models(&listed))
+}
+
+fn parse_models(listed: &Value) -> Vec<super::ModelOption> {
+    let mut models = listed
+        .pointer("/result/data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("hidden").and_then(Value::as_bool) != Some(true))
+        .filter_map(|m| {
+            let id = m.get("id").and_then(Value::as_str)?.to_owned();
+            crate::config::validate_model(Some(&id)).ok()?;
+            let efforts = m
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str))
+                .filter(|e| crate::config::validate_effort(Some(e)).is_ok())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let default_effort = m
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .filter(|e| efforts.iter().any(|x| x == e))
+                .map(str::to_owned);
+            let is_default = m.get("isDefault").and_then(Value::as_bool) == Some(true);
+            Some((
+                is_default,
+                super::ModelOption {
+                    id,
+                    efforts,
+                    default_effort,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    // Stable: the default model first, then the order Codex listed them.
+    models.sort_by_key(|(is_default, _)| !*is_default);
+    models.into_iter().map(|(_, model)| model).collect()
+}
+
 async fn send(stdin: &mut tokio::process::ChildStdin, message: Value) -> Result<()> {
     stdin.write_all(message.to_string().as_bytes()).await?;
     stdin.write_all(b"\n").await?;
@@ -231,10 +318,7 @@ async fn send(stdin: &mut tokio::process::ChildStdin, message: Value) -> Result<
     Ok(())
 }
 
-async fn response(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    id: i64,
-) -> Result<Value> {
+async fn response(lines: &mut AppServerLines, id: i64) -> Result<Value> {
     while let Some(line) = lines.next_line().await? {
         let value: Value = serde_json::from_str(&line).context("invalid app-server JSON")?;
         if value.get("id").and_then(Value::as_i64) == Some(id) {
@@ -252,6 +336,31 @@ mod tests {
     use super::*;
 
     const ACCOUNT: &str = "fixture@example.invalid";
+
+    #[test]
+    fn model_list_offers_visible_models_default_first_with_accepted_efforts() {
+        // Shaped like codex-cli 0.155's `model/list` response.
+        let effort = |e: &str| json!({"reasoningEffort": e, "description": ""});
+        let listed = json!({"id": 1, "result": {"data": [
+            {"id": "gpt-6-sol", "hidden": false, "isDefault": false,
+             "supportedReasoningEfforts": [effort("low"), effort("medium")],
+             "defaultReasoningEffort": "medium"},
+            {"id": "gpt-6-astra", "hidden": false, "isDefault": true,
+             "supportedReasoningEfforts": [effort("low"), effort("xhigh"), effort("max"), effort("ultra")],
+             "defaultReasoningEffort": "ultra"},
+            {"id": "internal-preview", "hidden": true, "isDefault": false,
+             "supportedReasoningEfforts": [effort("low")]},
+        ]}});
+        let models = parse_models(&listed);
+        let ids = models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, ["gpt-6-astra", "gpt-6-sol"]);
+        // Efforts Dispatch does not accept are never offered, and a default
+        // that is not offered is not focused.
+        assert_eq!(models[0].efforts, ["low", "xhigh"]);
+        assert_eq!(models[0].default_effort, None);
+        assert_eq!(models[1].default_effort.as_deref(), Some("medium"));
+        assert!(parse_models(&json!({"id": 1, "result": {}})).is_empty());
+    }
 
     fn evidence() -> AccountEvidence {
         AccountEvidence {
