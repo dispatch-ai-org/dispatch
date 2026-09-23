@@ -417,3 +417,19 @@ again at admission. After S6b it must run immediately before spawn.
   removed features, is left for the owner to revise. Pending: a real-agent
   dogfood run of the finished branch (needs the owner's go-ahead, since it
   uses the subscription). `cargo test`: 427 passed, 0 failed.
+- 2026-09-23 — Release dogfood on the finished branch (approved by the
+  owner). Isolated state `state-041`, which was at schema 23, and the Python
+  scratch project with `python3 -m unittest` as its check. Opening the state
+  migrated it to 24 with a `dispatch.schema-23-*` backup. `dispatch run`
+  selected the only eligible profile (Claude Code, `claude-sonnet-5`,
+  medium); the two Codex profiles were ineligible for missing account
+  evidence, as intended. Native run `01M37J7HATT86DBQXE1YWK1W1W`: one attempt,
+  observed model `claude-sonnet-5`, verification passed, exit 0, 32 s; its
+  launch record ended `cleaned`. An unrelated edit then moved the source;
+  `dispatch check` said CONTINUE (files_only, one changed file), and
+  `dispatch accept` recorded review revision 1 with the explanation verbatim,
+  ran the integration check on the merged tree (`analysis: integration`) and
+  applied two files (`applied_by: human`); the project's tests pass.
+  `AGENTS.md` no longer describes sync, public priors, planning or machine
+  control; it states that Dispatch uploads nothing and that adding any upload
+  needs a separate product and consent decision.

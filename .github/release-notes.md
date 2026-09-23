@@ -81,5 +81,9 @@ Code runs (`claude-sonnet-5`) completed through the new launch record, a killed
 supervisor left a correct record, and refusals worked against the real binaries. A
 state directory made by the real 0.4.0 binary (a two-candidate comparison with a
 blind evaluation, and a single-candidate run) upgraded to schema 24, and `accept`
-applied and recorded the review. Coherence claims are unchanged; see
+applied and recorded the review. On the finished branch, a real Claude Code run
+(`claude-sonnet-5`) on a Python project whose state was at schema 23 migrated it,
+passed verification in 32 seconds, and, after an unrelated edit moved the source,
+was accepted with a CONTINUE verdict after the integration check on the merged tree.
+Coherence claims are unchanged; see
 `docs/coherence-validation.md` for what is claimed and what would falsify it.
