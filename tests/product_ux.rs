@@ -75,7 +75,7 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
         .stdout
         .clone();
     let override_output = String::from_utf8(override_output)?;
-    assert!(override_output.contains("Chosen explicitly with --agent"));
+    assert!(override_output.contains("Chosen with --agent (no profile)"));
     assert!(fs::read_to_string(&marker)?.ends_with("cursor\n"));
     Ok(())
 }
@@ -113,7 +113,22 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Fix the greeting typo"));
+        .stdout(predicates::str::contains("Fix the greeting typo"))
+        .stdout(predicates::str::contains(
+            "Chosen with --agent (no profile)",
+        ))
+        .stdout(predicates::str::contains(
+            "Work\n  native codex · began against snapshot",
+        ))
+        .stdout(predicates::str::contains("tier").not());
+    base()
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("WORK"))
+        .stdout(predicates::str::contains("native codex"))
+        .stdout(predicates::str::contains("CANDIDATES").not())
+        .stdout(predicates::str::contains("ready_for_evaluation").not());
     base()
         .arg("explain")
         .assert()

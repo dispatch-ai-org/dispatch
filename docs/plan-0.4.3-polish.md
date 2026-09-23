@@ -426,3 +426,23 @@ decided). New languages for symbol facts.
   - Tests: a setup journey for the observe choice; the `run` refusal wording in
     `product_ux.rs`.
   - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 4. One Work line.
+  - `orchestrator::work_line(run, validity)` gives origin, the agent that did the
+    work (never `dispatch`), S0 (`snapshot <commit>`, `merge-base <commit>
+    (full)` or `snapshot at attach (partial)`), the verdict (`CONTINUE`,
+    `REFRESH`, `STOP`, `unmoved`, `not checked`) with its first reason, state,
+    who applied it, verification and review.
+  - `serve` uses it for rows and for `--json`. The new JSON fields are `origin`,
+    `s0`, `verification`, `review` and `applied_by`; existing keys keep their
+    meaning, except that `agent` names the harness for native runs.
+  - `history` shows WORK, STATE and VERDICT from each committed projection,
+    read as stored, instead of the raw status and a candidate count.
+  - The status summary shows the Work line with its start time. `Profile: …`
+    replaces "Allocation trial · tier", and the status line comes from `outcome`.
+  - Tests: `work_line` unit tests; `serve` JSON fields for native and attached
+    rows; `status` and `history` output in `product_ux.rs`; the allocation
+    status assertion uses the profile wording.
+  - Flake data point: `phase3_recovery::phase4_pty_intent_answer_recovery_review_and_restoration`
+    failed once in the full suite ("activity indicator did not update") and
+    passed alone.
+  - `cargo test`: 428 passed, 0 failed after those fixes.

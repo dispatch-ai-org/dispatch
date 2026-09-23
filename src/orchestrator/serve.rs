@@ -20,10 +20,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{ApplyOutcome, apply, auto_apply, persist_event};
+use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line};
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
-    RunMode, RunRecord, SourceKind, Validity, WorkResult,
+    RunMode, RunRecord, SourceKind, WorkResult,
     coherence::{self, WorkView, watch::Policy, world},
     db::Database,
     lock::{OperationLock, shutdown_signal},
@@ -48,7 +48,7 @@ pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
 
     let mut last_signal: Option<world::Signal> = None;
     let mut policies: HashMap<String, Policy> = HashMap::new();
-    let mut shown: HashMap<String, (Option<Decision>, &'static str, String)> = HashMap::new();
+    let mut shown: HashMap<String, String> = HashMap::new();
     let mut last_block: Vec<String> = Vec::new();
     let mut first = true;
 
@@ -397,66 +397,11 @@ fn ready_for_auto_apply(state: &State, root: &Path, errors: &mut TickErrors) -> 
 /// source-drift-blocked; a `Ready`, unapplied run whose last stored verdict
 /// is `Refresh`/`Stop` is shown as `blocked` too, since that is exactly why
 /// auto-apply has not (yet) applied it.
-fn state_word(run: &RunRecord, validity: Option<&Validity>) -> &'static str {
-    if run.outcome.lifecycle != LifecycleState::Finished {
-        return "working";
-    }
-    match run.outcome.application {
-        ApplicationState::Applied => "applied",
-        ApplicationState::BlockedBySourceDrift | ApplicationState::Failed => "blocked",
-        ApplicationState::NotApplied => {
-            if run.outcome.work_result != WorkResult::Ready {
-                "finished"
-            } else if validity.is_some_and(|validity| validity.decision != Decision::Continue) {
-                "blocked"
-            } else {
-                "ready"
-            }
-        }
-    }
-}
-
-fn verdict_word(decision: Option<Decision>) -> &'static str {
-    match decision {
-        Some(Decision::Continue) => "CONTINUE",
-        Some(Decision::Refresh) => "REFRESH",
-        Some(Decision::Stop) => "STOP",
-        None => "—",
-    }
-}
-
-fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_owned()
-    } else {
-        text.chars().take(max_chars).collect()
-    }
-}
-
-/// `(agent, decision, state, reason)` for one run's view line (part 14.11).
-/// The verdict is always the run's stored `coherence.validity`; native runs'
-/// verdicts are never recomputed here.
-fn describe(run: &RunRecord) -> (String, Option<Decision>, &'static str, String) {
+/// The view's line for one run: the shared Work line from its stored
+/// validity. Native runs' verdicts are never recomputed here.
+fn describe(run: &RunRecord) -> (WorkLine, Option<Decision>) {
     let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
-    let agent = if run.mode == RunMode::Attached {
-        run.candidates
-            .first()
-            .map(|candidate| candidate.harness_id.clone())
-            .unwrap_or_else(|| "external".into())
-    } else {
-        "dispatch".into()
-    };
-    let state = state_word(run, validity);
-    let reason = validity
-        .and_then(|validity| validity.reasons.first())
-        .map(|reason| clip(&reason.detail, 60))
-        .unwrap_or_else(|| "—".into());
-    (
-        agent,
-        validity.map(|validity| validity.decision),
-        state,
-        reason,
-    )
+    (work_line(run, validity), validity.map(|v| v.decision))
 }
 
 /// Runs whose `source_path` is `root` and that are still active or finished
@@ -484,25 +429,30 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
 fn render_view(
     runs: &[RunRecord],
     json: bool,
-    shown: &mut HashMap<String, (Option<Decision>, &'static str, String)>,
+    shown: &mut HashMap<String, String>,
     last_block: &mut Vec<String>,
 ) {
     let rows = view_rows(runs);
 
     if json {
         for run in rows {
-            let (agent, decision, state, reason) = describe(run);
-            let key = (decision, state, reason.clone());
+            let (line, decision) = describe(run);
+            let key = line.to_string();
             if shown.get(&run.id) != Some(&key) {
                 println!(
                     "{}",
                     serde_json::json!({
                         "type": "work",
                         "run_id": run.id,
-                        "agent": agent,
+                        "agent": line.agent,
                         "verdict": decision,
-                        "state": state,
-                        "reason": reason,
+                        "state": line.state,
+                        "reason": line.reason.as_deref().unwrap_or("—"),
+                        "origin": line.origin,
+                        "s0": line.s0,
+                        "verification": line.verification,
+                        "review": line.review,
+                        "applied_by": line.applied_by,
                     })
                 );
                 shown.insert(run.id.clone(), key);
@@ -514,12 +464,8 @@ fn render_view(
     let lines: Vec<String> = rows
         .iter()
         .map(|run| {
-            let (agent, decision, state, reason) = describe(run);
             let id8 = &run.id[..8.min(run.id.len())];
-            format!(
-                "{id8} · {agent} · {} · {state} · {reason}",
-                verdict_word(decision)
-            )
+            format!("{id8} · {}", describe(run).0)
         })
         .collect();
 
@@ -540,20 +486,6 @@ fn render_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clip_truncates_by_character_count() {
-        assert_eq!(clip("short", 60), "short");
-        assert_eq!(clip(&"x".repeat(70), 60), "x".repeat(60));
-    }
-
-    #[test]
-    fn verdict_word_matches_decisions_and_absence() {
-        assert_eq!(verdict_word(Some(Decision::Continue)), "CONTINUE");
-        assert_eq!(verdict_word(Some(Decision::Refresh)), "REFRESH");
-        assert_eq!(verdict_word(Some(Decision::Stop)), "STOP");
-        assert_eq!(verdict_word(None), "—");
-    }
 
     #[test]
     fn live_owner_state_maps_identity_outcomes() {

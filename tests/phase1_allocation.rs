@@ -129,7 +129,8 @@ fn enabled_trial_allocation_reaches_argv_and_persists_identity() -> anyhow::Resu
         .stdout
         .clone();
     let human_status = String::from_utf8(human_status)?;
-    assert!(human_status.contains("Allocation trial · strong tier"));
+    assert!(human_status.contains("Profile: codex · configured-model · high"));
+    assert!(!human_status.contains("tier"));
     assert!(human_status.contains("requested: configured-model"));
 
     let explanation = cargo_bin_cmd!("dispatch")

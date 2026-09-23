@@ -920,8 +920,6 @@ pub struct RunSummary {
     pub source_path: PathBuf,
     pub status: String,
     pub created_at: String,
-    pub candidate_count: usize,
-    pub evaluated: bool,
 }
 
 /// Dispatch's durable structured store. Large artifacts remain on disk and are
@@ -1700,26 +1698,19 @@ impl Database {
         }
         let limit = usize_integer(limit, "history limit")?;
         let mut statement = self.connection.prepare(
-            r#"SELECT r.id, r.task, s.path, r.status, r.created_at,
-                      COUNT(c.id), e.id IS NOT NULL
+            r#"SELECT r.id, r.task, s.path, r.status, r.created_at
                FROM runs r
                JOIN sources s ON s.id = r.source_id
-               LEFT JOIN candidates c ON c.run_id = r.id
-               LEFT JOIN evaluations e ON e.run_id = r.id
-               GROUP BY r.id
                ORDER BY r.created_at DESC, r.id DESC
                LIMIT ?1"#,
         )?;
         let rows = statement.query_map([limit], |row| {
-            let count: i64 = row.get(5)?;
             Ok(RunSummary {
                 id: row.get(0)?,
                 task: row.get(1)?,
                 source_path: PathBuf::from(row.get::<_, String>(2)?),
                 status: row.get(3)?,
                 created_at: row.get(4)?,
-                candidate_count: usize::try_from(count).unwrap_or(usize::MAX),
-                evaluated: row.get(6)?,
             })
         })?;
 
@@ -2918,8 +2909,6 @@ mod tests {
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].id, "run-1");
         assert_eq!(summary[0].source_path, PathBuf::from("/code/worker"));
-        assert_eq!(summary[0].candidate_count, 2);
-        assert!(!summary[0].evaluated);
 
         let mapping: Vec<(String, String)> = {
             let mut statement = database.connection.prepare(
@@ -2961,7 +2950,12 @@ mod tests {
 
         // Re-sync replaces, rather than duplicates, child rows.
         database.sync_run(&record)?;
-        assert_eq!(database.list_runs(10)?[0].candidate_count, 2);
+        let candidates: i64 = database.connection.query_row(
+            "SELECT COUNT(*) FROM candidates WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(candidates, 2);
         let checks: i64 = database.connection.query_row(
             "SELECT COUNT(*) FROM checks WHERE run_id = 'run-1'",
             [],

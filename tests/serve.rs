@@ -530,7 +530,7 @@ fn serve_view_lists_native_and_attached_runs() {
     let attached_id = fixture.attach(&[]);
 
     let serve = ServeProcess::spawn(&fixture, &["--json"]);
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashMap::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     while seen.len() < 2 && Instant::now() < deadline {
         let Some(line) = serve.next_line(Duration::from_secs(1)) else {
@@ -540,9 +540,24 @@ fn serve_view_lists_native_and_attached_runs() {
             && value["type"] == "work"
             && let Some(run_id) = value["run_id"].as_str()
         {
-            seen.insert(run_id.to_owned());
+            seen.insert(run_id.to_owned(), value.clone());
         }
     }
-    assert!(seen.contains(&native_id), "{seen:?}");
-    assert!(seen.contains(&attached_id), "{seen:?}");
+    // Each row says where the work came from, which agent did it and what it
+    // began against; a native row names its agent, never "dispatch".
+    let native = seen.get(&native_id).expect("native row");
+    assert_eq!(native["origin"], "native", "{native}");
+    assert_eq!(native["agent"], "fake-good", "{native}");
+    assert!(
+        native["s0"].as_str().unwrap().starts_with("snapshot "),
+        "{native}"
+    );
+    assert_eq!(native["review"], "pending", "{native}");
+    let attached = seen.get(&attached_id).expect("attached row");
+    assert_eq!(attached["origin"], "attached", "{attached}");
+    assert!(
+        attached["s0"].as_str().unwrap().starts_with("merge-base "),
+        "{attached}"
+    );
+    assert!(attached["verification"].is_string(), "{attached}");
 }
