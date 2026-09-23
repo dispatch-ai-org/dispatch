@@ -12,11 +12,31 @@ use std::process::Stdio;
 
 use tokio::signal::unix::{SignalKind, signal};
 
-use super::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use ulid::Ulid;
+
+use super::{
+    ApplyOutcome, apply, auto_apply, persist_event, publish_event, refresh_outcome,
+    result_verification,
+};
 use crate::{
-    AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail, BaselineProvenance,
-    FinishReason, OwnerState, admission,
+    ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
+    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
+    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, OwnerState,
+    ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, VerificationState, WaitingOn,
+    WorkResult,
     coherence::watch::{WatchSpec, Watcher},
+    db::Database,
+    lock::OperationLock,
+    process, source,
+    state::{State, write_text},
 };
 
 /// Request to attach external work Dispatch did not launch. See part 14.3.
@@ -219,8 +239,8 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         confidence,
         agent: request.agent.clone(),
         command: request.command.clone(),
-        owner: is_wrapped.then(admission::ProcessIdentity::current),
-        agent_process: request.pid.map(admission::process_identity),
+        owner: is_wrapped.then(process::ProcessIdentity::current),
+        agent_process: request.pid.map(process::process_identity),
         owner_state: if is_wrapped {
             OwnerState::Live
         } else {
@@ -238,7 +258,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     };
 
     let mut run = RunRecord {
-        phase3: None,
+        execution: None,
         id: run_id.clone(),
         task: task.clone(),
         exact_prompt: task,
@@ -272,7 +292,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             timeout_secs: config.execution.timeout_secs,
             cpus: config.execution.cpus,
             memory: config.execution.memory.clone(),
-            max_parallel: config.execution.max_parallel,
+            max_parallel: 1,
             docker_image: None,
             resource_limits_enforced: false,
             unsafe_local,
@@ -281,14 +301,11 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         baseline_checks: Vec::new(),
         candidates: vec![candidate],
         attempts: vec![attempt],
-        routing: None,
         allocation: None,
-        capacity: None,
-        admission: None,
         coherence: None,
-        evaluation: None,
         applied_candidate: None,
         attachment: Some(attachment),
+        historical: Default::default(),
     };
 
     let created_event = EventRecord {
@@ -431,7 +448,7 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         }
     };
     let child_pid = child.id();
-    let agent_process = admission::process_identity(child_pid);
+    let agent_process = process::process_identity(child_pid);
 
     let mut db = Database::open(state.db_path())?;
     if let Some(attachment) = run.attachment.as_mut() {
@@ -712,7 +729,7 @@ pub(super) async fn finish_locked(
     run.candidates[0].duration_ms = (Utc::now() - attached_at).num_milliseconds().max(0) as u64;
     run.candidates[0].exit_code = match &reason {
         FinishReason::ProcessExit { code } => *code,
-        FinishReason::Explicit | FinishReason::OwnerGone => None,
+        FinishReason::Explicit => None,
     };
 
     refresh_outcome(&mut run);

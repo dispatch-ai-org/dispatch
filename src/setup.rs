@@ -1,7 +1,7 @@
 //! Shared local resource setup. Discovery is read-only; only an explicitly
 //! confirmed proposal can write configuration. Launch authorization stays in core.
 use crate::{
-    CapacityValue, ResourceTier,
+    ResourceTier,
     config::{ExecutionConfig, ResourceConfig, ResourceProfile},
     state::State,
 };
@@ -20,6 +20,7 @@ pub struct Discovery {
     pub funding: String,
     pub account: String,
     pub claude: Option<crate::harness::claude::SubscriptionEvidence>,
+    pub codex: Option<crate::harness::codex::AccountEvidence>,
 }
 impl Discovery {
     pub fn summary(&self) -> String {
@@ -76,38 +77,39 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
             funding: "claude-subscription".into(),
             account,
             claude: Some(evidence),
+            codex: None,
         })
     } else {
         ensure!(provider == "codex", "unsupported provider");
-        let result = crate::capacity::probe_codex(
-            &executable,
-            "setup",
-            &[],
-            "standard",
-            &Default::default(),
-        )
-        .await;
-        let observed = result.observation;
+        use crate::harness::codex;
+        let observed = codex::Funding::from_probe(
+            &codex::read_account(&executable, std::time::Duration::from_secs(5)).await?,
+        );
         ensure!(
-            matches!(&observed.auth_mode, CapacityValue::Reported { value } if value == "chatgpt"),
+            observed.auth_mode.as_deref() == Some("chatgpt"),
             "ChatGPT subscription login was not confirmed. Choose Login, then revalidate; API and unknown authentication cannot be included."
         );
-        let CapacityValue::Reported { value: ref plan } = observed.plan_type else {
+        let Some(plan) = &observed.plan else {
             anyhow::bail!("subscription plan is unknown; no profile was authorized")
         };
         let funding = format!("chatgpt-{plan}");
-        ensure!(
-            crate::capacity::funding_change(&observed, &funding).is_none(),
-            "paid credits or unsupported service detected; no profile was authorized"
-        );
-        let CapacityValue::Reported { value: account } = observed.funding_identity else {
+        let Some(account) = observed.account_sha256.clone() else {
             anyhow::bail!("account identity is unknown; no profile was authorized")
         };
+        let evidence = codex::AccountEvidence {
+            account_sha256: account.clone(),
+            checked_at: Utc::now(),
+        };
+        ensure!(
+            codex::refusal(&observed, Some(&evidence), &funding).is_none(),
+            "paid credits or unsupported service detected; no profile was authorized"
+        );
         Ok(Discovery {
             executable,
             version,
             funding,
-            account: account.trim_start_matches("sha256:").into(),
+            codex: Some(evidence),
+            account,
             claude: None,
         })
     }
@@ -121,11 +123,6 @@ pub fn status(state: &State) -> Result<String> {
     ];
     if !config.allocation_enabled {
         lines.push("Included-resource allocation is not configured.".into());
-    }
-    if !config.capacity.admission {
-        lines.push(
-            "Shared admission is disabled; guided setup will not override this policy.".into(),
-        );
     }
     for provider in ["codex", "claude"] {
         lines.push(format!(
@@ -182,10 +179,6 @@ impl Proposal {
             },
         };
         config.validate()?;
-        ensure!(
-            config.capacity.admission,
-            "shared admission is disabled; change that advanced policy explicitly before setup"
-        );
         let highest = config
             .profiles
             .iter()
@@ -230,12 +223,19 @@ impl Proposal {
                     "account changed: add a new resource explicitly; existing account scope was preserved"
                 );
             }
+            if let Some(old) = &profile.codex_account {
+                ensure!(
+                    old.account_sha256 == discovery.account,
+                    "account changed: add a new resource explicitly; existing account scope was preserved"
+                );
+            }
             ensure!(
                 profile.funding_source == discovery.funding || provider == "claude",
                 "subscription plan changed: add a new resource explicitly"
             );
             profile.authorization_revision = revision;
             profile.claude_subscription = discovery.claude.clone();
+            profile.codex_account = discovery.codex.clone();
             profile
         } else {
             let shared = config.profiles.iter().find(|p| {
@@ -274,6 +274,7 @@ impl Proposal {
                 no_overage_verified: false,
                 authorization_revision: revision,
                 claude_subscription: discovery.claude.clone(),
+                codex_account: discovery.codex.clone(),
             }
         };
         ensure!(
@@ -432,6 +433,10 @@ mod tests {
             funding: "chatgpt-plus".into(),
             account: "a".repeat(64),
             claude: None,
+            codex: Some(crate::harness::codex::AccountEvidence {
+                account_sha256: "a".repeat(64),
+                checked_at: Utc::now(),
+            }),
         }
     }
     fn proposal(state: &State) -> Proposal {

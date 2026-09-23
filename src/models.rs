@@ -3,107 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::admission::ProcessIdentity;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskKind {
-    BugFix,
-    Feature,
-    Refactor,
-    Tests,
-    #[default]
-    Unknown,
-}
-
-impl TaskKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::BugFix => "bug_fix",
-            Self::Feature => "feature",
-            Self::Refactor => "refactor",
-            Self::Tests => "tests",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskScope {
-    Localized,
-    MultiFile,
-    Broad,
-    #[default]
-    Unknown,
-}
-
-impl TaskScope {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Localized => "localized",
-            Self::MultiFile => "multi_file",
-            Self::Broad => "broad",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TaskFeatures {
-    pub language: Option<String>,
-    pub task_kind: TaskKind,
-    pub scope: TaskScope,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutingDecision {
-    pub version: u32,
-    pub task_features: TaskFeatures,
-    pub selected_harness: String,
-    pub successes: u64,
-    pub attempts: u64,
-    pub specificity: u8,
-    pub source: String,
-    pub dataset: String,
-    pub dataset_version: String,
-    pub model: Option<String>,
-    #[serde(default)]
-    pub selection_basis: SelectionBasis,
-    #[serde(default)]
-    pub alternatives: Vec<RoutingAlternative>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectionBasis {
-    #[default]
-    Evidence,
-    Default,
-    Override,
-}
-
-impl SelectionBasis {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Evidence => "Evidence-based",
-            Self::Default => "Dispatch default",
-            Self::Override => "Agent override",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutingAlternative {
-    pub harness: String,
-    pub successes: u64,
-    pub attempts: u64,
-    pub specificity: Option<u8>,
-    pub source: Option<String>,
-    pub dataset: Option<String>,
-    pub dataset_version: Option<String>,
-    pub model: Option<String>,
-}
+use crate::process::ProcessIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -119,47 +19,6 @@ impl RoutingHumanOutcome {
             Self::Rejected => "rejected",
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutingHumanEvaluation {
-    pub outcome: RoutingHumanOutcome,
-    #[serde(default)]
-    pub reasons: Vec<String>,
-    pub explanation: Option<String>,
-    pub evaluated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RoutingObservation {
-    pub id: String,
-    pub run_id: String,
-    pub candidate_id: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub prediction: RoutingDecision,
-    pub harness_version: Option<String>,
-    pub model: Option<String>,
-    pub candidate_status: CandidateStatus,
-    pub exit_code: Option<i32>,
-    pub timed_out: bool,
-    pub verification: Option<Vec<CheckStatus>>,
-    pub human_evaluation: Option<RoutingHumanEvaluation>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BenchmarkPrior {
-    pub source: String,
-    pub dataset: String,
-    pub dataset_version: String,
-    pub harness: String,
-    pub model: Option<String>,
-    pub language: Option<String>,
-    pub task_kind: TaskKind,
-    pub scope: TaskScope,
-    pub successes: u64,
-    pub attempts: u64,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,11 +55,16 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
+    /// Work Dispatch selected an agent for and executed. Runs made before
+    /// 0.4.1 recorded `legacy`, `routed`, `allocation` or `comparison`.
     #[default]
-    Legacy,
-    Routed,
-    Allocation,
-    Comparison,
+    #[serde(
+        alias = "legacy",
+        alias = "routed",
+        alias = "allocation",
+        alias = "comparison"
+    )]
+    Native,
     /// External work Dispatch observes and can apply, but did not select,
     /// route or execute. See `AttachmentRecord`.
     Attached,
@@ -209,10 +73,7 @@ pub enum RunMode {
 impl RunMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Legacy => "legacy",
-            Self::Routed => "routed",
-            Self::Allocation => "allocation",
-            Self::Comparison => "comparison",
+            Self::Native => "native",
             Self::Attached => "attached",
         }
     }
@@ -371,10 +232,6 @@ pub enum CandidateStatus {
 }
 
 impl CandidateStatus {
-    pub(crate) fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Preparing | Self::Running | Self::Verifying)
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Preparing => "preparing",
@@ -464,6 +321,7 @@ pub struct EnvironmentRecord {
     pub timeout_secs: u64,
     pub cpus: f64,
     pub memory: String,
+    /// Agents run at once for this run: always 1 since 0.4.1.
     pub max_parallel: usize,
     #[serde(default)]
     pub docker_image: Option<String>,
@@ -482,8 +340,6 @@ pub struct CoherenceRecord {
     pub version: u32,
     #[serde(default)]
     pub refreshed_from: Option<String>,
-    #[serde(default)]
-    pub facts: Vec<MustHold>,
     #[serde(default)]
     pub validity: Option<Validity>,
     #[serde(default)]
@@ -611,8 +467,9 @@ pub struct AutoApplySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
-    #[serde(default)]
-    pub phase3: Option<GoalExecution>,
+    /// Native execution policy and lineage; `phase3` before 0.4.1.
+    #[serde(default, alias = "phase3")]
+    pub execution: Option<GoalExecution>,
     pub id: String,
     pub task: String,
     pub exact_prompt: String,
@@ -639,16 +496,9 @@ pub struct RunRecord {
     #[serde(default)]
     pub attempts: Vec<AttemptRecord>,
     #[serde(default)]
-    pub routing: Option<RoutingDecision>,
-    #[serde(default)]
     pub allocation: Option<AllocationDecision>,
     #[serde(default)]
-    pub capacity: Option<CapacityObservation>,
-    #[serde(default)]
-    pub admission: Option<AdmissionSummary>,
-    #[serde(default)]
     pub coherence: Option<CoherenceRecord>,
-    pub evaluation: Option<EvaluationRecord>,
     pub applied_candidate: Option<String>,
     /// Present only for `mode: Attached` work: provenance, capabilities,
     /// process identities and timestamps for external work Dispatch observes
@@ -656,6 +506,11 @@ pub struct RunRecord {
     /// existed and for every run Dispatch itself selected and ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<AttachmentRecord>,
+    /// Fields written by earlier Dispatch versions and no longer read
+    /// (routing, capacity, admission, blind evaluation). Kept verbatim so a
+    /// rewrite of an old run's metadata never loses what was recorded.
+    #[serde(flatten)]
+    pub historical: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Provenance, capabilities, process identities and timestamps for a
@@ -728,25 +583,6 @@ pub struct AttachCapabilities {
 pub enum FinishReason {
     ProcessExit { code: Option<i32> },
     Explicit,
-    OwnerGone,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", content = "candidate", rename_all = "snake_case")]
-pub enum EvaluationOutcome {
-    Candidate(String),
-    Tie,
-    Neither,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EvaluationRecord {
-    pub outcome: EvaluationOutcome,
-    #[serde(default)]
-    pub reasons: Vec<String>,
-    pub explanation: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub blind: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -863,130 +699,12 @@ pub struct AllocationAlternative {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocationDecision {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_evidence: Option<crate::private_evidence::DecisionEvidence>,
     pub version: u32,
     pub policy_version: String,
-    pub task_features: TaskFeatures,
     pub selected: ResourceChoice,
     pub reason: String,
     pub capability: CapabilitySnapshot,
     pub alternatives: Vec<AllocationAlternative>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "knowledge", rename_all = "snake_case")]
-pub enum CapacityValue<T> {
-    Reported {
-        value: T,
-    },
-    Estimated {
-        lower: T,
-        upper: T,
-        method: String,
-        samples: u32,
-    },
-    Unknown {
-        reason: String,
-    },
-}
-
-impl<T> CapacityValue<T> {
-    pub fn unknown(reason: impl Into<String>) -> Self {
-        Self::Unknown {
-            reason: reason.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CapacityMapping {
-    Mapped,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CapacityConstraint {
-    pub kind: String,
-    pub unit: String,
-    pub provider_bucket_id: Option<String>,
-    pub window_id: Option<String>,
-    pub reported_used_percent: Option<f64>,
-    pub remaining: CapacityValue<f64>,
-    pub reset_at: CapacityValue<DateTime<Utc>>,
-    pub window_duration_secs: CapacityValue<u64>,
-    pub scope: CapacityValue<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScarcityState {
-    Available,
-    Constrained,
-    Reserve,
-    Exhausted,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CapacityObservation {
-    pub id: String,
-    pub pool_id: String,
-    pub source: String,
-    pub source_version: String,
-    pub sampled_at: DateTime<Utc>,
-    pub valid_until: DateTime<Utc>,
-    pub mapping: CapacityMapping,
-    pub auth_mode: CapacityValue<String>,
-    #[serde(default = "unknown_funding_identity")]
-    pub funding_identity: CapacityValue<String>,
-    pub plan_type: CapacityValue<String>,
-    pub credits_available: CapacityValue<bool>,
-    pub service_tier: CapacityValue<String>,
-    pub constraints: Vec<CapacityConstraint>,
-    pub scarcity: ScarcityState,
-    pub attributable_attempt_id: Option<String>,
-    pub attribution: String,
-    pub raw_observation_ref: Option<PathBuf>,
-}
-
-fn unknown_funding_identity() -> CapacityValue<String> {
-    CapacityValue::unknown("funding identity not recorded")
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AdmissionState {
-    Queued,
-    Admitted,
-    Reconciliation,
-    Released,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AdmissionSummary {
-    pub request_id: String,
-    pub pool_id: String,
-    #[serde(default)]
-    pub attempt_id: String,
-    #[serde(default)]
-    pub route_snapshot_json: String,
-    #[serde(default)]
-    pub configuration_revision: String,
-    #[serde(default)]
-    pub canonical_pool_identity: String,
-    #[serde(default)]
-    pub authorization_id: String,
-    #[serde(default)]
-    pub authorization_revision: u64,
-    pub owner_session: String,
-    pub generation: u64,
-    pub priority: i32,
-    pub state: AdmissionState,
-    pub fence: Option<u64>,
-    pub enqueued_at: DateTime<Utc>,
-    pub released_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1003,7 +721,8 @@ pub struct GoalFeedbackRevision {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
-    pub phase3: Option<GoalExecution>,
+    #[serde(alias = "phase3")]
+    pub execution: Option<GoalExecution>,
     pub elapsed_ms: i64,
     pub schema_version: u32,
     pub run_id: String,
@@ -1015,10 +734,6 @@ pub struct RunResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allocation: Option<AllocationDecision>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<CapacityObservation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub admission: Option<AdmissionSummary>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub coherence: Option<CoherenceSummary>,
     /// Present only when `--auto-apply` attempted an automatic application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1028,19 +743,15 @@ pub struct RunResult {
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalExecution {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub planning: Option<crate::planning::Planning>,
     pub max_invocations: u32,
     pub deadline_at: DateTime<Utc>,
-    pub no_retry: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_harness: Option<String>,
     pub fixed_model: Option<String>,
     pub fixed_effort: Option<String>,
-    pub priority: i32,
     pub owner_uid: u32,
     #[serde(default)]
-    pub supervisor: Option<crate::admission::ProcessIdentity>,
+    pub supervisor: Option<crate::process::ProcessIdentity>,
     pub final_attempt_id: Option<String>,
     pub contributing_attempts: Vec<String>,
     pub provenance: String,
@@ -1050,22 +761,12 @@ pub struct GoalExecution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AttemptDetail {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_snapshot_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub consumed_artifacts: Vec<String>,
     #[serde(default)]
     pub usage_categories: std::collections::BTreeMap<String, u64>,
     pub parent_attempt_id: Option<String>,
     pub reason: Option<String>,
     pub input_baseline: Option<PathBuf>,
     pub decision: Option<AllocationDecision>,
-    pub admission: Option<AdmissionSummary>,
-    pub capacity: Option<CapacityObservation>,
     pub result: Option<CandidateRecord>,
     pub failure: Option<FailureKind>,
 }
@@ -1193,10 +894,6 @@ mod tests {
             serde_json::to_string(&FinishReason::Explicit).unwrap(),
             "\"explicit\""
         );
-        assert_eq!(
-            serde_json::to_string(&FinishReason::OwnerGone).unwrap(),
-            "\"owner_gone\""
-        );
     }
 
     /// A `run.json` written before attach existed has no `attachment` key.
@@ -1213,7 +910,7 @@ mod tests {
         }"#;
         let run: RunRecord = serde_json::from_str(old_run_json).unwrap();
         assert!(run.attachment.is_none());
-        assert_eq!(run.mode, RunMode::Legacy);
+        assert_eq!(run.mode, RunMode::Native);
     }
 
     #[test]

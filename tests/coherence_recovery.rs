@@ -124,6 +124,9 @@ impl Drop for OrphanGuard {
 }
 
 /// A Git source whose `codex` agent blocks on a FIFO mid-run.
+/// Launches that are not known to be over: none may outlast a run.
+const LIVE_LAUNCHES: &str = "attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')";
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -155,6 +158,16 @@ impl Fixture {
             &format!(
                 r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo 'codex fixture'; exit 0; fi
+if [ "$1" = 'app-server' ]; then
+while IFS= read -r line; do
+case "$line" in
+*'"id":0'*) printf '%s\n' '{{"id":0,"result":{{"userAgent":"fixture"}}}}' ;;
+*'"id":1'*) printf '%s\n' '{{"id":1,"result":{{"account":{{"type":"chatgpt","planType":"plus","email":"fixture@example.invalid"}}}}}}' ;;
+*'"id":2'*) printf '%s\n' '{{"id":2,"result":{{"rateLimitsByLimitId":{{}}}}}}'; exit 0 ;;
+esac
+done
+exit 0
+fi
 model=''; previous=''
 for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previous="$arg"; done
 printf '%s\n' "$model" >> '{root}/invocations'
@@ -183,7 +196,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         git(&source, &["add", "-A"])?;
         git(&source, &["commit", "--quiet", "-m", "initial"])?;
         let profiles = [("light-model", "low", "light"), ("strong-model", "high", "strong")].map(|(m, e, t)| {
-            format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n")
+            format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")
         }).concat();
         fs::write(
             state.join("resources.yml"),
@@ -326,7 +339,7 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     let message = Fixture::stderr(&accept);
     assert!(!message.contains("panicked"), "{message}");
     assert!(!message.is_empty());
-    let apply = f.command().args(["apply", &id, "A"]).output()?;
+    let apply = f.command().args(["accept", &id]).output()?;
     assert!(!apply.status.success());
     assert!(!Fixture::stderr(&apply).contains("panicked"));
     assert_eq!(tree(&f.source), source_before, "no partial writes");
@@ -344,17 +357,12 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     drop(db);
     assert_eq!(f.count("evaluations")?, 0);
 
-    // Cleanup per the existing helpers: the orphaned agent is stopped, and once
-    // the dead owner's lease has expired the next admission reclaims it.
+    // Cleanup: the orphaned agent is stopped before the next run starts.
     assert!(alive(pid), "kill -9 of the supervisor leaves the agent");
     // SAFETY: the pid is the fixture agent recorded in `agent.pid`.
     unsafe { libc::kill(pid, libc::SIGKILL) };
     orphan.0 = None;
     wait_until(|| Ok(!alive(pid)))?;
-    rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute(
-        "UPDATE pool_leases SET expires_at = '2000-01-01T00:00:00Z'",
-        [],
-    )?;
     fs::remove_file(f.root.join("started"))?;
     git(&f.source, &["checkout", "--quiet", "--", "src/lib.rs"])?;
     let mut next = f.start()?;
@@ -362,7 +370,6 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     f.release()?;
     let output = next.output()?;
     assert!(output.status.success(), "{}", Fixture::result(&output)?);
-    assert_eq!(f.count("pool_leases")?, 0, "no lease is left behind");
     // The interrupted run is still not acceptable, and is still loadable.
     assert!(!f.command().args(["accept", &id]).output()?.status.success());
     assert!(f.loaded(&id).is_ok());
@@ -398,7 +405,7 @@ impl FakeGood {
                 "--allow-unsafe-local",
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .output()?;
@@ -486,7 +493,7 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
     wait_until(|| Ok(!alive(pid)))?;
     let output = child.output()?;
     let result = Fixture::result(&output)?;
-    assert_eq!(result["phase3"]["failure"], "stale_work", "{result}");
+    assert_eq!(result["execution"]["failure"], "stale_work", "{result}");
     let old = result["run_id"].as_str().unwrap().to_owned();
     assert_eq!(
         f.loaded(&old)?.status,
@@ -511,7 +518,7 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
     );
     assert_eq!(f.count("runs")?, runs_before, "no run may be created");
     assert_eq!(f.count("attempts")?, 1);
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     assert_eq!(tree(&f.source), source_before);
     let check = f.command().args(["check", &old]).output()?;
     assert!(Fixture::stderr(&check).contains("not a ready, unapplied result"));
@@ -538,6 +545,6 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&checked.stdout)
     );
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     Ok(())
 }

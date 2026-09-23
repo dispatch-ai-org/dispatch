@@ -13,7 +13,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 sys.dont_write_bytecode = True
-from phase5_control import Fixture, finish, assert_error
+from provider_fixture import Fixture
 
 
 def proof(f):
@@ -33,9 +33,9 @@ def run(f, *args):
     return output,result
 
 
-def no_lease(f):
+def no_live_launch(f):
     with sqlite3.connect(f.state/'dispatch.db') as db:
-        assert db.execute('SELECT COUNT(*) FROM pool_leases').fetchone()[0]==0
+        assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
 
 
 def add_peer(f, binary, first='claude'):
@@ -51,10 +51,6 @@ def add_peer(f, binary, first='claude'):
     codex=codex.replace('model: fixture-model','model: codex-fixed')
     path.write_text('version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n'+(claude+codex if first=='claude' else codex+claude))
     return peer
-
-
-def grant(f):
-    f.key=Path(f.command('control-grant',f.source,'--allow-unsafe-local','--delegate-factual').stdout.decode().strip())
 
 
 def checked(output, result):
@@ -81,12 +77,9 @@ def scenario(binary, name):
             assert a['requested_effort']=='low' and a['observed_effort'] is None
             stored=f.stored(result['run_id'])
             assert stored['candidates'][0]['tokens']==22 and stored['candidates'][0]['cost_usd'] is None
-            assert stored['capacity']['scarcity']=='unknown'
             assert (f.source/'src/lib.rs').read_text()=='// baseline\n'
             assert f.count()==1
-            no_lease(f)
-            with sqlite3.connect(f.state/'dispatch.db') as db:
-                assert db.execute('SELECT COUNT(*) FROM sync_outbox').fetchone()[0]==0
+            no_live_launch(f)
         elif name in ('selection','missing'):
             peer=add_peer(f,binary,'codex')
             output,result=run(f)
@@ -157,8 +150,8 @@ def scenario(binary, name):
             assert output.returncode!=0 and f.count()<=1,(output.stdout,output.stderr)
             assert result is not None,(output.stdout,output.stderr)
             assert len(result['attempts'])<=1
-            assert f.stored(result['run_id'])['phase3']['failure']=='deadline'
-            no_lease(f)
+            assert f.stored(result['run_id'])['execution']['failure']=='deadline'
+            no_live_launch(f)
         elif name=='protocol':
             agent=f.root/'claude';original=agent.read_text()
             cases=["print('{broken')", "print(json.dumps({'type':'assistant','message':{'model':'fixture-model'}}))",
@@ -177,57 +170,20 @@ def scenario(binary, name):
                 assert output.returncode!=0,(replacement,result,output.stderr)
                 assert f.count()==before+1
                 assert len(result['attempts'])==1 and result['outcome']['work_result']=='failed'
-                assert not f.stored(result['run_id'])['phase3']['questions']
-                no_lease(f)
-        elif name=='recovery':
-            peer=add_peer(f,binary)
-            path=f.state/'resources.yml';original_profiles=path.read_text()
-            config=f.source/'dispatch.yml';config.write_text(config.read_text().replace('test -f result.txt', 'test "$(cat result.txt)" = ok'))
-            claude=f.root/'claude';codex=peer.root/'codex'
-            originals={claude:claude.read_text(),codex:codex.read_text()}
-            for first in ('claude','codex'):
-                # The first lane fails a check known to pass on the original baseline.
-                for agent,text in originals.items():
-                    if agent.name==first:
-                        text=text.replace("write_text('ok\\n')", "write_text('bad\\n')")
-                    agent.write_text(text)
-                text=original_profiles
-                if first=='claude':
-                    text=text.replace('model: codex-fixed\n    effort: low','model: codex-fixed\n    effort: low').replace('pool: codex-pool\n    provider_buckets: [codex]\n    tier: light','pool: codex-pool\n    provider_buckets: [codex]\n    tier: strong')
-                else:
-                    text=text.replace('pool: claude-pool\n    provider_buckets: [codex]\n    tier: light','pool: claude-pool\n    provider_buckets: [codex]\n    tier: strong')
-                path.write_text(text);proof(f)
-                output,result=run(f)
-                checked(output,result)
-                assert [a['harness_id'] for a in result['attempts']]==[first,'codex' if first=='claude' else 'claude'],result
-                a,b=result['attempts'];assert b['detail']['parent_attempt_id']==a['id']
-                assert a['detail']['input_baseline']==b['detail']['input_baseline']
-                assert Path(a['detail']['result']['workspace_path'],'result.txt').read_text()=='bad\n'
-                assert (f.source/'result.txt').read_text()=='ok\n'
-                no_lease(f)
-                before=f.count()+peer.count()
-                out,limited=run(f,'--no-retry')
-                assert out.returncode!=0 and len(limited['attempts'])==1 and f.count()+peer.count()==before+1
-                before=f.count()+peer.count()
-                out,limited=run(f,'--agent',first)
-                assert out.returncode!=0 and len(limited['attempts'])==1 and f.count()+peer.count()==before+1
-                for agent,script in originals.items():
-                    agent.write_text(script.replace("write_text('ok\\n')", "write_text('bad\\n')"))
-                proof(f);before=f.count()+peer.count()
-                out,failed=run(f)
-                assert out.returncode!=0 and len(failed['attempts'])==2 and f.count()+peer.count()==before+2
-                no_lease(f)
+                assert not f.stored(result['run_id'])['execution']['questions']
+                no_live_launch(f)
         elif name=='launch_change':
-            (f.root/'auth-boundary').write_text('3')
+            # Account checks: selection, then the preflight at the spawn boundary.
+            (f.root/'auth-boundary').write_text('2')
             output,result=run(f)
             assert output.returncode!=0 and f.count()==0,(output.stdout,output.stderr)
             assert len(result['attempts'])==1
             with sqlite3.connect(f.state/'dispatch.db') as db:
-                assert db.execute("SELECT COUNT(*) FROM capacity_authorizations WHERE status='rejected'").fetchone()[0]>0
+                assert db.execute("SELECT COUNT(*) FROM funding_refusals").fetchone()[0]>0
             # Restoring credentials alone must not renew the invalidated epoch.
             auth=f.root/'auth.json';value=json.loads(auth.read_text());value['email']='fixture@example.invalid';auth.write_text(json.dumps(value))
             output,_=run(f);assert output.returncode!=0 and f.count()==0
-            no_lease(f)
+            no_live_launch(f)
         elif name=='settings':
             directory=f.source/'.claude';directory.mkdir()
             (directory/'settings.json').write_text(json.dumps({'hooks':{'SessionStart':[{'command':'must-not-run'}]},'apiKeyHelper':'must-not-run','fastMode':True,'fallbackModel':['credit-model']}))
@@ -239,65 +195,6 @@ def scenario(binary, name):
             (Path(os.environ['HOME'])/'.claude').mkdir()
             (Path(os.environ['HOME'])/'.claude/managed-settings.json').write_text('{}')
             output,_=run(f);assert output.returncode!=0 and f.count()==1
-        elif name=='grants':
-            peer=add_peer(f,binary)
-            path=f.state/'resources.yml';both=path.read_text()
-            path.write_text(both.replace('harness: claude','harness: claude\n    enabled: false'))
-            grant(f)
-            path.write_text(both)
-            c=f.client()
-            accepted=c.call('submit',request_id='one',task='Add tests in src/lib.rs')
-            result=finish(c,accepted['run_id'])['result'];assert result['allocation']['selected']['harness']=='codex'
-            count=peer.count()+f.count()
-            path.write_text(both.replace('model: codex-fixed','model: changed'))
-            assert c.call('submit',request_id='one',task='Add tests in src/lib.rs')==accepted
-            assert peer.count()+f.count()==count
-            path.write_text(both);grant(f);broader=f.client()
-            accepted=broader.call('submit',task='Add tests in src/lib.rs')
-            result=finish(broader,accepted['run_id'])['result'];assert result['allocation']['selected']['harness']=='claude'
-        elif name=='pools':
-            peer=add_peer(f,binary)
-            grant(f)
-            f.mode.write_text('wait')
-            ready=os.open(f.ready,os.O_RDONLY|os.O_NONBLOCK)
-            c=f.client();a=c.call('submit',task='Add tests in src/lib.rs',model='fixture-model')
-            assert select.select([ready],[],[],10)[0];assert os.read(ready,1)==b'R'
-            grant(f);c2=f.client();queued=c2.call('submit',task='Add tests in src/lib.rs',model='fixture-model')
-            # Durable admission state is the barrier, not elapsed sleep.
-            deadline=time.monotonic()+10
-            while True:
-                with sqlite3.connect(f.state/'dispatch.db') as db:
-                    waiting=db.execute("SELECT COUNT(*) FROM admission_requests WHERE status='queued'").fetchone()[0]
-                if waiting: break
-                assert time.monotonic()<deadline
-                time.sleep(.01)
-            output,result=run(f,'--agent','codex');checked(output,result)
-            assert f.count()==1 and peer.count()==1
-            status=c2.call('status',run_id=queued['run_id'])
-            c2.call('cancel',run_id=queued['run_id'],revision=status['state_revision'])
-            with f.barrier.open('wb',buffering=0) as gate: gate.write(b'R')
-            finish(c,a['run_id']);finish(c2,queued['run_id']);os.close(ready)
-            no_lease(f)
-        elif name=='capacity':
-            peer=add_peer(f,binary)
-            output,result=run(f);checked(output,result)
-            pool=result['capacity']['pool_id']
-            with sqlite3.connect(f.state/'dispatch.db') as db:
-                obs=json.loads(db.execute('SELECT payload_json FROM capacity_observations WHERE pool_id=? ORDER BY sampled_at DESC LIMIT 1',(pool,)).fetchone()[0])
-                obs['id']='phase6-exhausted';obs['sampled_at']=datetime.now(timezone.utc).isoformat();obs['scarcity']='exhausted'
-                obs['constraints'][0].update(provider_bucket_id='codex',window_id='weekly',scope={'knowledge':'reported','value':'included_subscription'},remaining={'knowledge':'reported','value':0.0})
-                obs['mapping']='mapped'
-                db.execute('INSERT INTO capacity_observations(id,pool_id,source,source_version,sampled_at,valid_until,payload_json) VALUES(?,?,?,?,?,?,?)',
-                    (obs['id'],pool,obs['source'],obs['source_version'],obs['sampled_at'],obs['valid_until'],json.dumps(obs)))
-                constraint=obs['constraints'][0]
-                db.execute('INSERT INTO capacity_observation_constraints VALUES(?,?,?,?,?)',(obs['id'],0,'codex','weekly',json.dumps(constraint)))
-            output,result=run(f);checked(output,result)
-            assert result['allocation']['selected']['harness']=='codex'
-            assert f.count()==1 and peer.count()==1
-            path=f.state/'resources.yml'
-            path.write_text(path.read_text().replace('pool: claude-pool','pool: renamed-claude').replace('funding_source: claude-fixture','funding_source: renamed-funding').replace('provider_buckets: [codex]','provider_buckets: [codex, additional]',1))
-            output,result=run(f);checked(output,result)
-            assert result['allocation']['selected']['harness']=='codex' and f.count()==1
         elif name=='lifecycle':
             output,result=run(f);checked(output,result)
             path=f.state/'resources.yml';original=path.read_text()

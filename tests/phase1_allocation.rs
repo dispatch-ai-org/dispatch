@@ -13,11 +13,21 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
     fs::create_dir_all(&state)?;
     fs::write(source.join("src/lib.rs"), "pub fn original() {}\n")?;
     fs::write(source.join("src/main.rs"), "fn main() {}\n")?;
-    let agent = root.join("codex-fixture");
+    let agent = root.join("codex");
     fs::write(
         &agent,
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 1.0\\n'; exit 0; fi\n\
+         if [ \"$1\" = 'app-server' ]; then\n\
+         while IFS= read -r line; do\n\
+         case \"$line\" in\n\
+         *'\"id\":0'*) printf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"fixture\"}}' ;;\n\
+         *'\"id\":1'*) printf '%s\\n' '{\"id\":1,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}' ;;\n\
+         *'\"id\":2'*) printf '%s\\n' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'; exit 0 ;;\n\
+         esac\n\
+         done\n\
+         exit 0\n\
+         fi\n\
          printf '%s\\n' \"$@\" > invoked-argv.txt\n\
          printf 'allocated\\n' > allocated.txt\n\
          printf '{\"type\":\"result\",\"model\":\"observed-model\",\"reasoning_effort\":\"high\"}\\n'\n",
@@ -32,14 +42,13 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
     )?;
     fs::write(
         state.join("resources.yml"),
-        "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: chatgpt-codex\n    tier: strong\n    included: true\n    no_overage_verified: true\n",
+        "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: configured-model\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: chatgpt-codex\n    tier: strong\n    included: true\n    no_overage_verified: true\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
     )?;
     Ok((source, state))
 }
 
 #[test]
-fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_sync()
--> anyhow::Result<()> {
+fn enabled_trial_allocation_reaches_argv_and_persists_identity() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let (source, state) = fixture(temp.path())?;
     let output = cargo_bin_cmd!("dispatch")
@@ -60,7 +69,7 @@ fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_s
         .clone();
     let result: Value = serde_json::from_slice(&output)?;
     let run_id = result["run_id"].as_str().unwrap();
-    assert_eq!(result["mode"], "allocation");
+    assert_eq!(result["mode"], "native");
     assert_eq!(
         result["allocation"]["selected"]["requested_model"],
         "configured-model"
@@ -93,9 +102,7 @@ fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_s
         [run_id],
         |row| row.get(0),
     )?;
-    let outbox: i64 =
-        database.query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))?;
-    assert_eq!((routing, allocation, outbox), (0, 1, 0));
+    assert_eq!((routing, allocation), (0, 1));
 
     let status: Value = serde_json::from_slice(
         &cargo_bin_cmd!("dispatch")
@@ -200,6 +207,40 @@ fn allocation_review_is_append_only_and_safe_apply_is_unchanged() -> anyhow::Res
     Ok(())
 }
 
+/// With profiles configured, `--agent` only narrows the choice: an agent
+/// with no eligible profile is refused, never run without a funding contract.
+#[test]
+fn explicit_agent_without_an_eligible_profile_is_refused_not_run_unbound() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (source, state) = fixture(temp.path())?;
+    let error = cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Implement a new requested feature.",
+            "--agent",
+            "claude",
+            "--allow-unsafe-local",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let error = String::from_utf8(error)?;
+    assert!(
+        error.contains("no included, no-overage-verified resource profile is available")
+            && error.contains("explicit harness constraint"),
+        "{error}"
+    );
+    assert!(!state.join("runs").exists());
+    assert!(!source.join("allocated.txt").exists());
+    Ok(())
+}
+
 #[test]
 fn fixed_project_model_conflict_fails_before_creating_a_run() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
@@ -284,11 +325,21 @@ fn unknown_model_and_invalid_effort_are_rejected_without_substitution() -> anyho
 fn quota_failure_mid_attempt_stops_without_a_paid_or_model_fallback() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let (source, state) = fixture(temp.path())?;
-    let agent = temp.path().join("codex-fixture");
+    let agent = temp.path().join("codex");
     fs::write(
         &agent,
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then printf 'codex fixture 1.0\\n'; exit 0; fi\n\
+         if [ \"$1\" = 'app-server' ]; then\n\
+         while IFS= read -r line; do\n\
+         case \"$line\" in\n\
+         *'\"id\":0'*) printf '%s\\n' '{\"id\":0,\"result\":{\"userAgent\":\"fixture\"}}' ;;\n\
+         *'\"id\":1'*) printf '%s\\n' '{\"id\":1,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}' ;;\n\
+         *'\"id\":2'*) printf '%s\\n' '{\"id\":2,\"result\":{\"rateLimitsByLimitId\":{}}}'; exit 0 ;;\n\
+         esac\n\
+         done\n\
+         exit 0\n\
+         fi\n\
          printf '{\"type\":\"turn.failed\",\"message\":\"usage limit exceeded\",\"model\":\"configured-model\"}\\n'\n",
     )?;
     fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
@@ -310,7 +361,7 @@ fn quota_failure_mid_attempt_stops_without_a_paid_or_model_fallback() -> anyhow:
         .stdout
         .clone();
     let result: Value = serde_json::from_slice(&output)?;
-    assert_eq!(result["mode"], "allocation");
+    assert_eq!(result["mode"], "native");
     assert_eq!(result["outcome"]["work_result"], "failed");
     assert_eq!(result["attempts"].as_array().unwrap().len(), 1);
     assert_eq!(result["attempts"][0]["outcome"], "failed");

@@ -22,7 +22,6 @@ struct Fixture {
     source: PathBuf,
     state: PathBuf,
     run_id: String,
-    label: String,
 }
 
 impl Fixture {
@@ -48,7 +47,7 @@ impl Fixture {
             .args([
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .assert()
@@ -61,18 +60,12 @@ impl Fixture {
             .find_map(|line| line.strip_prefix("RUN "))
             .expect("run output includes an ID")
             .to_owned();
-        let mut fixture = Self {
+        Self {
             _temp: temp,
             source: fs::canonicalize(source).unwrap(),
             state,
             run_id,
-            label: String::new(),
-        };
-        fixture.label = fixture.metadata()["candidates"][0]["label"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        fixture
+        }
     }
 
     fn metadata_path(&self) -> PathBuf {
@@ -220,7 +213,11 @@ fn a_run_without_coherence_data_reads_as_coherence_capable_with_no_migration() {
     let fixture = Fixture::pre_coherence();
     let entries_before = fixture.state_entries();
     let versions_before = fixture.schema_versions();
-    assert_eq!(versions_before.last(), Some(&21), "{versions_before:?}");
+    assert_eq!(
+        versions_before.last(),
+        Some(&current_schema()),
+        "{versions_before:?}"
+    );
     fixture.strip_coherence();
     let source_before = fixture.source_files();
 
@@ -272,9 +269,7 @@ fn a_run_without_coherence_data_reads_as_coherence_capable_with_no_migration() {
     assert_eq!(check["validity"]["reasons"][0]["code"], "patch_conflict");
 
     // A blocked accept stores the verdict on the old run; explain then shows it.
-    let blocked = fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .failure();
+    let blocked = fixture.dispatch(&["accept", &fixture.run_id]).failure();
     assert!(Fixture::stderr(&blocked).contains("stale"));
     let explain = Fixture::stdout(&fixture.dispatch(&["explain", &fixture.run_id]).success());
     assert!(explain.contains("\nCoherence\n"), "{explain}");
@@ -317,9 +312,7 @@ fn a_run_without_coherence_data_applies_after_an_unrelated_edit() {
     fs::write(fixture.source.join("notes.txt"), "someone else's work\n").unwrap();
     fs::write(fixture.source.join("original.txt"), "edited elsewhere\n").unwrap();
 
-    fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .success();
+    fixture.dispatch(&["accept", &fixture.run_id]).success();
 
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(
@@ -331,7 +324,7 @@ fn a_run_without_coherence_data_applies_after_an_unrelated_edit() {
         "someone else's work\n"
     );
     assert_eq!(fixture.metadata()["status"], "applied");
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
     assert!(
         fixture
             .state_entries()
@@ -348,9 +341,7 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
     fs::write(&occupied, "someone else wrote this first\n").unwrap();
     let before = fixture.source_files();
 
-    let blocked = fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .failure();
+    let blocked = fixture.dispatch(&["accept", &fixture.run_id]).failure();
 
     let stderr = Fixture::stderr(&blocked);
     assert!(stderr.contains("stale"), "{stderr}");
@@ -366,7 +357,7 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
         "blocked_by_source_drift"
     );
     assert_eq!(metadata["coherence"]["validity"]["decision"], "refresh");
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
 }
 
 // Found by the manual v0.1.2 upgrade check (WP10b): a run made by 0.1.2 has
@@ -389,19 +380,18 @@ fn a_migrated_v012_run_can_be_checked() {
     );
 }
 
-// S1 (attach part 14.1/14.2): schema 21 widens `runs.run_mode`'s CHECK to
-// accept `'attached'`, and `RunRecord.attachment` is a new optional field.
-// The schema-20-to-21 rebuild itself (with rows in `attempts`, `control_runs`
-// and `planned_goals` referencing the migrated run) is proven in
-// `src/db.rs`'s own migration-fixture tests, which have direct access to the
-// private `MIGRATIONS` array this crate's tests cannot reach. These two
-// tests cover what is reachable from here: a run this (already schema-21)
-// binary produces has no `attachment` in its stored record, and the widened
-// CHECK really does accept and round-trip `run_mode = 'attached'`.
+// `runs.run_mode` accepts `'native'` and `'attached'`, and
+// `RunRecord.attachment` is optional. The rebuilds of `runs` themselves
+// (migrations 21 and 24, with child rows referencing the migrated run) are
+// proven in `src/db.rs`'s own migration-fixture tests, which have direct
+// access to the private `MIGRATIONS` array this crate's tests cannot reach.
+// These two tests cover what is reachable from here: a run this binary
+// produces has no `attachment` in its stored record, and the CHECK really
+// does accept and round-trip `run_mode = 'attached'`.
 #[test]
 fn a_run_this_binary_produces_has_no_attachment() {
     let fixture = Fixture::pre_coherence();
-    assert_eq!(fixture.schema_versions().last(), Some(&21));
+    assert_eq!(fixture.schema_versions().last(), Some(&current_schema()));
     assert!(fixture.metadata().get("attachment").is_none());
     let projection: String = fixture
         .db()
@@ -447,4 +437,12 @@ fn a_run_mode_attached_row_can_be_inserted_after_migration_and_read_back() {
         )
         .unwrap();
     assert_eq!(stored_mode, "attached");
+}
+
+/// The schema version this binary creates; a run it produced needs no migration.
+fn current_schema() -> i64 {
+    dispatch::db::Database::open_in_memory()
+        .unwrap()
+        .schema_version()
+        .unwrap()
 }

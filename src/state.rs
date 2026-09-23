@@ -110,7 +110,7 @@ impl State {
             .flatten();
         let mut run = match (projected, committed) {
             (Some(projected), Some(committed)) => {
-                if committed.phase3.is_some()
+                if committed.execution.is_some()
                     || committed.state_revision >= projected.state_revision
                 {
                     self.save_run(&committed)?;
@@ -131,12 +131,9 @@ impl State {
             "run metadata identity does not match directory {id}"
         );
         if let Some(database) = database {
-            crate::orchestrator::phase3::repair_abandoned(self, &database, &mut run)?;
-            if let Some(policy) = &mut run.phase3 {
+            crate::orchestrator::native::repair_abandoned(self, &database, &mut run)?;
+            if let Some(policy) = &mut run.execution {
                 policy.questions = database.questions_for_run(&id)?;
-            }
-            if let Some(admission) = database.admission_summary_for_run(&id)? {
-                run.admission = Some(admission);
             }
             self.repair_event_projection(&id, &database.events_for_run(&id)?)?;
         }

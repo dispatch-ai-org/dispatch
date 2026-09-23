@@ -180,7 +180,6 @@ def run_fixture(binary, source, state, scenario):
                     assert len(runs) == number
                     for run in runs:
                         assert Path(run['source_path']).resolve() == source.resolve()
-                        assert run['allocation']['task_features'] == {'language':'c','task_kind':'tests','scope':'localized'}
                         assert run['outcome']['review'] == 'pending'
                         assert run['outcome']['verification'] == 'passed'
                         assert db.execute("SELECT count(*) FROM events WHERE run_id=? AND event_type='run.finished'", (run['id'],)).fetchone()[0] == 1
@@ -228,7 +227,7 @@ def run_fixture(binary, source, state, scenario):
         fingerprints = [path.read_bytes() for path in immutable]
         assert run["outcome"]["review"] == "pending"
         with sqlite3.connect(state / "dispatch.db") as connection:
-            assert connection.execute("select count(*) from pool_leases").fetchone()[0] == 0
+            assert connection.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0] == 0
         if scenario == "unverified":
             assert "Unverified" in session.clean and "no checks configured" in session.clean
         if scenario in ("editor-return", "editor-cancel"):

@@ -1,0 +1,435 @@
+# Dispatch 0.4.1: pruning plan
+
+v0.4.1 is a subtractive release. It deletes the product archaeology that still
+decides how a native run starts, what `RunRecord` holds and what the database
+commit does, and it keeps the coherence and integration substrate unchanged.
+It builds no daemon, protocol, Herdr integration or Work Rebase, and it pulls in
+none of the 0.4.2 items.
+
+The audit that led to this plan was done against `v0.4.0` (`a717977`). The full
+decision document lives with the integrator; this file is the shared spec and
+the progress log.
+
+## Decisions
+
+- Sync (cloud contribution) is removed entirely. Local evaluation rows stay.
+- The automatic stronger-model retry is removed. Clarification questions stay.
+- A native run uses a configured profile or an explicit `--agent`. With
+  neither, it refuses with "run `dispatch setup` or pass `--agent`"; there is
+  no zero-setup fallback.
+- The control protocol (`control`, `control-grant`) is removed. `dispatch
+  events` remains the read-only journal follower.
+- A safety invariant is never replaced in the same change that deletes the
+  subsystem providing it. The replacement lands first, runs beside the old
+  mechanism and is proven by its own tests; the deletion comes later and must
+  not modify those tests.
+
+## Stages
+
+| Stage | Content |
+|---|---|
+| S0 | Branch `release-0.4.1` from `v0.4.0`; record the baseline; this file |
+| S1 | Remove benchmark/public-evidence and sync: `datasets`, `public_priors`, `recommend`, `evidence local`, `data refresh`, `sync`, `--route`, automatic routing |
+| S2a | Remove private evidence (commands, selection hook, TUI attest prompt, config) |
+| S2b | Remove planning (`--plan`, `/plan`, `--max-invocations`, `planning.rs`, `planned.rs`, hooks) |
+| S3 | Remove the control protocol; keep the question-authorization helpers |
+| S4 | Extract `ProcessIdentity` and friends to `process.rs`, `OperationLock` to `lock.rs`; named imports in attach/serve/apply |
+| S5a | **Additive.** Codex funding-identity refusal as an adapter preflight, beside the existing capacity/authorization check, with a proof suite |
+| S5b | One selection rule (profiles filtered by `--agent/--model/--effort`, first eligible); remove router, classifier, recovery retry |
+| S6a | **Additive.** Per-attempt durable child-launch record; `repair_abandoned` decides from it (with the admission check as an extra guard), with a proof suite |
+| S6b | **Gated on S5a + S6a.** Delete admission and capacity; the S5a/S6a suites are not modified |
+| S7a | Every native run goes through the one native engine; migrate tests from `--harnesses fake-* … apply <id> A` to `--agent fake-* … accept <id>` |
+| S7b | Delete the inline Routed/Comparison loop, `compare`, `evaluate`, `inspect`, hidden `apply`; rename `phase3.rs` to `native.rs` |
+| S8 | `RunMode` → `{Native, Attached}`; one human-review record; single-lock accept; migration 24 drops the obsolete tables |
+| S9 | Shared Work constructor and delivery step; watcher and serve share one observe/settle step |
+| S10 | CLI, config and docs tightening; release notes; real-agent dogfood; release |
+
+## Invariants every stage must keep
+
+- **Coherence.** The 36-scenario matrix on Git and plain sources; accept,
+  check, refresh, integration (L2), recovery, upgrade and the mid-run watcher,
+  including `mid_run: stop` cancelling stale native work.
+- **Integration.** Two runs finishing against one source serialize on the source
+  lock and the second is re-judged; an edit during integration checks is fenced
+  and re-validated once; `apply_checked` fences before and after its dry run.
+- **Authority.** `applied_by` distinguishes human from auto-apply; auto-apply
+  never records a review; auto-apply requires passed verification, and
+  integration-level analysis when the world moved.
+- **Attach and serve.** Foreign and wrapped attach, finish, the review rule,
+  adoption of a gone owner, serve integration and restart.
+- **Source safety.** Ignored build artifacts are not force-tracked into
+  baselines; the unsafe-local acknowledgement is required; the state directory
+  stays outside the source.
+- **Process cleanup.** Process-group termination and Docker cleanup on every
+  exit path.
+- **Persistence.** `state_revision` refuses concurrent writers; per-run event
+  sequence; older runs keep loading; upgrades back up the database first.
+- **Human review.** Review requires a delivered result; rejection closes the
+  work; an application by policy is never recorded as human acceptance.
+- **Funding safety (gate for S6b).** A profile never launches when the account
+  or funding identity the adapter observes differs from the one the user
+  authorized.
+- **Crash repair (gate for S6b).** A run is never closed while an agent child
+  it launched may still be alive.
+
+## S5a specification: funding refusals the replacement must reproduce
+
+Enumerated from `v0.4.0` + S1–S4 (`capacity.rs`, `admission.rs::authorize_launch`,
+`orchestrator.rs::{select_available_resource, admit_attempt}`, `setup.rs`,
+`harness/claude.rs`). Every refusal below happens before any agent child is
+spawned. The capacity and authorization path stays active until S6b.
+
+### Codex (`codex app-server` `account/read` + rate limits, `normalize_codex`)
+
+| # | Refusal today | Input |
+|---|---|---|
+| C1 | Authentication reported as anything but `chatgpt` (e.g. an API key) | `account.type` |
+| C2 | Paid credits reported available on any allowance bucket | `credits.hasCredits` |
+| C3 | Service tier reported as anything but `standard`/`default` | `serviceTier` |
+| C4 | Plan reported differs from the profile's `chatgpt-<plan>` funding source | `account.planType` |
+| C5 | Account identity (sha256 of email or id) reported and different from the authorized identity. Today the authorized identity is the **first observation under the profile's `authorization_revision`**, not the setup probe | `account.email`/`id` |
+| C6 | Allowance-window identity changed for an explicitly mapped pool (`provider_buckets`) | rate-limit ids |
+| C7 | **Sticky**: any conflict writes a `rejected` authorization; that revision stays refused, even if the account switches back, until setup re-authorizes (increments `authorization_revision`) | `capacity_authorizations` |
+| C8 | Newest evidence expired at the launch boundary | `valid_until` |
+| C9 | The bound profile changed in `resources.yml` between selection and spawn | `resources.yml` |
+
+An **unknown** field (probe unsupported or failed, `codex_probe: false`, field
+absent) is not a refusal today. Quota gating (exhausted/reserve) is not funding
+safety; it is removed with admission in S6b.
+
+### Claude (adapter-local already: `claude::preflight`, `discover_account`, `validate_executable`)
+
+| # | Refusal today |
+|---|---|
+| L1 | Subscription evidence expired or its contract fields not affirmed |
+| L2 | Executable hash differs from the evidence |
+| L3 | CLI version differs from the evidence |
+| L4 | Unsafe effective local settings |
+| L5 | Not logged in as a `claude.ai` first-party subscription |
+| L6 | Extra usage (paid credits) enabled |
+| L7 | Account identity (sha256 of email + org) differs from the evidence |
+| L8 | Forwarded environment variables configured |
+| L9 | **Sticky** as C7: a failed preflight during capacity observation becomes a `rejected` authorization for that revision |
+
+Claude's preflight runs at selection and, through the capacity observation,
+again at admission. After S6b it must run immediately before spawn.
+
+### Replacement (S5a, additive)
+
+- `src/harness/codex.rs`: the `account/read` probe and C1–C4 move into a Codex
+  adapter preflight; setup records the Codex account identity on the profile
+  (as Claude's evidence already does) and C5 compares against it (stricter
+  than today's first-sample baseline).
+- C8 is satisfied by running the preflight immediately before spawn; C9 by
+  re-checking the bound profile against `resources.yml` at the same point.
+- Proof suite: one test per row, each run against the new preflight alone,
+  plus a differential test that fixture observations refuse under both paths.
+- Decisions (2026-09-22):
+  - **Stickiness is preserved (C7/L9).** Any funding refusal records a durable
+    refusal for that profile and `authorization_revision`; the profile stays
+    refused until setup re-authorizes it, as in 0.4.0.
+  - **Unknown Codex identity refuses.** Stricter than 0.4.0: a Codex profile
+    marked `no_overage_verified` never launches unless the adapter observes the
+    authorized identity (a probe that is unsupported, fails or omits the
+    identity refuses).
+  - **C6 is dropped with pools** in S6b; C1–C5 still refuse.
+
+### S5a as built
+
+- `src/harness/codex.rs` owns the `app-server` account probe (moved from
+  `capacity.rs`, which now calls it) and the refusal rule `codex::refusal`
+  (C1–C5, missing evidence, unobservable identity). Only an executable named
+  `codex` is ever started with `app-server`; any other configured program
+  refuses rather than being run as a probe.
+- Setup records `codex_account` (account digest) on Codex profiles, as it
+  already recorded Claude's evidence. A Codex profile without it is not
+  eligible ("run `dispatch setup codex` to revalidate").
+- The Codex adapter preflight runs at selection and, through `run_harness`,
+  immediately before spawn. A refused preflight is a typed `PreflightRefused`.
+- Migration 22 adds `funding_refusals(funding_key, authorization_revision)`.
+  A refusal at selection or at the spawn boundary is recorded; selection
+  excludes a refused profile, and the native engine checks the record both
+  before admission and again after admission, just before execution.
+- After admission the native engine re-reads `resources.yml` and refuses when
+  the bound profile changed (C9). The narrower window between the spawn-time
+  preflight and the spawn itself is still held by admission's launch fence;
+  S6a's launch observer takes it over before S6b.
+- Proof suite: `tests/funding_safety.rs` (13 cases: authorized, C1–C5,
+  unobservable identity, unreadable account, missing evidence, a change at
+  the spawn boundary, C9, Codex and Claude stickiness), plus the pure-rule
+  tests in `harness::codex`. Codex cases run with `codex_probe: false`, so the
+  capacity path never probes and every refusal comes from the new path.
+  Claude's L1–L8 are one function (`claude::preflight`) called by both paths;
+  the unchanged phase6 `funding` scenarios prove them at the S6b gate.
+- **Pre-existing 0.4.0 defect found:** after a single selection-time
+  preflight rejection, the capacity path keeps refusing the profile even after
+  re-authorization, because selection judges the new revision against the
+  stored rejected observation and setup records no fresh one (Claude always;
+  Codex with `codex_probe: false`). The new path clears on re-authorization;
+  the defect disappears with the capacity path in S6b, which also adds the
+  "launches after re-authorization" tests.
+- Test fixtures: every fake Codex answers the account probe and every Codex
+  profile carries evidence; `timed_out_optional_probe_keeps_a_normal_run_usable_and_explained`
+  was deleted because the unknown-identity decision reverses exactly that
+  behavior (its inverse is `codex_unreadable_account_is_refused`); two phase2
+  message assertions accept the new path's refusal text.
+
+## Progress log
+
+- 2026-09-22 — S0: branch `release-0.4.1` from `v0.4.0`. Baseline `cargo test`:
+  728 passed, 10 failed, 3 ignored. Eight `terminal_bench` failures and the
+  doctest failure were caused by S1 edits made while the baseline was still
+  running; `pty_question_deadline` is the known load-sensitive fixture;
+  `claude_scoped_control_verified_review` refused because the locally installed
+  Claude CLI version differs from the fixture's subscription evidence
+  (environmental; the test belongs to the control protocol removed in S3).
+- 2026-09-22 — S1: removed `datasets`, `public_priors`, `evidence` (local),
+  `sync`, `recommend`, `data refresh`, `--route`, automatic routing and the
+  benchmark ranking half of the router, the bundled prior snapshot and the
+  envelope schemas. A native run with no configured profile and no `--agent`
+  is now refused. Tables are untouched until migration 22. Production −5.1K
+  lines, tests −3.6K. `cargo test`: 635 passed, 2 failed, both passing on rerun
+  (`phase4_pty_intent_answer_recovery_review_and_restoration`, a known
+  load-sensitive PTY fixture; the converted unsafe-local test, fixed).
+- 2026-09-22 — S2a: removed private evidence (`evidence private|propose|
+  annotate|policy|activate|rollback`, trial selection, the TUI "use this review
+  for local routing" prompt, `private_evidence` config, control-grant policy
+  pinning). `AllocationDecision.private_evidence` stays as an opaque JSON value
+  because the `private_decision_immutable` trigger refuses any projection
+  rewrite that changes it; migration 22 drops the trigger. `cargo test`:
+  609 passed, 3 failed in `phase8_planning`: `private_attribution` (its
+  behavior was removed here, case deleted) and the two load-sensitive deadline
+  fixtures, which pass in isolation.
+- 2026-09-22 — S2b: removed planning (`--plan`, `/plan`, `--max-invocations`,
+  `control-grant --allow-plan`, `planning.rs`, `planned.rs`, the planning
+  hooks in the event commit, apply, admission fence and TUI, and the
+  planned-only source helpers). A planned goal from 0.4.0 that is still
+  awaiting review is refused at apply (its delivery chain can no longer be
+  verified) rather than applied unverified; refresh it instead. `cargo test`:
+  543 passed, 1 failed (`claude_control_slow_output`, a known load-sensitive
+  control fixture; control is removed in S3).
+- 2026-09-22 — S3: removed the control protocol (`control --stdio`,
+  `control-grant`, sessions, grants, receipts, `commands/inspection.rs`, the
+  receipt and actor hooks in the event commit, control-only checkpoint
+  recovery, `examples/control_client.py`, `docs/control-protocol.md`). The
+  question-authorization helpers were all control-scoped no-ops for local
+  callers; `dispatch answer`/`cancel` keep their OS-owner check in the native
+  engine. The fake-provider fixture moved to `tests/fixtures/provider_fixture.py`;
+  the control-driven portfolio scenarios (`grants`, `pools`) were deleted
+  (same-pool admission exclusion is removed in S6b). `cargo test`: 489 passed,
+  0 failed.
+- 2026-09-22 — S4 (moves only, no behavior change): process identity and
+  liveness (`ProcessIdentity`, `identity_state`, `process_group_exists`,
+  `identity_from_row`) moved from `admission.rs` to `src/process.rs`;
+  `OperationLock`, `SignalListener` and `shutdown_signal` moved to
+  `src/lock.rs`; the event helper `transition` moved next to `persist_event`;
+  `attach`, `serve` and `apply` import named items instead of `super::*`.
+  `cargo test`: 489 passed, 0 failed.
+- 2026-09-22 — S5a (additive; the capacity and admission path is untouched and
+  still active): Codex adapter preflight with setup-recorded account evidence,
+  durable sticky funding refusals (migration 22), refusal checks at selection,
+  before admission and at the launch boundary, and the launch-boundary
+  re-read of `resources.yml`. Proof suite `tests/funding_safety.rs` (13) plus
+  `harness::codex` unit tests (11). Found and recorded a pre-existing 0.4.0
+  defect (a rejected profile stays refused after re-authorization in the
+  capacity path). `cargo test`: 512 passed, 0 failed.
+- 2026-09-23 — S5b: one selection rule (`choose_profile`): the first configured
+  profile, in file order, that is enabled, eligible, matches the backend and
+  any explicit `--agent`/`--model`/`--effort`, and passes the availability,
+  preflight and funding checks. Removed `router.rs`, `classifier.rs`, tier
+  policy, the automatic stronger-model retry and `--no-retry`; the native
+  engine's attempt loop is now a single attempt (a clarification answer
+  re-enters it). Tests: removed the retry cases (phase3 ×8, the portfolio
+  `recovery` scenario, the PTY `recovery` scenario, `classification.rs`);
+  retry-incidental tests now use a successful single attempt; fixtures no
+  longer assert classifier output or tier choice. The capacity checks at
+  selection are unchanged until S6b. `cargo test`: 479 passed, 0 failed.
+- 2026-09-23 — S6a (additive; admission untouched): `src/launch.rs` and
+  migration 23 (`attempt_launches`). The launch record lives in its own table,
+  not in the attempt row, because the run projection writer rewrites attempt
+  rows while the executor's observer is writing. `LaunchObserver` records
+  `intent` durably before spawn, then `spawned` with the child's identity, then
+  `cleaned`, `uncertain` or `spawn_failed`; it wraps admission's observer until
+  S6b. At `authorize_launch` it also re-checks the bound profile and funding
+  refusals, closing the window between the spawn-time preflight and the spawn
+  (typed `LaunchRefused`). `repair_abandoned` keeps "every attempt completed"
+  (that is what proves verification returned) and replaces the unresolved-lease
+  test with "no launch may be alive"; during S6a it requires both to agree and
+  logs any disagreement at info level. Proof suite: 10 unit tests in
+  `dispatch::launch` (every kill point against real process groups, the
+  observer sequence, the guard) and `tests/launch_record.rs` (a completed
+  attempt leaves `cleaned`; a SIGKILLed supervisor leaves `spawned` with the
+  running agent's identity and the run stays open). Real-agent dogfood is
+  deferred to the S10 release gate. `cargo test`: 491 passed, 0 failed.
+- 2026-09-23 — Real-agent dogfood (S6b gate), Claude Code 2.1.280, profile
+  `claude-sonnet-5`, scratch project `/private/tmp/dispatch-dogfood/project`,
+  isolated state directories (the real `~/.dispatch` was not migrated):
+  - Refusal path on real binaries, before re-attestation: every profile
+    refused before any model call (Codex: account evidence missing; Claude:
+    executable changed since its evidence). The Claude refusal was recorded as
+    sticky against revision 4. No run was created.
+  - After Jese re-attested the profile through `dispatch setup` (revision 5,
+    fresh evidence): the new path allowed it, but the capacity path refused it
+    ("funding revalidation failed: authentication changed to
+    adapter_preflight_rejected"): the pre-existing 0.4.0 defect recorded under
+    S5a, reproduced live. Continued in a fresh state with the same
+    re-attested configuration.
+  - Normal run: one real attempt completed, verification passed, delivered
+    exactly the requested docstring. Launch record `cleaned` with the child
+    pid; admission `released`/`cleanup_confirmed`; no disagreement.
+  - Killed supervisor: SIGKILL while `claude -p` was running. The record read
+    `spawned` with the agent's pid and process group, and the agent was still
+    alive; `dispatch status` left the run open; admission agreed
+    (`admitted`/`child_recorded`). The orphaned agent exited about a second
+    later (its output pipe was gone); the record then reads not alive. The run
+    stays open because its attempt never completed, as in 0.4.0. No
+    disagreement logged; the source was untouched.
+- 2026-09-23 — S6b (gate met: S5a and S6a proof suites green, real-agent
+  dogfood recorded): deleted `admission.rs` and `capacity.rs` (the admission
+  queue, pool leases, heartbeats, capacity observations, scarcity and
+  authorization epochs), `admit_attempt`, `observe_capacity`, `--priority`
+  and the `capacity:` section of `resources.yml` (still parsed and ignored).
+  Invariants carried over: work whose agent cleanup is unconfirmed is still
+  failed rather than verified (`ExecutionResult.cleanup_confirmed` replaces the
+  lease release); a run cannot wait on a human while a launched agent may be
+  running (launch records replace the admission check); crash repair decides
+  from launch records alone; interrupted attempts are marked `not_launched`
+  from the launch record; Codex setup discovery uses the adapter probe and
+  refusal rule. A run recorded without a supervisor is no longer presumed
+  abandoned through admission's owner row (conservative). Test changes: the
+  phase2 suite and admission/capacity unit tests are removed with their
+  behavior; the portfolio `capacity` scenario is removed; `launch_change` now
+  targets the spawn-boundary preflight (two account checks, not three);
+  admission-specific assertions became launch-record assertions. New:
+  `tests/reauthorization.rs` (Codex and Claude launch again after
+  re-authorization), confirming the 0.4.0 stuck-profile defect is gone. The
+  S5a/S6a proof files are unchanged. `cargo test`: 437 passed, 0 failed after
+  the pool-split config test was removed with its validation.
+- 2026-09-23 — S7a: every native run goes through the one native engine. An
+  explicit `--agent X` run with no matching profile is an unbound native run
+  (`allocation: None`, `phase3.fixed_harness`): no funding contract, but the
+  same launch record, watcher, questions, crash repair and run lock.
+  `--agent` also accepts the unadvertised `fake-*` adapters. The test
+  substrate moved from `--harnesses fake-* … apply <id> A` to
+  `--agent fake-* … accept <id>` (13 files); only the multi-candidate
+  comparison cases still use `--harnesses` until S7b. Behavior decisions:
+  (1) only execution failures stop a native attempt; a completed attempt whose
+  checks fail, including on a baseline that already fails, is delivered for
+  review with its verification state and its classification is kept in
+  `phase3.failure` (the old stop existed to decide whether to spend the
+  removed retry; auto-apply still requires passed verification); (2) Ctrl-C on
+  a native run is recorded as cancelled work, as the TUI always did;
+  (3) `explain` on a native run reports the explicitly chosen agent;
+  (4) the native status summary reports the human review outcome.
+  `cargo test`: 437 passed, 0 failed (PTY fixture on rerun).
+- 2026-09-23 — S7b: deleted the old multi-candidate loop and its surface:
+  `--harnesses`, `--max-parallel`, blind shuffled labels and the 702-candidate
+  cap, `compare`, `evaluate`, `inspect`, the hidden `apply <id> <label>`
+  command, routing observations (writes and reads) and the routed
+  human-evaluation path. `run_dispatch` now always hands one agent to the
+  native engine (`src/orchestrator/phase3.rs` renamed `native.rs`). Reviews of
+  every non-attached run, including routed runs made before 0.4.1, are
+  recorded the same way until S8 unifies the review store; `accept`/`reject`
+  without an id pick the latest run whose review is pending. `refresh` of a
+  pre-0.4.1 routed run redoes the agent that produced it. Tests: the
+  comparison e2e test became a single-agent non-Git end-to-end test (safe
+  apply, verbatim explanation, stale refusal); `routing_observations.rs` and
+  the comparison-only routed test were removed; `routed_run.rs` is now
+  `unsafe_local.rs`. `cargo test`: 430 passed, 0 failed.
+- 2026-09-23 — S8a: one human-review record and a single-lock accept. Every
+  review, attached work included, is one `goal_feedback_revisions` revision
+  (reasons, verbatim explanation), `outcome.review` and a
+  `review.accepted|rejected` event; the attached-only recorder is gone and
+  `cleaner-change` (a comparison reason) is no longer accepted. `accept`
+  records the review and applies under one hold of the run's operation lock,
+  closing the window in which the lock was released between the two; the CLI
+  may still revise a review (the latest revision stands), the review menu
+  still requires a pending one. `apply_locked` applies the run's sole result
+  and the `apply()` wrapper is deleted. `RunRecord` loses `routing`,
+  `capacity`, `admission` and `evaluation`; fields written by earlier
+  versions are kept verbatim in a flattened `historical` map, so rewriting an
+  older run's metadata loses nothing. `RunResult`/`AttemptDetail` lose their
+  capacity, admission and planning fields; `AllocationDecision` loses the
+  always-empty `task_features`. `phase3` is now `execution` in metadata and
+  `--json` output (older `phase3` still loads). The projection writer no
+  longer writes `routing_decision_json` or deletes blind-evaluation rows,
+  which remain as historical human judgments; `show`/`status` lost the
+  routed-run and blind-evaluation displays. `cargo test`: 428 passed,
+  0 failed.
+- 2026-09-23 — S8b: `RunMode` is `{Native, Attached}`; `legacy`, `routed`,
+  `allocation` and `comparison` load as `native`. Migration 24 drops the sync,
+  public-prior, capacity, admission, control, private-evidence and planning
+  tables and triggers (the automatic pre-upgrade backup keeps every row) and
+  rebuilds `runs` with `run_mode IN ('native','attached')` and without
+  `routing_decision_json`. Human judgments stay: `goal_feedback_revisions`,
+  and the blind `evaluations` and routed `routing_observations`/
+  `routing_feedback_events` recorded before 0.4.1. `AllocationDecision`
+  loses `private_evidence` now that its trigger is gone. Tests that asserted
+  "no lease left" now assert that no launch record is still live (intent,
+  spawned or uncertain). Upgrade evidence: a new unit test upgrades a
+  schema-21 (v0.4.0) database with a routed run, a completed attempt, a blind
+  evaluation and a routing observation; by hand, a state directory made by
+  the real v0.4.0 binary (a two-candidate comparison with a blind
+  evaluation, a single-candidate run) upgraded to schema 24 with a
+  `dispatch.schema-21-*` backup, and `accept` applied and recorded the
+  review. That hand check found a defect introduced in S8a: a completed
+  attempt's evidence was compared byte for byte with its re-serialization,
+  so any attempt recorded before the attempt types shrank was "changed" and
+  every older run became unwritable (the source was modified, then recording
+  the application failed). Completed attempts are now compared through the
+  current type and their stored rows are never rewritten; the unit test
+  fails without the fix. Not done: runs still queued or executing under
+  0.4.0 at upgrade are not interrupted by the migration. Crash repair never
+  closes a run whose attempt is unfinished, so such a run stays open rather
+  than being closed while an agent may be alive; release notes will say to
+  finish in-flight work before upgrading. Observation for S9: `accept`
+  records the review before applying, so a failed apply leaves an accepted
+  review on an unapplied result (0.4.0 did the same). `cargo test`: 429
+  passed, 0 failed.
+- 2026-09-23 — S9: `serve` uses the watcher's `settle` (the duplicated
+  `settle_uncertain` and its two tests are gone); `CoherenceRecord.facts`
+  (never written by any release) and the uncalled `derive_for_run` are
+  removed, so facts are only ever derived from (S0, Δ); the unwired
+  `FinishReason::OwnerGone` is removed; `run` and `refresh` share one
+  output-mode rule in `main.rs`. `docs/attach.md` now says what `serve` does
+  on restart: only a stored `Live` owner that is gone is adopted; an owner
+  whose liveness cannot be told is observed, not marked adopted. Not built:
+  a shared `RunRecord` constructor. The native and attached constructions
+  differ in backend, outcome, candidates and attempts, and a shared one
+  would take about ten parameters to save a dozen lines. Observation kept as
+  is: `accept` records the human review before applying, so a blocked apply
+  leaves an accepted review on a stale result (as in 0.4.0); the judgment is
+  the human's, and the blocked application is recorded separately.
+  `cargo test`: 426 passed, 0 failed.
+- 2026-09-23 — S10: README, product guide, coherence, attach, validation and
+  install docs describe 0.4.1: one agent per run from a profile or `--agent`,
+  no routing, sync, planning, control protocol, retry, capacity or
+  comparison. The docs that only described removed features are deleted
+  (planning, private evidence, phase 5/7/8 reports and captures, the
+  allocation plan); the dated RC validation report stays as a historical
+  record. `execution.max_parallel` is no longer configuration (existing
+  files that set it still load); runs record `max_parallel: 1`. CLI `about`,
+  `run`/`explain` help and the package description state the product. New
+  test: with profiles configured, `--agent` for an agent with no eligible
+  profile is refused, never run unbound (the README states this rule).
+  Release notes in `.github/release-notes.md`; version 0.4.1. Not changed:
+  `AGENTS.md`, whose sync and public-evidence policy paragraphs now describe
+  removed features, is left for the owner to revise. Pending: a real-agent
+  dogfood run of the finished branch (needs the owner's go-ahead, since it
+  uses the subscription). `cargo test`: 427 passed, 0 failed.
+- 2026-09-23 — Release dogfood on the finished branch (approved by the
+  owner). Isolated state `state-041`, which was at schema 23, and the Python
+  scratch project with `python3 -m unittest` as its check. Opening the state
+  migrated it to 24 with a `dispatch.schema-23-*` backup. `dispatch run`
+  selected the only eligible profile (Claude Code, `claude-sonnet-5`,
+  medium); the two Codex profiles were ineligible for missing account
+  evidence, as intended. Native run `01M37J7HATT86DBQXE1YWK1W1W`: one attempt,
+  observed model `claude-sonnet-5`, verification passed, exit 0, 32 s; its
+  launch record ended `cleaned`. An unrelated edit then moved the source;
+  `dispatch check` said CONTINUE (files_only, one changed file), and
+  `dispatch accept` recorded review revision 1 with the explanation verbatim,
+  ran the integration check on the merged tree (`analysis: integration`) and
+  applied two files (`applied_by: human`); the project's tests pass.
+  `AGENTS.md` no longer describes sync, public priors, planning or machine
+  control; it states that Dispatch uploads nothing and that adding any upload
+  needs a separate product and consent decision.

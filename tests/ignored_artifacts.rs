@@ -171,7 +171,7 @@ impl Fixture {
                     "--allow-unsafe-local",
                     "--auto-apply",
                     "--json",
-                    "--harnesses",
+                    "--agent",
                     "codex",
                 ])
                 .stdout(Stdio::piped())

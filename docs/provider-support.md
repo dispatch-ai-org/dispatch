@@ -31,10 +31,3 @@ states conditions for running Claude Code in a product. These are relevant limit
 not a blanket distribution approval for Dispatch. Decide the public Claude support
 wording and obtain clarification if needed; keep it scoped experimental until then.
 No legal conclusion or provider endorsement is asserted by fixture or live success.
-
-A separately approvable live plan is already concrete in the
-[Phase 8 handoff](phase8-design-handoff.md#separately-approvable-live-experiment):
-a disposable raylib copy, one useful setting/documentation goal, original checks,
-maximum four invocations and 600 seconds, no paid fallback, one human review. Exact
-current eligible profile identities must be displayed at authorization time. This
-pass did not inspect account credentials, run that experiment, or spend allowance.

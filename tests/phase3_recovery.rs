@@ -1,7 +1,6 @@
 #![cfg(unix)]
 use anyhow::{Context, Result};
-use chrono::Utc;
-use dispatch::{CapacityValue, capacity::unknown_observation, db::Database, state::State};
+use dispatch::{db::Database, state::State};
 use serde_json::Value;
 use std::{
     fs,
@@ -40,6 +39,16 @@ impl Fixture {
             &format!(
                 r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo 'codex fixture'; exit 0; fi
+if [ "$1" = 'app-server' ]; then
+while IFS= read -r line; do
+case "$line" in
+*'"id":0'*) printf '%s\n' '{{"id":0,"result":{{"userAgent":"fixture"}}}}' ;;
+*'"id":1'*) printf '%s\n' '{{"id":1,"result":{{"account":{{"type":"chatgpt","planType":"plus","email":"fixture@example.invalid"}}}}}}' ;;
+*'"id":2'*) printf '%s\n' '{{"id":2,"result":{{"rateLimitsByLimitId":{{}}}}}}'; exit 0 ;;
+esac
+done
+exit 0
+fi
 model=''; previous=''
 for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previous="$arg"; done
 printf '%s\n' "$model" >> '{root}/invocations'
@@ -89,7 +98,7 @@ test "$(cat result.txt)" = 'ok'
                 agent.display()
             ),
         )?;
-        let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n")).concat();
+        let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")).concat();
         fs::write(
             state.join("resources.yml"),
             format!(
@@ -146,7 +155,7 @@ test "$(cat result.txt)" = 'ok'
         Ok(self.answer_command(result, revision).output()?)
     }
     fn answer_command(&self, result: &Value, revision: &str) -> Command {
-        let q = &result["phase3"]["questions"][0];
+        let q = &result["execution"]["questions"][0];
         let mut command = self.command();
         command.args([
             "answer",
@@ -180,8 +189,8 @@ test "$(cat result.txt)" = 'ok'
             serde_json::to_value(&after.attempts)?,
             serde_json::to_value(&before.attempts)?
         );
-        let policy = after.phase3.as_ref().unwrap();
-        let old_policy = before.phase3.as_ref().unwrap();
+        let policy = after.execution.as_ref().unwrap();
+        let old_policy = before.execution.as_ref().unwrap();
         assert_eq!(policy.questions, old_policy.questions);
         assert_eq!(policy.deadline_at, old_policy.deadline_at);
         assert_eq!(policy.final_attempt_id, old_policy.final_attempt_id);
@@ -192,13 +201,16 @@ test "$(cat result.txt)" = 'ok'
             );
         }
         assert_eq!(self.count(), 1);
-        self.no_leases()
+        self.no_live_launches()
     }
-    fn no_leases(&self) -> Result<()> {
+    fn no_live_launches(&self) -> Result<()> {
         let db = rusqlite::Connection::open(self.state.join("dispatch.db"))?;
         assert_eq!(
-            db.query_row("SELECT COUNT(*) FROM pool_leases", [], |r| r
-                .get::<_, i64>(0))?,
+            db.query_row(
+                "SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
             0
         );
         Ok(())
@@ -213,87 +225,9 @@ fn initial_success_selects_first_without_recovery() -> Result<()> {
     assert!(output.status.success());
     assert_eq!(f.count(), 1);
     assert_eq!(r["attempts"].as_array().unwrap().len(), 1);
-    assert_eq!(r["phase3"]["final_attempt_id"], r["attempts"][0]["id"]);
+    assert_eq!(r["execution"]["final_attempt_id"], r["attempts"][0]["id"]);
     assert_eq!(r["outcome"]["verification"], "passed");
-    f.no_leases()
-}
-
-#[test]
-fn recovery_success_retains_failed_workspace_original_diff_and_fresh_permissions() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let output = f.run(&[])?;
-    let r = Fixture::result(&output)?;
-    assert!(output.status.success(), "{r}");
-    assert_eq!(f.count(), 2);
-    let a = &r["attempts"][0];
-    let b = &r["attempts"][1];
-    assert_eq!(a["resource"]["tier"], "light");
-    assert_eq!(b["resource"]["tier"], "strong");
-    assert_eq!(b["detail"]["parent_attempt_id"], a["id"]);
-    assert_eq!(b["detail"]["reason"], "target_verification_failure");
-    assert_ne!(
-        a["detail"]["admission"]["request_id"],
-        b["detail"]["admission"]["request_id"]
-    );
-    assert_ne!(
-        a["detail"]["admission"]["authorization_id"],
-        b["detail"]["admission"]["authorization_id"]
-    );
-    assert!(
-        b["detail"]["admission"]["fence"].as_u64() > a["detail"]["admission"]["fence"].as_u64()
-    );
-    assert_eq!(a["detail"]["admission"]["state"], "released");
-    assert_eq!(r["phase3"]["final_attempt_id"], b["id"]);
-    assert_eq!(r["phase3"]["provenance"], "mixed_attempt_context");
-    let failed = Path::new(a["detail"]["result"]["workspace_path"].as_str().unwrap());
-    assert_eq!(
-        fs::read_to_string(failed.join("src/lib.rs"))?,
-        "// failed-light\n"
-    );
-    let run = f.loaded(r["run_id"].as_str().unwrap())?;
-    assert_eq!(run.candidates.len(), 1);
-    assert_eq!(run.candidates[0].harness_id, "mixed");
-    assert!(run.candidates[0].model.is_none());
-    let diff = fs::read_to_string(&run.candidates[0].diff_path)?;
-    assert!(diff.contains("-// baseline"));
-    assert!(diff.contains("+// delivered"));
-    assert!(!diff.contains("failed-light"));
-    assert_eq!(
-        fs::read_to_string(f.source.join("src/lib.rs"))?,
-        "// baseline\n"
-    );
-    let conn = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
-        2
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM routing_observations", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(serde_json::to_value(&run.attempts)?, r["attempts"]);
-    f.no_leases()
-}
-
-#[test]
-fn recovery_failure_stops_after_two_and_no_retry_stops_after_one() -> Result<()> {
-    for no_retry in [false, true] {
-        let f = Fixture::new("both-fail")?;
-        let o = f.run(if no_retry { &["--no-retry"] } else { &[] })?;
-        let r = Fixture::result(&o)?;
-        assert_eq!(o.status.code(), Some(3));
-        assert_eq!(f.count(), if no_retry { 1 } else { 2 });
-        assert_eq!(r["outcome"]["verification"], "failed");
-        assert_eq!(r["phase3"]["failure"], "target_verification");
-        f.no_leases()?;
-    }
-    Ok(())
+    f.no_live_launches()
 }
 
 #[test]
@@ -333,62 +267,13 @@ fn baseline_failure_and_harness_failure_do_not_escalate() -> Result<()> {
         assert!(!o.status.success());
         assert_eq!(f.count(), 1);
         assert_eq!(
-            r["phase3"]["failure"],
+            r["execution"]["failure"],
             if baseline {
                 "baseline_infrastructure"
             } else {
                 "harness_process"
             }
         );
-    }
-    Ok(())
-}
-
-#[test]
-fn shared_capacity_or_funding_changes_block_recovery_before_spawn() -> Result<()> {
-    for funding in [false, true] {
-        let f = Fixture::new("recovery")?;
-        fs::write(f.root.join("gate"), "")?;
-        let child = f
-            .run_command(&[])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let until = Instant::now() + Duration::from_secs(12);
-        while !f.root.join("verification-waiting").exists() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(f.root.join("verification-waiting").exists());
-        f.no_leases()?;
-        let db = Database::open(f.state.join("dispatch.db"))?;
-        let mut observation =
-            unknown_observation("shared", "default", Utc::now(), 300, "between attempts");
-        if funding {
-            observation.credits_available = CapacityValue::Reported { value: true };
-        } else {
-            let c = &mut observation.constraints[0];
-            c.provider_bucket_id = Some("codex".into());
-            c.window_id = Some("primary".into());
-            c.scope = CapacityValue::Reported {
-                value: "shared".into(),
-            };
-            c.remaining = CapacityValue::Reported { value: 10.0 };
-        }
-        db.append_capacity_observation(&observation)?;
-        fs::write(f.root.join("continue"), "")?;
-        let o = child.wait_with_output()?;
-        let r = Fixture::result(&o)?;
-        assert_eq!(f.count(), 1);
-        assert!(!o.status.success());
-        assert_eq!(
-            r["phase3"]["failure"],
-            if funding {
-                "authorization"
-            } else {
-                "capacity_admission"
-            }
-        );
-        f.no_leases()?;
     }
     Ok(())
 }
@@ -401,11 +286,11 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     assert_eq!(o.status.code(), Some(4));
     assert_eq!(r["outcome"]["lifecycle"], "waiting");
     assert_eq!(r["outcome"]["waiting_on"], "human");
-    f.no_leases()?;
+    f.no_live_launches()?;
     let before = f.loaded(r["run_id"].as_str().unwrap())?;
     assert_eq!(
-        serde_json::to_value(before.phase3.as_ref().unwrap().questions.clone())?,
-        r["phase3"]["questions"]
+        serde_json::to_value(before.execution.as_ref().unwrap().questions.clone())?,
+        r["execution"]["questions"]
     );
     assert!(!f.answer(&r, "0")?.status.success());
     assert_eq!(f.count(), 1);
@@ -413,18 +298,21 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     let result = Fixture::result(&answered)?;
     assert!(answered.status.success(), "{result}");
     assert_eq!(f.count(), 2);
-    assert_eq!(result["phase3"]["questions"][0]["state"], "answered");
+    assert_eq!(result["execution"]["questions"][0]["state"], "answered");
     assert_eq!(
         result["attempts"][1]["detail"]["reason"],
         "clarification_answer"
     );
-    assert_ne!(
-        result["attempts"][0]["detail"]["admission"]["fence"],
-        result["attempts"][1]["detail"]["admission"]["fence"]
-    );
+    // Each attempt has its own launch record, cleaned up before the next.
+    let launches: i64 = rusqlite::Connection::open(f.state.join("dispatch.db"))?.query_row(
+        "SELECT COUNT(DISTINCT attempt_id) FROM attempt_launches WHERE run_id=?1 AND state='cleaned'",
+        [result["run_id"].as_str().unwrap()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(launches, 2);
     assert!(!f.answer(&r, "1")?.status.success());
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -432,7 +320,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
     let f = Fixture::new("clarify")?;
     let r = Fixture::result(&f.run(&[])?)?;
     let id = r["run_id"].as_str().unwrap();
-    let q = r["phase3"]["questions"][0]["id"].as_str().unwrap();
+    let q = r["execution"]["questions"][0]["id"].as_str().unwrap();
     let mut stale = f.loaded(id)?;
     let cancel = f
         .command()
@@ -441,7 +329,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
     assert!(cancel.status.success());
     let cancelled = Fixture::result(&cancel)?;
     assert_eq!(cancelled["outcome"]["work_result"], "cancelled");
-    assert_eq!(cancelled["phase3"]["questions"][0]["state"], "cancelled");
+    assert_eq!(cancelled["execution"]["questions"][0]["state"], "cancelled");
     assert!(!f.answer(&r, "1")?.status.success());
     let current = f.loaded(id)?;
     stale.state_revision = current.state_revision;
@@ -464,7 +352,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
         dispatch::WorkResult::Cancelled
     );
     assert_eq!(f.count(), 1);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -473,15 +361,15 @@ fn checkpoint_continuation_cannot_create_third_invocation_and_malformed_stops() 
         let f = Fixture::new(mode)?;
         let first = Fixture::result(&f.run(&[])?)?;
         if mode == "malformed" {
-            assert_eq!(first["phase3"]["failure"], "unsupported_checkpoint");
+            assert_eq!(first["execution"]["failure"], "unsupported_checkpoint");
             assert_eq!(f.count(), 1);
         } else {
             let second = Fixture::result(&f.answer(&first, "1")?)?;
-            assert_eq!(second["phase3"]["failure"], "invocation_limit");
+            assert_eq!(second["execution"]["failure"], "invocation_limit");
             assert_eq!(f.count(), 2);
             assert_ne!(second["outcome"]["waiting_on"], "human");
         }
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -534,16 +422,16 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
 fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     let f = Fixture::new("timeout")?;
     let r = Fixture::result(&f.run(&["--timeout", "5"])?)?;
-    assert_eq!(r["phase3"]["failure"], "deadline");
+    assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
-    f.no_leases()?;
+    f.no_live_launches()?;
     let g = Fixture::new("clarify")?;
     let r = Fixture::result(&g.run(&["--timeout", "5"])?)?;
     thread::sleep(Duration::from_secs(5));
     let answer = Fixture::result(&g.answer(&r, "1")?)?;
-    assert_eq!(answer["phase3"]["failure"], "deadline");
+    assert_eq!(answer["execution"]["failure"], "deadline");
     assert_eq!(g.count(), 1);
-    g.no_leases()
+    g.no_live_launches()
 }
 
 #[test]
@@ -552,7 +440,7 @@ fn question_commands_reject_wrong_identity_generation_and_local_actor() -> Resul
     let r = Fixture::result(&f.run(&[])?)?;
     let other = Fixture::result(&f.run(&[])?)?;
     let id = r["run_id"].as_str().unwrap();
-    let q = r["phase3"]["questions"][0]["id"].as_str().unwrap();
+    let q = r["execution"]["questions"][0]["id"].as_str().unwrap();
     for (run, question, generation) in [
         (id, "wrong-question", "1"),
         (other["run_id"].as_str().unwrap(), q, "1"),
@@ -576,18 +464,18 @@ fn question_commands_reject_wrong_identity_generation_and_local_actor() -> Resul
         assert!(!output.status.success());
     }
     assert_eq!(
-        f.loaded(id)?.phase3.unwrap().questions[0].state,
+        f.loaded(id)?.execution.unwrap().questions[0].state,
         dispatch::QuestionState::Pending
     );
     // Current local authority comes from persisted owner identity, not a CLI actor parameter.
     let mut run = f.loaded(id)?;
-    run.phase3.as_mut().unwrap().owner_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    run.execution.as_mut().unwrap().owner_uid = unsafe { libc::geteuid() }.wrapping_add(1);
     Database::open(f.state.join("dispatch.db"))?.sync_run(&run)?;
     let denied = f.answer(&r, "1")?;
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("unauthorized local caller"));
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -603,31 +491,30 @@ fn continuation_rechecks_configuration_and_shared_funding() -> Result<()> {
                     .replace("no_overage_verified: true", "no_overage_verified: false"),
             )?;
         } else {
-            let db = Database::open(f.state.join("dispatch.db"))?;
-            let mut observation = unknown_observation(
-                "shared",
-                "standard",
-                Utc::now(),
-                300,
-                "funding changed while waiting",
-            );
-            observation.credits_available = CapacityValue::Reported { value: true };
-            db.append_capacity_observation(&observation)?;
+            // The provider starts reporting paid credits while the question waits.
+            let agent = f.root.join("codex");
+            fs::write(
+                &agent,
+                fs::read_to_string(&agent)?.replace(
+                    r#"{"rateLimitsByLimitId":{}}"#,
+                    r#"{"rateLimitsByLimitId":{"codex":{"credits":{"hasCredits":true}}}}"#,
+                ),
+            )?;
         }
         let output = f.answer(&first, "1")?;
         let result = Fixture::result(&output)?;
         assert!(!output.status.success());
         assert_eq!(f.count(), 1);
-        assert_eq!(result["phase3"]["failure"], "authorization");
-        assert_eq!(result["phase3"]["questions"][0]["state"], "answered");
-        f.no_leases()?;
+        assert_eq!(result["execution"]["failure"], "authorization");
+        assert_eq!(result["execution"]["questions"][0]["state"], "answered");
+        f.no_live_launches()?;
     }
     Ok(())
 }
 
 #[test]
 fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() -> Result<()> {
-    for mode in ["recovery", "clarify"] {
+    for mode in ["success", "clarify"] {
         let f = Fixture::new(mode)?;
         let result = Fixture::result(&f.run(&[])?)?;
         let id = result["run_id"].as_str().unwrap();
@@ -644,23 +531,23 @@ fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() 
         let mut stale = current.clone();
         stale.state_revision += 100;
         stale.outcome.lifecycle = dispatch::LifecycleState::Working;
-        stale.phase3.as_mut().unwrap().questions.clear();
+        stale.execution.as_mut().unwrap().questions.clear();
         stale.attempts.clear();
         state.save_run(&stale)?;
         let output = f.command().args(["status", id, "--json"]).output()?;
         let status = Fixture::result(&output)?;
         assert_eq!(status["attempts"], result["attempts"]);
-        assert_eq!(status["phase3"], result["phase3"]);
+        assert_eq!(status["execution"], result["execution"]);
         assert_eq!(status["outcome"], result["outcome"]);
         assert_eq!(f.count(), if mode == "recovery" { 2 } else { 1 });
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
 
 #[test]
 fn completed_attempt_evidence_and_rejection_cannot_be_rewritten() -> Result<()> {
-    let f = Fixture::new("recovery")?;
+    let f = Fixture::new("success")?;
     let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     let original = f.loaded(id)?;
@@ -700,16 +587,11 @@ fn completed_attempt_evidence_and_rejection_cannot_be_rewritten() -> Result<()> 
         )
         .is_err()
     );
-    assert_eq!(f.count(), 2);
-    // Review remains local; accepting/rejecting mixed work creates no legacy observation/upload.
+    assert_eq!(f.count(), 1);
+    // Review creates no legacy routing observation.
     let conn = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM routing_observations", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r
             .get::<_, i64>(0))?,
         0
     );
@@ -725,92 +607,20 @@ fn verification_infrastructure_failure_does_not_trigger_recovery() -> Result<()>
     )?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 1);
-    assert_eq!(result["phase3"]["failure"], "verification_infrastructure");
+    assert_eq!(
+        result["execution"]["failure"],
+        "verification_infrastructure"
+    );
     assert_eq!(
         result["attempts"][0]["detail"]["failure"],
         "verification_infrastructure"
     );
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
-fn jsonl_exposes_both_attempts_and_delivery() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let output = f
-        .command()
-        .arg("run")
-        .arg(&f.source)
-        .args([
-            "--task",
-            "Add tests in src/lib.rs",
-            "--allow-unsafe-local",
-            "--jsonl",
-        ])
-        .output()?;
-    assert!(output.status.success());
-    let lines = String::from_utf8(output.stdout)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let events = lines
-        .iter()
-        .filter(|v| v["type"] == "event")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|v| v["event"]["event_type"] == "attempt.started")
-            .count(),
-        2
-    );
-    let result = &lines.last().unwrap()["result"];
-    assert_eq!(result["attempts"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        result["phase3"]["final_attempt_id"],
-        result["attempts"][1]["id"]
-    );
-    Ok(())
-}
-
-#[test]
-fn recovery_uses_remaining_goal_deadline_instead_of_a_new_budget() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let agent = f.root.join("codex");
-    let script = fs::read_to_string(&agent)?.replace(
-        "mode=$(cat",
-        "if [ \"$model\" = 'strong-model' ]; then sleep 40; else sleep 8; fi\nmode=$(cat",
-    );
-    executable(&agent, &script)?;
-    let mut child = OwnedChild(
-        f.run_command(&["--timeout", "30"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    wait_until(|| Ok(f.count() == 2 || child.0.try_wait()?.is_some()))?;
-    assert_eq!(f.count(), 2, "deadline test never reached recovery");
-    let output = child.output()?;
-    let result = Fixture::result(&output)?;
-    assert_eq!(f.count(), 2);
-    assert_eq!(result["phase3"]["failure"], "deadline");
-    assert_eq!(result["attempts"][1]["detail"]["failure"], "deadline");
-    assert_eq!(output.status.code(), Some(124));
-    // Eight seconds spent by Attempt 1 must not be added to the goal's
-    // thirty-second deadline. Leave ample startup headroom under parallel load.
-    assert!(result["elapsed_ms"].as_i64().unwrap() < 34_000);
-    assert!(
-        result["attempts"][1]["detail"]["result"]["duration_ms"]
-            .as_u64()
-            .unwrap()
-            < 26_000
-    );
-    f.no_leases()
-}
-
-#[test]
-fn recovery_delivery_applies_from_original_baseline_and_pending_question_is_not_reviewable()
--> Result<()> {
-    let f = Fixture::new("recovery")?;
+fn delivery_applies_from_original_baseline_and_pending_question_is_not_reviewable() -> Result<()> {
+    let f = Fixture::new("success")?;
     let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     assert!(f.command().args(["accept", id]).output()?.status.success());
@@ -835,7 +645,7 @@ fn recovery_delivery_applies_from_original_baseline_and_pending_question_is_not_
     }
     assert_eq!(
         g.loaded(pending["run_id"].as_str().unwrap())?
-            .phase3
+            .execution
             .unwrap()
             .questions[0]
             .state,
@@ -850,8 +660,8 @@ fn unavailable_baseline_tool_stops_before_model_invocation() -> Result<()> {
     executable(&f.root.join("verify"), "#!/bin/sh\nexit 127\n")?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 0);
-    assert_eq!(result["phase3"]["failure"], "baseline_infrastructure");
-    f.no_leases()
+    assert_eq!(result["execution"]["failure"], "baseline_infrastructure");
+    f.no_live_launches()
 }
 
 #[test]
@@ -862,16 +672,21 @@ fn checkpoint_requires_clean_exit_and_a_final_agent_report() -> Result<()> {
         let result = Fixture::result(&output)?;
         assert!(!output.status.success());
         assert_eq!(f.count(), 1);
-        assert!(result["phase3"]["questions"].as_array().unwrap().is_empty());
+        assert!(
+            result["execution"]["questions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            result["phase3"]["failure"],
+            result["execution"]["failure"],
             if mode == "checkpoint-crash" {
                 "harness_process"
             } else {
                 "unsupported_checkpoint"
             }
         );
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -883,7 +698,7 @@ fn signal_killed_verification_is_unknown_and_never_recovers() -> Result<()> {
     f.checks(&["if [ \"$(cat result.txt)\" = bad ]; then kill -KILL $$; fi"])?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 1);
-    assert_eq!(result["phase3"]["failure"], "verification_unknown");
+    assert_eq!(result["execution"]["failure"], "verification_unknown");
     assert_eq!(
         result["attempts"][0]["detail"]["failure"],
         "verification_unknown"
@@ -891,7 +706,7 @@ fn signal_killed_verification_is_unknown_and_never_recovers() -> Result<()> {
     let checks = &result["attempts"][0]["detail"]["result"]["checks"];
     assert_eq!(checks[0]["status"], "failed");
     assert!(checks[0]["exit_code"].is_null());
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -903,7 +718,7 @@ fn any_infrastructure_or_unknown_check_blocks_other_target_failures() -> Result<
         let result = Fixture::result(&f.run(&[])?)?;
         assert_eq!(f.count(), 1);
         assert_eq!(
-            result["phase3"]["failure"],
+            result["execution"]["failure"],
             if extra == "exit 127" {
                 "verification_infrastructure"
             } else {
@@ -916,31 +731,7 @@ fn any_infrastructure_or_unknown_check_blocks_other_target_failures() -> Result<
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0]["exit_code"], 1);
         assert_eq!(checks[1]["status"], "failed");
-        f.no_leases()?;
-    }
-    Ok(())
-}
-
-#[test]
-fn one_or_multiple_known_target_failures_still_recover() -> Result<()> {
-    for count in [1, 2] {
-        let f = Fixture::new("recovery")?;
-        f.checks(&vec!["test \"$(cat result.txt)\" = ok"; count])?;
-        let output = f.run(&[])?;
-        let result = Fixture::result(&output)?;
-        assert!(output.status.success());
-        assert_eq!(f.count(), 2);
-        assert_eq!(
-            result["attempts"][0]["detail"]["failure"],
-            "target_verification"
-        );
-        let checks = result["attempts"][0]["detail"]["result"]["checks"]
-            .as_array()
-            .unwrap();
-        assert_eq!(checks.len(), count);
-        assert!(checks.iter().all(|c| c["exit_code"] == 1));
-        assert_eq!(result["outcome"]["verification"], "passed");
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -967,19 +758,19 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
         executable(
             &f.root.join("codex"),
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo fixture; exit 0; fi\necho call >> '{}'\n{reports}exit {exit}\n",
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo fixture; exit 0; fi\nif [ \"$1\" = 'app-server' ]; then\nwhile IFS= read -r line; do\ncase \"$line\" in\n*'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{\"userAgent\":\"fixture\"}}}}' ;;\n*'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"account\":{{\"type\":\"chatgpt\",\"planType\":\"plus\",\"email\":\"fixture@example.invalid\"}}}}}}' ;;\n*'\"id\":2'*) printf '%s\\n' '{{\"id\":2,\"result\":{{\"rateLimitsByLimitId\":{{}}}}}}'; exit 0 ;;\nesac\ndone\nexit 0\nfi\necho call >> '{}'\n{reports}exit {exit}\n",
                 f.root.join("invocations").display()
             ),
         )?;
         let result = Fixture::result(&f.run(&[])?)?;
         assert_eq!(result["outcome"]["waiting_on"] == "human", accepted);
         assert_eq!(
-            result["phase3"]["questions"].as_array().unwrap().len(),
+            result["execution"]["questions"].as_array().unwrap().len(),
             usize::from(accepted)
         );
         if !accepted {
             assert_eq!(
-                result["phase3"]["failure"],
+                result["execution"]["failure"],
                 if exit == 0 {
                     "unsupported_checkpoint"
                 } else {
@@ -988,7 +779,7 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
             );
         }
         assert_eq!(f.count(), 1);
-        f.no_leases()?;
+        f.no_live_launches()?;
     }
     Ok(())
 }
@@ -996,20 +787,6 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
 // Fixtures block on a FIFO only after the relevant durable transition. The
 // guard kills/reaps the owner even if a regression causes an assertion panic.
 struct OwnedChild(std::process::Child);
-impl OwnedChild {
-    fn output(mut self) -> Result<Output> {
-        use std::io::Read;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        self.0.stdout.take().unwrap().read_to_end(&mut stdout)?;
-        self.0.stderr.take().unwrap().read_to_end(&mut stderr)?;
-        Ok(Output {
-            status: self.0.wait()?,
-            stdout,
-            stderr,
-        })
-    }
-}
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -1065,8 +842,8 @@ fn committed_attempt_owner_fixture() -> Result<()> {
     run.outcome.lifecycle = dispatch::LifecycleState::Working;
     run.outcome.work_result = dispatch::WorkResult::Pending;
     run.outcome.review = dispatch::ReviewState::NotRequested;
-    let policy = run.phase3.as_mut().unwrap();
-    policy.supervisor = Some(dispatch::admission::ProcessIdentity::current());
+    let policy = run.execution.as_mut().unwrap();
+    policy.supervisor = Some(dispatch::process::ProcessIdentity::current());
     policy.final_attempt_id = None;
     policy.failure = None;
     let attempt_id = run.attempts[0].id.clone();
@@ -1091,7 +868,7 @@ fn committed_attempt_owner_fixture() -> Result<()> {
 #[test]
 fn dead_owner_after_attempt_finish_is_repaired_but_live_owner_is_not() -> Result<()> {
     let f = Fixture::new("both-fail")?;
-    let result = Fixture::result(&f.run(&["--no-retry"])?)?;
+    let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     let mut child = OwnedChild(
         Command::new(std::env::current_exe()?)
@@ -1113,7 +890,7 @@ fn dead_owner_after_attempt_finish_is_repaired_but_live_owner_is_not() -> Result
     assert_eq!(before.outcome.lifecycle, dispatch::LifecycleState::Working);
     assert!(child.0.try_wait()?.is_none());
     assert!(before.attempts.iter().all(|a| a.completed_at.is_some()));
-    f.no_leases()?;
+    f.no_live_launches()?;
     child.0.kill()?;
     child.0.wait()?;
     f.assert_interrupted(&before)
@@ -1144,7 +921,7 @@ fn dead_owner_after_answer_commit_is_repaired_without_replaying_or_reopening() -
         dispatch::LifecycleState::Preparing
     );
     assert!(child.0.try_wait()?.is_none());
-    f.no_leases()?;
+    f.no_live_launches()?;
     child.0.kill()?;
     child.0.wait()?;
     f.assert_interrupted(&before)?;
@@ -1165,11 +942,11 @@ fn answer_setup_error_records_interruption_and_preserves_the_committed_answer() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("failed to parse resource config"));
     let stopped = f.loaded(id)?;
     assert_eq!(
-        stopped.phase3.as_ref().unwrap().questions[0].state,
+        stopped.execution.as_ref().unwrap().questions[0].state,
         dispatch::QuestionState::Answered
     );
     assert_eq!(
-        stopped.phase3.as_ref().unwrap().questions[0]
+        stopped.execution.as_ref().unwrap().questions[0]
             .answer
             .as_deref(),
         Some("blue")
@@ -1177,36 +954,6 @@ fn answer_setup_error_records_interruption_and_preserves_the_committed_answer() 
     assert_eq!(
         serde_json::to_value(&stopped.attempts)?,
         serde_json::to_value(&before.attempts)?
-    );
-    f.assert_interrupted(&stopped)
-}
-
-#[test]
-fn recovery_setup_error_records_interruption_before_returning() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    fs::write(f.root.join("gate"), "")?;
-    let child = OwnedChild(
-        f.run_command(&[])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    wait_until(|| Ok(f.root.join("verification-waiting").exists()))?;
-    fs::write(f.state.join("resources.yml"), "invalid: [\n")?;
-    fs::write(f.root.join("continue"), "")?;
-    let mut child = child;
-    assert!(!child.0.wait()?.success());
-    let id = fs::read_dir(f.state.join("runs"))?
-        .next()
-        .unwrap()?
-        .file_name()
-        .to_string_lossy()
-        .into_owned();
-    let stopped = f.loaded(&id)?;
-    assert!(stopped.attempts[0].completed_at.is_some());
-    assert_eq!(
-        stopped.attempts[0].detail.failure,
-        Some(dispatch::FailureKind::TargetVerification)
     );
     f.assert_interrupted(&stopped)
 }
@@ -1220,23 +967,23 @@ fn reload_requires_positive_owner_and_cleanup_evidence() -> Result<()> {
         let mut run = f.loaded(id)?;
         run.outcome.lifecycle = dispatch::LifecycleState::Working;
         run.outcome.work_result = dispatch::WorkResult::Pending;
-        run.phase3.as_mut().unwrap().supervisor = match evidence {
-            "live" => Some(dispatch::admission::ProcessIdentity::current()),
+        run.execution.as_mut().unwrap().supervisor = match evidence {
+            "live" => Some(dispatch::process::ProcessIdentity::current()),
             "missing" | "legacy" => None,
-            _ => Some(dispatch::admission::process_identity(u32::MAX)),
+            _ => Some(dispatch::process::process_identity(u32::MAX)),
         };
         let mut db = Database::open(f.state.join("dispatch.db"))?;
         db.sync_run(&run)?;
-        if evidence == "missing" {
-            rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute("UPDATE admission_requests SET owner_pid=NULL,owner_start_identity=NULL,owner_boot_identity=NULL WHERE run_id=?1", [id])?;
-        }
         if evidence == "unresolved" {
+            // The agent's cleanup was never confirmed and it is still alive.
+            let live = serde_json::to_string(&dispatch::process::ProcessIdentity::current())?;
             rusqlite::Connection::open(f.state.join("dispatch.db"))?.execute(
-                "UPDATE admission_requests SET status='reconciliation' WHERE run_id=?1",
-                [id],
+                "UPDATE attempt_launches SET state='uncertain', child_json=?2 WHERE run_id=?1",
+                rusqlite::params![id, live],
             )?;
         }
-        if matches!(evidence, "unlocked-dead" | "legacy") {
+        // Without a recorded supervisor, work is never presumed abandoned.
+        if evidence == "unlocked-dead" {
             f.assert_interrupted(&run)?;
         } else {
             assert_eq!(
@@ -1280,7 +1027,7 @@ fn phase4_natural_goal_reaches_review_with_light_and_standard_profiles_only() ->
         fs::read_to_string(f.source.join("main.c"))?,
         "int ballRadius = 20;\n"
     );
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[test]
@@ -1289,7 +1036,6 @@ fn phase4_pty_intent_answer_recovery_review_and_restoration() -> Result<()> {
         ("accept", "success"),
         ("reject", "success"),
         ("clarify", "clarify"),
-        ("recovery", "recover"),
         ("drift", "success"),
         ("cancel", "timeout"),
         ("active-eof", "timeout"),
@@ -1436,7 +1182,7 @@ fn phase4_two_foreground_sessions_keep_their_own_deliveries() -> Result<()> {
         );
     }
     assert_eq!(f.count(), 2);
-    f.no_leases()
+    f.no_live_launches()
 }
 
 #[tokio::test]
@@ -1470,7 +1216,7 @@ fn phase4_follow_registration_racing_completion_cannot_lose_it() -> Result<()> {
     let f = Fixture::new("both-fail")?;
     fs::write(f.root.join("gate"), "")?;
     let mut worker = f
-        .run_command(&["--no-retry"])
+        .run_command(&[])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

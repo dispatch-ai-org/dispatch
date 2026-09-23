@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod codex;
 
 use std::{
     env,
@@ -19,48 +20,6 @@ use crate::{
         ExecutionStatus, Executor, trusted_host_executable,
     },
 };
-
-pub(crate) async fn observe_resource(
-    executable: &Path,
-    selected: &crate::ResourceChoice,
-    coordinated_pool: &str,
-    profile: &crate::config::ResourceProfile,
-    config: &crate::config::CapacityConfig,
-    run_dir: &Path,
-) -> crate::capacity::CapacityProbeResult {
-    if selected.harness == "claude" {
-        crate::harness::claude::observe(executable, profile, coordinated_pool, run_dir, config)
-            .await
-    } else if selected.harness == "codex"
-        && config.codex_probe
-        && crate::capacity::supports_codex_account_probe(executable)
-    {
-        crate::capacity::probe_codex(
-            executable,
-            coordinated_pool,
-            &profile.provider_buckets,
-            &selected.service_mode,
-            config,
-        )
-        .await
-    } else {
-        let reason = if config.codex_probe {
-            "Codex account probe unavailable for this configured executable"
-        } else {
-            "capacity probe disabled"
-        };
-        crate::capacity::CapacityProbeResult {
-            observation: crate::capacity::unknown_observation(
-                coordinated_pool,
-                &selected.service_mode,
-                chrono::Utc::now(),
-                config.freshness_secs,
-                reason,
-            ),
-            raw: serde_json::json!({"unavailable": reason}),
-        }
-    }
-}
 
 pub const SUPPORTED_HARNESSES: &[&str] = &[
     "claude",
@@ -240,6 +199,19 @@ pub trait HarnessAdapter: Send + Sync {
     }
 }
 
+/// The adapter's preflight refused to launch the agent: for an included-only
+/// profile, a funding or invocation-contract check failed. Nothing was spawned.
+#[derive(Debug)]
+pub struct PreflightRefused(pub String);
+
+impl std::fmt::Display for PreflightRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PreflightRefused {}
+
 pub async fn run_harness(
     adapter: &dyn HarnessAdapter,
     executor: &Executor,
@@ -271,7 +243,7 @@ pub async fn run_harness(
         if let Some(observer) = &request.observer {
             observer.preflight_failed()?;
         }
-        return Err(error);
+        return Err(PreflightRefused(format!("{error:#}")).into());
     }
     let command = adapter.build_command(&request)?;
     let mut execution_request = ExecutionRequest::new(
@@ -321,7 +293,7 @@ pub async fn run_harness(
         token_semantics: telemetry.token_semantics,
         cost_usd: telemetry.cost_usd,
         // A provider rejection after spawn is a failed invocation, not a
-        // pre-launch admission deferral. Its restriction is persisted above.
+        // pre-launch deferral.
         failure: telemetry.failure.map(|failure| {
             if failure == crate::FailureKind::CapacityAdmission {
                 crate::FailureKind::HarnessProcess
@@ -473,6 +445,24 @@ impl HarnessAdapter for CodexAdapter {
 
     fn final_result(&self, stdout: &str) -> std::result::Result<String, String> {
         structured_final(stdout, "codex")
+    }
+
+    async fn preflight(&self, _executor: &Executor, request: &HarnessRunRequest) -> Result<()> {
+        // Only a run bound to an included-only profile carries a funding
+        // contract; an explicit `--agent codex` run has none to check.
+        if self.config.allocation_service_mode.is_some() {
+            codex::preflight(
+                &self.executable(),
+                self.config.codex_account.as_ref(),
+                self.config.funding_source.as_deref().unwrap_or_default(),
+                request
+                    .timeout
+                    .unwrap_or(Duration::from_secs(5))
+                    .min(Duration::from_secs(5)),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn build_command(&self, request: &HarnessRunRequest) -> Result<CommandSpec> {
@@ -1033,6 +1023,8 @@ mod tests {
             executable: Some(PathBuf::from("custom-agent")),
             extra_args: vec!["--extra".into()],
             allocation_service_mode: None,
+            codex_account: None,
+            funding_source: None,
             claude_subscription: None,
         };
 

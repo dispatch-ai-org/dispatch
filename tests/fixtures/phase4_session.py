@@ -104,7 +104,7 @@ try:
             if scenario=='clarify':
                 wait('Which');resize(35,16)
                 with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
-                    assert db.execute('select count(*) from pool_leases').fetchone()[0]==0
+                    assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
                 send(b'\x1b[200~blue\x1b[201~');resize(100,28);send(b'\r')
             wait('Review changes');diff_start=len(clean);send(b'd\r');wait('delivered');pump(.2)
             if scenario!='plain': assert 'index ' not in clean[diff_start:], 'visual diff leaked index hashes'
@@ -140,11 +140,10 @@ try:
         run=records[0]
         if scenario=='natural':
             assert run['task']=="Let's adjust the size of the bouncing ball to make it twice as big."
-            assert run['allocation']['selected']['tier']=='standard'
-            assert run['allocation']['task_features']['scope']=='unknown'
+            # One selection rule: the first available configured profile.
+            assert run['allocation']['selected']['resolved_model']=='light-model'
             assert len(run['attempts'])==1
-        if scenario=='clarify':assert len(run['attempts'])==2 and len(run['phase3']['questions'])==1
-        if scenario=='recovery':assert len(run['attempts'])==2
+        if scenario=='clarify':assert len(run['attempts'])==2 and len(run['execution']['questions'])==1
         if scenario in ('cancel','active-eof','hangup'):assert run['outcome']['work_result'] in ('cancelled','interrupted')
         elif scenario=='drift':assert run['outcome']['application']=='blocked_by_source_drift'
         elif scenario in ('reject','recovery','concurrent','natural'):assert run['outcome']['review']=='rejected'
@@ -161,7 +160,7 @@ try:
             assert run['outcome']['review']=='accepted'
         else:assert run['outcome']['application']=='applied'
         with sqlite3.connect(os.path.join(state,'dispatch.db')) as db:
-            if scenario!='concurrent': assert db.execute('select count(*) from pool_leases').fetchone()[0]==0
+            if scenario!='concurrent': assert db.execute("SELECT COUNT(*) FROM attempt_launches WHERE state IN ('intent','spawned','uncertain')").fetchone()[0]==0
     print('PTY passed:',scenario)
 finally:
     try:os.killpg(pid,signal.SIGKILL)

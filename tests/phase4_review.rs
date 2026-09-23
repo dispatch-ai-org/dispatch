@@ -30,7 +30,7 @@ impl Fixture {
             fs::write(source.join("before rename.txt"), "same bytes\n")?;
             fs::write(source.join("image.bin"), [0, 1, 2, 3])?;
         }
-        let agent = root.join("fixture-agent");
+        let agent = root.join("codex");
         fs::write(
             &agent,
             r#"#!/usr/bin/env python3
@@ -38,6 +38,16 @@ import pathlib, sys, time
 root = pathlib.Path(__file__).parent
 if '--version' in sys.argv:
     print('review fixture')
+    raise SystemExit(0)
+if 'app-server' in sys.argv:
+    for line in sys.stdin:
+        if '"id":0' in line:
+            print('{"id":0,"result":{"userAgent":"fixture"}}', flush=True)
+        elif '"id":1' in line:
+            print('{"id":1,"result":{"account":{"type":"chatgpt","planType":"plus","email":"fixture@example.invalid"}}}', flush=True)
+        elif '"id":2' in line:
+            print('{"id":2,"result":{"rateLimitsByLimitId":{}}}', flush=True)
+            break
     raise SystemExit(0)
 with (root / 'invocations').open('a') as calls: calls.write('fixture\n')
 time.sleep(0.25)
@@ -72,7 +82,7 @@ print('{"type":"result","model":"light-model"}')
         )?;
         fs::write(
             state.join("resources.yml"),
-            "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light-model\n    effort: low\n    runtime: local\n    service_mode: standard\n    pool: fixture\n    tier: light\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n",
+            "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light-model\n    effort: low\n    runtime: local\n    service_mode: standard\n    pool: fixture\n    tier: light\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
         )?;
         Ok(Self {
             _temp: temp,
@@ -199,7 +209,7 @@ fn phase4_plain_review_transition_appears_once_per_delivery() -> Result<()> {
             fixture.source.join("tests/collision_test.c"),
             "// C fixture\n",
         )?;
-        let agent = fixture.source.parent().unwrap().join("fixture-agent");
+        let agent = fixture.source.parent().unwrap().join("codex");
         let script = fs::read_to_string(&agent)?.replace("src/lib.rs", "tests/collision_test.c");
         fs::write(agent, script)?;
         fixture.exercise(scenario)?;

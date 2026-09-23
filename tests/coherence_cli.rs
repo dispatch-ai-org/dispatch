@@ -37,7 +37,7 @@ impl Fixture {
             .args([
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .assert()
@@ -207,7 +207,7 @@ fn check_json_prints_the_validity_and_run_id() {
 #[test]
 fn check_fails_cleanly_when_the_run_is_not_ready() {
     let fixture = Fixture::new("");
-    fixture.dispatch(&["apply", &fixture.run_id, "A"]).success();
+    fixture.dispatch(&["accept", &fixture.run_id]).success();
 
     let assert = fixture.dispatch(&["check", &fixture.run_id]).failure();
 
@@ -248,12 +248,12 @@ fn status_json_carries_coherence_only_when_the_world_moved() {
 #[test]
 fn explain_shows_the_coherence_section_only_when_there_is_data() {
     let fixture = Fixture::new("");
-    let quiet = fixture.dispatch(&["explain"]).failure();
+    let quiet = fixture.dispatch(&["explain"]).success();
     assert!(!Fixture::stdout(&quiet).contains("Coherence"));
 
     fixture.conflicting_edit();
     // A blocked accept stores the verdict and when the work first went stale.
-    let blocked = fixture.dispatch(&["apply", &fixture.run_id, "A"]).failure();
+    let blocked = fixture.dispatch(&["accept", &fixture.run_id]).failure();
     assert!(Fixture::stderr(&blocked).contains("stale"));
 
     let assert = fixture.dispatch(&["explain"]).success();
@@ -284,7 +284,7 @@ fn blocked_accept_names_refresh_and_reject() {
     let fixture = Fixture::new("");
     fixture.conflicting_edit();
 
-    let assert = fixture.dispatch(&["apply", &fixture.run_id, "A"]).failure();
+    let assert = fixture.dispatch(&["accept", &fixture.run_id]).failure();
 
     let id = &fixture.run_id;
     let stderr = Fixture::stderr(&assert);
@@ -371,7 +371,7 @@ fn refresh_requires_the_same_acknowledgements_again() {
 #[test]
 fn refresh_of_a_run_that_is_not_ready_fails_cleanly() {
     let fixture = Fixture::new("");
-    fixture.dispatch(&["apply", &fixture.run_id, "A"]).success();
+    fixture.dispatch(&["accept", &fixture.run_id]).success();
     let before = fixture.snapshot(&fixture.run_id);
 
     let assert = fixture.dispatch(&["refresh", &fixture.run_id]).failure();

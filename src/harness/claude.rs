@@ -538,62 +538,6 @@ pub fn checkpoint(
     })
 }
 
-pub async fn observe(
-    executable: &Path,
-    profile: &ResourceProfile,
-    pool: &str,
-    workspace: &Path,
-    capacity: &crate::config::CapacityConfig,
-) -> crate::capacity::CapacityProbeResult {
-    let mut observation = crate::capacity::unknown_observation(
-        pool,
-        &profile.service_mode,
-        Utc::now(),
-        capacity.freshness_secs,
-        "Claude headless preflight has no supported quota endpoint",
-    );
-    observation.source = "claude_auth_status_v1".into();
-    let request = HarnessRunRequest::new(workspace, "", workspace)
-        .with_timeout(Duration::from_secs(capacity.probe_timeout_secs));
-    let result = match &profile.claude_subscription {
-        Some(evidence) => {
-            preflight(
-                executable,
-                evidence,
-                &Executor::new(crate::config::ExecutionConfig::default()),
-                &request,
-            )
-            .await
-        }
-        None => Err(anyhow::anyhow!("Claude funding evidence missing")),
-    };
-    let raw = match result {
-        Ok(raw) => {
-            let evidence = profile.claude_subscription.as_ref().unwrap();
-            observation.source_version = evidence.cli_version.clone();
-            observation.valid_until = observation.valid_until.min(evidence.valid_until);
-            observation.auth_mode = crate::CapacityValue::Reported {
-                value: "claude.ai".into(),
-            };
-            observation.funding_identity = crate::CapacityValue::Reported {
-                value: evidence.account_sha256.clone(),
-            };
-            // Neither a user assertion nor auth status measures credit availability.
-            observation.service_tier = crate::CapacityValue::unknown(
-                "standard service requested; no provider service-tier observation",
-            );
-            raw
-        }
-        Err(_) => {
-            observation.auth_mode = crate::CapacityValue::Reported {
-                value: "unvalidated_claude_subscription".into(),
-            };
-            json!({"version":1,"error":"Claude subscription authentication/configuration validation failed"})
-        }
-    };
-    crate::capacity::CapacityProbeResult { observation, raw }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

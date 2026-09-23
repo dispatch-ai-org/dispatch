@@ -19,30 +19,6 @@ fn scenario(script: &str, name: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-macro_rules! control {
-    ($($name:ident => $case:literal),* $(,)?) => {$(#[test] fn $name() { scenario("phase5_control", $case); })*};
-}
-control! {
-    claude_scoped_control_verified_review => "smoke",
-    claude_control_durable_idempotency => "idempotency",
-    claude_control_clarification_idempotency => "clarify",
-    claude_control_authority => "authority",
-    claude_checkpoint_recovery => "recovery",
-    claude_control_cancellation => "cancel",
-    claude_owner_eof => "disconnect",
-    claude_question_eof => "question_eof",
-    claude_observer_disconnect => "observer",
-    claude_control_framing => "framing",
-    claude_control_recovery_limits => "recovery_limits",
-    claude_control_unclassified_question => "unclassified",
-    claude_control_broken_pipe => "broken_pipe",
-    claude_control_lost_answer_receipt => "lost_answer",
-    claude_control_changed_funding => "funding",
-    claude_control_slow_output => "slow",
-    claude_control_recovery_drift => "recovery_drift",
-    claude_control_answer_cancel_race => "answer_cancel",
-    claude_control_wait_events => "waits",
-}
 macro_rules! portfolio {
     ($($name:ident => $case:literal),* $(,)?) => {$(#[test] fn $name() { scenario("phase6_portfolio", $case); })*};
 }
@@ -52,10 +28,6 @@ portfolio! {
     portfolio_missing_optional_and_explicit_failure => "missing",
     claude_funding_hazards_before_launch => "funding",
     claude_protocol_failures_do_not_recover => "protocol",
-    portfolio_cross_harness_recovery_both_directions => "recovery",
-    portfolio_grant_cannot_expand_and_receipts_do_not_replay => "grants",
-    portfolio_independent_pools_and_same_pool_exclusion => "pools",
-    portfolio_retained_capacity_routes_to_other_provider => "capacity",
     claude_profile_lifecycle_preserves_history => "lifecycle",
     claude_final_preflight_invalidates_epoch => "launch_change",
     claude_effective_settings_preserve_context_without_hooks => "settings",

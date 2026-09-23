@@ -9,10 +9,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    #[serde(skip_serializing_if = "crate::planning::PlanningConfig::is_empty")]
-    pub planning: crate::planning::PlanningConfig,
-    #[serde(skip_serializing_if = "crate::private_evidence::EvidenceConfig::is_disabled")]
-    pub private_evidence: crate::private_evidence::EvidenceConfig,
     #[serde(skip_serializing_if = "CoherenceConfig::is_default")]
     pub coherence: CoherenceConfig,
     pub execution: ExecutionConfig,
@@ -74,7 +70,6 @@ pub struct ExecutionConfig {
     pub timeout_secs: u64,
     pub cpus: f64,
     pub memory: String,
-    pub max_parallel: usize,
     pub docker_image: String,
     pub forwarded_env: Vec<String>,
 }
@@ -86,7 +81,6 @@ impl Default for ExecutionConfig {
             timeout_secs: 1800,
             cpus: 2.0,
             memory: "4g".into(),
-            max_parallel: 3,
             docker_image: "ubuntu:24.04".into(),
             forwarded_env: Vec::new(),
         }
@@ -122,6 +116,12 @@ pub struct HarnessConfig {
     pub allocation_service_mode: Option<String>,
     #[serde(skip)]
     pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
+    /// Bound from the selected profile: the authorized Codex account and the
+    /// funding source the adapter preflight must observe. Never from YAML.
+    #[serde(skip)]
+    pub codex_account: Option<crate::harness::codex::AccountEvidence>,
+    #[serde(skip)]
+    pub funding_source: Option<String>,
 }
 
 impl HarnessesConfig {
@@ -141,6 +141,8 @@ impl HarnessesConfig {
         config.effort = profile.effort.clone();
         config.allocation_service_mode = Some(profile.service_mode.clone());
         config.claude_subscription = profile.claude_subscription.clone();
+        config.codex_account = profile.codex_account.clone();
+        config.funding_source = Some(profile.funding_source.clone());
     }
     pub fn bind(&mut self, choice: &crate::ResourceChoice, resources: &ResourceConfig) {
         if let Some(profile) = resources.profiles.iter().find(|p| {
@@ -193,10 +195,6 @@ impl Config {
         );
         anyhow::ensure!(self.execution.cpus > 0.0, "execution.cpus must be positive");
         anyhow::ensure!(
-            self.execution.max_parallel > 0,
-            "execution.max_parallel must be positive"
-        );
-        anyhow::ensure!(
             !self.execution.memory.trim().is_empty(),
             "execution.memory must not be empty"
         );
@@ -218,7 +216,7 @@ impl Config {
     }
 
     pub fn example_yaml() -> &'static str {
-        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  max_parallel: 3\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
+        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
     }
 }
 
@@ -248,34 +246,7 @@ pub fn validate_effort(effort: Option<&str>) -> Result<()> {
 pub struct ResourceConfig {
     pub version: u32,
     pub allocation_enabled: bool,
-    pub capacity: CapacityConfig,
     pub profiles: Vec<ResourceProfile>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CapacityConfig {
-    pub codex_probe: bool,
-    pub probe_timeout_secs: u64,
-    pub freshness_secs: u64,
-    pub admission: bool,
-    pub lease_secs: u64,
-    pub heartbeat_secs: u64,
-    pub aging_secs: u64,
-}
-
-impl Default for CapacityConfig {
-    fn default() -> Self {
-        Self {
-            codex_probe: true,
-            probe_timeout_secs: 5,
-            freshness_secs: 300,
-            admission: true,
-            lease_secs: 20,
-            heartbeat_secs: 5,
-            aging_secs: 60,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +255,10 @@ pub struct ResourceProfile {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_subscription: Option<crate::harness::claude::SubscriptionEvidence>,
+    /// The Codex account authorized at setup; the adapter preflight refuses to
+    /// launch when it observes any other account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_account: Option<crate::harness::codex::AccountEvidence>,
     pub provider: String,
     pub funding_source: String,
     pub harness: String,
@@ -316,15 +291,6 @@ impl ResourceProfile {
             .map(|e| format!("claude-account:{}", e.account_sha256))
             .unwrap_or_else(|| self.funding_source.clone())
     }
-    pub fn admission_buckets(&self) -> Vec<String> {
-        // Claude v1 has no authoritative preflight bucket mapping. All choices
-        // for the authenticated account conservatively share one allowance.
-        if self.harness == "claude" {
-            Vec::new()
-        } else {
-            self.provider_buckets.clone()
-        }
-    }
     pub fn eligibility(&self) -> Result<()> {
         anyhow::ensure!(self.enabled, "resource profile disabled");
         anyhow::ensure!(
@@ -334,7 +300,32 @@ impl ResourceProfile {
         if self.harness == "claude" {
             crate::harness::claude::eligibility(self)?;
         }
+        if self.harness == "codex" {
+            anyhow::ensure!(
+                self.codex_account.is_some(),
+                "Codex account evidence missing; run `dispatch setup codex` to revalidate"
+            );
+        }
         Ok(())
+    }
+
+    /// The funding identity a refusal is recorded against: provider, plan and
+    /// authorized account. With `authorization_revision` it keys the durable
+    /// funding refusals that setup clears by re-authorizing.
+    pub fn funding_key(&self) -> String {
+        let account = self
+            .claude_subscription
+            .as_ref()
+            .map(|e| e.account_sha256.as_str())
+            .or(self
+                .codex_account
+                .as_ref()
+                .map(|e| e.account_sha256.as_str()))
+            .unwrap_or("");
+        format!(
+            "{}/{}/{}/{account}",
+            self.provider, self.harness, self.funding_source
+        )
     }
 }
 
@@ -368,30 +359,6 @@ impl ResourceConfig {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.version == 1, "resources.yml version must be 1");
-        anyhow::ensure!(
-            self.capacity.probe_timeout_secs > 0,
-            "capacity probe timeout must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.freshness_secs > 0,
-            "capacity freshness must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.lease_secs > 0,
-            "capacity lease duration must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.heartbeat_secs > 0,
-            "capacity heartbeat must be positive"
-        );
-        anyhow::ensure!(
-            self.capacity.heartbeat_secs < self.capacity.lease_secs,
-            "capacity heartbeat must be shorter than the lease duration"
-        );
-        anyhow::ensure!(
-            self.capacity.aging_secs > 0,
-            "capacity aging must be positive"
-        );
         for profile in &self.profiles {
             if !profile.enabled {
                 continue;
@@ -436,36 +403,6 @@ impl ResourceConfig {
                     .all(|bucket| !bucket.trim().is_empty()),
                 "provider bucket IDs must not be empty"
             );
-        }
-        for (index, left) in self.profiles.iter().enumerate() {
-            for right in &self.profiles[index + 1..] {
-                if !left.enabled || !right.enabled {
-                    continue;
-                }
-                if left.pool == right.pool {
-                    anyhow::ensure!(
-                        left.provider == right.provider
-                            && left.funding_scope() == right.funding_scope()
-                            && left.provider_buckets == right.provider_buckets,
-                        "profiles in one resource pool must share provider, funding source, and provider bucket mapping"
-                    );
-                }
-                let overlapping_buckets = left.admission_buckets().is_empty()
-                    || right.provider_buckets.is_empty()
-                    || left
-                        .provider_buckets
-                        .iter()
-                        .any(|bucket| right.provider_buckets.contains(bucket));
-                if left.provider == right.provider
-                    && left.funding_scope() == right.funding_scope()
-                    && overlapping_buckets
-                {
-                    anyhow::ensure!(
-                        left.pool == right.pool,
-                        "profiles sharing a funding source and allowance bucket must use one resource pool"
-                    );
-                }
-            }
         }
         Ok(())
     }
@@ -549,20 +486,5 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.profiles[1].provider, "anthropic");
-    }
-
-    #[test]
-    fn shared_allowance_cannot_be_split_into_per_model_tanks() {
-        let config: ResourceConfig = serde_yaml::from_str(
-            "version: 1\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light\n    effort: low\n    service_mode: standard\n    runtime: local\n    pool: light-only\n    provider_buckets: [codex]\n    tier: light\n    included: true\n    no_overage_verified: true\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: strong\n    effort: high\n    service_mode: standard\n    runtime: local\n    pool: strong-only\n    provider_buckets: [codex]\n    tier: strong\n    included: true\n    no_overage_verified: true\n",
-        )
-        .unwrap();
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("one resource pool")
-        );
     }
 }

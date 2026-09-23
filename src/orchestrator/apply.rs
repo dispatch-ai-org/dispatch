@@ -6,11 +6,26 @@
 //! is now, and applies through the digest or fingerprint fence. What differs
 //! is the authority: a human decision records acceptance, a policy never does.
 
-use super::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use anyhow::Result;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+
+use super::{persist_event, sole_candidate, transition};
 use crate::{
-    AnalysisLevel, AppliedBy,
+    AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
+    LifecycleState, ReviewState, RunPhase, RunRecord, RunStatus, Validity, VerificationState,
+    WorkResult,
     coherence::{AcceptGate, CoherenceBlocked, run_config},
-    source::ApplyReport,
+    db::Database,
+    lock::OperationLock,
+    source::{self, ApplyReport},
+    state::State,
 };
 
 /// Who is applying. This is threaded into the persisted outcome and events so
@@ -100,7 +115,6 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     let mut record = run.coherence.take().unwrap_or(CoherenceRecord {
         version: 1,
         refreshed_from: None,
-        facts: Vec::new(),
         validity: None,
         first_invalid_at: None,
     });
@@ -114,7 +128,7 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
 /// Remember a watcher's verdict and commit it as `coherence.checked` (a
 /// `Continue` decision) or `coherence.invalidated` (anything else), returning
 /// which kind was committed. Shared by the allocation-run watcher
-/// (`phase3::apply_watch`) and the attach owner loop / `serve` (part 14.5);
+/// (`native::apply_watch`) and the attach owner loop / `serve` (part 14.5);
 /// none of them implement `mid_run: stop` themselves.
 pub(super) fn persist_verdict(
     state: &State,
@@ -128,7 +142,7 @@ pub(super) fn persist_verdict(
     } else {
         "coherence.invalidated"
     };
-    super::phase3::transition(
+    transition(
         state,
         db,
         run,
@@ -229,24 +243,13 @@ fn persist_application_failed(
     Ok(run)
 }
 
-pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    apply_locked(state, run, candidate_label, false, ApplyAuthority::Human)
-}
-
-/// Apply `candidate_label` of `run` onto the source under the per-source lock.
+/// Apply the run's result onto the source under the per-source lock.
 /// The caller holds the run's operation lock. `authority` names who is
 /// applying: only a human decision marks the review as accepted; a policy
 /// application leaves the review exactly as it was.
 pub(super) fn apply_locked(
     state: &State,
     mut run: RunRecord,
-    candidate_label: &str,
     quiet: bool,
     authority: ApplyAuthority,
 ) -> Result<()> {
@@ -259,9 +262,12 @@ pub(super) fn apply_locked(
         run.id,
         run.status.as_str()
     );
-    crate::planning::verify_delivery(&run)?;
-    let candidate = find_candidate(&run, candidate_label)?;
-    let normalized_label = candidate.label.clone();
+    anyhow::ensure!(
+        !was_planned(&run),
+        "run {} is a planned goal from an earlier Dispatch whose delivery can no longer be verified; refresh it instead",
+        run.id
+    );
+    let normalized_label = sole_candidate(&run)?.label.clone();
     let _source_lock = OperationLock::acquire(
         &source_lock_path(state, &run),
         "another apply operation is already modifying this source",
@@ -462,6 +468,14 @@ fn decide(
 /// between authorization and the real `git apply`. Matched by text because
 /// the fence is inside `anyhow::ensure!`, same as `apply_locked` already does
 /// for the human path.
+/// Planned goals (removed in 0.4.1) delivered through an integrity chain this
+/// version no longer verifies, so their results are never applied.
+fn was_planned(run: &RunRecord) -> bool {
+    run.execution
+        .as_ref()
+        .is_some_and(|goal| goal.provenance == "planned_policy_chain")
+}
+
 fn is_fence_failure(message: &str) -> bool {
     message.contains("source changed during apply validation")
         || message.contains("source has changed since this run was created")
@@ -506,7 +520,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if run.candidates.len() != 1 {
         return persist_skip(state, run, "not_sole_candidate");
     }
-    if crate::planning::verify_delivery(&run).is_err() {
+    if was_planned(&run) {
         return persist_skip(state, run, "delivery_unverifiable");
     }
     let Some(config) = run_config(&run_dir) else {

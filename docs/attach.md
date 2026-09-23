@@ -69,7 +69,7 @@ candidate label, and none of them need to know whether Dispatch launched the age
 | `candidates[0]` | `workspace_path` = the external worktree or directory; `diff_path` = `runs/<id>/delta.patch`; `harness_id` = `attachment.agent` or `"external"`; `label` = `"A"`; `checks` filled at finish |
 | `attempts[0]` | one record, `role: "attached"`, same `harness_id`, `resource: None`, every model field `None` (never guessed) |
 | `environment` | `execution_backend: "local"`; `unsafe_local` = the `--allow-unsafe-local` acknowledgement; the rest copied from the root's `dispatch.yml` |
-| `phase3` | `None`: no invocation budget, no admission, no questions |
+| `execution` | `None`: no invocation budget, no questions |
 | `task` | `--task` text, or `"attached work in <workspace basename>"`; `exact_prompt` equals `task` |
 | `attachment: Option<AttachmentRecord>` | provenance, capabilities, process identities, timestamps (below); `None` for every native run |
 | `outcome` while active | `lifecycle: Working, work_result: Pending, verification: NotRun, review: NotRequested, phase: Executing` |
@@ -79,8 +79,7 @@ below). A binary built before this exists refuses a state directory that has alr
 been migrated to schema 21.
 
 What attached Work cannot do: `dispatch refresh` (refused — see "Review of attached
-work" below); it never produces allocation feedback or a routing observation, so an
-attached result never becomes routing evidence.
+work" below).
 
 ## S0 and confidence
 
@@ -333,13 +332,12 @@ above.
 
 ## Review of attached work
 
-`dispatch accept`/`dispatch reject`, and the review menu's equivalents, gain a third
-branch for `RunMode::Attached` (next to the existing allocation and routing branches):
-`outcome.review` is set and a `review.accepted`/`review.rejected` event is committed
-with `{"reasons": [...], "explanation": ...}` — no `goal_feedback_revisions` row, no
-routing evaluation, because attached results never become routing evidence. The apply
-itself then goes through the same `apply_locked(..., ApplyAuthority::Human)` every
-other human accept uses.
+`dispatch accept`/`dispatch reject`, and the review menu's equivalents, record a
+review of attached work exactly as they do for native work (since 0.4.1): one
+`goal_feedback_revisions` row with the reasons and the verbatim explanation,
+`outcome.review`, and a `review.accepted`/`review.rejected` event. The review and, on
+accept, `apply_locked(..., ApplyAuthority::Human)` run under one hold of the run's
+operation lock.
 
 - `load_latest_unresolved_single` (the target of a bare `dispatch accept`/`dispatch
   reject` with no id) also returns an attached run whose review is still `Pending`.
@@ -375,7 +373,7 @@ that turns a `Validity` into a stored verdict: it calls `remember_validity` (sta
 `first_invalid_at` the first time a run becomes invalid) and commits
 `coherence.checked` (for `Continue`) or `coherence.invalidated` (otherwise) through the
 same transition path every other event uses. The allocation-run mid-run watcher
-(`phase3::apply_watch`), the wrapped attach owner loop, and `serve` all call it
+(`native::apply_watch`), the wrapped attach owner loop, and `serve` all call it
 directly; none of them re-implement `mid_run: stop` — `apply_watch` is the only caller
 that still does, and only for native allocation runs.
 
@@ -385,7 +383,7 @@ that still does, and only for native allocation runs.
   `AttachmentRecord`), the materialized S0 baseline, the frozen `delta.patch`, every
   event, and `attachment.owner_state`/`finished_at`/`finish_reason`.
 - **Recomputed on every use**: the world, symbol tables, facts and the verdict shown by
-  `check`, `status`, `explain` and the control protocol's `result` — exactly as for
+  `check`, `status` and `explain` — exactly as for
   native runs. `serve`'s view line reads the *last stored* verdict; it does not
   recompute one for display beyond what its own tick already evaluated and persisted.
 
@@ -394,8 +392,10 @@ that still does, and only for native allocation runs.
 - **`serve` restart.** Active attached Work is read back from the database
   (`mode = attached`, `lifecycle != Finished`). The wrapper's stored `ProcessIdentity`
   (and the agent's, if known) is re-checked with `identity_state`: `ExactLive` is left
-  alone (a live wrapper owns it); `Gone`/`Reused`/`Unknown` is adopted, honestly marking
-  `owner_state`. Nothing is finished, applied or relaunched by a restart.
+  alone (a live wrapper owns it); a stored `Live` owner that is now `Gone`/`Reused` is
+  adopted (above); a foreign attachment with no owner, or an owner whose liveness
+  cannot be told (`Unknown`), is observed but not marked adopted. Nothing is finished,
+  applied or relaunched by a restart.
 - **A wrapper crash** leaves its Work `Working` with a stale `owner_state: Live` until
   `serve` next observes that root and adopts it (or until a human runs `dispatch
   finish` directly), whichever happens first.
@@ -427,10 +427,8 @@ that still does, and only for native allocation runs.
   session's own watcher notices a landing by `serve` on its next poll, and vice versa.
 - Nothing in the standalone path reads the `serve` lock or requires `serve` to be
   running.
-- Attached Work is visible over the [control protocol](control-protocol.md) exactly
-  like any other run (`status`/`result`, `mode: "attached"`); the protocol has no
-  attach operation and does not need one, since attach is always a foreground,
-  human-typed command.
+- Attached Work appears in `status --json` like any other run, with
+  `mode: "attached"`. Attach is always a foreground, human-typed command.
 
 ## Migration 21
 

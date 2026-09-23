@@ -40,7 +40,6 @@ pub struct Options {
     pub plain: bool,
     pub ascii: bool,
     pub no_color: bool,
-    pub no_retry: bool,
 }
 
 pub fn suitable() -> bool {
@@ -283,7 +282,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
         String::new(),
         label(run, event).to_owned(),
     ];
-    if crate::planning::planning(run).is_none() {
+    {
         lines.push(if width < 40 {
             format!("{work_mark} {model}\n{verify_mark} checks  {review_mark} review")
         } else {
@@ -304,7 +303,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
     }
     // One attempt is already represented by the work node. Show branches only
     // when the committed history contains recovery or clarification continuation.
-    if crate::planning::planning(run).is_none() && run.attempts.len() > 1 {
+    if run.attempts.len() > 1 {
         for attempt in &run.attempts {
             let prefix = match attempt.detail.reason.as_deref() {
                 Some("target_verification_failure") => "Recovery · ",
@@ -364,60 +363,6 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
             diff.lines_removed
         ));
     }
-    if let Some(p) = crate::planning::planning(run) {
-        lines.push("Planned work · sequential execution".into());
-        if p.plan.is_none() {
-            lines.push(format!("Planner · {model}"));
-        }
-        for task in p
-            .tasks
-            .iter()
-            .filter(|_| run.outcome.work_result != WorkResult::Ready)
-        {
-            let spec = p
-                .plan
-                .as_ref()
-                .and_then(|p| p.tasks.iter().find(|s| s.id == task.id));
-            let mark = match task.state {
-                crate::planning::TaskState::Integrated => done,
-                crate::planning::TaskState::Failed => failed,
-                _ => pending,
-            };
-            let title = spec.map(|s| s.objective.as_str()).unwrap_or(&task.id);
-            let state = match task.state {
-                crate::planning::TaskState::Pending => "queued",
-                crate::planning::TaskState::Working => "working",
-                crate::planning::TaskState::Waiting => "needs attention",
-                crate::planning::TaskState::Integrated => "checked + integrated",
-                crate::planning::TaskState::Failed => "failed",
-            };
-            lines.push(format!("{mark} {}", clip(title, width.saturating_sub(3))));
-            lines.push(format!(
-                "  {} · {state}",
-                model_name(&task.decision.selected.resolved_model)
-            ));
-            if let Some(spec) =
-                spec.filter(|_| task.state != crate::planning::TaskState::Integrated)
-            {
-                let dependencies = spec
-                    .prerequisites
-                    .iter()
-                    .chain(task.pending_prerequisite.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !dependencies.is_empty() {
-                    lines.push(format!(
-                        "  requires checked output: {}",
-                        dependencies.join(", ")
-                    ));
-                }
-            }
-        }
-        if let Some(error) = &p.error {
-            lines.push(format!("Stopped: {}", clip(error, 240)));
-        }
-        lines.push("One shared extra for the entire goal".into());
-    }
     if let Some(q) = pending_question(run) {
         lines.push(
             "Decision needed · answering continues this goal within its remaining limit.".into(),
@@ -427,11 +372,8 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
             lines.push(q.report.choices.join(" / "));
         }
     }
-    if let Some(failure) = run.phase3.as_ref().and_then(|p| p.failure) {
+    if let Some(failure) = run.execution.as_ref().and_then(|p| p.failure) {
         let reason = match failure {
-            FailureKind::InvocationLimit if crate::planning::planning(run).is_some() => {
-                "The shared invocation limit leaves no continuation budget."
-            }
             FailureKind::InvocationLimit => {
                 "The two-invocation limit leaves no continuation budget."
             }
@@ -466,7 +408,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
 }
 
 pub fn pending_question(run: &RunRecord) -> Option<&Clarification> {
-    run.phase3
+    run.execution
         .as_ref()?
         .questions
         .last()
@@ -492,18 +434,22 @@ pub fn review_command(run: &RunRecord) -> Result<ReviewCommand> {
 }
 
 fn launch_accounting(state: &State, run: &RunRecord) -> String {
-    let maximum = run.phase3.as_ref().map_or(2, |p| {
-        p.planning
-            .as_ref()
-            .and_then(|p| p.plan.as_ref())
-            .map_or(p.max_invocations, |plan| {
-                p.max_invocations.min(plan.tasks.len() as u32 + 2)
-            })
-    });
+    let maximum = run.execution.as_ref().map_or(2, |p| p.max_invocations);
     let counts = (|| -> Result<(u32, u32)> {
         let db = crate::db::Database::open_read_only(state.db_path())?;
         db.connection().busy_timeout(Duration::from_millis(10))?;
-        Ok(db.connection().query_row("SELECT COALESCE(SUM(launch_knowledge IN ('child_recorded','cleanup_confirmed')),0), COALESCE(SUM(launch_knowledge NOT IN ('child_recorded','cleanup_confirmed','launch_intent_committed','launch_not_started')),0) FROM admission_requests WHERE run_id=?1",[&run.id],|r|Ok((r.get(0)?,r.get(1)?)))?)
+        let launches = crate::launch::launches_for_run(&db, &run.id)?;
+        let known = launches.iter().filter(|l| l.child.is_some()).count();
+        let uncertain = launches
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.state,
+                    crate::launch::LaunchState::Intent | crate::launch::LaunchState::Uncertain
+                )
+            })
+            .count();
+        Ok((u32::try_from(known)?, u32::try_from(uncertain)?))
     })();
     match counts {
         Ok((known, uncertain)) => {
@@ -520,23 +466,6 @@ fn details(run: &RunRecord) -> String {
     );
     if let Some(decision) = &run.allocation {
         text.push_str(&format!("\nAllocation: {}", decision.reason));
-    }
-    if let Some(p) = crate::planning::planning(run) {
-        text.push_str(&format!(
-            "\nPlan revision: {} · sequential execution",
-            p.revision
-        ));
-        if let Some(error) = &p.error {
-            text.push_str(&format!("\nStopped: {error}"));
-        }
-        for task in &p.tasks {
-            text.push_str(&format!("\nTask {}: {:?}\n  Suitability: {}\n  Selection: {}\n  Input: {}\n  Checked artifact: {}", task.id, task.state, task.feature_provenance, task.decision.reason, task.input.as_deref().unwrap_or("not assigned"), task.artifact.as_deref().unwrap_or("not integrated")));
-        }
-        for artifact in &p.artifacts {
-            if !artifact.verification_changes.is_empty() {
-                text.push_str(&format!("\nVerification files changed: {}. Checks used the original owner-approved files.", artifact.verification_changes.join(", ")));
-            }
-        }
     }
     for attempt in &run.attempts {
         text.push_str(&format!(
@@ -998,10 +927,7 @@ struct Ui {
     /// Session-scoped only: off at every start, never persisted. See
     /// `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
     auto_apply: bool,
-    reviewed: Option<(
-        RunRecord,
-        std::result::Result<crate::private_evidence::AnnotationRequest, String>,
-    )>,
+    reviewed: Option<RunRecord>,
     #[cfg(unix)]
     term: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -1527,10 +1453,9 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
     ui.commit(&context)?;
     loop {
         let prompt = if ui.reviewed.is_some() {
-            "Next goal: What do you want to accomplish?\n[f] Use this review for local routing   [i] Details"
+            "Next goal: What do you want to accomplish?\n[i] Details"
         } else {
-            "What do you want to accomplish?\nDirect by default · /plan for sequential work
-/resources accounts · /checks project checks"
+            "What do you want to accomplish?\n/resources accounts · /checks project checks"
         };
         let prompt = if options.plain && ui.auto_apply {
             prompt.replacen("accomplish?", "accomplish? (auto-apply on)", 1)
@@ -1566,22 +1491,8 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
                 }
                 continue;
             }
-            Input::Submit(task) if ui.reviewed.is_some() && task.trim() == "f" => {
-                let (run, request) = ui.reviewed.as_ref().unwrap().clone();
-                if let Err(error) = attest_review(&mut ui, state, &run, request).await {
-                    ui.commit(&format!("Local feedback not recorded: {}. Review and application are unchanged. Choose f to inspect this run again and explicitly confirm, or continue to the next goal.", clip(&format!("{error:#}"), 240)))?;
-                    // Refresh only this displayed identity, never another session's latest run.
-                    if let Ok(current) = state.load_run(&run.id) {
-                        let request =
-                            crate::private_evidence::prepare_review_annotation(state, &current)
-                                .map_err(|error| format!("{error:#}"));
-                        ui.reviewed = Some((current, request));
-                    }
-                }
-                continue;
-            }
             Input::Submit(task) if ui.reviewed.is_some() && task.trim() == "i" => {
-                let (run, _) = ui.reviewed.as_ref().unwrap().clone();
+                let run = ui.reviewed.as_ref().unwrap().clone();
                 ui.diagnostics(&run).await?;
                 continue;
             }
@@ -1657,27 +1568,15 @@ async fn run_goal(
             setup::checks(ui, source).await?;
         }
     }
-    let plan = task.starts_with("/plan ");
-    let task = task.strip_prefix("/plan ").unwrap_or(&task).to_owned();
-    if plan {
-        ui.commit("Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations under one deadline. One final human review.")?;
-    }
     let request = RunRequest {
-        plan,
-        max_invocations: None,
         source: source.to_path_buf(),
         task,
-        harnesses: vec![],
-        route: false,
         agent: None,
         model: None,
         effort: None,
         config_path: None,
         backend: None,
         timeout_secs: None,
-        max_parallel: None,
-        priority: 0,
-        no_retry: options.no_retry,
         allow_unsafe_local: local,
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,
@@ -1690,7 +1589,7 @@ async fn run_goal(
     loop {
         if let Some(command) = question_command(&run) {
             let deadline = run
-                .phase3
+                .execution
                 .as_ref()
                 .map(|p| {
                     format!(
@@ -1703,22 +1602,7 @@ async fn run_goal(
                 "{}\n{deadline}Your answer (Ctrl+C cancels this goal)",
                 ui.launch_line
             );
-            let answer = if let Some(policy) = run.phase3.as_ref().filter(|p| p.planning.is_some())
-            {
-                let remaining = (policy.deadline_at - chrono::Utc::now())
-                    .to_std()
-                    .unwrap_or_default();
-                match tokio::time::timeout(remaining, ui.prompt(&prompt)).await {
-                    Ok(answer) => answer?,
-                    Err(_) => {
-                        run = state.load_run(&run.id)?;
-                        ui.commit(&projection(&run, None, ui.width(), options.ascii))?;
-                        continue;
-                    }
-                }
-            } else {
-                ui.prompt(&prompt).await?
-            };
+            let answer = ui.prompt(&prompt).await?;
             match answer {
                 Input::Submit(answer) if !answer.trim().is_empty() => {
                     run = ui
@@ -1905,9 +1789,7 @@ async fn review_goal(
                     ui.commit(&format!("{error:#}"))?;
                 }
                 if matches!(run.outcome.review, ReviewState::Accepted | ReviewState::Rejected) {
-                    let request = crate::private_evidence::prepare_review_annotation(state, &run)
-                        .map_err(|error| format!("{error:#}"));
-                    ui.reviewed = Some((run, request));
+                    ui.reviewed = Some(run);
                 }
                 if action == "aa" && result.is_ok() {
                     ui.auto_apply = true;
@@ -1922,33 +1804,6 @@ async fn review_goal(
             _ => notice = "Choose Review changes, Open in editor, Accept & apply, Reject, Leave pending, or Details.".into(),
         }
     }
-}
-
-async fn attest_review(
-    ui: &mut Ui,
-    state: &State,
-    run: &RunRecord,
-    request: std::result::Result<crate::private_evidence::AnnotationRequest, String>,
-) -> Result<()> {
-    let request = request.map_err(anyhow::Error::msg)?;
-    ui.input_boundary().await?;
-    let body = format!(
-        "{}\nReview: {:?}\n\nThis was ordinary work and reflects my own review. Record it as local routing evidence. Routing will not change automatically.\n\n[c] Confirm this statement   [b] Back without recording",
-        projection(run, None, ui.width().saturating_sub(3), ui.options.ascii)
-            .lines()
-            .filter(|line| !line.is_empty() && !line.contains(" ━━ ") && !line.contains(" == "))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        run.outcome.review
-    );
-    match ui.command_prompt(&body).await? {
-        Input::Submit(action) if action.trim() == "c" => {
-            crate::private_evidence::commit_annotation(state, &request)?;
-            ui.commit("Local routing evidence recorded. Routing is unchanged.")?;
-        }
-        _ => ui.commit("No local feedback recorded. Review and application are unchanged.")?,
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2080,38 +1935,6 @@ mod tests {
     }
 
     #[test]
-    fn planned_review_keeps_verification_visible_before_long_task_list() {
-        let mut r = run();
-        let decision = serde_json::json!({
-            "version":1,"policy_version":"planned-contract-v1","task_features":crate::TaskFeatures::default(),
-            "selected":{"provider":"fixture","funding_source":"fixture","harness":"codex","requested_model":"fixture-standard","resolved_model":"fixture-standard","service_mode":"standard","runtime":"local","pool":"fixture","tier":"standard","no_overage_verified":true,"internal_composition":"controlled"},
-            "reason":"fixture","capability":{"version":1,"source":"fixture","harness":"codex","observed_at":r.created_at,"models":[]},"alternatives":[]
-        });
-        let tasks = (0..4)
-            .map(|i| {
-                serde_json::json!({
-                    "id":format!("task-{i}"),"state":"integrated","decision":decision,
-                    "feature_provenance":"validated contract"
-                })
-            })
-            .collect::<Vec<_>>();
-        r.phase3 = Some(serde_json::from_value(serde_json::json!({
-            "max_invocations":6,"deadline_at":r.created_at,"no_retry":false,"priority":0,"owner_uid":0,
-            "contributing_attempts":[],"provenance":"planned_policy_chain","questions":[],
-            "planning":{"version":1,"revision":"fixture","approved_checks":{},"owner_policy":{},"plan":{"version":1,"tasks":[]},"tasks":tasks,"snapshots":[],"artifacts":[],"root_checks":[]}
-        })).unwrap());
-        r.outcome.work_result = WorkResult::Ready;
-        r.outcome.verification = VerificationState::Passed;
-        r.outcome.review = ReviewState::Pending;
-        // Eight visible content rows model the limited space above narrow review controls.
-        for width in [24, 35] {
-            let visible = render(&projection(&r, None, width, true), width);
-            assert!(visible.contains("Ready for review"), "{visible}");
-            assert!(visible.contains("Verification passed"), "{visible}");
-        }
-    }
-
-    #[test]
     fn waiting_for_a_decision_or_capacity_never_claims_agent_is_running() {
         let mut r = run();
         r.outcome.phase = RunPhase::Executing;
@@ -2210,7 +2033,6 @@ mod tests {
         r.coherence = Some(CoherenceRecord {
             version: 1,
             refreshed_from: None,
-            facts: Vec::new(),
             validity: Some(Validity {
                 decision,
                 evaluated_at: chrono::Utc::now(),

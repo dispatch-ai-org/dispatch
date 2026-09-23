@@ -144,7 +144,7 @@ fn check(spec: &WatchSpec, previous: Option<Signal>) -> Result<(Signal, Option<V
 /// Parse errors while a person is mid-edit are normal, so uncertainty must not
 /// invalidate work mid-run. Drop `AnalysisUncertain` reasons; a refresh that
 /// rested only on them is a continue.
-fn settle(mut validity: Validity) -> Validity {
+pub(crate) fn settle(mut validity: Validity) -> Validity {
     validity
         .reasons
         .retain(|reason| reason.code != ReasonCode::AnalysisUncertain);

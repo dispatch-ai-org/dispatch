@@ -22,35 +22,27 @@ task
 ```
 
 Work coherence is the center of the product and the public story. Agent
-selection, allocation, isolated execution, verification, planning, machine
-control and cost accounting are how Dispatch carries the work; they support the
-promise and are not separate product theses. Keep selection local and
-evidence-based, do not present public priors as ground truth, and feed the
-selected harness into the same execution core used by deliberate overrides.
-Multi-harness comparison remains an advanced evaluation workflow.
+selection, allocation, isolated execution, verification and cost accounting are
+how Dispatch carries the work; they support the promise and are not separate
+product theses. Keep selection local and explicit: one configured profile or an
+explicit `--agent`, fed into the same execution core.
 
 Public claims about coherence must match what is shipped and measured. Today
 that is an accept-time gate with symbol-level facts for Rust and Python, file-level
-facts elsewhere, and an advisory mid-run watcher on allocation runs. Do not claim
+facts elsewhere, and an advisory mid-run watcher on native runs. Do not claim
 tokens, minutes or money saved until a real run was stopped and the attempt
 timestamps show it. The metrics that decide whether the thesis holds, and what
 would falsify it, are in `docs/coherence-validation.md`.
 
 ## Architectural ownership
 
-**Rust owns execution.** Rust owns the CLI, task/run orchestration, process supervision, harness adapters, source state, Git/worktrees/internal snapshots, execution backends, limits and timeouts, verification, diff and artifact capture, events, evaluation, task features, locally cached priors and prediction, SQLite/local persistence, and the explicit opt-in sync contract/outbox/client.
+**Rust owns execution.** Rust owns the CLI, task/run orchestration, process supervision, harness adapters, source state, Git/worktrees/internal snapshots, execution backends, limits and timeouts, verification, diff and artifact capture, events, human review, and SQLite/local persistence.
 
 If explicitly requested later, **Go may own networked coordination and learning**: authentication, teams, server-side ingestion, aggregate statistics, training-data processing, and server-side routing services. Do not implement Go or cloud services in this repository.
 
 Cloud must never be required to execute a normal local Dispatch run.
 
-Public benchmark evidence must be normalized offline and distributed as a
-compact versioned snapshot. Bundle a fallback with the CLI and cache only
-normalized entries locally; normal runs must never fetch live benchmark data.
-Preserve provenance and treat public evidence as an observation, not a quality
-label or ground truth.
-
-Evaluation upload is off by default and requires explicit user opt-in. A Cloud ingestion token is a separate submission permission: storing or possessing it never implies consent, and it must remain outside the envelope and preview. Source code, snapshots, full diffs, logs, local paths, environment data, and credentials are outside the v0.1.0 sync scope. Task text and human explanations are shared only after their inclusion has been clearly disclosed, and preview must serialize the exact payload used for upload.
+Dispatch uploads nothing and fetches no benchmark data.
 
 ## Keep Dispatch small
 
@@ -98,7 +90,6 @@ Automated verification means the configured checks passed. It does not establish
 - Do not fabricate or silently estimate transaction cost.
 - Retain Dispatch, harness, and model versions where available.
 - Preserve failures, timeouts, and partial artifacts as data.
-- Keep sync consent explicit and separate from ingestion permission, preserve stable evaluation IDs, and retain failed uploads locally.
 - Do not conflate automated checks with overall quality.
 - Do not create composite quality scores without explicit product direction.
 
@@ -112,7 +103,7 @@ Do not introduce an internal plugin framework without multiple demonstrated inte
 
 ## Local-first and source safety
 
-Ordinary local directories, non-Git projects, existing Git repositories, and linked worktrees are first-class inputs. GitHub, a remote repository, an account, cloud services, and evaluation sync must remain optional.
+Ordinary local directories, non-Git projects, existing Git repositories, and linked worktrees are first-class inputs. GitHub, a remote repository, an account and cloud services must remain optional.
 
 During evaluation, harnesses work in independent candidate states rather than directly in the user's original source. Preserve snapshot fidelity, candidate isolation, source-drift checks, and explicit apply semantics. Never weaken the unsafe-local acknowledgement or imply that local execution is sandboxed.
 
@@ -129,7 +120,7 @@ Unless explicitly requested, do not add:
 - synthetic or composite quality scores;
 - new execution backends or benchmark infrastructure.
 
-Do not broaden the versioned evaluation envelope to upload source, patches, logs, or additional telemetry without a separate explicit product and consent decision. Do not put server-side cloud, routing, or learning implementation in the public core.
+Do not add any upload of source, patches, logs, task text or telemetry without a separate explicit product and consent decision. Do not put server-side cloud, routing, or learning implementation in the public core.
 
 Do not opportunistically broaden a focused task.
 

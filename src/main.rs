@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "dispatch",
     version,
-    about = "Dispatch — give a software task to the best available coding agent"
+    about = "Dispatch — keep coding-agent work valid while the code moves"
 )]
 struct Cli {
     /// Override ~/.dispatch (also available as DISPATCH_HOME).
@@ -29,9 +29,6 @@ struct Cli {
     /// Keep native terminal colors (also respects NO_COLOR).
     #[arg(long, global = true)]
     no_color: bool,
-    /// Disable bounded recovery in the interactive session.
-    #[arg(long, hide = true)]
-    no_retry: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -47,30 +44,6 @@ enum Command {
         checks: bool,
         #[arg(value_parser = ["codex", "claude"])]
         provider: Option<String>,
-    },
-    /// Foreground, scoped bidirectional JSON Lines (requires a human-issued grant).
-    Control {
-        #[arg(long, required = true)]
-        stdio: bool,
-        #[arg(long)]
-        grant_fd: i32,
-        #[arg(long)]
-        read_only: bool,
-    },
-    /// Authorize a fixed machine scope as the local human owner; prints a private key path.
-    ControlGrant {
-        /// Explicitly authorize planned goals, within the shared invocation limit.
-        #[arg(long)]
-        allow_plan: bool,
-        source: PathBuf,
-        #[arg(long, default_value_t = 600)]
-        timeout: u64,
-        #[arg(long, default_value_t = 2)]
-        max_invocations: u32,
-        #[arg(long)]
-        allow_unsafe_local: bool,
-        #[arg(long)]
-        delegate_factual: bool,
     },
     /// Follow committed semantic events (advanced, read-only JSON Lines).
     #[command(hide = true)]
@@ -100,7 +73,7 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Work on a software task with the best available coding agent.
+    /// Work on a software task with your configured coding agent (or --agent).
     Run(RunArgs),
     /// Answer a durable clarification and continue within the existing goal limit.
     Answer {
@@ -126,15 +99,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect locally cached evidence for supported real harnesses.
-    #[command(hide = true)]
-    Recommend(RecommendArgs),
-    /// Inspect observed local outcomes without changing routing.
-    #[command(hide = true)]
-    Evidence {
-        #[command(subcommand)]
-        command: EvidenceCommand,
-    },
     /// Show the state of one run (or the latest run).
     Status {
         run_id: Option<String>,
@@ -150,7 +114,7 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
-    /// Explain why Dispatch chose the agent for the latest task.
+    /// Explain which agent and resource the latest task used.
     Explain { run_id: Option<String> },
     /// Check whether a finished result is still valid against the source as it is now.
     Check {
@@ -196,142 +160,12 @@ enum Command {
     Accept(ReviewArgs),
     /// Reject the latest single result without changing the source tree.
     Reject(ReviewArgs),
-    /// Print the path to a candidate's complete workspace.
-    #[command(hide = true)]
-    Inspect {
-        run_id: String,
-        candidate: String,
-        /// Start the user's shell in the candidate workspace.
-        #[arg(long)]
-        shell: bool,
-    },
-    /// Compare blind candidates and optionally persist an evaluation.
-    #[command(hide = true)]
-    Compare(CompareArgs),
-    /// Record accept/reject feedback for one predictively routed result.
-    #[command(hide = true)]
-    Evaluate(EvaluateArgs),
-    /// Safely apply one candidate to the original source.
-    #[command(hide = true)]
-    Apply { run_id: String, candidate: String },
-    /// Import public benchmark snapshots into the local evidence cache.
-    #[command(hide = true)]
-    Datasets {
-        #[command(subcommand)]
-        command: DatasetCommand,
-    },
-    /// Refresh the compact public routing data cache.
-    #[command(hide = true)]
-    Data {
-        #[command(subcommand)]
-        command: DataCommand,
-    },
-    /// Review opt-in records; bare `dispatch sync` explicitly transmits queued data.
-    #[command(hide = true)]
-    Sync {
-        #[command(subcommand)]
-        command: Option<SyncCommand>,
-    },
     /// Print the Dispatch version.
     Version,
 }
 
-#[derive(Debug, Subcommand)]
-enum DatasetCommand {
-    /// Import a local benchmark snapshot without network access.
-    Import {
-        #[arg(value_parser = ["swe-bench", "terminal-bench"])]
-        dataset: String,
-        path: PathBuf,
-    },
-    /// Export imported normalized priors as a versioned maintainer snapshot.
-    ExportPublicPriors { output: PathBuf },
-}
-
-#[derive(Debug, Subcommand)]
-enum DataCommand {
-    /// Fetch the latest compact public routing data; existing data remains on failure.
-    Refresh,
-}
-
-#[derive(Debug, Subcommand)]
-enum EvidenceCommand {
-    /// Count routed outcomes for this source location, without ranking harnesses.
-    Local { source: PathBuf },
-    /// Inspect attributable private evidence and immutable decision-time metadata.
-    Private { run_id: String },
-    /// Build an inspectable trial proposal; does not activate it.
-    Propose { run_id: String },
-    /// Attest origin/review provenance for an existing outcome; creates no feedback.
-    Annotate {
-        run_id: String,
-        #[arg(long)]
-        origin: String,
-        #[arg(long, default_value = "unknown")]
-        review: String,
-        #[arg(long)]
-        repair_minutes: Option<u64>,
-    },
-    /// Inspect exact versioned proposal content and validity.
-    Policy { proposal_id: String },
-    /// Owner-controlled future preference change, with a stale-revision fence.
-    Activate {
-        source: PathBuf,
-        proposal_id: String,
-        #[arg(long)]
-        expected_revision: u64,
-    },
-    /// Restore the deterministic policy for future goals.
-    Rollback {
-        source: PathBuf,
-        #[arg(long)]
-        expected_revision: u64,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum SyncCommand {
-    /// Record current contribution consent and queue eligible records; does not upload.
-    Enable,
-    /// Disable all contribution uploads.
-    Disable,
-    /// Show consent and outbox state without contacting the cloud.
-    Status,
-    /// Print the exact eligible upload body without transmitting; requires consent.
-    Preview {
-        run_id: String,
-        /// Select a record when the run has both evaluation and routing data.
-        #[arg(long = "type", value_parser = ["evaluation", "routing-observation", "routing-feedback"])]
-        record_type: Option<String>,
-        /// Select one immutable routed-feedback revision.
-        #[arg(long, requires = "record_type", value_parser = clap::value_parser!(u32).range(1..))]
-        revision: Option<u32>,
-    },
-    /// Manage the developer-preview Dispatch Cloud ingestion token.
-    Token {
-        #[command(subcommand)]
-        command: SyncTokenCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum SyncTokenCommand {
-    /// Store a server-issued ingestion token locally.
-    Set { token: String },
-    /// Report only whether a token is configured.
-    Status,
-    /// Remove the locally stored ingestion token.
-    Clear,
-}
-
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Opt in: one planner, up to four sequential tasks, one shared extra (six calls maximum).
-    #[arg(long, conflicts_with_all = ["route", "harnesses"])]
-    plan: bool,
-    /// Smaller goal-wide invocation limit; planned default 6, direct default 2.
-    #[arg(long)]
-    max_invocations: Option<u32>,
     /// Desired software change. The source defaults to the current directory.
     task_or_legacy_source: Option<String>,
 
@@ -347,25 +181,17 @@ struct RunArgs {
     #[arg(long, conflicts_with = "task")]
     task_file: Option<PathBuf>,
 
-    /// Comma-separated adapter IDs. Fakes make the complete workflow testable offline.
-    #[arg(long, value_delimiter = ',', conflicts_with_all = ["route", "agent"], hide = true)]
-    harnesses: Option<Vec<String>>,
-
     /// Deliberately choose one supported coding agent.
-    #[arg(long, value_parser = ["claude", "codex", "cursor"], conflicts_with_all = ["route", "harnesses"])]
+    #[arg(long, value_parser = agent_id)]
     agent: Option<String>,
 
     /// Select a configured model resource.
-    #[arg(long, conflicts_with_all = ["route", "harnesses"])]
+    #[arg(long)]
     model: Option<String>,
 
     /// Select the configured provider-specific effort for this attempt.
-    #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], conflicts_with_all = ["route", "harnesses"], hide = true)]
+    #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], hide = true)]
     effort: Option<String>,
-
-    /// Select one locally runnable real harness using cached routing evidence.
-    #[arg(long, conflicts_with_all = ["harnesses", "agent"], hide = true)]
-    route: bool,
 
     #[arg(long, hide = true)]
     config: Option<PathBuf>,
@@ -375,17 +201,6 @@ struct RunArgs {
 
     #[arg(long, hide = true)]
     timeout: Option<u64>,
-
-    #[arg(long, hide = true)]
-    max_parallel: Option<usize>,
-
-    /// Disable the single automatic stronger recovery.
-    #[arg(long, hide = true)]
-    no_retry: bool,
-
-    /// Admission priority within the shared local subscription pool.
-    #[arg(long, value_parser = ["background", "normal", "urgent"], default_value = "normal", hide = true)]
-    priority: String,
 
     /// Explicitly allow real agents or project checks to execute on the host.
     #[arg(long, hide = true)]
@@ -475,44 +290,6 @@ struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
-struct RecommendArgs {
-    #[arg(default_value = ".")]
-    source: PathBuf,
-
-    #[command(flatten)]
-    task_input: TaskInput,
-}
-
-#[derive(Debug, Args)]
-struct TaskInput {
-    #[arg(
-        long,
-        required_unless_present = "task_file",
-        conflicts_with = "task_file"
-    )]
-    task: Option<String>,
-
-    #[arg(long, required_unless_present = "task", conflicts_with = "task")]
-    task_file: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-struct CompareArgs {
-    run_id: String,
-
-    /// Submit A/B/.../tie/neither without the interactive prompt.
-    #[arg(long)]
-    winner: Option<String>,
-
-    #[command(flatten)]
-    feedback: FeedbackArgs,
-
-    /// Prompt for outcome, labels, and multiline freeform text.
-    #[arg(long)]
-    evaluate: bool,
-}
-
-#[derive(Debug, Args)]
 struct FeedbackArgs {
     /// Optional structured reason; repeat the flag for multiple labels.
     #[arg(long = "reason")]
@@ -534,18 +311,6 @@ impl FeedbackArgs {
             None => Ok(self.explanation.clone()),
         }
     }
-}
-
-#[derive(Debug, Args)]
-struct EvaluateArgs {
-    run_id: String,
-
-    /// Whether the routed result was acceptable for the task.
-    #[arg(long, value_parser = ["accept", "reject"])]
-    outcome: String,
-
-    #[command(flatten)]
-    feedback: FeedbackArgs,
 }
 
 #[derive(Debug, Args)]
@@ -590,7 +355,6 @@ async fn run() -> Result<()> {
                 plain: cli.plain,
                 ascii: cli.ascii,
                 no_color: cli.no_color,
-                no_retry: cli.no_retry,
             },
         )
         .await;
@@ -609,35 +373,9 @@ async fn run() -> Result<()> {
                     plain: cli.plain,
                     ascii: cli.ascii,
                     no_color: cli.no_color,
-                    no_retry: cli.no_retry,
                 },
             )
             .await
-        }
-        Command::Control {
-            stdio: _,
-            grant_fd,
-            read_only,
-        } => dispatch::control::stdio(state, grant_fd, read_only).await,
-        Command::ControlGrant {
-            allow_plan,
-            source,
-            timeout,
-            max_invocations,
-            allow_unsafe_local,
-            delegate_factual,
-        } => {
-            let path = dispatch::commands::grant_mode(
-                &state,
-                &source,
-                timeout,
-                max_invocations,
-                allow_unsafe_local,
-                delegate_factual,
-                allow_plan,
-            )?;
-            println!("{}", path.display());
-            Ok(())
         }
         Command::Events {
             run_id,
@@ -723,77 +461,21 @@ async fn run() -> Result<()> {
             let jsonl = args.jsonl;
             let (source, task) = read_run_input(&args)?;
             let request = orchestrator::RunRequest {
-                plan: args.plan,
-                max_invocations: args.max_invocations,
                 source,
                 task,
-                harnesses: args.harnesses.unwrap_or_default(),
-                route: args.route,
                 agent: args.agent,
                 model: args.model,
                 effort: args.effort,
                 config_path: args.config,
                 backend: args.backend,
                 timeout_secs: args.timeout,
-                max_parallel: args.max_parallel,
-                no_retry: args.no_retry,
-                priority: match args.priority.as_str() {
-                    "background" => -1,
-                    "urgent" => 1,
-                    _ => 0,
-                },
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
-                output: if json {
-                    if auto_apply {
-                        orchestrator::RunOutputMode::Silent
-                    } else {
-                        orchestrator::RunOutputMode::Json
-                    }
-                } else if jsonl {
-                    orchestrator::RunOutputMode::Jsonl
-                } else {
-                    orchestrator::RunOutputMode::Human
-                },
+                output: run_output_mode(json, jsonl, auto_apply),
                 refreshed_from: None,
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
             finish_run(&state, run, auto_apply, json, jsonl)
-        }
-        Command::Recommend(args) => {
-            let task = read_task(args.task_input)?;
-            orchestrator::recommend(&state, &args.source, &task)
-        }
-        Command::Evidence {
-            command: EvidenceCommand::Local { source },
-        } => dispatch::evidence::inspect_local(&state, &source),
-        Command::Evidence { command } => {
-            use dispatch::private_evidence as private;
-            let value = match command {
-                EvidenceCommand::Private { run_id } => private::inspect(&state, &run_id)?,
-                EvidenceCommand::Propose { run_id } => private::propose(&state, &run_id)?,
-                EvidenceCommand::Annotate {
-                    run_id,
-                    origin,
-                    review,
-                    repair_minutes,
-                } => private::annotate(&state, &run_id, &origin, &review, repair_minutes)?,
-                EvidenceCommand::Policy { proposal_id } => {
-                    private::policy_inspect(&state, &proposal_id)?
-                }
-                EvidenceCommand::Activate {
-                    source,
-                    proposal_id,
-                    expected_revision,
-                } => private::transition(&state, &source, Some(&proposal_id), expected_revision)?,
-                EvidenceCommand::Rollback {
-                    source,
-                    expected_revision,
-                } => private::transition(&state, &source, None, expected_revision)?,
-                EvidenceCommand::Local { .. } => unreachable!(),
-            };
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
         }
         Command::Status {
             run_id,
@@ -819,17 +501,7 @@ async fn run() -> Result<()> {
             let auto_apply = args.auto_apply;
             let json = args.json;
             let jsonl = args.jsonl;
-            let output = if json {
-                if auto_apply {
-                    orchestrator::RunOutputMode::Silent
-                } else {
-                    orchestrator::RunOutputMode::Json
-                }
-            } else if jsonl {
-                orchestrator::RunOutputMode::Jsonl
-            } else {
-                orchestrator::RunOutputMode::Human
-            };
+            let output = run_output_mode(json, jsonl, auto_apply);
             let request = orchestrator::refresh_request(
                 &state,
                 args.run_id.as_deref(),
@@ -916,104 +588,6 @@ async fn run() -> Result<()> {
                 explanation,
             )
         }
-        Command::Inspect {
-            run_id,
-            candidate,
-            shell,
-        } => orchestrator::inspect(&state, &run_id, &candidate, shell),
-        Command::Compare(args) => {
-            let evaluation = orchestrator::EvaluationInput {
-                winner: args.winner,
-                explanation: args.feedback.read_explanation()?,
-                reasons: args.feedback.reasons,
-            };
-            orchestrator::compare(&state, &args.run_id, evaluation, args.evaluate)
-        }
-        Command::Evaluate(args) => {
-            let evaluation = orchestrator::RoutingEvaluationInput {
-                outcome: args.outcome,
-                explanation: args.feedback.read_explanation()?,
-                reasons: args.feedback.reasons,
-            };
-            orchestrator::evaluate_routed(&state, &args.run_id, evaluation)
-        }
-        Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
-        Command::Datasets { command } => match command {
-            DatasetCommand::Import { dataset, path } => {
-                let report = match dataset.as_str() {
-                    "swe-bench" => dispatch::datasets::import_swe_bench(&state, &path)?,
-                    "terminal-bench" => dispatch::datasets::import_terminal_bench(&state, &path)?,
-                    _ => unreachable!("clap validates dataset names"),
-                };
-                println!(
-                    "Imported {} {} for harness {} (model {})",
-                    report.prior.dataset,
-                    report.prior.dataset_version,
-                    report.prior.harness,
-                    report.prior.model.as_deref().unwrap_or("unknown")
-                );
-                println!(
-                    "Observed {}/{} successful attempts; cached raw snapshot at {}",
-                    report.prior.successes,
-                    report.prior.attempts,
-                    report.raw_snapshot_path.display()
-                );
-                Ok(())
-            }
-            DatasetCommand::ExportPublicPriors { output } => {
-                let snapshot = dispatch::public_priors::export_public_priors(&state, &output)?;
-                println!(
-                    "Exported {} public prior entries to {}\nSnapshot: {}",
-                    snapshot.entries.len(),
-                    output.display(),
-                    snapshot.snapshot_id
-                );
-                Ok(())
-            }
-        },
-        Command::Data {
-            command: DataCommand::Refresh,
-        } => {
-            match dispatch::public_priors::refresh(&state) {
-                Ok((dispatch::public_priors::RefreshResult::Updated, snapshot)) => {
-                    let agents = snapshot
-                        .entries
-                        .iter()
-                        .map(|entry| entry.harness.as_str())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len();
-                    println!("Public routing data updated.");
-                    println!("Snapshot: {}", snapshot.snapshot_id);
-                    println!("Agents: {agents}");
-                    println!("Evidence groups: {}", snapshot.entries.len());
-                }
-                Ok((dispatch::public_priors::RefreshResult::Current, snapshot)) => {
-                    println!("Public routing data is up to date.");
-                    println!("Snapshot: {}", snapshot.snapshot_id);
-                }
-                Err(_) => {
-                    println!("Could not refresh public routing data.");
-                    println!("Existing local data remains available.");
-                }
-            }
-            Ok(())
-        }
-        Command::Sync { command } => match command {
-            Some(SyncCommand::Enable) => dispatch::sync::enable(&state),
-            Some(SyncCommand::Disable) => dispatch::sync::disable(&state),
-            Some(SyncCommand::Status) => dispatch::sync::status(&state),
-            Some(SyncCommand::Preview {
-                run_id,
-                record_type,
-                revision,
-            }) => dispatch::sync::preview(&state, &run_id, record_type.as_deref(), revision),
-            Some(SyncCommand::Token { command }) => match command {
-                SyncTokenCommand::Set { token } => dispatch::sync::token_set(&state, &token),
-                SyncTokenCommand::Status => dispatch::sync::token_status(&state),
-                SyncTokenCommand::Clear => dispatch::sync::token_clear(&state),
-            },
-            None => dispatch::sync::flush(&state),
-        },
         Command::Version => {
             println!("dispatch {}", dispatch::VERSION);
             Ok(())
@@ -1039,6 +613,20 @@ async fn run() -> Result<()> {
 /// `0`; otherwise the run's own exit code, unchanged (a run that already
 /// failed for its own reason, for example verification, is not relabeled
 /// "not applied automatically").
+/// With `--json --auto-apply` the run stays silent: `finish_run` prints the
+/// one result after the automatic application.
+fn run_output_mode(json: bool, jsonl: bool, auto_apply: bool) -> orchestrator::RunOutputMode {
+    if json && auto_apply {
+        orchestrator::RunOutputMode::Silent
+    } else if json {
+        orchestrator::RunOutputMode::Json
+    } else if jsonl {
+        orchestrator::RunOutputMode::Jsonl
+    } else {
+        orchestrator::RunOutputMode::Human
+    }
+}
+
 fn finish_run(
     state: &State,
     run: dispatch::RunRecord,
@@ -1108,12 +696,13 @@ fn finish_run(
     Ok(())
 }
 
-fn read_task(input: TaskInput) -> Result<String> {
-    match (input.task, input.task_file) {
-        (Some(task), None) => Ok(task),
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read task file {}", path.display())),
-        _ => unreachable!("clap enforces one task source"),
+/// A supported coding agent. The deterministic `fake-*` adapters are accepted
+/// but not advertised; they make the complete workflow testable offline.
+fn agent_id(value: &str) -> std::result::Result<String, String> {
+    match value {
+        "claude" | "codex" | "cursor" => Ok(value.to_owned()),
+        fake if fake.starts_with("fake-") => Ok(fake.to_owned()),
+        _ => Err("possible values: claude, codex, cursor".into()),
     }
 }
 

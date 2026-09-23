@@ -516,7 +516,7 @@ fn serve_view_lists_native_and_attached_runs() {
                 "--allow-unsafe-local",
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .success();

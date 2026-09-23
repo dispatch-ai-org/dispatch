@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Launches that are not known to be over: none may outlast a run.
+const LIVE_LAUNCHES: &str = "attempt_launches WHERE state IN ('intent', 'spawned', 'uncertain')";
+
 struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
@@ -79,6 +82,16 @@ impl Fixture {
             &format!(
                 r#"#!/bin/sh
 if [ "$1" = '--version' ]; then echo 'codex fixture'; exit 0; fi
+if [ "$1" = 'app-server' ]; then
+while IFS= read -r line; do
+case "$line" in
+*'"id":0'*) printf '%s\n' '{{"id":0,"result":{{"userAgent":"fixture"}}}}' ;;
+*'"id":1'*) printf '%s\n' '{{"id":1,"result":{{"account":{{"type":"chatgpt","planType":"plus","email":"fixture@example.invalid"}}}}}}' ;;
+*'"id":2'*) printf '%s\n' '{{"id":2,"result":{{"rateLimitsByLimitId":{{}}}}}}'; exit 0 ;;
+esac
+done
+exit 0
+fi
 model=''; previous=''
 for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previous="$arg"; done
 printf '%s\n' "$model" >> '{root}/invocations'
@@ -107,7 +120,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         git(&source, &["add", "-A"])?;
         git(&source, &["commit", "--quiet", "-m", "initial"])?;
         let profiles = [("light-model", "low", "light"), ("strong-model", "high", "strong")].map(|(m, e, t)| {
-            format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n")
+            format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")
         }).concat();
         fs::write(
             state.join("resources.yml"),
@@ -377,7 +390,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
         let result = Fixture::result(&output)?;
         assert!(!f.root.join("finished").exists());
         assert_eq!(output.status.code(), Some(1), "{result}");
-        assert_eq!(result["phase3"]["failure"], "stale_work");
+        assert_eq!(result["execution"]["failure"], "stale_work");
         assert_eq!(result["outcome"]["work_result"], "cancelled");
         assert_eq!(f.event_count("coherence.invalidated"), 1);
         assert_eq!(f.event_count("coherence.stopped"), 1);
@@ -385,7 +398,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
         let run = f.loaded(id)?;
         assert_eq!(run.status, dispatch::RunStatus::Interrupted);
         assert_eq!(
-            run.phase3.as_ref().unwrap().failure,
+            run.execution.as_ref().unwrap().failure,
             Some(dispatch::FailureKind::StaleWork)
         );
         assert!(run.coherence.unwrap().first_invalid_at.is_some());
@@ -409,7 +422,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
                 .starts_with("work stopped: the source changed underneath it (")
         );
         // Nothing counts against the agent and nothing is left leased.
-        assert_eq!(f.count("pool_leases")?, 0);
+        assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
         assert_eq!(f.count("routing_observations")?, 0);
         assert_eq!(f.count("goal_feedback_revisions")?, 0);
         assert_eq!(f.count("evaluations")?, 0);
@@ -430,7 +443,10 @@ fn a_second_run_after_a_stopped_one_works() -> Result<()> {
     f.edit_source("src/lib.rs", "// human edit\n")?;
     wait_until(|| Ok(!alive(pid)))?;
     let output = child.output()?;
-    assert_eq!(Fixture::result(&output)?["phase3"]["failure"], "stale_work");
+    assert_eq!(
+        Fixture::result(&output)?["execution"]["failure"],
+        "stale_work"
+    );
     fs::remove_file(f.root.join("started"))?;
     // A different source state with no conflicting edit completes.
     git(&f.source, &["checkout", "--quiet", "--", "src/lib.rs"])?;
@@ -439,6 +455,6 @@ fn a_second_run_after_a_stopped_one_works() -> Result<()> {
     f.release()?;
     let output = child.output()?;
     assert!(output.status.success(), "{}", Fixture::result(&output)?);
-    assert_eq!(f.count("pool_leases")?, 0);
+    assert_eq!(f.count(LIVE_LAUNCHES)?, 0);
     Ok(())
 }

@@ -61,7 +61,8 @@ snapshot and the verdict.
 - **Refresh outcomes.** Whether a refreshed run was accepted, rejected or went
   stale again.
 - **Bypasses.** Every use of `coherence.accept: strict`, every accept over a
-  disagreed verdict, and every run on a path with no watcher (planned or legacy).
+  disagreed verdict, and every run on a path with no watcher (runs made before 0.4.1 by the legacy,
+  routed, comparison or planned paths).
 - **Auto-apply outcomes and post-hoc disagreement.** Every `auto_apply.skipped` and
   `auto_apply.blocked` reason, every `result.applied`/`application.failed` with
   `applied_by: auto_apply`, and every later `review.rejected` on a run that was
@@ -93,8 +94,8 @@ broader control-plane framing waits.
 
 - Lead with the problem and the verdict, publicly: "Keep autonomous software
   work valid while the code moves."
-- Agent selection, allocation, execution, verification, planning and machine
-  control are how Dispatch carries work. They are not separate product stories.
+- Agent selection, allocation, execution and verification are how Dispatch
+  carries work. They are not separate product stories.
 - The "control plane for autonomous software work" framing belongs in the founder
   narrative, not on the homepage or README, until the falsifiers above have been
   tested.

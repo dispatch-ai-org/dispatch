@@ -461,7 +461,7 @@ fn finish_then_root_moves_then_check_refreshes() {
 }
 
 #[test]
-fn accept_records_review_only_and_applies() {
+fn accept_records_review_and_applies() {
     let f = Fixture::new(true);
     let id = f.attach(&[]);
     edit_workspace(&f.workspace);
@@ -470,7 +470,7 @@ fn accept_records_review_only_and_applies() {
     f.dispatch(&["accept", &id]).success();
 
     assert_eq!(f.event_count(&id, "review.accepted"), 1);
-    assert_eq!(f.goal_feedback_count(&id), 0);
+    assert_eq!(f.goal_feedback_count(&id), 1);
     assert_eq!(
         fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
         "pub fn f() -> i32 {\n    2\n}\n"
@@ -493,7 +493,7 @@ fn reject_records_review_only() {
     f.dispatch(&["reject", &id]).success();
 
     assert_eq!(f.event_count(&id, "review.rejected"), 1);
-    assert_eq!(f.goal_feedback_count(&id), 0);
+    assert_eq!(f.goal_feedback_count(&id), 1);
     assert!(!f.root.join("src/new.rs").exists());
     assert_eq!(
         fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
