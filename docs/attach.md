@@ -383,7 +383,7 @@ that still does, and only for native allocation runs.
   `AttachmentRecord`), the materialized S0 baseline, the frozen `delta.patch`, every
   event, and `attachment.owner_state`/`finished_at`/`finish_reason`.
 - **Recomputed on every use**: the world, symbol tables, facts and the verdict shown by
-  `check`, `status`, `explain` and the control protocol's `result` — exactly as for
+  `check`, `status` and `explain` — exactly as for
   native runs. `serve`'s view line reads the *last stored* verdict; it does not
   recompute one for display beyond what its own tick already evaluated and persisted.
 
@@ -392,8 +392,10 @@ that still does, and only for native allocation runs.
 - **`serve` restart.** Active attached Work is read back from the database
   (`mode = attached`, `lifecycle != Finished`). The wrapper's stored `ProcessIdentity`
   (and the agent's, if known) is re-checked with `identity_state`: `ExactLive` is left
-  alone (a live wrapper owns it); `Gone`/`Reused`/`Unknown` is adopted, honestly marking
-  `owner_state`. Nothing is finished, applied or relaunched by a restart.
+  alone (a live wrapper owns it); a stored `Live` owner that is now `Gone`/`Reused` is
+  adopted (above); a foreign attachment with no owner, or an owner whose liveness
+  cannot be told (`Unknown`), is observed but not marked adopted. Nothing is finished,
+  applied or relaunched by a restart.
 - **A wrapper crash** leaves its Work `Working` with a stale `owner_state: Live` until
   `serve` next observes that root and adopts it (or until a human runs `dispatch
   finish` directly), whichever happens first.

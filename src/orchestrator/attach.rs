@@ -729,7 +729,7 @@ pub(super) async fn finish_locked(
     run.candidates[0].duration_ms = (Utc::now() - attached_at).num_milliseconds().max(0) as u64;
     run.candidates[0].exit_code = match &reason {
         FinishReason::ProcessExit { code } => *code,
-        FinishReason::Explicit | FinishReason::OwnerGone => None,
+        FinishReason::Explicit => None,
     };
 
     refresh_outcome(&mut run);

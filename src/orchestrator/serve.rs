@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 
 use super::{ApplyOutcome, apply, auto_apply, persist_event};
 use crate::{
-    ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReasonCode,
-    ReviewState, RunMode, RunRecord, SourceKind, Validity, WorkResult,
+    ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
+    RunMode, RunRecord, SourceKind, Validity, WorkResult,
     coherence::{self, WorkView, watch::Policy, world},
     db::Database,
     lock::{OperationLock, shutdown_signal},
@@ -346,7 +346,7 @@ fn reevaluate(
                 continue;
             }
         };
-        let validity = settle_uncertain(validity);
+        let validity = coherence::watch::settle(validity);
         let policy = policies.entry(run.id.clone()).or_default();
         let Some(worth_sending) = policy.step(Instant::now(), Some(validity)) else {
             continue;
@@ -365,20 +365,6 @@ fn reevaluate(
         pass.changed = true;
     }
     pass
-}
-
-/// Restates `coherence::watch`'s private `settle`: parse errors while a
-/// workspace is mid-edit are normal, so uncertainty alone must never
-/// invalidate attached Work either. Only `Policy`'s visibility was widened
-/// for this packet, so this few-line rule is duplicated rather than exported.
-fn settle_uncertain(mut validity: Validity) -> Validity {
-    validity
-        .reasons
-        .retain(|reason| reason.code != ReasonCode::AnalysisUncertain);
-    if validity.decision == Decision::Refresh && validity.reasons.is_empty() {
-        validity.decision = Decision::Continue;
-    }
-    validity
 }
 
 /// Every attached run ready to auto-apply: finished, `Ready`, unreviewed,
@@ -554,48 +540,6 @@ fn render_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AnalysisLevel, Reason};
-
-    fn reason(code: ReasonCode) -> Reason {
-        Reason {
-            code,
-            fact_id: None,
-            path: None,
-            detail: format!("{code:?}"),
-        }
-    }
-
-    fn validity(decision: Decision, codes: &[ReasonCode]) -> Validity {
-        Validity {
-            decision,
-            evaluated_at: Utc::now(),
-            world_digest: "d".into(),
-            world_changed: true,
-            changed_files: 1,
-            reasons: codes.iter().copied().map(reason).collect(),
-            analysis: AnalysisLevel::FilesOnly,
-        }
-    }
-
-    #[test]
-    fn settle_uncertain_turns_a_purely_uncertain_refresh_into_continue() {
-        let v = validity(Decision::Refresh, &[ReasonCode::AnalysisUncertain]);
-        let settled = settle_uncertain(v);
-        assert_eq!(settled.decision, Decision::Continue);
-        assert!(settled.reasons.is_empty());
-    }
-
-    #[test]
-    fn settle_uncertain_keeps_a_real_reason_even_when_mixed_with_uncertainty() {
-        let v = validity(
-            Decision::Refresh,
-            &[ReasonCode::AnalysisUncertain, ReasonCode::FactBroken],
-        );
-        let settled = settle_uncertain(v);
-        assert_eq!(settled.decision, Decision::Refresh);
-        assert_eq!(settled.reasons.len(), 1);
-        assert_eq!(settled.reasons[0].code, ReasonCode::FactBroken);
-    }
 
     #[test]
     fn clip_truncates_by_character_count() {

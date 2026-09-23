@@ -2033,7 +2033,6 @@ mod tests {
         r.coherence = Some(CoherenceRecord {
             version: 1,
             refreshed_from: None,
-            facts: Vec::new(),
             validity: Some(Validity {
                 decision,
                 evaluated_at: chrono::Utc::now(),

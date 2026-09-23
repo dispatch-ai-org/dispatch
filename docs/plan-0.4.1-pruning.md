@@ -386,3 +386,18 @@ again at admission. After S6b it must run immediately before spawn.
   records the review before applying, so a failed apply leaves an accepted
   review on an unapplied result (0.4.0 did the same). `cargo test`: 429
   passed, 0 failed.
+- 2026-09-23 — S9: `serve` uses the watcher's `settle` (the duplicated
+  `settle_uncertain` and its two tests are gone); `CoherenceRecord.facts`
+  (never written by any release) and the uncalled `derive_for_run` are
+  removed, so facts are only ever derived from (S0, Δ); the unwired
+  `FinishReason::OwnerGone` is removed; `run` and `refresh` share one
+  output-mode rule in `main.rs`. `docs/attach.md` now says what `serve` does
+  on restart: only a stored `Live` owner that is gone is adopted; an owner
+  whose liveness cannot be told is observed, not marked adopted. Not built:
+  a shared `RunRecord` constructor. The native and attached constructions
+  differ in backend, outcome, candidates and attempts, and a shared one
+  would take about ten parameters to save a dozen lines. Observation kept as
+  is: `accept` records the human review before applying, so a blocked apply
+  leaves an accepted review on a stale result (as in 0.4.0); the judgment is
+  the human's, and the blocked application is recorded separately.
+  `cargo test`: 426 passed, 0 failed.

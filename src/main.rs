@@ -471,17 +471,7 @@ async fn run() -> Result<()> {
                 timeout_secs: args.timeout,
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
-                output: if json {
-                    if auto_apply {
-                        orchestrator::RunOutputMode::Silent
-                    } else {
-                        orchestrator::RunOutputMode::Json
-                    }
-                } else if jsonl {
-                    orchestrator::RunOutputMode::Jsonl
-                } else {
-                    orchestrator::RunOutputMode::Human
-                },
+                output: run_output_mode(json, jsonl, auto_apply),
                 refreshed_from: None,
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
@@ -511,17 +501,7 @@ async fn run() -> Result<()> {
             let auto_apply = args.auto_apply;
             let json = args.json;
             let jsonl = args.jsonl;
-            let output = if json {
-                if auto_apply {
-                    orchestrator::RunOutputMode::Silent
-                } else {
-                    orchestrator::RunOutputMode::Json
-                }
-            } else if jsonl {
-                orchestrator::RunOutputMode::Jsonl
-            } else {
-                orchestrator::RunOutputMode::Human
-            };
+            let output = run_output_mode(json, jsonl, auto_apply);
             let request = orchestrator::refresh_request(
                 &state,
                 args.run_id.as_deref(),
@@ -633,6 +613,20 @@ async fn run() -> Result<()> {
 /// `0`; otherwise the run's own exit code, unchanged (a run that already
 /// failed for its own reason, for example verification, is not relabeled
 /// "not applied automatically").
+/// With `--json --auto-apply` the run stays silent: `finish_run` prints the
+/// one result after the automatic application.
+fn run_output_mode(json: bool, jsonl: bool, auto_apply: bool) -> orchestrator::RunOutputMode {
+    if json && auto_apply {
+        orchestrator::RunOutputMode::Silent
+    } else if json {
+        orchestrator::RunOutputMode::Json
+    } else if jsonl {
+        orchestrator::RunOutputMode::Jsonl
+    } else {
+        orchestrator::RunOutputMode::Human
+    }
+}
+
 fn finish_run(
     state: &State,
     run: dispatch::RunRecord,

@@ -620,7 +620,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         coherence: request.refreshed_from.map(|old| CoherenceRecord {
             version: 1,
             refreshed_from: Some(old),
-            facts: Vec::new(),
             validity: None,
             first_invalid_at: None,
         }),
@@ -2471,7 +2470,6 @@ mod tests {
         let record = |validity: &Validity| CoherenceRecord {
             version: 1,
             refreshed_from: None,
-            facts: Vec::new(),
             validity: Some(validity.clone()),
             first_invalid_at: None,
         };

@@ -340,8 +340,6 @@ pub struct CoherenceRecord {
     #[serde(default)]
     pub refreshed_from: Option<String>,
     #[serde(default)]
-    pub facts: Vec<MustHold>,
-    #[serde(default)]
     pub validity: Option<Validity>,
     #[serde(default)]
     pub first_invalid_at: Option<DateTime<Utc>>,
@@ -584,7 +582,6 @@ pub struct AttachCapabilities {
 pub enum FinishReason {
     ProcessExit { code: Option<i32> },
     Explicit,
-    OwnerGone,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -895,10 +892,6 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FinishReason::Explicit).unwrap(),
             "\"explicit\""
-        );
-        assert_eq!(
-            serde_json::to_string(&FinishReason::OwnerGone).unwrap(),
-            "\"owner_gone\""
         );
     }
 

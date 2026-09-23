@@ -115,7 +115,6 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
     let mut record = run.coherence.take().unwrap_or(CoherenceRecord {
         version: 1,
         refreshed_from: None,
-        facts: Vec::new(),
         validity: None,
         first_invalid_at: None,
     });

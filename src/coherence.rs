@@ -13,7 +13,7 @@ use chrono::Utc;
 
 use crate::{
     AnalysisLevel, ApplicationState, CandidateRecord, CoherenceRecord, Decision, LifecycleState,
-    MustHold, Reason, ReasonCode, RunRecord, RunStatus, Validity, WorkResult,
+    Reason, ReasonCode, RunRecord, RunStatus, Validity, WorkResult,
     coherence::world::WorldObservation,
     config::{AcceptMode, Config},
     source::{fingerprint_tree, git_command, run_git},
@@ -103,22 +103,12 @@ pub fn with_live_validity(run: &RunRecord) -> RunRecord {
         let record = shown.coherence.get_or_insert(CoherenceRecord {
             version: 1,
             refreshed_from: None,
-            facts: Vec::new(),
             validity: None,
             first_invalid_at: None,
         });
         record.validity = Some(validity);
     }
     shown
-}
-
-/// The facts the candidate's patch assumes about the baseline, for callers
-/// that store them on the run's `CoherenceRecord`. Independent of the world.
-pub fn derive_for_run(run: &RunRecord, candidate_label: &str) -> Result<Vec<MustHold>> {
-    let work = WorkView::of(run, find_candidate(run, candidate_label)?);
-    let patch = fs::read(work.delta_patch)
-        .with_context(|| format!("failed to read delta {}", work.delta_patch.display()))?;
-    Ok(facts::derive_facts(&work, &facts::parse_patch(&patch))?.facts)
 }
 
 fn find_candidate<'a>(run: &'a RunRecord, candidate_label: &str) -> Result<&'a CandidateRecord> {
@@ -350,8 +340,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        CandidateRecord, CandidateStatus, CoherenceRecord, DiffStats, FactKind, FactOrigin,
-        MustHold, SourceKind,
+        CandidateRecord, CandidateStatus, CoherenceRecord, DiffStats, SourceKind,
         source::{SourceSnapshot, create_snapshot},
     };
 
@@ -743,20 +732,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_for_run_returns_the_patch_facts_without_observing_the_world() {
-        let fixture = Fixture::new(true, &[("a.rs", "pub fn one() -> u8 {\n    1\n}\n")]);
-        let patch = fixture.patch(
-            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n pub fn one() -> u8 {\n-    1\n+    2\n }\n",
-        );
-        let run = fixture.run(patch);
-        let facts = derive_for_run(&run, "A").unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].subject, "one");
-        assert_eq!(facts[0].origin, FactOrigin::Modified);
-        assert!(derive_for_run(&run, "B").is_err());
-    }
-
-    #[test]
     fn gate_without_a_readable_config_snapshot_is_legacy_and_skips_the_oracle() {
         let fixture = Fixture::new(true, &base_files());
         let run = fixture.run(fixture.patch(PATCH_A));
@@ -805,16 +780,6 @@ mod tests {
         let record = CoherenceRecord {
             version: 1,
             refreshed_from: Some("01OLD".into()),
-            facts: vec![MustHold {
-                id: "abc123".into(),
-                kind: FactKind::Signature,
-                path: "a.txt".into(),
-                subject: "auth::validate".into(),
-                origin: FactOrigin::Referenced,
-                sig_fp: "sig".into(),
-                full_fp: None,
-                display: "fn validate()".into(),
-            }],
             validity: Some(fixture.evaluate(&patch)),
             first_invalid_at: Some(Utc::now()),
         };
@@ -834,6 +799,6 @@ mod tests {
 
         let defaulted: CoherenceRecord = serde_json::from_str("{}").unwrap();
         assert_eq!(defaulted.version, 1);
-        assert!(defaulted.facts.is_empty() && defaulted.validity.is_none());
+        assert!(defaulted.validity.is_none());
     }
 }
