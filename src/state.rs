@@ -131,7 +131,7 @@ impl State {
             "run metadata identity does not match directory {id}"
         );
         if let Some(database) = database {
-            crate::orchestrator::phase3::repair_abandoned(self, &database, &mut run)?;
+            crate::orchestrator::native::repair_abandoned(self, &database, &mut run)?;
             if let Some(policy) = &mut run.phase3 {
                 policy.questions = database.questions_for_run(&id)?;
             }

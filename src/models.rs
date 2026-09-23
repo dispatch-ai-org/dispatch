@@ -356,10 +356,6 @@ pub enum CandidateStatus {
 }
 
 impl CandidateStatus {
-    pub(crate) fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Preparing | Self::Running | Self::Verifying)
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Preparing => "preparing",

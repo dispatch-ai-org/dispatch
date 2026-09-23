@@ -13,8 +13,7 @@ use rusqlite::{
 
 use crate::models::{
     AttemptRecord, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
-    GoalFeedbackRevision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunMode,
-    RunRecord,
+    GoalFeedbackRevision, RoutingHumanOutcome, RunRecord,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -1338,7 +1337,6 @@ impl Database {
         if let Some(evaluation) = &run.evaluation {
             insert_evaluation(&transaction, &run.id, evaluation, false)?;
         }
-        sync_routing_observation(&transaction, run)?;
 
         effect(&transaction)?;
         transaction.commit().context("failed to commit run sync")
@@ -1609,82 +1607,6 @@ impl Database {
         transaction.commit().context("failed to commit evaluation")
     }
 
-    pub fn routing_observation(&self, id: &str) -> Result<Option<RoutingObservation>> {
-        self.read_routing_observation(
-            "SELECT observation_json FROM routing_observations WHERE id = ?1",
-            id,
-        )
-    }
-
-    pub fn routing_observation_for_run(&self, run_id: &str) -> Result<Option<RoutingObservation>> {
-        self.read_routing_observation(
-            "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
-            run_id,
-        )
-    }
-
-    pub fn routing_observations(&self) -> Result<Vec<RoutingObservation>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT observation_json FROM routing_observations ORDER BY id")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| deserialize_routing_observation(row?))
-            .collect()
-    }
-
-    pub fn save_routing_human_evaluation(
-        &mut self,
-        run_id: &str,
-        evaluation: &RoutingHumanEvaluation,
-    ) -> Result<RoutingObservation> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let json = transaction
-            .query_row(
-                "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
-                [run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .with_context(|| format!("run {run_id} has no routing observation"))?;
-        let mut observation = deserialize_routing_observation(json)?;
-        if observation
-            .human_evaluation
-            .as_ref()
-            .is_some_and(|existing| same_routing_human_evaluation(existing, evaluation))
-        {
-            transaction.commit()?;
-            return Ok(observation);
-        }
-
-        observation.updated_at = evaluation.evaluated_at;
-        observation.human_evaluation = Some(evaluation.clone());
-        let json = serde_json::to_string(&observation)
-            .context("failed to serialize routing observation")?;
-        transaction.execute(
-            "UPDATE routing_observations SET updated_at = ?1, observation_json = ?2 \
-             WHERE run_id = ?3",
-            params![timestamp(observation.updated_at), json, run_id],
-        )?;
-        transaction
-            .commit()
-            .context("failed to commit routing evaluation")?;
-        Ok(observation)
-    }
-
-    fn read_routing_observation(
-        &self,
-        query: &str,
-        identity: &str,
-    ) -> Result<Option<RoutingObservation>> {
-        self.connection
-            .query_row(query, [identity], |row| row.get::<_, String>(0))
-            .optional()?
-            .map(deserialize_routing_observation)
-            .transpose()
-    }
-
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1941,98 +1863,6 @@ fn insert_artifact(
     Ok(())
 }
 
-fn sync_routing_observation(transaction: &Transaction<'_>, run: &RunRecord) -> Result<()> {
-    if run.mode == RunMode::Allocation {
-        return Ok(());
-    }
-    let Some(prediction) = &run.routing else {
-        return Ok(());
-    };
-    let [candidate] = run.candidates.as_slice() else {
-        return Ok(());
-    };
-    if !candidate.status.is_terminal() {
-        return Ok(());
-    }
-    anyhow::ensure!(
-        candidate.harness_id == prediction.selected_harness,
-        "routed run {} selected {} but recorded candidate {}",
-        run.id,
-        prediction.selected_harness,
-        candidate.harness_id
-    );
-
-    let id = format!("routing-observation-{}", run.id);
-    let now = Utc::now();
-    let existing = transaction
-        .query_row(
-            "SELECT observation_json FROM routing_observations WHERE run_id = ?1",
-            [&run.id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .map(deserialize_routing_observation)
-        .transpose()?;
-    let created_at = existing
-        .as_ref()
-        .map_or(now, |observation| observation.created_at);
-    let human_evaluation = existing.and_then(|observation| observation.human_evaluation);
-    let observation = RoutingObservation {
-        id: id.clone(),
-        run_id: run.id.clone(),
-        candidate_id: candidate.id.clone(),
-        created_at,
-        updated_at: now,
-        prediction: prediction.clone(),
-        harness_version: candidate.harness_version.clone(),
-        model: candidate.model.clone(),
-        candidate_status: candidate.status.clone(),
-        exit_code: candidate.exit_code,
-        timed_out: candidate.timed_out,
-        verification: (!candidate.checks.is_empty()).then(|| {
-            candidate
-                .checks
-                .iter()
-                .map(|check| check.status.clone())
-                .collect()
-        }),
-        human_evaluation,
-    };
-    let json =
-        serde_json::to_string(&observation).context("failed to serialize routing observation")?;
-    transaction.execute(
-        r#"INSERT INTO routing_observations(
-                id, run_id, candidate_id, created_at, updated_at, observation_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(run_id) DO UPDATE SET
-                candidate_id = excluded.candidate_id,
-                updated_at = excluded.updated_at,
-                observation_json = excluded.observation_json"#,
-        params![
-            id,
-            run.id,
-            candidate.id,
-            timestamp(observation.created_at),
-            timestamp(observation.updated_at),
-            json,
-        ],
-    )?;
-    Ok(())
-}
-
-fn deserialize_routing_observation(json: String) -> Result<RoutingObservation> {
-    serde_json::from_str(&json).context("failed to deserialize routing observation")
-}
-
-fn same_routing_human_evaluation(
-    left: &RoutingHumanEvaluation,
-    right: &RoutingHumanEvaluation,
-) -> bool {
-    left.outcome == right.outcome
-        && left.reasons == right.reasons
-        && left.explanation == right.explanation
-}
-
 fn insert_evaluation(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -2243,6 +2073,8 @@ fn persist_questions(connection: &Connection, run: &RunRecord) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use crate::RunMode;
 
     use chrono::{TimeZone, Utc};
     use rusqlite::OptionalExtension;

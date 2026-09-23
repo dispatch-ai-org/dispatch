@@ -160,24 +160,6 @@ enum Command {
     Accept(ReviewArgs),
     /// Reject the latest single result without changing the source tree.
     Reject(ReviewArgs),
-    /// Print the path to a candidate's complete workspace.
-    #[command(hide = true)]
-    Inspect {
-        run_id: String,
-        candidate: String,
-        /// Start the user's shell in the candidate workspace.
-        #[arg(long)]
-        shell: bool,
-    },
-    /// Compare blind candidates and optionally persist an evaluation.
-    #[command(hide = true)]
-    Compare(CompareArgs),
-    /// Record accept/reject feedback for one predictively routed result.
-    #[command(hide = true)]
-    Evaluate(EvaluateArgs),
-    /// Safely apply one candidate to the original source.
-    #[command(hide = true)]
-    Apply { run_id: String, candidate: String },
     /// Print the Dispatch version.
     Version,
 }
@@ -199,20 +181,16 @@ struct RunArgs {
     #[arg(long, conflicts_with = "task")]
     task_file: Option<PathBuf>,
 
-    /// Comma-separated adapter IDs. Fakes make the complete workflow testable offline.
-    #[arg(long, value_delimiter = ',', conflicts_with = "agent", hide = true)]
-    harnesses: Option<Vec<String>>,
-
     /// Deliberately choose one supported coding agent.
-    #[arg(long, value_parser = agent_id, conflicts_with = "harnesses")]
+    #[arg(long, value_parser = agent_id)]
     agent: Option<String>,
 
     /// Select a configured model resource.
-    #[arg(long, conflicts_with = "harnesses")]
+    #[arg(long)]
     model: Option<String>,
 
     /// Select the configured provider-specific effort for this attempt.
-    #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], conflicts_with = "harnesses", hide = true)]
+    #[arg(long, value_parser = ["minimal", "low", "medium", "high", "xhigh"], hide = true)]
     effort: Option<String>,
 
     #[arg(long, hide = true)]
@@ -223,9 +201,6 @@ struct RunArgs {
 
     #[arg(long, hide = true)]
     timeout: Option<u64>,
-
-    #[arg(long, hide = true)]
-    max_parallel: Option<usize>,
 
     /// Explicitly allow real agents or project checks to execute on the host.
     #[arg(long, hide = true)]
@@ -315,22 +290,6 @@ struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
-struct CompareArgs {
-    run_id: String,
-
-    /// Submit A/B/.../tie/neither without the interactive prompt.
-    #[arg(long)]
-    winner: Option<String>,
-
-    #[command(flatten)]
-    feedback: FeedbackArgs,
-
-    /// Prompt for outcome, labels, and multiline freeform text.
-    #[arg(long)]
-    evaluate: bool,
-}
-
-#[derive(Debug, Args)]
 struct FeedbackArgs {
     /// Optional structured reason; repeat the flag for multiple labels.
     #[arg(long = "reason")]
@@ -352,18 +311,6 @@ impl FeedbackArgs {
             None => Ok(self.explanation.clone()),
         }
     }
-}
-
-#[derive(Debug, Args)]
-struct EvaluateArgs {
-    run_id: String,
-
-    /// Whether the routed result was acceptable for the task.
-    #[arg(long, value_parser = ["accept", "reject"])]
-    outcome: String,
-
-    #[command(flatten)]
-    feedback: FeedbackArgs,
 }
 
 #[derive(Debug, Args)]
@@ -516,14 +463,12 @@ async fn run() -> Result<()> {
             let request = orchestrator::RunRequest {
                 source,
                 task,
-                harnesses: args.harnesses.unwrap_or_default(),
                 agent: args.agent,
                 model: args.model,
                 effort: args.effort,
                 config_path: args.config,
                 backend: args.backend,
                 timeout_secs: args.timeout,
-                max_parallel: args.max_parallel,
                 allow_unsafe_local: args.allow_unsafe_local,
                 allow_forwarded_env: args.allow_forwarded_env,
                 output: if json {
@@ -663,28 +608,6 @@ async fn run() -> Result<()> {
                 explanation,
             )
         }
-        Command::Inspect {
-            run_id,
-            candidate,
-            shell,
-        } => orchestrator::inspect(&state, &run_id, &candidate, shell),
-        Command::Compare(args) => {
-            let evaluation = orchestrator::EvaluationInput {
-                winner: args.winner,
-                explanation: args.feedback.read_explanation()?,
-                reasons: args.feedback.reasons,
-            };
-            orchestrator::compare(&state, &args.run_id, evaluation, args.evaluate)
-        }
-        Command::Evaluate(args) => {
-            let evaluation = orchestrator::RoutingEvaluationInput {
-                outcome: args.outcome,
-                explanation: args.feedback.read_explanation()?,
-                reasons: args.feedback.reasons,
-            };
-            orchestrator::evaluate_routed(&state, &args.run_id, evaluation)
-        }
-        Command::Apply { run_id, candidate } => orchestrator::apply(&state, &run_id, &candidate),
         Command::Version => {
             println!("dispatch {}", dispatch::VERSION);
             Ok(())

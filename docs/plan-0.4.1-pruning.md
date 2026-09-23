@@ -322,3 +322,17 @@ again at admission. After S6b it must run immediately before spawn.
   (3) `explain` on a native run reports the explicitly chosen agent;
   (4) the native status summary reports the human review outcome.
   `cargo test`: 437 passed, 0 failed (PTY fixture on rerun).
+- 2026-09-23 — S7b: deleted the old multi-candidate loop and its surface:
+  `--harnesses`, `--max-parallel`, blind shuffled labels and the 702-candidate
+  cap, `compare`, `evaluate`, `inspect`, the hidden `apply <id> <label>`
+  command, routing observations (writes and reads) and the routed
+  human-evaluation path. `run_dispatch` now always hands one agent to the
+  native engine (`src/orchestrator/phase3.rs` renamed `native.rs`). Reviews of
+  every non-attached run, including routed runs made before 0.4.1, are
+  recorded the same way until S8 unifies the review store; `accept`/`reject`
+  without an id pick the latest run whose review is pending. `refresh` of a
+  pre-0.4.1 routed run redoes the agent that produced it. Tests: the
+  comparison e2e test became a single-agent non-Git end-to-end test (safe
+  apply, verbatim explanation, stale refusal); `routing_observations.rs` and
+  the comparison-only routed test were removed; `routed_run.rs` is now
+  `unsafe_local.rs`. `cargo test`: 430 passed, 0 failed.

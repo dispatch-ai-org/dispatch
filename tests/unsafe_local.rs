@@ -1,11 +1,11 @@
+//! Local execution of a real agent requires the explicit unsafe-local
+//! acknowledgement; nothing runs without it.
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
 use assert_cmd::cargo_bin_cmd;
-use dispatch::db::Database;
-use serde_json::Value;
 
 fn source(root: &Path) -> PathBuf {
     let source = root.join("source");
@@ -79,56 +79,6 @@ fn configure_with_check(
             cursor.display()
         ),
     )?;
-    Ok(())
-}
-
-fn only_metadata(state: &Path) -> anyhow::Result<(PathBuf, Value)> {
-    let paths = fs::read_dir(state.join("runs"))?
-        .map(|entry| entry.map(|entry| entry.path().join("metadata.json")))
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(paths.len(), 1);
-    let path = paths.into_iter().next().unwrap();
-    let value = serde_json::from_slice(&fs::read(&path)?)?;
-    Ok((path, value))
-}
-
-#[test]
-fn explicit_non_routed_run_creates_no_routing_observation() -> anyhow::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let source = source(temp.path());
-    let state = temp.path().join("state");
-
-    cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .arg("run")
-        .arg(&source)
-        .args([
-            "--task",
-            "Exercise the explicit workflow.",
-            "--harnesses",
-            "fake-good",
-        ])
-        .assert()
-        .success();
-
-    let (_, metadata) = only_metadata(&state)?;
-    let database = Database::open(state.join("dispatch.db"))?;
-    assert!(
-        database
-            .routing_observation_for_run(metadata["id"].as_str().unwrap())?
-            .is_none()
-    );
-    let run_id = metadata["id"].as_str().unwrap();
-    cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["evaluate", run_id, "--outcome", "accept"])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "This run was not predictively routed.\nUse `dispatch compare",
-        ));
     Ok(())
 }
 

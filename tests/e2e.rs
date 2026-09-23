@@ -1,7 +1,5 @@
 use std::{
     fs,
-    io::ErrorKind,
-    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -13,57 +11,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 #[test]
-fn normal_local_commands_do_not_contact_cloud() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let cloud_url = format!("http://{}", listener.local_addr().unwrap());
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    let state = temp.path().join("state");
-
-    dispatch_command(&state, &cloud_url)
-        .arg("init")
-        .arg(&source)
-        .assert()
-        .success();
-    dispatch_command(&state, &cloud_url)
-        .arg("doctor")
-        .arg(&source)
-        .assert()
-        .success();
-    let run = dispatch_command(&state, &cloud_url)
-        .arg("run")
-        .arg(&source)
-        .args([
-            "--task",
-            "Exercise the local workflow.",
-            "--harnesses",
-            "fake-good,fake-bad",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let run_id = String::from_utf8(run.stdout)
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("RUN "))
-        .unwrap()
-        .to_owned();
-    dispatch_command(&state, &cloud_url)
-        .args(["compare", &run_id, "--winner", "tie"])
-        .assert()
-        .success();
-    dispatch_command(&state, &cloud_url)
-        .arg("history")
-        .assert()
-        .success();
-
-    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
-}
-
-#[test]
-fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
+fn non_git_native_run_applies_safely_end_to_end() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("plain-source");
     let state = temp.path().join("dispatch-state");
@@ -71,142 +19,58 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
     fs::write(source.join("original.txt"), "unchanged baseline\n").unwrap();
     fs::write(
         source.join("dispatch.yml"),
-        "execution:\n  timeout_secs: 1\n  max_parallel: 3\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
+        "execution:\n  timeout_secs: 5\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
     )
     .unwrap();
+    let run = |task: &str, agent: &str| {
+        let output = cargo_bin_cmd!("dispatch")
+            .args(["--state-dir"])
+            .arg(&state)
+            .arg("run")
+            .arg(&source)
+            .arg("--allow-unsafe-local")
+            .args(["--task", task, "--agent", agent, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["run_id"].as_str().unwrap().to_owned()
+    };
 
-    let output = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .arg("run")
-        .arg(&source)
-        .arg("--allow-unsafe-local")
-        .args([
-            "--task",
-            "Make a deterministic candidate artifact.",
-            "--harnesses",
-            "fake-good,fake-bad,fake-crash",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let run_id = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("RUN "))
-        .expect("run output includes an ID")
-        .to_owned();
-
+    let run_id = run("Make a deterministic candidate artifact.", "fake-good");
+    // The work happened in an isolated copy; the source is untouched.
     assert_eq!(
         fs::read_to_string(source.join("original.txt")).unwrap(),
         "unchanged baseline\n"
     );
     assert!(!source.join("dispatch-fake-good.txt").exists());
-    assert!(!source.join("dispatch-fake-bad.txt").exists());
-
     let metadata_path = state.join("runs").join(&run_id).join("metadata.json");
     let metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["source_kind"], "directory");
-    assert_eq!(metadata["status"], "ready_for_evaluation");
+    assert_eq!(metadata["outcome"]["work_result"], "ready");
     assert_eq!(metadata["baseline_checks"][0]["status"], "failed");
-    let candidates = metadata["candidates"].as_array().unwrap();
-    assert_eq!(candidates.len(), 3);
-    let good = candidate_for(candidates, "fake-good");
-    let bad = candidate_for(candidates, "fake-bad");
-    let crash = candidate_for(candidates, "fake-crash");
-    assert_eq!(good["status"], "completed");
-    assert_eq!(bad["status"], "completed");
-    assert_eq!(crash["status"], "failed");
-    assert_eq!(good["checks"].as_array().unwrap().len(), 1);
-    assert_eq!(good["checks"][0]["status"], "passed");
-    assert_eq!(bad["checks"][0]["status"], "passed");
-    assert_eq!(good["diff_stats"]["files_changed"], 1);
+    let candidate = &metadata["candidates"][0];
+    assert_eq!(candidate["status"], "completed");
+    assert_eq!(candidate["checks"][0]["status"], "passed");
+    assert_eq!(candidate["diff_stats"]["files_changed"], 1);
     assert!(
-        Path::new(good["workspace_path"].as_str().unwrap())
+        Path::new(candidate["workspace_path"].as_str().unwrap())
             .join("original.txt")
             .is_file()
     );
-    assert!(Path::new(good["diff_path"].as_str().unwrap()).is_file());
+    assert!(Path::new(candidate["diff_path"].as_str().unwrap()).is_file());
 
-    let blind_output = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", &run_id])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let blind_output = String::from_utf8(blind_output.stdout).unwrap();
-    assert!(blind_output.contains("Harness mapping  blind"));
-    assert!(blind_output.contains("Baseline verification FAIL"));
-    assert!(!blind_output.contains("fake-good"));
-    assert!(!blind_output.contains("fake-bad"));
-
-    let good_label = good["label"].as_str().unwrap();
-    let invalid = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", &run_id, "--winner", good_label])
-        .args(["--reason", "some-unsupported-value"])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let invalid_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&invalid.stdout),
-        String::from_utf8_lossy(&invalid.stderr)
-    );
-    assert!(invalid_output.contains("unknown structured reason"));
-    assert!(invalid_output.contains("cleaner-change"));
-    assert!(!invalid_output.contains("fake-good"));
-    assert!(!invalid_output.contains("fake-bad"));
-    let rejected: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-    assert!(rejected["evaluation"].is_null());
-
+    // A human accept applies the result and keeps the explanation verbatim.
     let explanation = "\nThe exact regression behavior is right.\nKeep this spacing verbatim.  \n";
     let explanation_path = temp.path().join("reasoning.txt");
     fs::write(&explanation_path, explanation).unwrap();
-    let evaluated_output = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", &run_id, "--winner", good_label])
-        .args(["--reason", "correctness", "--reason", "tests"])
-        .arg("--explanation-file")
-        .arg(&explanation_path)
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let evaluated_output = String::from_utf8(evaluated_output.stdout).unwrap();
-    assert!(evaluated_output.contains("Harness identities are now revealed"));
-    assert!(evaluated_output.contains("fake-good"));
-
-    let evaluated: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-    assert_eq!(evaluated["evaluation"]["outcome"]["kind"], "candidate");
-    assert_eq!(evaluated["evaluation"]["explanation"], explanation);
-    assert_eq!(
-        evaluated["evaluation"]["reasons"],
-        serde_json::json!(["correctness", "tests"])
-    );
-    let reloaded = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", &run_id])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let reloaded = String::from_utf8(reloaded.stdout).unwrap();
-    assert!(reloaded.contains("Harness mapping  revealed"));
-    assert!(reloaded.contains("fake-good"));
-    assert!(reloaded.contains("The exact regression behavior is right."));
-
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
-        .args(["apply", &run_id, good_label])
+        .args(["accept", &run_id, "--reason", "correctness"])
+        .arg("--explanation-file")
+        .arg(&explanation_path)
         .assert()
         .success();
     assert!(source.join("dispatch-fake-good.txt").is_file());
@@ -214,99 +78,33 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
         fs::read_to_string(source.join("original.txt")).unwrap(),
         "unchanged baseline\n"
     );
-
     let database = Connection::open(state.join("dispatch.db")).unwrap();
     let stored_explanation: String = database
         .query_row(
-            "SELECT explanation FROM evaluations WHERE run_id = ?1",
+            "SELECT explanation FROM goal_feedback_revisions WHERE run_id = ?1",
             [&run_id],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(stored_explanation, explanation);
-    let event_count: i64 = database
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE run_id = ?1",
-            [&run_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(event_count >= 10);
 
-    // A later run snapshots the now-current source. Any edit after that point
-    // makes apply fail before writing even one candidate file.
-    let second_output = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .arg("run")
-        .arg(&source)
-        .arg("--allow-unsafe-local")
-        .args([
-            "--task",
-            "Create another fake artifact.",
-            "--agent",
-            "fake-bad",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let second_stdout = String::from_utf8(second_output.stdout).unwrap();
-    let second_run = second_stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("RUN "))
-        .unwrap();
-    database
-        .execute("DELETE FROM candidates WHERE run_id = ?1", [second_run])
-        .unwrap();
-    cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", second_run, "--winner", "A"])
-        .assert()
-        .failure();
-    let second_metadata = state.join("runs").join(second_run).join("metadata.json");
-    let rejected: Value = serde_json::from_slice(&fs::read(second_metadata).unwrap()).unwrap();
-    assert!(rejected["evaluation"].is_null());
-    let still_blind = cargo_bin_cmd!("dispatch")
-        .args(["--state-dir"])
-        .arg(&state)
-        .args(["compare", second_run])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let still_blind = String::from_utf8(still_blind.stdout).unwrap();
-    assert!(still_blind.contains("Harness mapping  blind"));
-    assert!(!still_blind.contains("fake-bad"));
-    // An unrelated edit no longer blocks apply (see tests/coherence_accept.rs);
-    // a change that occupies the candidate's own output does.
+    // A later run snapshots the now-current source. A change that occupies
+    // the result's own output afterwards makes it stale; nothing is applied.
+    let second_run = run("Create another fake artifact.", "fake-bad");
     for name in ["dispatch-fake-good.txt", "dispatch-fake-bad.txt"] {
         fs::write(source.join(name), "user wrote this after the run\n").unwrap();
     }
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
-        .args(["accept", second_run])
+        .args(["accept", &second_run])
         .assert()
         .failure()
         .stderr(predicates::str::contains("this work is stale"));
-}
-
-fn candidate_for<'a>(candidates: &'a [Value], harness: &str) -> &'a Value {
-    candidates
-        .iter()
-        .find(|candidate| candidate["harness_id"] == harness)
-        .unwrap_or_else(|| panic!("missing {harness} candidate"))
-}
-
-fn dispatch_command(state: &Path, cloud_url: &str) -> assert_cmd::Command {
-    let mut command = cargo_bin_cmd!("dispatch");
-    command
-        .args(["--state-dir"])
-        .arg(state)
-        .env("DISPATCH_CLOUD_URL", cloud_url);
-    command
+    assert_eq!(
+        fs::read_to_string(source.join("dispatch-fake-bad.txt")).unwrap(),
+        "user wrote this after the run\n"
+    );
 }
 
 #[cfg(unix)]

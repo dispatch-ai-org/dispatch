@@ -1,3 +1,9 @@
+//! The native engine: one agent attempt per drive, in an isolated workspace
+//! made from the run's snapshot, with the coherence watcher, the durable
+//! launch record, configured verification and clarification questions. Every
+//! native run uses it, whether a configured profile or `--agent` chose the
+//! agent; a profile-bound run also carries its funding contract.
+
 use super::*;
 use crate::{
     AttemptDetail, Clarification, FailureKind, GoalExecution, QuestionState,
@@ -877,7 +883,7 @@ async fn drive_inner(
 }
 
 /// Local typed commands are authorized by the OS identity owning the run.
-/// There is no caller-supplied actor/grant or remote transport in Phase 3.
+/// There is no caller-supplied actor or remote transport.
 #[derive(Debug)]
 pub struct QuestionCommand {
     pub run_id: String,

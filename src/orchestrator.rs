@@ -1,17 +1,15 @@
 mod apply;
 pub mod attach;
-pub(crate) mod phase3;
+pub(crate) mod native;
 pub mod serve;
 pub use apply::{ApplyAuthority, ApplyOutcome, apply, auto_apply};
-pub use phase3::{QuestionCommand, answer_question, cancel_question};
+pub use native::{QuestionCommand, answer_question, cancel_question};
 use std::{
-    collections::{HashSet, VecDeque},
     ffi::OsString,
     fs,
     future::Future,
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    pin::Pin,
     process::Command,
     sync::{
         Arc,
@@ -22,17 +20,14 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use futures::{StreamExt, stream::FuturesUnordered};
-use rand::seq::SliceRandom;
 use ulid::Ulid;
 
 use crate::{
     AllocationDecision, ApplicationState, AppliedBy, AttemptRecord, CandidateRecord,
     CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
     EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
-    ReviewState, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation,
-    RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, SelectionBasis, VERSION,
-    VerificationState, WaitingOn, WorkResult,
+    ReviewState, RoutingDecision, RoutingHumanOutcome, RunMode, RunOutcome, RunPhase, RunRecord,
+    RunResult, RunStatus, SelectionBasis, VERSION, VerificationState, WaitingOn, WorkResult,
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -109,32 +104,17 @@ const EVALUATION_REASONS: &[&str] = &[
 pub struct RunRequest {
     pub source: PathBuf,
     pub task: String,
-    pub harnesses: Vec<String>,
     pub agent: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub config_path: Option<PathBuf>,
     pub backend: Option<String>,
     pub timeout_secs: Option<u64>,
-    pub max_parallel: Option<usize>,
     pub allow_unsafe_local: bool,
     pub allow_forwarded_env: bool,
     pub output: RunOutputMode,
     /// The run this one redoes on the current source (`dispatch refresh`).
     pub refreshed_from: Option<String>,
-}
-
-#[derive(Default)]
-pub struct EvaluationInput {
-    pub winner: Option<String>,
-    pub reasons: Vec<String>,
-    pub explanation: Option<String>,
-}
-
-pub struct RoutingEvaluationInput {
-    pub outcome: String,
-    pub reasons: Vec<String>,
-    pub explanation: Option<String>,
 }
 
 pub fn init(state: &State, path: &Path, force: bool) -> Result<()> {
@@ -577,9 +557,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     if let Some(timeout) = request.timeout_secs {
         config.execution.timeout_secs = timeout;
     }
-    if let Some(max_parallel) = request.max_parallel {
-        config.execution.max_parallel = max_parallel;
-    }
     config.validate()?;
     crate::config::validate_model(request.model.as_deref())?;
     crate::config::validate_effort(request.effort.as_deref())?;
@@ -590,11 +567,10 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     );
 
     let resources = crate::config::ResourceConfig::load(&state.root)?;
-    let allocation_requested = (resources.allocation_enabled && request.harnesses.is_empty())
-        || request.model.is_some()
-        || request.effort.is_some();
+    let allocation_requested =
+        resources.allocation_enabled || request.model.is_some() || request.effort.is_some();
     anyhow::ensure!(
-        allocation_requested || request.agent.is_some() || !request.harnesses.is_empty(),
+        allocation_requested || request.agent.is_some(),
         "no coding agent is configured: run `dispatch setup` to configure one, or pass --agent claude|codex|cursor"
     );
     let fixed_harness = request.agent.clone();
@@ -604,10 +580,8 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         authorize_local_commands("configured coding-agent commands", request.output)?;
         local_authorized = true;
     }
-    // Every run except an explicit multi-harness comparison is native: one
-    // agent, one engine, whether a configured profile or `--agent` chose it.
-    let native = allocation_requested || request.agent.is_some();
-    let (mut harnesses, allocation) = if allocation_requested {
+    // One agent per run, chosen by a configured profile or by `--agent`.
+    let (harness, allocation) = if allocation_requested {
         let decision = select_available_resource(
             state,
             &source_path,
@@ -618,59 +592,30 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.effort.as_deref(),
         )
         .await?;
-        (vec![decision.selected.harness.clone()], Some(decision))
-    } else if let Some(agent) = request.agent {
-        (vec![agent], None)
+        (decision.selected.harness.clone(), Some(decision))
     } else {
         (
             request
-                .harnesses
-                .into_iter()
-                .map(|id| id.trim().to_lowercase())
-                .filter(|id| !id.is_empty())
-                .collect::<Vec<_>>(),
+                .agent
+                .clone()
+                .context("no coding agent was chosen")?,
             None,
         )
     };
-    let fixed_config = config.harnesses.get(
-        allocation
-            .as_ref()
-            .map(|decision| decision.selected.harness.as_str())
-            .or(fixed_harness.as_deref())
-            .unwrap_or("codex"),
-    );
+    let fixed_config = config.harnesses.get(&harness);
     let fixed_model = request.model.clone().or(fixed_config.model.clone());
     let fixed_effort = request.effort.clone().or(fixed_config.effort.clone());
     if let Some(decision) = &allocation {
         config.harnesses.bind(&decision.selected, &resources);
     }
-    anyhow::ensure!(!harnesses.is_empty(), "at least one harness is required");
-    let mut seen = HashSet::new();
-    for harness_id in &harnesses {
-        anyhow::ensure!(
-            seen.insert(harness_id.clone()),
-            "duplicate harness: {harness_id}"
-        );
-        adapter_for(harness_id, &config.harnesses)?;
-    }
-    let executes_untrusted_host_code = harnesses.iter().any(|id| !id.starts_with("fake-"))
+    adapter_for(&harness, &config.harnesses)?;
+    let executes_untrusted_host_code = !harness.starts_with("fake-")
         || !config.checks.baseline.is_empty()
         || !config.checks.verify.is_empty();
     let unsafe_local = config.execution.backend == "local" && executes_untrusted_host_code;
     if unsafe_local && !local_authorized {
-        authorize_local_commands(
-            &harnesses
-                .iter()
-                .map(|id| harness_name(id))
-                .collect::<Vec<_>>()
-                .join(", "),
-            request.output,
-        )?;
+        authorize_local_commands(harness_name(&harness), request.output)?;
     }
-    anyhow::ensure!(
-        harnesses.len() <= 702,
-        "at most 702 candidates are supported in v0"
-    );
 
     if request.output == RunOutputMode::Human
         && let Some(decision) = &allocation
@@ -684,14 +629,10 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let run_dir = state.run_dir(&run_id);
     fs::create_dir(&run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
-    let _run_lock = if native {
-        Some(OperationLock::acquire(
-            &run_dir.join(".operation.lock"),
-            "run is already supervised",
-        )?)
-    } else {
-        None
-    };
+    let _run_lock = OperationLock::acquire(
+        &run_dir.join(".operation.lock"),
+        "run is already supervised",
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -734,11 +675,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
         status: RunStatus::Preparing,
-        mode: if native {
-            RunMode::Allocation
-        } else {
-            RunMode::Comparison
-        },
+        mode: RunMode::Allocation,
         state_revision: 0,
         outcome: RunOutcome {
             lifecycle: LifecycleState::Preparing,
@@ -791,7 +728,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         // (S3) sets this field.
         attachment: None,
     };
-    if run.mode == RunMode::Allocation {
+    {
         run.phase3 = Some(crate::GoalExecution {
             max_invocations: 2,
             deadline_at: run.created_at
@@ -801,7 +738,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             fixed_harness,
             fixed_model,
             fixed_effort,
-            owner_uid: phase3::local_uid(),
+            owner_uid: native::local_uid(),
             supervisor: Some(crate::process::ProcessIdentity::current()),
             final_attempt_id: None,
             contributing_attempts: Vec::new(),
@@ -810,7 +747,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             questions: Vec::new(),
         });
     }
-    let _deadline = phase3::DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
+    let _deadline = native::DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
     let created_event = EventRecord {
         run_id: run.id.clone(),
         candidate_label: None,
@@ -898,15 +835,15 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     }
     if cancellation.is_cancelled() {
         if run.phase3.is_some() {
-            let failure = phase3::interrupted(&run);
-            phase3::stop(
+            let failure = native::interrupted(&run);
+            native::stop(
                 state,
                 &mut db,
                 &mut run,
                 failure,
                 "goal interrupted during baseline checks",
             )?;
-            phase3::emit(&run, request.output)?;
+            native::emit(&run, request.output)?;
             return Ok(run);
         }
         finish_interrupted(state, &mut db, &mut run)?;
@@ -932,397 +869,16 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         &mut run,
     )?;
 
-    if run.mode == RunMode::Allocation {
-        return phase3::drive(
-            state,
-            &mut db,
-            run,
-            config,
-            resources,
-            cancellation,
-            request.output,
-        )
-        .await;
-    }
-
-    // Randomize the durable label mapping independently of execution order.
-    let mut labels = (0..harnesses.len())
-        .map(candidate_label)
-        .collect::<Vec<_>>();
-    labels.shuffle(&mut rand::rng());
-    let mut pending = VecDeque::new();
-    if request.output == RunOutputMode::Human {
-        println!("\nPreparing {} candidate(s)...", harnesses.len());
-    }
-    for (harness_id, label) in harnesses.drain(..).zip(labels) {
-        let candidate_id = Ulid::new().to_string();
-        let candidate_dir = run_dir.join("candidates").join(candidate_id.to_lowercase());
-        let workspace = match source::create_candidate_workspace(
-            &run.baseline_path,
-            &candidate_dir.join("workspace"),
-        ) {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                let message = format!("failed to prepare candidate {label}: {error:#}");
-                finish_failed(state, &mut db, &mut run, &message)?;
-                bail!(message);
-            }
-        };
-        let prompt_path = candidate_dir.join("prompt.txt");
-        let stdout_path = candidate_dir.join("stdout.log");
-        let stderr_path = candidate_dir.join("stderr.log");
-        let diff_path = candidate_dir.join("diff.patch");
-        if let Err(error) = write_text(&prompt_path, &exact_prompt) {
-            let message = format!("failed to persist candidate {label} prompt: {error:#}");
-            finish_failed(state, &mut db, &mut run, &message)?;
-            bail!(message);
-        }
-        let candidate = CandidateRecord {
-            id: candidate_id,
-            label,
-            harness_id,
-            harness_version: None,
-            model: None,
-            status: CandidateStatus::Preparing,
-            workspace_path: workspace,
-            prompt_path,
-            stdout_path,
-            stderr_path,
-            diff_path,
-            duration_ms: 0,
-            exit_code: None,
-            timed_out: false,
-            tokens: None,
-            token_semantics: None,
-            cost_usd: None,
-            error: None,
-            diff_stats: DiffStats::default(),
-            checks: Vec::new(),
-        };
-        let requested_model = match candidate.harness_id.as_str() {
-            "claude" => config.harnesses.claude.model.clone(),
-            "codex" => config.harnesses.codex.model.clone(),
-            "cursor" => config.harnesses.cursor.model.clone(),
-            _ => None,
-        };
-        let requested_effort = match candidate.harness_id.as_str() {
-            "claude" => config.harnesses.claude.effort.clone(),
-            "codex" => config.harnesses.codex.effort.clone(),
-            "cursor" => config.harnesses.cursor.effort.clone(),
-            _ => None,
-        };
-        run.attempts.push(AttemptRecord {
-            detail: Default::default(),
-            id: Ulid::new().to_string(),
-            run_id: run.id.clone(),
-            candidate_id: candidate.id.clone(),
-            role: "executor".into(),
-            ordinal: u32::try_from(run.attempts.len() + 1).unwrap_or(u32::MAX),
-            generation: 1,
-            harness_id: candidate.harness_id.clone(),
-            harness_version: None,
-            requested_model: requested_model.clone(),
-            resolved_model: requested_model,
-            observed_model: None,
-            requested_effort: requested_effort.clone(),
-            resolved_effort: requested_effort,
-            observed_effort: None,
-            started_at: Utc::now(),
-            completed_at: None,
-            outcome: "preparing".into(),
-            raw_telemetry_path: candidate_dir.join("harness.jsonl"),
-            resource: run
-                .allocation
-                .as_ref()
-                .map(|decision| decision.selected.clone()),
-        });
-        run.candidates.push(candidate.clone());
-        pending.push_back(candidate);
-    }
-    run.candidates
-        .sort_by(|left, right| left.label.cmp(&right.label));
-    run.status = RunStatus::Running;
-    run.outcome.lifecycle = LifecycleState::Working;
-    run.outcome.phase = RunPhase::Executing;
-    db.sync_run(&run)?;
-
-    if request.output != RunOutputMode::Silent
-        && config.execution.backend == "local"
-        && executes_untrusted_host_code
-    {
-        eprintln!(
-            "warning: real harnesses are running locally; use --backend docker with a harness-enabled image for a container boundary"
-        );
-    }
-
-    type CandidateFuture = Pin<Box<dyn Future<Output = CandidateExecution> + Send>>;
-    let mut running: FuturesUnordered<CandidateFuture> = FuturesUnordered::new();
-    let (check_tx, mut check_rx) = tokio::sync::mpsc::unbounded_channel();
-    let parallelism = config
-        .execution
-        .max_parallel
-        .min(run.candidates.len())
-        .max(1);
-
-    let mut interrupted = false;
-    let mut orchestration_error = None;
-    'candidate_loop: while !pending.is_empty() || !running.is_empty() {
-        if cancellation.is_cancelled() {
-            interrupted = true;
-            break;
-        }
-        #[cfg(test)]
-        if CANCEL_AT_HANDOFF
-            .try_with(|point| *point == 2)
-            .unwrap_or(false)
-        {
-            cancellation.cancel();
-        }
-        while running.len() < parallelism && !cancellation.is_cancelled() {
-            let Some(mut candidate) = pending.pop_front() else {
-                break;
-            };
-            candidate.status = CandidateStatus::Running;
-            let attempt_id = update_attempt_started(&mut run, &candidate.id);
-            replace_candidate(&mut run, candidate.clone());
-            let persisted = (|| -> Result<()> {
-                db.sync_run(&run)?;
-                persist_event(
-                    state,
-                    &db,
-                    EventRecord {
-                        run_id: run.id.clone(),
-                        candidate_label: Some(candidate.label.clone()),
-                        event_type: "attempt.started".into(),
-                        timestamp: Utc::now(),
-                        payload: serde_json::json!({"harness": candidate.harness_id}),
-                        attempt_id: Some(attempt_id.clone()),
-                        ..EventRecord::default()
-                    },
-                    &mut run,
-                )
-            })();
-            if let Err(error) = persisted {
-                orchestration_error = Some(error.context("failed to persist candidate start"));
-                break 'candidate_loop;
-            }
-            if request.output == RunOutputMode::Human {
-                println!("Candidate {}   running", candidate.label);
-            }
-            let candidate_config = config.clone();
-            let candidate_prompt = exact_prompt.clone();
-            let baseline_path = run.baseline_path.clone();
-            let candidate_cancellation = cancellation.clone();
-            let candidate_check_tx = check_tx.clone();
-            running.push(Box::pin(async move {
-                execute_candidate(
-                    candidate,
-                    candidate_prompt,
-                    candidate_config,
-                    baseline_path,
-                    candidate_cancellation,
-                    (candidate_check_tx, attempt_id),
-                    None,
-                )
-                .await
-            }));
-        }
-
-        let next = tokio::select! {
-            candidate = running.next() => candidate,
-            Some(event) = check_rx.recv() => {
-                if let Err(error) = persist_check_lifecycle(state, &db, &mut run, event) {
-                    orchestration_error = Some(error.context("failed to persist check transition"));
-                    break 'candidate_loop;
-                }
-                continue 'candidate_loop;
-            }
-            _ = cancellation.cancelled() => {
-                interrupted = true;
-                None
-            }
-        };
-        if interrupted {
-            break;
-        }
-        let Some(execution) = next else {
-            continue;
-        };
-        let candidate = execution.candidate.clone();
-        while let Ok(event) = check_rx.try_recv() {
-            if let Err(error) = persist_check_lifecycle(state, &db, &mut run, event) {
-                orchestration_error = Some(error.context("failed to persist check transition"));
-                break 'candidate_loop;
-            }
-        }
-        let event_type = "attempt.finished";
-        if request.output == RunOutputMode::Human {
-            println!(
-                "Candidate {}   {:<16} {}",
-                candidate.label,
-                candidate.status.as_str(),
-                format_duration(candidate.duration_ms)
-            );
-        }
-        replace_candidate(&mut run, candidate.clone());
-        let attempt_id = update_attempt_finished(&mut run, &candidate, &execution);
-        let persisted = (|| -> Result<()> {
-            db.sync_run(&run)?;
-            persist_event(
-                state,
-                &db,
-                EventRecord {
-                    run_id: run.id.clone(),
-                    candidate_label: Some(candidate.label.clone()),
-                    event_type: event_type.into(),
-                    timestamp: Utc::now(),
-                    payload: serde_json::json!({
-                        "status": candidate.status.as_str(),
-                        "duration_ms": candidate.duration_ms,
-                        "files_changed": candidate.diff_stats.files_changed,
-                    }),
-                    attempt_id: Some(attempt_id),
-                    ..EventRecord::default()
-                },
-                &mut run,
-            )
-        })();
-        if let Err(error) = persisted {
-            orchestration_error = Some(error.context("failed to persist candidate completion"));
-            break;
-        }
-    }
-
-    if interrupted || orchestration_error.is_some() {
-        cancellation.cancel();
-        while let Some(execution) = running.next().await {
-            let candidate = execution.candidate.clone();
-            update_attempt_finished(&mut run, &candidate, &execution);
-            replace_candidate(&mut run, candidate);
-        }
-        for mut candidate in pending {
-            candidate.status = if interrupted {
-                CandidateStatus::Cancelled
-            } else {
-                CandidateStatus::Failed
-            };
-            let message = if interrupted {
-                "run interrupted before candidate started"
-            } else {
-                "run failed before candidate started"
-            };
-            candidate.error = Some(message.into());
-            let _ = write_text(&candidate.stdout_path, "");
-            let _ = write_text(&candidate.stderr_path, &format!("{message}\n"));
-            let _ = write_text(&candidate.diff_path, "");
-            replace_candidate(&mut run, candidate);
-        }
-        for candidate in &mut run.candidates {
-            if matches!(
-                candidate.status,
-                CandidateStatus::Preparing | CandidateStatus::Running | CandidateStatus::Verifying
-            ) {
-                candidate.status = if interrupted {
-                    CandidateStatus::Cancelled
-                } else {
-                    CandidateStatus::Failed
-                };
-                append_candidate_error(
-                    candidate,
-                    if interrupted {
-                        "run interrupted".into()
-                    } else {
-                        "run orchestration failed".into()
-                    },
-                );
-            }
-        }
-        if let Some(error) = orchestration_error {
-            let message = format!("{error:#}");
-            if let Err(persist_error) = finish_failed(state, &mut db, &mut run, &message) {
-                return Err(error.context(format!(
-                    "failed to persist terminal run status: {persist_error:#}"
-                )));
-            }
-            return Err(error);
-        }
-        finish_interrupted(state, &mut db, &mut run)?;
-        bail!(
-            "run {} interrupted; partial candidate workspaces were preserved",
-            run.id
-        );
-    }
-
-    run.completed_at = Some(Utc::now());
-    refresh_outcome(&mut run);
-    run.status = if run.outcome.work_result == WorkResult::Ready {
-        RunStatus::ReadyForEvaluation
-    } else {
-        RunStatus::Failed
-    };
-    run.candidates
-        .sort_by(|left, right| left.label.cmp(&right.label));
-    let finalized = (|| -> Result<()> {
-        db.sync_run(&run)?;
-        persist_event(
-            state,
-            &db,
-            EventRecord {
-                run_id: run.id.clone(),
-                candidate_label: None,
-                event_type: "run.finished".into(),
-                timestamp: Utc::now(),
-                payload: serde_json::json!({
-                    "candidate_count": run.candidates.len(),
-                    "outcome": run.outcome,
-                }),
-                ..EventRecord::default()
-            },
-            &mut run,
-        )
-    })();
-    if let Err(error) = finalized {
-        let message = format!("failed to finalize run: {error:#}");
-        finish_failed(state, &mut db, &mut run, &message)?;
-        return Err(error.context("failed to finalize run"));
-    }
-
-    if request.output == RunOutputMode::Json {
-        println!("{}", serde_json::to_string(&run_result(&run))?);
-    } else if request.output == RunOutputMode::Jsonl {
-        println!(
-            "{}",
-            serde_json::json!({"type": "result", "result": run_result(&run)})
-        );
-    } else if request.output == RunOutputMode::Silent {
-        // The in-process presenter receives committed projections.
-    } else if run.routing.is_some() || run.allocation.is_some() {
-        let heading = if run.outcome.verification == VerificationState::Failed {
-            "Verification failed"
-        } else if run.outcome.work_result == WorkResult::Ready {
-            "Ready for review"
-        } else {
-            "Attempt failed"
-        };
-        print_single_result_summary(&run, heading, false, None);
-    } else {
-        println!(
-            "\n{}.\n",
-            if run.outcome.work_result == WorkResult::Ready {
-                "Run ready for evaluation"
-            } else {
-                "Run failed"
-            }
-        );
-        println!(
-            "Baseline verification {}\n",
-            checks_summary(&run.baseline_checks)
-        );
-        print_candidates(&run, false);
-        println!("Inspect: dispatch inspect {} A", run.id);
-        println!("Compare: dispatch compare {}", run.id);
-    }
-    Ok(run)
+    native::drive(
+        state,
+        &mut db,
+        run,
+        config,
+        resources,
+        cancellation,
+        request.output,
+    )
+    .await
 }
 
 fn result_verification(candidate: &CandidateRecord) -> &'static str {
@@ -1753,31 +1309,6 @@ fn update_attempt_finished(
     attempt.id.clone()
 }
 
-fn candidate_label(index: usize) -> String {
-    let mut number = index + 1;
-    let mut label = Vec::new();
-    while number > 0 {
-        number -= 1;
-        label.push((b'A' + (number % 26) as u8) as char);
-        number /= 26;
-    }
-    label.iter().rev().collect()
-}
-
-fn replace_candidate(run: &mut RunRecord, candidate: CandidateRecord) {
-    if let Some(existing) = run
-        .candidates
-        .iter_mut()
-        .find(|item| item.id == candidate.id)
-    {
-        *existing = candidate;
-    } else {
-        run.candidates.push(candidate);
-    }
-    run.candidates
-        .sort_by(|left, right| left.label.cmp(&right.label));
-}
-
 fn append_candidate_error(candidate: &mut CandidateRecord, error: String) {
     match &mut candidate.error {
         Some(existing) => {
@@ -2075,21 +1606,14 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
     if run.phase3.is_some() {
-        return phase3::emit(&run, RunOutputMode::Human);
+        return native::emit(&run, RunOutputMode::Human);
     }
     if id.is_none()
         && (run.routing.is_some() || run.allocation.is_some())
         && run.candidates.len() == 1
     {
-        let database = Database::open(state.db_path())?;
-        let routed_feedback = database
-            .routing_observation_for_run(&run.id)?
-            .and_then(|observation| observation.human_evaluation);
-        let allocation_feedback = database.latest_goal_feedback(&run.id)?;
-        let human_outcome = allocation_feedback
-            .as_ref()
-            .map(|feedback| &feedback.outcome)
-            .or_else(|| routed_feedback.as_ref().map(|feedback| &feedback.outcome));
+        let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
+        let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
         print_single_result_summary(&run, "Latest task", true, human_outcome);
         return Ok(());
     }
@@ -2157,10 +1681,6 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
     let run = state.load_run(&resolved_run_id)?;
     let reveal = run.evaluation.is_some();
     print_run_header(&run, reveal);
-    let database = Database::open(state.db_path())?;
-    if let Some(observation) = database.routing_observation_for_run(&run.id)? {
-        print_routing_observation(&observation);
-    }
     if let Some(decision) = &run.allocation {
         println!();
         print_allocation_details(decision);
@@ -2221,208 +1741,6 @@ pub fn diff(
         .with_context(|| format!("failed to read {}", candidate.diff_path.display()))?;
     print!("{patch}");
     Ok(())
-}
-
-pub fn inspect(state: &State, run_id: &str, candidate: &str, shell: bool) -> Result<()> {
-    let run = state.load_run(run_id)?;
-    let candidate = find_candidate(&run, candidate)?;
-    println!(
-        "Candidate {} workspace:\n\n{}",
-        candidate.label,
-        candidate.workspace_path.display()
-    );
-    if shell {
-        let shell_program = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-        let status = Command::new(shell_program)
-            .current_dir(&candidate.workspace_path)
-            .status()
-            .context("failed to start shell")?;
-        anyhow::ensure!(status.success(), "candidate shell exited with {status}");
-    }
-    Ok(())
-}
-
-pub fn compare(
-    state: &State,
-    run_id: &str,
-    mut input: EvaluationInput,
-    interactive: bool,
-) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply operation is already using this run",
-    )?;
-    let mut run = state.load_run(&resolved_run_id)?;
-    let already_evaluated = run.evaluation.is_some();
-    if !already_evaluated
-        && !matches!(
-            run.status,
-            RunStatus::ReadyForEvaluation | RunStatus::Applied
-        )
-    {
-        bail!(
-            "run {} is {}; evaluation requires a run that is ready for evaluation",
-            run.id,
-            run.status.as_str()
-        );
-    }
-    let reveal = already_evaluated;
-    print_run_header(&run, reveal);
-    println!("\nTask:\n{}\n", run.task);
-    println!(
-        "Baseline verification {}\n",
-        checks_summary(&run.baseline_checks)
-    );
-    print_candidates(&run, reveal);
-
-    if interactive && input.winner.is_none() && !already_evaluated {
-        input = prompt_for_evaluation(&run)?;
-    }
-    if input.winner.is_none() {
-        if let Some(evaluation) = &run.evaluation {
-            print_evaluation(evaluation);
-        } else {
-            println!("\nUse --evaluate, or --winner A|B|tie|neither, to record an evaluation.");
-        }
-        return Ok(());
-    }
-    if already_evaluated {
-        bail!(
-            "run {} already has an evaluation; it was not overwritten",
-            run.id
-        );
-    }
-
-    let winner = input.winner.as_deref().expect("checked above");
-    let outcome = parse_outcome(&run, winner)?;
-    let reasons = normalize_reasons(input.reasons)?;
-    let evaluation = EvaluationRecord {
-        outcome,
-        reasons,
-        explanation: input.explanation,
-        created_at: Utc::now(),
-        blind: true,
-    };
-    run.evaluation = Some(evaluation.clone());
-    run.outcome.review = match &evaluation.outcome {
-        EvaluationOutcome::Neither => ReviewState::Rejected,
-        _ => ReviewState::Accepted,
-    };
-    if run.status != RunStatus::Applied {
-        run.status = RunStatus::Evaluated;
-    }
-    let mut db = Database::open(state.db_path())?;
-    db.save_evaluation(&run.id, &evaluation)?;
-    persist_event(
-        state,
-        &db,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: None,
-            event_type: "evaluation.submitted".into(),
-            timestamp: Utc::now(),
-            payload: serde_json::to_value(&evaluation)?,
-            ..EventRecord::default()
-        },
-        &mut run,
-    )?;
-    // Metadata is the reveal source of truth and is written last. Any earlier
-    // validation, database, event, or serialization failure leaves it blind.
-    state.save_run(&run)?;
-
-    println!("\nEvaluation recorded. Harness identities are now revealed:\n");
-    print_candidates(&run, true);
-    print_evaluation(&evaluation);
-    Ok(())
-}
-
-pub fn evaluate_routed(state: &State, run_id: &str, input: RoutingEvaluationInput) -> Result<()> {
-    let observation = record_routing_evaluation(state, run_id, input)?;
-    println!("Routing evaluation recorded.\n");
-    print_routing_observation(&observation);
-    Ok(())
-}
-
-fn record_routing_evaluation(
-    state: &State,
-    run_id: &str,
-    input: RoutingEvaluationInput,
-) -> Result<RoutingObservation> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply/evaluate operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    record_routing_evaluation_locked(state, run, input)
-}
-
-fn record_routing_evaluation_locked(
-    state: &State,
-    mut run: RunRecord,
-    input: RoutingEvaluationInput,
-) -> Result<RoutingObservation> {
-    if run.routing.is_none() || run.candidates.len() != 1 {
-        bail!(
-            "This run was not predictively routed.\nUse `dispatch compare <run-id> --evaluate` for candidate comparison."
-        );
-    }
-
-    let outcome = match input.outcome.as_str() {
-        "accept" => RoutingHumanOutcome::Accepted,
-        "reject" => RoutingHumanOutcome::Rejected,
-        _ => bail!("routed evaluation outcome must be accept or reject"),
-    };
-    let reasons = normalize_reasons(input.reasons)?;
-    anyhow::ensure!(
-        !reasons.iter().any(|reason| reason == "cleaner-change"),
-        "structured reason \"cleaner-change\" is only valid for candidate comparison"
-    );
-    let evaluation = RoutingHumanEvaluation {
-        outcome,
-        reasons,
-        explanation: input.explanation,
-        evaluated_at: Utc::now(),
-    };
-    let mut database = Database::open(state.db_path())?;
-    anyhow::ensure!(
-        database.routing_observation_for_run(&run.id)?.is_some(),
-        "routed run {} has no completed routing observation",
-        run.id
-    );
-    let observation = database.save_routing_human_evaluation(&run.id, &evaluation)?;
-    database.save_goal_feedback(
-        &run.id,
-        evaluation.outcome.clone(),
-        evaluation.reasons.clone(),
-        evaluation.explanation.clone(),
-    )?;
-    run.outcome.review = match &evaluation.outcome {
-        RoutingHumanOutcome::Accepted => ReviewState::Accepted,
-        RoutingHumanOutcome::Rejected => ReviewState::Rejected,
-    };
-    persist_event(
-        state,
-        &database,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: run
-                .candidates
-                .first()
-                .map(|candidate| candidate.label.clone()),
-            event_type: match &evaluation.outcome {
-                RoutingHumanOutcome::Accepted => "review.accepted",
-                RoutingHumanOutcome::Rejected => "review.rejected",
-            }
-            .into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"reasons": evaluation.reasons}),
-            ..EventRecord::default()
-        },
-        &mut run,
-    )?;
-    Ok(observation)
 }
 
 /// Captured from the displayed delivery, never resolved through "latest".
@@ -2497,20 +1815,10 @@ pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> 
     let (run, _lock) = review_target(state, command)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    if run.mode == RunMode::Allocation {
-        record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
-    } else if run.mode == RunMode::Attached {
+    if run.mode == RunMode::Attached {
         record_attach_review_locked(state, run, accept, vec![], None)?;
     } else {
-        record_routing_evaluation_locked(
-            state,
-            run,
-            RoutingEvaluationInput {
-                outcome: if accept { "accept" } else { "reject" }.into(),
-                reasons: vec![],
-                explanation: None,
-            },
-        )?;
+        record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
     }
     // A run already applied by the auto-apply policy only has its human
     // review recorded here; applying again would be a second, redundant
@@ -2543,20 +1851,10 @@ pub fn accept_or_reject_latest(
     let candidate = sole_candidate(&run)?.label.clone();
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    if run.mode == RunMode::Allocation {
-        record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
-    } else if run.mode == RunMode::Attached {
+    if run.mode == RunMode::Attached {
         record_attach_review(state, &run.id, accept, reasons, explanation)?;
     } else {
-        record_routing_evaluation(
-            state,
-            &run.id,
-            RoutingEvaluationInput {
-                outcome: if accept { "accept" } else { "reject" }.into(),
-                reasons,
-                explanation,
-            },
-        )?;
+        record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
     }
     if accept {
         if already_auto_applied {
@@ -2693,27 +1991,25 @@ pub fn refresh_request(
     let reasons = crate::coherence::live_validity(&run)
         .map(|validity| validity.reasons)
         .unwrap_or_default();
-    let allocation = run.mode == RunMode::Allocation;
+    // The same agent choice again; runs made before 0.4.1 without an explicit
+    // choice redo the agent that produced their result.
     let goal = run.phase3.as_ref();
-    let fixed = |value: Option<&String>| value.filter(|_| allocation).cloned();
+    let agent = goal
+        .and_then(|goal| goal.fixed_harness.clone())
+        .or_else(|| {
+            (run.mode != RunMode::Allocation)
+                .then(|| run.candidates.first().map(|c| c.harness_id.clone()))
+                .flatten()
+        });
     Ok(RunRequest {
         source: run.source_path.clone(),
         task: refresh_task(&run.task, &run.id, &reasons),
-        harnesses: if allocation {
-            Vec::new()
-        } else {
-            run.candidates
-                .iter()
-                .map(|candidate| candidate.harness_id.clone())
-                .collect()
-        },
-        agent: fixed(goal.and_then(|goal| goal.fixed_harness.as_ref())),
-        model: fixed(goal.and_then(|goal| goal.fixed_model.as_ref())),
-        effort: fixed(goal.and_then(|goal| goal.fixed_effort.as_ref())),
+        agent,
+        model: goal.and_then(|goal| goal.fixed_model.clone()),
+        effort: goal.and_then(|goal| goal.fixed_effort.clone()),
         config_path: options.config_path,
         backend: Some(run.environment.execution_backend.clone()),
         timeout_secs: Some(run.environment.timeout_secs),
-        max_parallel: Some(run.environment.max_parallel),
         allow_unsafe_local: options.allow_unsafe_local,
         allow_forwarded_env: options.allow_forwarded_env,
         output: options.output,
@@ -3047,8 +2343,8 @@ fn record_allocation_feedback_locked(
     quiet: bool,
 ) -> Result<()> {
     anyhow::ensure!(
-        run.mode == RunMode::Allocation,
-        "run {} is not a native run",
+        run.mode != RunMode::Attached,
+        "run {} is attached work",
         run.id
     );
     anyhow::ensure!(
@@ -3188,68 +2484,6 @@ pub fn read_verbatim(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-fn prompt_for_evaluation(run: &RunRecord) -> Result<EvaluationInput> {
-    let labels = run
-        .candidates
-        .iter()
-        .map(|c| c.label.as_str())
-        .collect::<Vec<_>>()
-        .join("/");
-    println!("\nChoose {labels}/Tie/Neither (blank cancels):");
-    print!("> ");
-    io::stdout().flush()?;
-    let mut winner = String::new();
-    io::stdin().read_line(&mut winner)?;
-    let winner = winner.trim().to_owned();
-    if winner.is_empty() {
-        return Ok(EvaluationInput::default());
-    }
-    parse_outcome(run, &winner)?;
-
-    println!("\nOptional structured reasons (comma-separated, or blank):");
-    println!("{}", EVALUATION_REASONS.join(", "));
-    print!("> ");
-    io::stdout().flush()?;
-    let mut reasons = String::new();
-    io::stdin().read_line(&mut reasons)?;
-    let reasons = reasons
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-
-    println!(
-        "\nAdditional reasoning (optional, unrestricted). End with a line containing only '.':"
-    );
-    let mut explanation = String::new();
-    loop {
-        let mut line = String::new();
-        let bytes = io::stdin().read_line(&mut line)?;
-        if bytes == 0 || matches!(line.as_str(), ".\n" | ".\r\n" | ".") {
-            break;
-        }
-        explanation.push_str(&line);
-    }
-    Ok(EvaluationInput {
-        winner: Some(winner),
-        reasons,
-        explanation: (!explanation.is_empty()).then_some(explanation),
-    })
-}
-
-fn parse_outcome(run: &RunRecord, value: &str) -> Result<EvaluationOutcome> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case("tie") {
-        return Ok(EvaluationOutcome::Tie);
-    }
-    if value.eq_ignore_ascii_case("neither") {
-        return Ok(EvaluationOutcome::Neither);
-    }
-    let candidate = find_candidate(run, value)?;
-    Ok(EvaluationOutcome::Candidate(candidate.label.clone()))
-}
-
 fn normalize_reasons(reasons: Vec<String>) -> Result<Vec<String>> {
     let mut output = Vec::new();
     for reason in reasons {
@@ -3298,7 +2532,6 @@ fn load_latest_for_source(state: &State, source_path: &Path, single: bool) -> Re
 
 fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<RunRecord> {
     let source_path = source::resolve_source(Some(source_path))?;
-    let database = Database::open(state.db_path())?;
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
@@ -3312,16 +2545,7 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
         {
             continue;
         }
-        if run.mode == RunMode::Allocation && database.latest_goal_feedback(&run.id)?.is_none() {
-            return Ok(run);
-        }
-        if run.mode == RunMode::Attached && run.outcome.review == ReviewState::Pending {
-            return Ok(run);
-        }
-        if database
-            .routing_observation_for_run(&run.id)?
-            .is_some_and(|observation| observation.human_evaluation.is_none())
-        {
+        if run.outcome.review == ReviewState::Pending {
             return Ok(run);
         }
     }
@@ -3443,48 +2667,6 @@ fn print_evaluation(evaluation: &EvaluationRecord) {
     }
     if let Some(explanation) = &evaluation.explanation {
         println!("  Explanation:\n{}", indent(explanation, "    "));
-    }
-}
-
-fn print_routing_observation(observation: &RoutingObservation) {
-    let verification = match observation.verification.as_deref() {
-        None => "unknown",
-        Some(checks) if checks.iter().all(|status| *status == CheckStatus::Passed) => "PASS",
-        Some(checks) if checks.contains(&CheckStatus::Failed) => "FAIL",
-        Some(checks) if checks.contains(&CheckStatus::TimedOut) => "TIMED_OUT",
-        Some(_) => "NOT_RUN",
-    };
-    let human = observation
-        .human_evaluation
-        .as_ref()
-        .map_or("not recorded", |evaluation| evaluation.outcome.as_str());
-    println!("Routing observation");
-    println!("  ID              {}", observation.id);
-    println!(
-        "  Harness         {}",
-        observation.prediction.selected_harness
-    );
-    println!(
-        "  Harness version {}",
-        observation.harness_version.as_deref().unwrap_or("unknown")
-    );
-    println!(
-        "  Model           {}",
-        observation.model.as_deref().unwrap_or("unknown")
-    );
-    println!(
-        "  Process         {}",
-        observation.candidate_status.as_str()
-    );
-    println!("  Verification    {verification}");
-    println!("  Human evaluation {human}");
-    if let Some(evaluation) = &observation.human_evaluation {
-        if !evaluation.reasons.is_empty() {
-            println!("  Reasons         {}", evaluation.reasons.join(", "));
-        }
-        if let Some(explanation) = &evaluation.explanation {
-            println!("  Explanation:\n{}", indent(explanation, "    "));
-        }
     }
 }
 
@@ -3778,14 +2960,12 @@ mod tests {
                         RunRequest {
                             source: project,
                             task: "Deterministic handoff fixture".into(),
-                            harnesses: vec![],
                             agent: Some("codex".into()),
                             model: Some("fixture".into()),
                             effort: Some("medium".into()),
                             config_path: None,
                             backend: None,
                             timeout_secs: None,
-                            max_parallel: None,
                             allow_unsafe_local: true,
                             allow_forwarded_env: false,
                             output: RunOutputMode::Json,

@@ -129,7 +129,7 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
 /// Remember a watcher's verdict and commit it as `coherence.checked` (a
 /// `Continue` decision) or `coherence.invalidated` (anything else), returning
 /// which kind was committed. Shared by the allocation-run watcher
-/// (`phase3::apply_watch`) and the attach owner loop / `serve` (part 14.5);
+/// (`native::apply_watch`) and the attach owner loop / `serve` (part 14.5);
 /// none of them implement `mid_run: stop` themselves.
 pub(super) fn persist_verdict(
     state: &State,
