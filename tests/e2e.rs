@@ -169,7 +169,7 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
 
     let metadata: Value = serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
     // The native engine records a user interrupt as cancelled work.
-    assert_eq!(metadata["phase3"]["failure"], "cancelled");
+    assert_eq!(metadata["execution"]["failure"], "cancelled");
     assert_eq!(metadata["outcome"]["lifecycle"], "finished");
     assert_eq!(metadata["outcome"]["work_result"], "cancelled");
     assert_eq!(metadata["outcome"]["verification"], "not_run");

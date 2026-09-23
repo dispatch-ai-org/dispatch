@@ -387,7 +387,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
         let result = Fixture::result(&output)?;
         assert!(!f.root.join("finished").exists());
         assert_eq!(output.status.code(), Some(1), "{result}");
-        assert_eq!(result["phase3"]["failure"], "stale_work");
+        assert_eq!(result["execution"]["failure"], "stale_work");
         assert_eq!(result["outcome"]["work_result"], "cancelled");
         assert_eq!(f.event_count("coherence.invalidated"), 1);
         assert_eq!(f.event_count("coherence.stopped"), 1);
@@ -395,7 +395,7 @@ fn stop_mode_kills_the_agent_when_the_work_is_stale() -> Result<()> {
         let run = f.loaded(id)?;
         assert_eq!(run.status, dispatch::RunStatus::Interrupted);
         assert_eq!(
-            run.phase3.as_ref().unwrap().failure,
+            run.execution.as_ref().unwrap().failure,
             Some(dispatch::FailureKind::StaleWork)
         );
         assert!(run.coherence.unwrap().first_invalid_at.is_some());
@@ -440,7 +440,10 @@ fn a_second_run_after_a_stopped_one_works() -> Result<()> {
     f.edit_source("src/lib.rs", "// human edit\n")?;
     wait_until(|| Ok(!alive(pid)))?;
     let output = child.output()?;
-    assert_eq!(Fixture::result(&output)?["phase3"]["failure"], "stale_work");
+    assert_eq!(
+        Fixture::result(&output)?["execution"]["failure"],
+        "stale_work"
+    );
     fs::remove_file(f.root.join("started"))?;
     // A different source state with no conflicting edit completes.
     git(&f.source, &["checkout", "--quiet", "--", "src/lib.rs"])?;

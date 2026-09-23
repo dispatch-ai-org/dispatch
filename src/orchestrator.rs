@@ -2,7 +2,7 @@ mod apply;
 pub mod attach;
 pub(crate) mod native;
 pub mod serve;
-pub use apply::{ApplyAuthority, ApplyOutcome, apply, auto_apply};
+pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
 pub use native::{QuestionCommand, answer_question, cancel_question};
 use std::{
     ffi::OsString,
@@ -25,9 +25,9 @@ use ulid::Ulid;
 use crate::{
     AllocationDecision, ApplicationState, AppliedBy, AttemptRecord, CandidateRecord,
     CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
-    EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
-    ReviewState, RoutingDecision, RoutingHumanOutcome, RunMode, RunOutcome, RunPhase, RunRecord,
-    RunResult, RunStatus, SelectionBasis, VERSION, VerificationState, WaitingOn, WorkResult,
+    EnvironmentRecord, EventRecord, LifecycleState, ReviewState, RoutingHumanOutcome, RunMode,
+    RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
+    WorkResult,
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -94,7 +94,6 @@ const EVALUATION_REASONS: &[&str] = &[
     "readability",
     "tests",
     "edge-cases",
-    "cleaner-change",
     "performance",
     "cost",
     "latency",
@@ -301,98 +300,6 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     Ok(())
 }
 
-fn specificity_label(specificity: u8) -> &'static str {
-    match specificity {
-        0 => "generic",
-        3 => "exact",
-        _ => "partial",
-    }
-}
-
-fn selection_label(decision: &RoutingDecision) -> &'static str {
-    if decision.selection_basis == SelectionBasis::Default && decision.alternatives.len() == 1 {
-        "Only available agent"
-    } else {
-        decision.selection_basis.as_str()
-    }
-}
-
-fn print_selection_reason(decision: &RoutingDecision) {
-    println!("Why:");
-    match decision.selection_basis {
-        SelectionBasis::Evidence => println!(
-            "  {} had the strongest relevant observed benchmark performance\n  among eligible agents with compatible evidence.",
-            harness_name(&decision.selected_harness)
-        ),
-        SelectionBasis::Default if decision.alternatives.len() == 1 => println!(
-            "  This is the only execution-eligible agent; no performance comparison was possible."
-        ),
-        SelectionBasis::Default => println!(
-            "  Dispatch did not have enough comparable public performance data\n  to make an evidence-based choice."
-        ),
-        SelectionBasis::Override => println!("  You explicitly selected this agent."),
-    }
-    if decision.selection_basis == SelectionBasis::Evidence
-        && decision.alternatives.iter().any(|a| a.attempts == 0)
-    {
-        println!(
-            "  Agents without compatible evidence were not compared; their performance is unknown."
-        );
-    } else if decision.selection_basis == SelectionBasis::Default
-        && decision.alternatives.iter().any(|a| a.attempts > 0)
-    {
-        println!("  Available benchmark evidence did not determine the selection.");
-    }
-}
-
-fn print_routing_decision(decision: &RoutingDecision) {
-    println!("Agent\n  {}", harness_name(&decision.selected_harness));
-    println!("Selection\n  {}", selection_label(decision));
-    print_selection_reason(decision);
-    if !decision.alternatives.is_empty() {
-        println!("Available benchmark evidence:");
-    }
-    for alternative in &decision.alternatives {
-        if alternative.attempts > 0 {
-            println!(
-                "  {}: {}/{}",
-                harness_name(&alternative.harness),
-                alternative.successes,
-                alternative.attempts
-            );
-        } else {
-            println!(
-                "  {}: no compatible public evidence",
-                harness_name(&alternative.harness)
-            );
-        }
-    }
-    if decision.selection_basis != SelectionBasis::Evidence {
-        println!();
-        return;
-    }
-    println!("Advanced details:");
-    println!(
-        "  benchmark success: {}/{} ({:.1}%)",
-        decision.successes,
-        decision.attempts,
-        decision.successes as f64 / decision.attempts as f64 * 100.0
-    );
-    println!(
-        "  evidence specificity: {}/3 ({})",
-        decision.specificity,
-        specificity_label(decision.specificity)
-    );
-    println!("  source: {}", decision.source);
-    println!("  dataset: {}", decision.dataset);
-    println!("  dataset version: {}", decision.dataset_version);
-    println!(
-        "  model: {}",
-        decision.model.as_deref().unwrap_or("<unknown>")
-    );
-    println!();
-}
-
 fn print_allocation_decision(decision: &AllocationDecision) {
     println!("Resource");
     println!(
@@ -496,7 +403,6 @@ fn choose_profile(
         private_evidence: None,
         version: 1,
         policy_version: "first-available-profile-v1".into(),
-        task_features: crate::TaskFeatures::default(),
         selected,
         reason: reason.into(),
         capability,
@@ -664,7 +570,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let exact_prompt = build_prompt(&request.task);
     let now = Utc::now();
     let mut run = RunRecord {
-        phase3: None,
+        execution: None,
         id: run_id.clone(),
         task: request.task,
         exact_prompt: exact_prompt.clone(),
@@ -711,10 +617,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_checks: Vec::new(),
         candidates: Vec::new(),
         attempts: Vec::new(),
-        routing: None,
         allocation,
-        capacity: None,
-        admission: None,
         coherence: request.refreshed_from.map(|old| CoherenceRecord {
             version: 1,
             refreshed_from: Some(old),
@@ -722,14 +625,14 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             validity: None,
             first_invalid_at: None,
         }),
-        evaluation: None,
         applied_candidate: None,
         // Native runs never carry attachment provenance; only `dispatch attach`
         // (S3) sets this field.
         attachment: None,
+        historical: Default::default(),
     };
     {
-        run.phase3 = Some(crate::GoalExecution {
+        run.execution = Some(crate::GoalExecution {
             max_invocations: 2,
             deadline_at: run.created_at
                 + chrono::TimeDelta::seconds(
@@ -747,7 +650,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             questions: Vec::new(),
         });
     }
-    let _deadline = native::DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
+    let _deadline = native::DeadlineGuard::new(run.execution.as_ref(), cancellation.clone());
     let created_event = EventRecord {
         run_id: run.id.clone(),
         candidate_label: None,
@@ -834,7 +737,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         db.sync_run(&run)?;
     }
     if cancellation.is_cancelled() {
-        if run.phase3.is_some() {
+        if run.execution.is_some() {
             let failure = native::interrupted(&run);
             native::stop(
                 state,
@@ -936,9 +839,6 @@ fn print_single_result_summary(
             "  Allocation trial · {} tier\n",
             decision.selected.tier.as_str()
         );
-    } else if let Some(decision) = &run.routing {
-        println!("Agent\n  {}", harness_name(&decision.selected_harness));
-        println!("  {} selection\n", selection_label(decision));
     } else if let Some(candidate) = run.candidates.first() {
         println!("Agent\n  {}", harness_name(&candidate.harness_id));
         println!("  Chosen explicitly with --agent\n");
@@ -1498,7 +1398,7 @@ pub fn run_result(run: &RunRecord) -> RunResult {
     let exit_code = if run.outcome.waiting_on == WaitingOn::Human {
         4
     } else if run
-        .phase3
+        .execution
         .as_ref()
         .is_some_and(|p| p.failure == Some(crate::FailureKind::Deadline))
     {
@@ -1512,7 +1412,7 @@ pub fn run_result(run: &RunRecord) -> RunResult {
         }
     };
     RunResult {
-        phase3: run.phase3.clone(),
+        execution: run.execution.clone(),
         elapsed_ms: (run.completed_at.unwrap_or_else(Utc::now) - run.created_at)
             .num_milliseconds()
             .max(0),
@@ -1524,8 +1424,6 @@ pub fn run_result(run: &RunRecord) -> RunResult {
         exit_code,
         attempts: run.attempts.clone(),
         allocation: run.allocation.clone(),
-        capacity: run.capacity.clone(),
-        admission: run.admission.clone(),
         coherence: run
             .coherence
             .as_ref()
@@ -1605,22 +1503,18 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     };
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
-    if run.phase3.is_some() {
+    if run.execution.is_some() {
         return native::emit(&run, RunOutputMode::Human);
     }
-    if id.is_none()
-        && (run.routing.is_some() || run.allocation.is_some())
-        && run.candidates.len() == 1
-    {
+    if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
         let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
         let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
         print_single_result_summary(&run, "Latest task", true, human_outcome);
         return Ok(());
     }
-    let reveal = run.evaluation.is_some();
-    print_run_header(&run, reveal);
+    print_run_header(&run);
     println!("\nTask\n  {}\n", one_line(&run.task, 120));
-    print_candidates(&run, reveal);
+    print_candidates(&run);
     if let Some(line) = coherence_line(&run) {
         println!("{line}");
     }
@@ -1679,8 +1573,7 @@ pub fn history(state: &State, limit: usize) -> Result<()> {
 pub fn show(state: &State, run_id: &str) -> Result<()> {
     let resolved_run_id = state.resolve_run_id(run_id)?;
     let run = state.load_run(&resolved_run_id)?;
-    let reveal = run.evaluation.is_some();
-    print_run_header(&run, reveal);
+    print_run_header(&run);
     if let Some(decision) = &run.allocation {
         println!();
         print_allocation_details(decision);
@@ -1689,7 +1582,7 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
     println!("\nBaseline checks");
     print_checks(&run.baseline_checks);
     println!("\nCandidates");
-    print_candidates(&run, reveal);
+    print_candidates(&run);
     for candidate in &run.candidates {
         println!("Candidate {} artifacts", candidate.label);
         println!("  stdout   {}", candidate.stdout_path.display());
@@ -1698,9 +1591,6 @@ pub fn show(state: &State, run_id: &str) -> Result<()> {
         println!("  checks");
         print_checks(&candidate.checks);
         println!();
-    }
-    if let Some(evaluation) = &run.evaluation {
-        print_evaluation(evaluation);
     }
     if let Some(label) = &run.applied_candidate {
         println!("\nApplied candidate: {label}");
@@ -1755,6 +1645,19 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
+    let (run, lock) = locked_delivery(state, command)?;
+    anyhow::ensure!(
+        run.outcome.review == ReviewState::Pending,
+        "result has already been reviewed"
+    );
+    Ok((run, lock))
+}
+
+/// Lock the run and confirm it is still the delivered result `command` names.
+/// A review judges a delivered result: attached work that is still active has
+/// no patch yet (`dispatch finish` produces it), and a native run waiting on a
+/// question is answered, not reviewed.
+fn locked_delivery(state: &State, command: &ReviewCommand) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,
@@ -1775,12 +1678,13 @@ pub(crate) fn review_target(
     );
     anyhow::ensure!(
         run.outcome.lifecycle == LifecycleState::Finished
-            && run.outcome.work_result == WorkResult::Ready,
-        "review requires a delivered result"
-    );
-    anyhow::ensure!(
-        run.outcome.review == ReviewState::Pending,
-        "result has already been reviewed"
+            && run.outcome.work_result == WorkResult::Ready
+            && run
+                .execution
+                .as_ref()
+                .is_none_or(|execution| execution.final_attempt_id.is_some()),
+        "run {} has no delivered result to review; finish attached work or answer the pending question first",
+        run.id
     );
     Ok((run, lock))
 }
@@ -1813,26 +1717,7 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
 
 pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
     let (run, _lock) = review_target(state, command)?;
-    let already_auto_applied = run.outcome.application == ApplicationState::Applied
-        && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    if run.mode == RunMode::Attached {
-        record_attach_review_locked(state, run, accept, vec![], None)?;
-    } else {
-        record_allocation_feedback_locked(state, run, accept, vec![], None, true)?;
-    }
-    // A run already applied by the auto-apply policy only has its human
-    // review recorded here; applying again would be a second, redundant
-    // application and rejection must never revert the source.
-    if accept && !already_auto_applied {
-        let run = state.load_run(&command.run_id)?;
-        apply::apply_locked(
-            state,
-            run,
-            &command.candidate_id,
-            true,
-            ApplyAuthority::Human,
-        )?;
-    }
+    review_locked(state, run, accept, Vec::new(), None, true)?;
     state.load_run(&command.run_id)
 }
 
@@ -1848,19 +1733,21 @@ pub fn accept_or_reject_latest(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
     };
-    let candidate = sole_candidate(&run)?.label.clone();
+    let command = ReviewCommand {
+        run_id: run.id.clone(),
+        candidate_id: sole_candidate(&run)?.id.clone(),
+        revision: run.state_revision,
+    };
+    // One lock covers the review and the apply. A result may be reviewed
+    // again (the latest revision stands), so this does not require a
+    // pending review the way the interactive delivery does.
+    let (run, _lock) = locked_delivery(state, &command)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    if run.mode == RunMode::Attached {
-        record_attach_review(state, &run.id, accept, reasons, explanation)?;
-    } else {
-        record_allocation_feedback(state, &run.id, accept, reasons, explanation)?;
-    }
+    review_locked(state, run, accept, reasons, explanation, false)?;
     if accept {
         if already_auto_applied {
             println!("Result was already applied by auto-apply; your review is recorded.");
-        } else {
-            apply(state, &run.id, &candidate)?;
         }
     } else {
         println!("Result rejected. The source tree was not changed.");
@@ -1993,7 +1880,7 @@ pub fn refresh_request(
         .unwrap_or_default();
     // The same agent choice again; runs made before 0.4.1 without an explicit
     // choice redo the agent that produced their result.
-    let goal = run.phase3.as_ref();
+    let goal = run.execution.as_ref();
     let agent = goal
         .and_then(|goal| goal.fixed_harness.clone())
         .or_else(|| {
@@ -2179,7 +2066,7 @@ fn explain_selection(run: &RunRecord) -> Result<()> {
         return Ok(());
     }
     if let Some(agent) = run
-        .phase3
+        .execution
         .as_ref()
         .and_then(|goal| goal.fixed_harness.as_deref())
     {
@@ -2189,96 +2076,11 @@ fn explain_selection(run: &RunRecord) -> Result<()> {
         );
         return Ok(());
     }
-    let decision = run
-        .routing
-        .as_ref()
-        .context("this run has no single-agent selection to explain")?;
-    println!("Task classification");
-    println!(
-        "  language: {}",
-        decision
-            .task_features
-            .language
-            .as_deref()
-            .unwrap_or("unknown")
-    );
-    println!("  kind: {}", decision.task_features.task_kind.as_str());
-    println!("  scope: {}", decision.task_features.scope.as_str());
-    println!("\nEligible agents");
-    if decision.alternatives.is_empty() {
-        println!(
-            "  {} (explicit override)",
-            harness_name(&decision.selected_harness)
-        );
-    } else {
-        for alternative in &decision.alternatives {
-            if alternative.attempts == 0 {
-                println!(
-                    "  {}: no compatible public evidence",
-                    harness_name(&alternative.harness)
-                );
-            } else {
-                println!(
-                    "  {}: {}/{} observed benchmark results, specificity {}/3",
-                    harness_name(&alternative.harness),
-                    alternative.successes,
-                    alternative.attempts,
-                    alternative.specificity.unwrap_or(0)
-                );
-                println!(
-                    "    source: {}\n    dataset: {}\n    dataset version: {}\n    model: {}",
-                    provenance_name(alternative.source.as_deref().unwrap_or("unknown")),
-                    alternative.dataset.as_deref().unwrap_or("unknown"),
-                    alternative.dataset_version.as_deref().unwrap_or("unknown"),
-                    alternative.model.as_deref().unwrap_or("unknown")
-                );
-            }
-        }
-    }
-    println!(
-        "\nSelected agent\n  {}",
-        harness_name(&decision.selected_harness)
-    );
-    println!("Selection basis\n  {}", selection_label(decision));
-    print_selection_reason(decision);
-    // Historical decisions may predate the per-agent evidence snapshot.
-    if decision.selection_basis == SelectionBasis::Evidence && decision.alternatives.is_empty() {
-        println!("Public provenance");
-        println!("  source: {}", provenance_name(&decision.source));
-        println!("  dataset: {}", decision.dataset);
-        println!("  dataset version: {}", decision.dataset_version);
-        println!(
-            "  model: {}",
-            decision.model.as_deref().unwrap_or("unknown")
-        );
-    }
-    match decision.selection_basis {
-        SelectionBasis::Evidence => println!(
-            "\nLimitation\n  These are observed public benchmark outcomes, not confidence or a calibrated probability."
-        ),
-        SelectionBasis::Default => println!(
-            "\nLimitation\n  No compatible public evidence was used; the stable default order is not a performance claim."
-        ),
-        SelectionBasis::Override => println!(
-            "\nLimitation\n  This choice reflects your override, not a Dispatch performance comparison."
-        ),
-    }
-    Ok(())
+    bail!("this run has no single-agent selection to explain")
 }
 
 fn print_allocation_details(decision: &AllocationDecision) {
-    println!("Task classification");
-    println!(
-        "  language: {}",
-        decision
-            .task_features
-            .language
-            .as_deref()
-            .unwrap_or("unknown")
-    );
-    println!("  kind: {}", decision.task_features.task_kind.as_str());
-    println!("  scope: {}", decision.task_features.scope.as_str());
-    println!("\nSelected resource");
+    println!("Selected resource");
     println!("  provider: {}", decision.selected.provider);
     println!("  funding source: {}", decision.selected.funding_source);
     println!("  harness: {}", decision.selected.harness);
@@ -2318,23 +2120,12 @@ fn print_allocation_details(decision: &AllocationDecision) {
     }
 }
 
-fn record_allocation_feedback(
-    state: &State,
-    run_id: &str,
-    accept: bool,
-    reasons: Vec<String>,
-    explanation: Option<String>,
-) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply/evaluate operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    record_allocation_feedback_locked(state, run, accept, reasons, explanation, false)
-}
-
-fn record_allocation_feedback_locked(
+/// Record a human review of a delivered result, for every kind of work, and
+/// on accept apply it. The review is a revision (reasons and explanation
+/// verbatim), `outcome.review` and a `review.accepted|rejected` event. The
+/// caller holds the run lock from `locked_delivery`, so the review and the
+/// apply judge the same revision of the run.
+fn review_locked(
     state: &State,
     mut run: RunRecord,
     accept: bool,
@@ -2342,32 +2133,19 @@ fn record_allocation_feedback_locked(
     explanation: Option<String>,
     quiet: bool,
 ) -> Result<()> {
-    anyhow::ensure!(
-        run.mode != RunMode::Attached,
-        "run {} is attached work",
-        run.id
-    );
-    anyhow::ensure!(
-        run.phase3
-            .as_ref()
-            .is_none_or(|p| p.final_attempt_id.is_some()
-                && run.outcome.lifecycle == LifecycleState::Finished
-                && run.outcome.work_result == WorkResult::Ready),
-        "review requires a delivered candidate; use the typed answer/cancel operation for a pending question"
-    );
-    sole_candidate(&run)?;
+    // A run already applied by the auto-apply policy only has its human
+    // review recorded here; applying again would be a second, redundant
+    // application and rejection must never revert the source.
+    let already_auto_applied = run.outcome.application == ApplicationState::Applied
+        && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
-    anyhow::ensure!(
-        !reasons.iter().any(|reason| reason == "cleaner-change"),
-        "structured reason \"cleaner-change\" is only valid for candidate comparison"
-    );
     let outcome = if accept {
         RoutingHumanOutcome::Accepted
     } else {
         RoutingHumanOutcome::Rejected
     };
     let mut database = Database::open(state.db_path())?;
-    let feedback = database.save_goal_feedback(&run.id, outcome.clone(), reasons, explanation)?;
+    let feedback = database.save_goal_feedback(&run.id, outcome, reasons, explanation)?;
     run.outcome.review = if accept {
         ReviewState::Accepted
     } else {
@@ -2395,83 +2173,11 @@ fn record_allocation_feedback_locked(
         &mut run,
     )?;
     if !quiet {
-        println!(
-            "Allocation feedback recorded (revision {}).",
-            feedback.revision
-        );
+        println!("Review recorded (revision {}).", feedback.revision);
     }
-    Ok(())
-}
-
-/// Record review of attached work (part 14.6): only `outcome.review` and a
-/// `review.accepted|rejected` event, on the run's own operation lock. Never a
-/// `goal_feedback_revisions` row, never routing evidence: attached results
-/// were not selected, routed or executed by Dispatch.
-fn record_attach_review(
-    state: &State,
-    run_id: &str,
-    accept: bool,
-    reasons: Vec<String>,
-    explanation: Option<String>,
-) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply/evaluate operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    record_attach_review_locked(state, run, accept, reasons, explanation)
-}
-
-fn record_attach_review_locked(
-    state: &State,
-    mut run: RunRecord,
-    accept: bool,
-    reasons: Vec<String>,
-    explanation: Option<String>,
-) -> Result<()> {
-    anyhow::ensure!(
-        run.mode == RunMode::Attached,
-        "run {} is not attached work",
-        run.id
-    );
-    // A review is a judgment of a delivered result: attached work that is
-    // still active has no Δ to judge yet (`dispatch finish` produces it).
-    anyhow::ensure!(
-        run.outcome.lifecycle == LifecycleState::Finished
-            && run.outcome.work_result == WorkResult::Ready,
-        "review requires a delivered result; finish attached work {} first",
-        run.id
-    );
-    sole_candidate(&run)?;
-    let reasons = normalize_reasons(reasons)?;
-    let database = Database::open(state.db_path())?;
-    run.outcome.review = if accept {
-        ReviewState::Accepted
-    } else {
-        ReviewState::Rejected
-    };
-    persist_event(
-        state,
-        &database,
-        EventRecord {
-            run_id: run.id.clone(),
-            candidate_label: run
-                .candidates
-                .first()
-                .map(|candidate| candidate.label.clone()),
-            event_type: if accept {
-                "review.accepted"
-            } else {
-                "review.rejected"
-            }
-            .into(),
-            timestamp: Utc::now(),
-            payload: serde_json::json!({"reasons": reasons, "explanation": explanation}),
-            ..EventRecord::default()
-        },
-        &mut run,
-    )?;
+    if accept && !already_auto_applied {
+        apply::apply_locked(state, run, quiet, ApplyAuthority::Human)?;
+    }
     Ok(())
 }
 
@@ -2538,9 +2244,8 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
         let run = state.load_run(&projected.id)?;
         if run.source_path != source_path
             || run.candidates.len() != 1
-            || (run.routing.is_none()
-                && run.allocation.is_none()
-                && run.phase3.is_none()
+            || (run.allocation.is_none()
+                && run.execution.is_none()
                 && run.mode != RunMode::Attached)
         {
             continue;
@@ -2555,49 +2260,25 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
     )
 }
 
-fn provenance_name(source: &str) -> &str {
-    if source.contains("harbor") {
-        "Harbor"
-    } else if source.contains("swe-bench") {
-        "SWE-bench"
-    } else {
-        source
-    }
-}
-
-fn print_run_header(run: &RunRecord, reveal: bool) {
+fn print_run_header(run: &RunRecord) {
     println!("RUN {}", run.id);
     println!("Status           {}", run.status.as_str());
     println!("Source           {}", run.source_path.display());
     println!("Source type      {}", run.source_kind.as_str());
     println!("Baseline         {}", run.baseline_commit);
-    if reveal {
-        println!("Harness mapping  revealed");
-    } else {
-        println!("Harness mapping  blind");
-    }
-    if let Some(decision) = &run.routing {
-        println!();
-        print_routing_decision(decision);
-    }
     if let Some(decision) = &run.allocation {
         println!();
         print_allocation_decision(decision);
     }
 }
 
-fn print_candidates(run: &RunRecord, reveal: bool) {
+fn print_candidates(run: &RunRecord) {
     if run.candidates.is_empty() {
         println!("No candidates recorded.");
         return;
     }
     for candidate in &run.candidates {
-        let title = if reveal {
-            format!("Candidate {} ({})", candidate.label, candidate.harness_id)
-        } else {
-            format!("Candidate {}", candidate.label)
-        };
-        println!("{title}");
+        println!("Candidate {} ({})", candidate.label, candidate.harness_id);
         println!("  Status          {}", candidate.status.as_str());
         println!("  Verification    {}", verification_summary(candidate));
         println!(
@@ -2625,7 +2306,7 @@ fn print_candidates(run: &RunRecord, reveal: bool) {
             "  Diff             +{} / -{}",
             candidate.diff_stats.lines_added, candidate.diff_stats.lines_removed
         );
-        if reveal && let Some(error) = &candidate.error {
+        if let Some(error) = &candidate.error {
             println!("  Error           {}", one_line(error, 100));
         }
         println!();
@@ -2656,26 +2337,6 @@ fn print_diff_stats(candidate: &CandidateRecord) {
         "+{} / -{}",
         candidate.diff_stats.lines_added, candidate.diff_stats.lines_removed
     );
-}
-
-fn print_evaluation(evaluation: &EvaluationRecord) {
-    let outcome = evaluation_outcome(&evaluation.outcome);
-    println!("\nEvaluation");
-    println!("  Outcome         {outcome}");
-    if !evaluation.reasons.is_empty() {
-        println!("  Reasons         {}", evaluation.reasons.join(", "));
-    }
-    if let Some(explanation) = &evaluation.explanation {
-        println!("  Explanation:\n{}", indent(explanation, "    "));
-    }
-}
-
-fn evaluation_outcome(outcome: &EvaluationOutcome) -> String {
-    match outcome {
-        EvaluationOutcome::Candidate(label) => format!("Candidate {label}"),
-        EvaluationOutcome::Tie => "Tie".into(),
-        EvaluationOutcome::Neither => "Neither".into(),
-    }
 }
 
 fn verification_summary(candidate: &CandidateRecord) -> &'static str {
@@ -2770,14 +2431,6 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
             }
         }
     }
-}
-
-fn indent(value: &str, prefix: &str) -> String {
-    value
-        .lines()
-        .map(|line| format!("{prefix}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[cfg(test)]
@@ -3029,15 +2682,16 @@ mod tests {
         let reasons = normalize_reasons(vec![
             " Correctness ".into(),
             "correctness".into(),
-            "cleaner-change".into(),
+            "tests".into(),
         ])
         .unwrap();
-        assert_eq!(reasons, vec!["correctness", "cleaner-change"]);
+        assert_eq!(reasons, vec!["correctness", "tests"]);
         let error = normalize_reasons(vec!["vibes".into()])
             .unwrap_err()
             .to_string();
         assert!(error.contains("valid reasons:"));
-        assert!(error.contains("edge-cases, cleaner-change"));
+        assert!(error.contains("edge-cases, performance"));
+        assert!(normalize_reasons(vec!["cleaner-change".into()]).is_err());
     }
 
     #[test]

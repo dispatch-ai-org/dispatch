@@ -143,7 +143,7 @@ try:
             # One selection rule: the first available configured profile.
             assert run['allocation']['selected']['resolved_model']=='light-model'
             assert len(run['attempts'])==1
-        if scenario=='clarify':assert len(run['attempts'])==2 and len(run['phase3']['questions'])==1
+        if scenario=='clarify':assert len(run['attempts'])==2 and len(run['execution']['questions'])==1
         if scenario in ('cancel','active-eof','hangup'):assert run['outcome']['work_result'] in ('cancelled','interrupted')
         elif scenario=='drift':assert run['outcome']['application']=='blocked_by_source_drift'
         elif scenario in ('reject','recovery','concurrent','natural'):assert run['outcome']['review']=='rejected'

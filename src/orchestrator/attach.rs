@@ -258,7 +258,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     };
 
     let mut run = RunRecord {
-        phase3: None,
+        execution: None,
         id: run_id.clone(),
         task: task.clone(),
         exact_prompt: task,
@@ -301,14 +301,11 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         baseline_checks: Vec::new(),
         candidates: vec![candidate],
         attempts: vec![attempt],
-        routing: None,
         allocation: None,
-        capacity: None,
-        admission: None,
         coherence: None,
-        evaluation: None,
         applied_candidate: None,
         attachment: Some(attachment),
+        historical: Default::default(),
     };
 
     let created_event = EventRecord {

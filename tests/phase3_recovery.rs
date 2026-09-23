@@ -155,7 +155,7 @@ test "$(cat result.txt)" = 'ok'
         Ok(self.answer_command(result, revision).output()?)
     }
     fn answer_command(&self, result: &Value, revision: &str) -> Command {
-        let q = &result["phase3"]["questions"][0];
+        let q = &result["execution"]["questions"][0];
         let mut command = self.command();
         command.args([
             "answer",
@@ -189,8 +189,8 @@ test "$(cat result.txt)" = 'ok'
             serde_json::to_value(&after.attempts)?,
             serde_json::to_value(&before.attempts)?
         );
-        let policy = after.phase3.as_ref().unwrap();
-        let old_policy = before.phase3.as_ref().unwrap();
+        let policy = after.execution.as_ref().unwrap();
+        let old_policy = before.execution.as_ref().unwrap();
         assert_eq!(policy.questions, old_policy.questions);
         assert_eq!(policy.deadline_at, old_policy.deadline_at);
         assert_eq!(policy.final_attempt_id, old_policy.final_attempt_id);
@@ -222,7 +222,7 @@ fn initial_success_selects_first_without_recovery() -> Result<()> {
     assert!(output.status.success());
     assert_eq!(f.count(), 1);
     assert_eq!(r["attempts"].as_array().unwrap().len(), 1);
-    assert_eq!(r["phase3"]["final_attempt_id"], r["attempts"][0]["id"]);
+    assert_eq!(r["execution"]["final_attempt_id"], r["attempts"][0]["id"]);
     assert_eq!(r["outcome"]["verification"], "passed");
     f.no_leases()
 }
@@ -264,7 +264,7 @@ fn baseline_failure_and_harness_failure_do_not_escalate() -> Result<()> {
         assert!(!o.status.success());
         assert_eq!(f.count(), 1);
         assert_eq!(
-            r["phase3"]["failure"],
+            r["execution"]["failure"],
             if baseline {
                 "baseline_infrastructure"
             } else {
@@ -286,8 +286,8 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     f.no_leases()?;
     let before = f.loaded(r["run_id"].as_str().unwrap())?;
     assert_eq!(
-        serde_json::to_value(before.phase3.as_ref().unwrap().questions.clone())?,
-        r["phase3"]["questions"]
+        serde_json::to_value(before.execution.as_ref().unwrap().questions.clone())?,
+        r["execution"]["questions"]
     );
     assert!(!f.answer(&r, "0")?.status.success());
     assert_eq!(f.count(), 1);
@@ -295,7 +295,7 @@ fn clarification_answer_is_durable_released_and_single_use() -> Result<()> {
     let result = Fixture::result(&answered)?;
     assert!(answered.status.success(), "{result}");
     assert_eq!(f.count(), 2);
-    assert_eq!(result["phase3"]["questions"][0]["state"], "answered");
+    assert_eq!(result["execution"]["questions"][0]["state"], "answered");
     assert_eq!(
         result["attempts"][1]["detail"]["reason"],
         "clarification_answer"
@@ -317,7 +317,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
     let f = Fixture::new("clarify")?;
     let r = Fixture::result(&f.run(&[])?)?;
     let id = r["run_id"].as_str().unwrap();
-    let q = r["phase3"]["questions"][0]["id"].as_str().unwrap();
+    let q = r["execution"]["questions"][0]["id"].as_str().unwrap();
     let mut stale = f.loaded(id)?;
     let cancel = f
         .command()
@@ -326,7 +326,7 @@ fn cancelled_question_rejects_answers_and_late_events() -> Result<()> {
     assert!(cancel.status.success());
     let cancelled = Fixture::result(&cancel)?;
     assert_eq!(cancelled["outcome"]["work_result"], "cancelled");
-    assert_eq!(cancelled["phase3"]["questions"][0]["state"], "cancelled");
+    assert_eq!(cancelled["execution"]["questions"][0]["state"], "cancelled");
     assert!(!f.answer(&r, "1")?.status.success());
     let current = f.loaded(id)?;
     stale.state_revision = current.state_revision;
@@ -358,11 +358,11 @@ fn checkpoint_continuation_cannot_create_third_invocation_and_malformed_stops() 
         let f = Fixture::new(mode)?;
         let first = Fixture::result(&f.run(&[])?)?;
         if mode == "malformed" {
-            assert_eq!(first["phase3"]["failure"], "unsupported_checkpoint");
+            assert_eq!(first["execution"]["failure"], "unsupported_checkpoint");
             assert_eq!(f.count(), 1);
         } else {
             let second = Fixture::result(&f.answer(&first, "1")?)?;
-            assert_eq!(second["phase3"]["failure"], "invocation_limit");
+            assert_eq!(second["execution"]["failure"], "invocation_limit");
             assert_eq!(f.count(), 2);
             assert_ne!(second["outcome"]["waiting_on"], "human");
         }
@@ -419,14 +419,14 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
 fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     let f = Fixture::new("timeout")?;
     let r = Fixture::result(&f.run(&["--timeout", "5"])?)?;
-    assert_eq!(r["phase3"]["failure"], "deadline");
+    assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
     f.no_leases()?;
     let g = Fixture::new("clarify")?;
     let r = Fixture::result(&g.run(&["--timeout", "5"])?)?;
     thread::sleep(Duration::from_secs(5));
     let answer = Fixture::result(&g.answer(&r, "1")?)?;
-    assert_eq!(answer["phase3"]["failure"], "deadline");
+    assert_eq!(answer["execution"]["failure"], "deadline");
     assert_eq!(g.count(), 1);
     g.no_leases()
 }
@@ -437,7 +437,7 @@ fn question_commands_reject_wrong_identity_generation_and_local_actor() -> Resul
     let r = Fixture::result(&f.run(&[])?)?;
     let other = Fixture::result(&f.run(&[])?)?;
     let id = r["run_id"].as_str().unwrap();
-    let q = r["phase3"]["questions"][0]["id"].as_str().unwrap();
+    let q = r["execution"]["questions"][0]["id"].as_str().unwrap();
     for (run, question, generation) in [
         (id, "wrong-question", "1"),
         (other["run_id"].as_str().unwrap(), q, "1"),
@@ -461,12 +461,12 @@ fn question_commands_reject_wrong_identity_generation_and_local_actor() -> Resul
         assert!(!output.status.success());
     }
     assert_eq!(
-        f.loaded(id)?.phase3.unwrap().questions[0].state,
+        f.loaded(id)?.execution.unwrap().questions[0].state,
         dispatch::QuestionState::Pending
     );
     // Current local authority comes from persisted owner identity, not a CLI actor parameter.
     let mut run = f.loaded(id)?;
-    run.phase3.as_mut().unwrap().owner_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+    run.execution.as_mut().unwrap().owner_uid = unsafe { libc::geteuid() }.wrapping_add(1);
     Database::open(f.state.join("dispatch.db"))?.sync_run(&run)?;
     let denied = f.answer(&r, "1")?;
     assert!(!denied.status.success());
@@ -502,8 +502,8 @@ fn continuation_rechecks_configuration_and_shared_funding() -> Result<()> {
         let result = Fixture::result(&output)?;
         assert!(!output.status.success());
         assert_eq!(f.count(), 1);
-        assert_eq!(result["phase3"]["failure"], "authorization");
-        assert_eq!(result["phase3"]["questions"][0]["state"], "answered");
+        assert_eq!(result["execution"]["failure"], "authorization");
+        assert_eq!(result["execution"]["questions"][0]["state"], "answered");
         f.no_leases()?;
     }
     Ok(())
@@ -528,13 +528,13 @@ fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() 
         let mut stale = current.clone();
         stale.state_revision += 100;
         stale.outcome.lifecycle = dispatch::LifecycleState::Working;
-        stale.phase3.as_mut().unwrap().questions.clear();
+        stale.execution.as_mut().unwrap().questions.clear();
         stale.attempts.clear();
         state.save_run(&stale)?;
         let output = f.command().args(["status", id, "--json"]).output()?;
         let status = Fixture::result(&output)?;
         assert_eq!(status["attempts"], result["attempts"]);
-        assert_eq!(status["phase3"], result["phase3"]);
+        assert_eq!(status["execution"], result["execution"]);
         assert_eq!(status["outcome"], result["outcome"]);
         assert_eq!(f.count(), if mode == "recovery" { 2 } else { 1 });
         f.no_leases()?;
@@ -609,7 +609,10 @@ fn verification_infrastructure_failure_does_not_trigger_recovery() -> Result<()>
     )?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 1);
-    assert_eq!(result["phase3"]["failure"], "verification_infrastructure");
+    assert_eq!(
+        result["execution"]["failure"],
+        "verification_infrastructure"
+    );
     assert_eq!(
         result["attempts"][0]["detail"]["failure"],
         "verification_infrastructure"
@@ -644,7 +647,7 @@ fn delivery_applies_from_original_baseline_and_pending_question_is_not_reviewabl
     }
     assert_eq!(
         g.loaded(pending["run_id"].as_str().unwrap())?
-            .phase3
+            .execution
             .unwrap()
             .questions[0]
             .state,
@@ -659,7 +662,7 @@ fn unavailable_baseline_tool_stops_before_model_invocation() -> Result<()> {
     executable(&f.root.join("verify"), "#!/bin/sh\nexit 127\n")?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 0);
-    assert_eq!(result["phase3"]["failure"], "baseline_infrastructure");
+    assert_eq!(result["execution"]["failure"], "baseline_infrastructure");
     f.no_leases()
 }
 
@@ -671,9 +674,14 @@ fn checkpoint_requires_clean_exit_and_a_final_agent_report() -> Result<()> {
         let result = Fixture::result(&output)?;
         assert!(!output.status.success());
         assert_eq!(f.count(), 1);
-        assert!(result["phase3"]["questions"].as_array().unwrap().is_empty());
+        assert!(
+            result["execution"]["questions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            result["phase3"]["failure"],
+            result["execution"]["failure"],
             if mode == "checkpoint-crash" {
                 "harness_process"
             } else {
@@ -692,7 +700,7 @@ fn signal_killed_verification_is_unknown_and_never_recovers() -> Result<()> {
     f.checks(&["if [ \"$(cat result.txt)\" = bad ]; then kill -KILL $$; fi"])?;
     let result = Fixture::result(&f.run(&[])?)?;
     assert_eq!(f.count(), 1);
-    assert_eq!(result["phase3"]["failure"], "verification_unknown");
+    assert_eq!(result["execution"]["failure"], "verification_unknown");
     assert_eq!(
         result["attempts"][0]["detail"]["failure"],
         "verification_unknown"
@@ -712,7 +720,7 @@ fn any_infrastructure_or_unknown_check_blocks_other_target_failures() -> Result<
         let result = Fixture::result(&f.run(&[])?)?;
         assert_eq!(f.count(), 1);
         assert_eq!(
-            result["phase3"]["failure"],
+            result["execution"]["failure"],
             if extra == "exit 127" {
                 "verification_infrastructure"
             } else {
@@ -759,12 +767,12 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
         let result = Fixture::result(&f.run(&[])?)?;
         assert_eq!(result["outcome"]["waiting_on"] == "human", accepted);
         assert_eq!(
-            result["phase3"]["questions"].as_array().unwrap().len(),
+            result["execution"]["questions"].as_array().unwrap().len(),
             usize::from(accepted)
         );
         if !accepted {
             assert_eq!(
-                result["phase3"]["failure"],
+                result["execution"]["failure"],
                 if exit == 0 {
                     "unsupported_checkpoint"
                 } else {
@@ -836,7 +844,7 @@ fn committed_attempt_owner_fixture() -> Result<()> {
     run.outcome.lifecycle = dispatch::LifecycleState::Working;
     run.outcome.work_result = dispatch::WorkResult::Pending;
     run.outcome.review = dispatch::ReviewState::NotRequested;
-    let policy = run.phase3.as_mut().unwrap();
+    let policy = run.execution.as_mut().unwrap();
     policy.supervisor = Some(dispatch::process::ProcessIdentity::current());
     policy.final_attempt_id = None;
     policy.failure = None;
@@ -936,11 +944,11 @@ fn answer_setup_error_records_interruption_and_preserves_the_committed_answer() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("failed to parse resource config"));
     let stopped = f.loaded(id)?;
     assert_eq!(
-        stopped.phase3.as_ref().unwrap().questions[0].state,
+        stopped.execution.as_ref().unwrap().questions[0].state,
         dispatch::QuestionState::Answered
     );
     assert_eq!(
-        stopped.phase3.as_ref().unwrap().questions[0]
+        stopped.execution.as_ref().unwrap().questions[0]
             .answer
             .as_deref(),
         Some("blue")
@@ -961,7 +969,7 @@ fn reload_requires_positive_owner_and_cleanup_evidence() -> Result<()> {
         let mut run = f.loaded(id)?;
         run.outcome.lifecycle = dispatch::LifecycleState::Working;
         run.outcome.work_result = dispatch::WorkResult::Pending;
-        run.phase3.as_mut().unwrap().supervisor = match evidence {
+        run.execution.as_mut().unwrap().supervisor = match evidence {
             "live" => Some(dispatch::process::ProcessIdentity::current()),
             "missing" | "legacy" => None,
             _ => Some(dispatch::process::process_identity(u32::MAX)),

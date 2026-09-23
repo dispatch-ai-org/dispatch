@@ -16,7 +16,7 @@ use anyhow::Result;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::{find_candidate, persist_event, sole_candidate, transition};
+use super::{persist_event, sole_candidate, transition};
 use crate::{
     AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
     LifecycleState, ReviewState, RunPhase, RunRecord, RunStatus, Validity, VerificationState,
@@ -244,24 +244,13 @@ fn persist_application_failed(
     Ok(run)
 }
 
-pub fn apply(state: &State, run_id: &str, candidate_label: &str) -> Result<()> {
-    let resolved_run_id = state.resolve_run_id(run_id)?;
-    let _run_lock = OperationLock::acquire(
-        &state.run_dir(&resolved_run_id).join(".operation.lock"),
-        "another compare/apply operation is already using this run",
-    )?;
-    let run = state.load_run(&resolved_run_id)?;
-    apply_locked(state, run, candidate_label, false, ApplyAuthority::Human)
-}
-
-/// Apply `candidate_label` of `run` onto the source under the per-source lock.
+/// Apply the run's result onto the source under the per-source lock.
 /// The caller holds the run's operation lock. `authority` names who is
 /// applying: only a human decision marks the review as accepted; a policy
 /// application leaves the review exactly as it was.
 pub(super) fn apply_locked(
     state: &State,
     mut run: RunRecord,
-    candidate_label: &str,
     quiet: bool,
     authority: ApplyAuthority,
 ) -> Result<()> {
@@ -279,8 +268,7 @@ pub(super) fn apply_locked(
         "run {} is a planned goal from an earlier Dispatch whose delivery can no longer be verified; refresh it instead",
         run.id
     );
-    let candidate = find_candidate(&run, candidate_label)?;
-    let normalized_label = candidate.label.clone();
+    let normalized_label = sole_candidate(&run)?.label.clone();
     let _source_lock = OperationLock::acquire(
         &source_lock_path(state, &run),
         "another apply operation is already modifying this source",
@@ -484,7 +472,7 @@ fn decide(
 /// Planned goals (removed in 0.4.1) delivered through an integrity chain this
 /// version no longer verifies, so their results are never applied.
 fn was_planned(run: &RunRecord) -> bool {
-    run.phase3
+    run.execution
         .as_ref()
         .is_some_and(|goal| goal.provenance == "planned_policy_chain")
 }

@@ -42,7 +42,7 @@ impl Drop for DeadlineGuard {
 }
 
 fn expects_execution(run: &RunRecord) -> bool {
-    run.phase3.is_some()
+    run.execution.is_some()
         && run.outcome.lifecycle != LifecycleState::Finished
         && run.outcome.waiting_on != WaitingOn::Human
         && run.outcome.work_result != WorkResult::Cancelled
@@ -67,7 +67,7 @@ fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str
     } else {
         WaitingOn::None
     };
-    run.phase3
+    run.execution
         .as_mut()
         .unwrap()
         .failure
@@ -132,7 +132,7 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
     };
     *run = current;
     // A run recorded without a supervisor is never presumed abandoned.
-    let supervisor = run.phase3.as_ref().and_then(|p| p.supervisor.clone());
+    let supervisor = run.execution.as_ref().and_then(|p| p.supervisor.clone());
     let gone = supervisor.as_ref().is_some_and(|owner| {
         matches!(
             crate::process::identity_state(owner),
@@ -186,7 +186,7 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
         ),
         RunOutputMode::Human => {
             if let Some(q) = run
-                .phase3
+                .execution
                 .as_ref()
                 .and_then(|p| p.questions.last())
                 .filter(|q| q.state == QuestionState::Pending)
@@ -211,7 +211,7 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
             } else {
                 println!(
                     "Work stopped: {:?}",
-                    run.phase3.as_ref().and_then(|p| p.failure)
+                    run.execution.as_ref().and_then(|p| p.failure)
                 );
             }
             for attempt in &run.attempts {
@@ -232,7 +232,7 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
             println!(
                 "{} attempt(s); final attempt: {}",
                 run.attempts.len(),
-                run.phase3
+                run.execution
                     .as_ref()
                     .and_then(|p| p.final_attempt_id.as_deref())
                     .unwrap_or("none")
@@ -252,7 +252,7 @@ pub(super) fn stop(
     if RUN_OUTPUT_MODE.load(Ordering::Relaxed) != RunOutputMode::Silent.code() {
         eprintln!("{reason}");
     }
-    run.phase3.as_mut().unwrap().failure = Some(failure);
+    run.execution.as_mut().unwrap().failure = Some(failure);
     run.completed_at = Some(Utc::now());
     run.status = match failure {
         FailureKind::CapacityAdmission => RunStatus::Deferred,
@@ -298,7 +298,7 @@ pub(super) fn stop(
 }
 
 pub(super) fn interrupted(run: &RunRecord) -> FailureKind {
-    if Utc::now() >= run.phase3.as_ref().unwrap().deadline_at {
+    if Utc::now() >= run.execution.as_ref().unwrap().deadline_at {
         FailureKind::Deadline
     } else {
         FailureKind::Cancelled
@@ -440,7 +440,7 @@ fn prepare(
         prompt.push_str(&format!("\n\n{}", diagnostics(parent)));
     }
     if let Some(question) = run
-        .phase3
+        .execution
         .as_ref()
         .unwrap()
         .questions
@@ -469,7 +469,7 @@ pub(super) fn prepare_input(
     // A profile-bound attempt runs the profile's resource; an explicit agent
     // runs its project configuration.
     let goal = run
-        .phase3
+        .execution
         .as_ref()
         .context("native run without execution policy")?;
     let (harness, model, effort) = match &decision {
@@ -611,7 +611,8 @@ async fn drive_inner(
     };
     let mut reason = (!initial).then(|| "clarification_answer".to_owned());
     'attempt: {
-        if cancellation.is_cancelled() || Utc::now() >= run.phase3.as_ref().unwrap().deadline_at {
+        if cancellation.is_cancelled() || Utc::now() >= run.execution.as_ref().unwrap().deadline_at
+        {
             let failure = interrupted(&run);
             stop(
                 state,
@@ -622,7 +623,7 @@ async fn drive_inner(
             )?;
             break 'attempt;
         }
-        if run.attempts.len() >= run.phase3.as_ref().unwrap().max_invocations.min(2) as usize {
+        if run.attempts.len() >= run.execution.as_ref().unwrap().max_invocations.min(2) as usize {
             stop(
                 state,
                 db,
@@ -682,8 +683,8 @@ async fn drive_inner(
         if let Some(decision) = &decision {
             config.harnesses.bind(&decision.selected, &resources);
         }
-        run.phase3.as_mut().unwrap().final_attempt_id = None;
-        run.phase3.as_mut().unwrap().failure = None;
+        run.execution.as_mut().unwrap().final_attempt_id = None;
+        run.execution.as_mut().unwrap().failure = None;
         let candidate = prepare(state, &mut run, decision.clone(), reason.take())?;
         run.status = RunStatus::Running;
         run.completed_at = None;
@@ -795,7 +796,7 @@ async fn drive_inner(
         } else if execution.checkpoint.as_ref().is_some_and(|r| r.is_err()) {
             Some(FailureKind::UnsupportedCheckpoint)
         } else if execution.checkpoint.is_some()
-            && run.attempts.len() >= run.phase3.as_ref().unwrap().max_invocations.min(2) as usize
+            && run.attempts.len() >= run.execution.as_ref().unwrap().max_invocations.min(2) as usize
         {
             Some(FailureKind::InvocationLimit)
         } else {
@@ -843,17 +844,17 @@ async fn drive_inner(
                 actor_uid: None,
                 actor: None,
             };
-            run.phase3.as_mut().unwrap().questions.push(question);
+            run.execution.as_mut().unwrap().questions.push(question);
             run.outcome.lifecycle = LifecycleState::Waiting;
             run.outcome.waiting_on = WaitingOn::Human;
             run.outcome.work_result = WorkResult::Pending;
             run.outcome.verification = VerificationState::NotRun;
             let payload =
-                serde_json::json!({"question":run.phase3.as_ref().unwrap().questions.last()});
+                serde_json::json!({"question":run.execution.as_ref().unwrap().questions.last()});
             transition(state, db, &mut run, "question.pending", payload)?;
             break 'attempt;
         }
-        let policy = run.phase3.as_mut().unwrap();
+        let policy = run.execution.as_mut().unwrap();
         policy.final_attempt_id = Some(final_id);
         policy.contributing_attempts = run.attempts.iter().map(|a| a.id.clone()).collect();
         if run.attempts.len() > 1 {
@@ -867,7 +868,7 @@ async fn drive_inner(
             delivery.token_semantics = Some("see_per_attempt".into());
         }
         refresh_outcome(&mut run);
-        run.phase3.as_mut().unwrap().failure = failure;
+        run.execution.as_mut().unwrap().failure = failure;
         run.completed_at = Some(Utc::now());
         run.status = if run.outcome.work_result == WorkResult::Ready {
             RunStatus::ReadyForEvaluation
@@ -904,7 +905,7 @@ fn resolve(
     )?;
     let mut run = state.load_run(&id)?;
     let policy = run
-        .phase3
+        .execution
         .as_mut()
         .context("run has no clarification policy")?;
     #[cfg(unix)]
@@ -995,7 +996,7 @@ pub async fn answer_question(
     let (config, resources) = finish_error(state, &db, &run.id, setup)?;
     let cancellation = operation_cancellation();
     let _signals = SignalListener::install(cancellation.clone());
-    let _deadline = DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
+    let _deadline = DeadlineGuard::new(run.execution.as_ref(), cancellation.clone());
     drive(state, &mut db, run, config, resources, cancellation, output).await
 }
 

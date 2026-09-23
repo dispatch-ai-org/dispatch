@@ -110,7 +110,7 @@ impl State {
             .flatten();
         let mut run = match (projected, committed) {
             (Some(projected), Some(committed)) => {
-                if committed.phase3.is_some()
+                if committed.execution.is_some()
                     || committed.state_revision >= projected.state_revision
                 {
                     self.save_run(&committed)?;
@@ -132,7 +132,7 @@ impl State {
         );
         if let Some(database) = database {
             crate::orchestrator::native::repair_abandoned(self, &database, &mut run)?;
-            if let Some(policy) = &mut run.phase3 {
+            if let Some(policy) = &mut run.execution {
                 policy.questions = database.questions_for_run(&id)?;
             }
             self.repair_event_projection(&id, &database.events_for_run(&id)?)?;

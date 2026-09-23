@@ -336,3 +336,23 @@ again at admission. After S6b it must run immediately before spawn.
   apply, verbatim explanation, stale refusal); `routing_observations.rs` and
   the comparison-only routed test were removed; `routed_run.rs` is now
   `unsafe_local.rs`. `cargo test`: 430 passed, 0 failed.
+- 2026-09-23 — S8a: one human-review record and a single-lock accept. Every
+  review, attached work included, is one `goal_feedback_revisions` revision
+  (reasons, verbatim explanation), `outcome.review` and a
+  `review.accepted|rejected` event; the attached-only recorder is gone and
+  `cleaner-change` (a comparison reason) is no longer accepted. `accept`
+  records the review and applies under one hold of the run's operation lock,
+  closing the window in which the lock was released between the two; the CLI
+  may still revise a review (the latest revision stands), the review menu
+  still requires a pending one. `apply_locked` applies the run's sole result
+  and the `apply()` wrapper is deleted. `RunRecord` loses `routing`,
+  `capacity`, `admission` and `evaluation`; fields written by earlier
+  versions are kept verbatim in a flattened `historical` map, so rewriting an
+  older run's metadata loses nothing. `RunResult`/`AttemptDetail` lose their
+  capacity, admission and planning fields; `AllocationDecision` loses the
+  always-empty `task_features`. `phase3` is now `execution` in metadata and
+  `--json` output (older `phase3` still loads). The projection writer no
+  longer writes `routing_decision_json` or deletes blind-evaluation rows,
+  which remain as historical human judgments; `show`/`status` lost the
+  routed-run and blind-evaluation displays. `cargo test`: 428 passed,
+  0 failed.

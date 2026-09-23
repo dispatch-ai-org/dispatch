@@ -496,7 +496,7 @@ fn stopped_run_cannot_be_refreshed_and_a_fresh_run_still_works() -> Result<()> {
     wait_until(|| Ok(!alive(pid)))?;
     let output = child.output()?;
     let result = Fixture::result(&output)?;
-    assert_eq!(result["phase3"]["failure"], "stale_work", "{result}");
+    assert_eq!(result["execution"]["failure"], "stale_work", "{result}");
     let old = result["run_id"].as_str().unwrap().to_owned();
     assert_eq!(
         f.loaded(&old)?.status,

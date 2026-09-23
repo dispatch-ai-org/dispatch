@@ -1665,7 +1665,7 @@ mod tests {
         candidate: CandidateRecord,
     ) -> RunRecord {
         RunRecord {
-            phase3: None,
+            execution: None,
             id: "test-run".into(),
             task: "test task".into(),
             exact_prompt: "test prompt".into(),
@@ -1698,14 +1698,11 @@ mod tests {
             baseline_checks: Vec::new(),
             candidates: vec![candidate],
             attempts: Vec::new(),
-            routing: None,
             allocation: None,
-            capacity: None,
-            admission: None,
             coherence: None,
-            evaluation: None,
             applied_candidate: None,
             attachment: None,
+            historical: Default::default(),
         }
     }
 

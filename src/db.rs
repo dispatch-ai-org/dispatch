@@ -12,8 +12,8 @@ use rusqlite::{
 };
 
 use crate::models::{
-    AttemptRecord, CandidateRecord, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
-    GoalFeedbackRevision, RoutingHumanOutcome, RunRecord,
+    AttemptRecord, CandidateRecord, CheckResult, EventRecord, GoalFeedbackRevision,
+    RoutingHumanOutcome, RunRecord,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -1115,12 +1115,6 @@ impl Database {
         run: &RunRecord,
         effect: impl FnOnce(&Transaction<'_>) -> Result<()>,
     ) -> Result<()> {
-        let routing_decision_json = run
-            .routing
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize routing decision")?;
         let outcome_json =
             serde_json::to_string(&run.outcome).context("failed to serialize run outcome")?;
         let transaction = self
@@ -1194,12 +1188,12 @@ impl Database {
                     created_at, completed_at, dispatch_version, os, architecture,
                     execution_backend, timeout_secs, cpus, memory, max_parallel,
                     docker_image, resource_limits_enforced, unsafe_local,
-                    forwarded_env_json, applied_candidate, routing_decision_json,
+                    forwarded_env_json, applied_candidate,
                     run_mode, state_revision, outcome_json, run_projection_json
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23,
-                    ?24, ?25, ?26, ?27
+                    ?24, ?25, ?26
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     source_id = excluded.source_id,
@@ -1223,7 +1217,6 @@ impl Database {
                     unsafe_local = excluded.unsafe_local,
                     forwarded_env_json = excluded.forwarded_env_json,
                     applied_candidate = excluded.applied_candidate,
-                    routing_decision_json = excluded.routing_decision_json,
                     run_mode = excluded.run_mode,
                     state_revision = excluded.state_revision,
                     outcome_json = excluded.outcome_json,
@@ -1252,7 +1245,6 @@ impl Database {
                 serde_json::to_string(&run.environment.forwarded_env)
                     .context("failed to serialize forwarded environment names")?,
                 run.applied_candidate,
-                routing_decision_json,
                 run.mode.as_str(),
                 unsigned(run.state_revision, "run state revision")?,
                 outcome_json,
@@ -1284,7 +1276,9 @@ impl Database {
 
         // Evaluations reference candidates, so remove the old evaluation before
         // replacing a run's candidate set. Reasons cascade from the evaluation.
-        transaction.execute("DELETE FROM evaluations WHERE run_id = ?1", [&run.id])?;
+        // Blind evaluations from earlier versions are historical human
+        // judgments; nothing writes them any more and a projection rewrite
+        // must not delete them.
         transaction.execute("DELETE FROM checks WHERE run_id = ?1", [&run.id])?;
         transaction.execute("DELETE FROM artifacts WHERE run_id = ?1", [&run.id])?;
         transaction.execute("DELETE FROM attempts WHERE run_id = ?1 AND (details_json IS NULL OR completed_at IS NULL)", [&run.id])?;
@@ -1305,7 +1299,7 @@ impl Database {
             "UPDATE runs SET delivery_attempt_id=?2 WHERE id=?1",
             params![
                 run.id,
-                run.phase3
+                run.execution
                     .as_ref()
                     .and_then(|p| p.final_attempt_id.as_deref())
             ],
@@ -1332,10 +1326,6 @@ impl Database {
         for check in &run.baseline_checks {
             insert_check(&transaction, &run.id, None, check)?;
             insert_check_artifacts(&transaction, &run.id, None, check)?;
-        }
-
-        if let Some(evaluation) = &run.evaluation {
-            insert_evaluation(&transaction, &run.id, evaluation, false)?;
         }
 
         effect(&transaction)?;
@@ -1601,12 +1591,6 @@ impl Database {
             .context("failed to replay run events")
     }
 
-    pub fn save_evaluation(&mut self, run_id: &str, evaluation: &EvaluationRecord) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        insert_evaluation(&transaction, run_id, evaluation, true)?;
-        transaction.commit().context("failed to commit evaluation")
-    }
-
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1863,76 +1847,6 @@ fn insert_artifact(
     Ok(())
 }
 
-fn insert_evaluation(
-    transaction: &Transaction<'_>,
-    run_id: &str,
-    evaluation: &EvaluationRecord,
-    mark_run_evaluated: bool,
-) -> Result<()> {
-    let (outcome, selected_candidate, selected_candidate_id) = match &evaluation.outcome {
-        EvaluationOutcome::Candidate(selected) => {
-            let candidate_id = transaction
-                .query_row(
-                    "SELECT id FROM candidates \
-                     WHERE run_id = ?1 AND (id = ?2 OR label = ?2) \
-                     ORDER BY CASE WHEN label = ?2 THEN 0 ELSE 1 END \
-                     LIMIT 1",
-                    params![run_id, selected],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .with_context(|| format!("run {run_id} has no candidate {selected}"))?;
-            ("candidate", Some(selected.as_str()), Some(candidate_id))
-        }
-        EvaluationOutcome::Tie => ("tie", None, None),
-        EvaluationOutcome::Neither => ("neither", None, None),
-    };
-
-    // This also makes re-submission atomic: old reasons disappear with the old
-    // evaluation and are replaced in their original order.
-    transaction.execute("DELETE FROM evaluations WHERE run_id = ?1", [run_id])?;
-    let public_id = evaluation_public_id(run_id);
-    transaction.execute(
-        r#"INSERT INTO evaluations(
-                run_id, outcome, selected_candidate, selected_candidate_id,
-                explanation, created_at, blind, public_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-        params![
-            run_id,
-            outcome,
-            selected_candidate,
-            selected_candidate_id,
-            evaluation.explanation,
-            timestamp(evaluation.created_at),
-            evaluation.blind,
-            public_id,
-        ],
-    )?;
-    let evaluation_id = transaction.last_insert_rowid();
-    for (position, reason) in evaluation.reasons.iter().enumerate() {
-        transaction.execute(
-            "INSERT INTO evaluation_reasons(evaluation_id, position, reason) \
-             VALUES (?1, ?2, ?3)",
-            params![
-                evaluation_id,
-                usize_integer(position, "evaluation reason position")?,
-                reason
-            ],
-        )?;
-    }
-    if mark_run_evaluated {
-        transaction.execute(
-            "UPDATE runs SET status = 'evaluated' WHERE id = ?1",
-            [run_id],
-        )?;
-    }
-    Ok(())
-}
-
-fn evaluation_public_id(run_id: &str) -> String {
-    format!("evaluation-{run_id}")
-}
-
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -1964,7 +1878,7 @@ fn validate_terminal_write(
     run: &RunRecord,
     explicit_review: bool,
 ) -> Result<()> {
-    if run.phase3.is_some() {
+    if run.execution.is_some() {
         let mut statement = connection.prepare("SELECT id,details_json FROM attempts WHERE run_id=?1 AND completed_at IS NOT NULL AND details_json IS NOT NULL")?;
         for row in statement.query_map([&run.id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -2007,7 +1921,7 @@ fn validate_terminal_write(
 }
 
 fn persist_questions(connection: &Connection, run: &RunRecord) -> Result<()> {
-    let Some(policy) = &run.phase3 else {
+    let Some(policy) = &run.execution else {
         return Ok(());
     };
     for question in &policy.questions {
@@ -2077,7 +1991,6 @@ mod tests {
     use crate::RunMode;
 
     use chrono::{TimeZone, Utc};
-    use rusqlite::OptionalExtension;
     use serde_json::json;
 
     use super::*;
@@ -2134,9 +2047,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn older_run_fields_load_and_survive_a_rewrite() {
+        // A 0.4.0 projection: `phase3` is now `execution`, and fields no
+        // longer read (routing, capacity, admission, blind evaluation) are
+        // carried through a rewrite verbatim.
+        let mut value = serde_json::to_value(run("run-older")).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("execution");
+        object.insert(
+            "phase3".into(),
+            serde_json::json!({
+                "max_invocations": 2, "deadline_at": "2026-01-01T00:00:00Z",
+                "fixed_model": null, "fixed_effort": null, "owner_uid": 501,
+                "final_attempt_id": null, "contributing_attempts": [],
+                "provenance": "goal", "failure": null, "questions": []
+            }),
+        );
+        object.insert(
+            "routing".into(),
+            serde_json::json!({"selected_harness": "codex"}),
+        );
+        object.insert("capacity".into(), serde_json::Value::Null);
+        object.insert(
+            "evaluation".into(),
+            serde_json::json!({"outcome": {"kind": "tie"}}),
+        );
+
+        let loaded: RunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.execution.as_ref().unwrap().owner_uid, 501);
+        assert!(!loaded.historical.contains_key("phase3"));
+        let rewritten = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(rewritten["routing"]["selected_harness"], "codex");
+        assert_eq!(rewritten["evaluation"]["outcome"]["kind"], "tie");
+        assert!(rewritten["capacity"].is_null() && rewritten.get("capacity").is_some());
+        assert_eq!(rewritten["execution"]["owner_uid"], 501);
+        assert!(rewritten.get("phase3").is_none());
+    }
+
     fn run(id: &str) -> RunRecord {
         RunRecord {
-            phase3: None,
+            execution: None,
             id: id.to_owned(),
             task: "Fix the retry race".to_owned(),
             exact_prompt: "Fix the retry race\n\nKeep the public API.".to_owned(),
@@ -2172,14 +2123,11 @@ mod tests {
                 candidate("cand-b", "B", "claude"),
             ],
             attempts: Vec::new(),
-            routing: None,
             allocation: None,
-            capacity: None,
-            admission: None,
             coherence: None,
-            evaluation: None,
             applied_candidate: None,
             attachment: None,
+            historical: Default::default(),
         }
     }
 
@@ -2305,7 +2253,7 @@ mod tests {
             database
                 .committed_run_projection("prior")?
                 .unwrap()
-                .phase3
+                .execution
                 .is_none()
         );
         assert_eq!(
@@ -2786,93 +2734,6 @@ mod tests {
     }
 
     #[test]
-    fn saves_candidate_evaluation_and_verbatim_freeform_text() -> Result<()> {
-        let mut database = Database::open_in_memory()?;
-        database.sync_run(&run("run-eval"))?;
-        let explanation =
-            "  B handled cancellation.\n\nKeep this indentation:\n    exact words  \n";
-        let evaluation = EvaluationRecord {
-            outcome: EvaluationOutcome::Candidate("B".to_owned()),
-            reasons: vec!["correctness".to_owned(), "better architecture".to_owned()],
-            explanation: Some(explanation.to_owned()),
-            created_at: at(5),
-            blind: true,
-        };
-        database.save_evaluation("run-eval", &evaluation)?;
-
-        let stored: (String, String, String, bool) = database.connection.query_row(
-            "SELECT outcome, selected_candidate, explanation, blind \
-             FROM evaluations WHERE run_id = 'run-eval'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        assert_eq!(
-            stored,
-            ("candidate".into(), "B".into(), explanation.into(), true)
-        );
-        let reasons: Vec<String> = {
-            let mut statement = database.connection.prepare(
-                "SELECT er.reason FROM evaluation_reasons er \
-                 JOIN evaluations e ON e.id = er.evaluation_id \
-                 WHERE e.run_id = 'run-eval' ORDER BY er.position",
-            )?;
-            statement
-                .query_map([], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        assert_eq!(reasons, evaluation.reasons);
-        assert_eq!(database.list_runs(1)?[0].status, "evaluated");
-        assert!(database.list_runs(1)?[0].evaluated);
-        Ok(())
-    }
-
-    #[test]
-    fn persists_tie_neither_and_embedded_evaluations() -> Result<()> {
-        let mut database = Database::open_in_memory()?;
-        let mut record = run("run-outcomes");
-        record.status = RunStatus::Evaluated;
-        record.evaluation = Some(EvaluationRecord {
-            outcome: EvaluationOutcome::Tie,
-            reasons: vec![],
-            explanation: Some("Both are acceptable.\n".to_owned()),
-            created_at: at(5),
-            blind: true,
-        });
-        database.sync_run(&record)?;
-        let outcome: String = database.connection.query_row(
-            "SELECT outcome FROM evaluations WHERE run_id = 'run-outcomes'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(outcome, "tie");
-
-        // Later lifecycle transitions retain the evaluation without having the
-        // embedded evaluation overwrite the authoritative run status.
-        record.status = RunStatus::Applied;
-        record.applied_candidate = Some("A".to_owned());
-        database.sync_run(&record)?;
-        assert_eq!(database.list_runs(1)?[0].status, "applied");
-
-        database.save_evaluation(
-            "run-outcomes",
-            &EvaluationRecord {
-                outcome: EvaluationOutcome::Neither,
-                reasons: vec!["other".to_owned()],
-                explanation: Some("Neither preserves the public API.".to_owned()),
-                created_at: at(6),
-                blind: true,
-            },
-        )?;
-        let outcome: String = database.connection.query_row(
-            "SELECT outcome FROM evaluations WHERE run_id = 'run-outcomes'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(outcome, "neither");
-        Ok(())
-    }
-
-    #[test]
     fn appends_structured_events_without_rewriting_them_on_sync() -> Result<()> {
         let mut database = Database::open_in_memory()?;
         let record = run("run-events");
@@ -2898,43 +2759,6 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&stored.2)?,
             json!({"exit_code": 0, "message": "done"})
         );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_evaluation_for_unknown_candidate_without_losing_previous_one() -> Result<()> {
-        let mut database = Database::open_in_memory()?;
-        database.sync_run(&run("run-invalid"))?;
-        database.save_evaluation(
-            "run-invalid",
-            &EvaluationRecord {
-                outcome: EvaluationOutcome::Tie,
-                reasons: vec![],
-                explanation: None,
-                created_at: at(5),
-                blind: true,
-            },
-        )?;
-        let result = database.save_evaluation(
-            "run-invalid",
-            &EvaluationRecord {
-                outcome: EvaluationOutcome::Candidate("Z".to_owned()),
-                reasons: vec![],
-                explanation: None,
-                created_at: at(6),
-                blind: true,
-            },
-        );
-        assert!(result.is_err());
-        let existing = database
-            .connection
-            .query_row(
-                "SELECT outcome FROM evaluations WHERE run_id = 'run-invalid'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        assert_eq!(existing.as_deref(), Some("tie"));
         Ok(())
     }
 }

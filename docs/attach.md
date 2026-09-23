@@ -69,7 +69,7 @@ candidate label, and none of them need to know whether Dispatch launched the age
 | `candidates[0]` | `workspace_path` = the external worktree or directory; `diff_path` = `runs/<id>/delta.patch`; `harness_id` = `attachment.agent` or `"external"`; `label` = `"A"`; `checks` filled at finish |
 | `attempts[0]` | one record, `role: "attached"`, same `harness_id`, `resource: None`, every model field `None` (never guessed) |
 | `environment` | `execution_backend: "local"`; `unsafe_local` = the `--allow-unsafe-local` acknowledgement; the rest copied from the root's `dispatch.yml` |
-| `phase3` | `None`: no invocation budget, no admission, no questions |
+| `execution` | `None`: no invocation budget, no questions |
 | `task` | `--task` text, or `"attached work in <workspace basename>"`; `exact_prompt` equals `task` |
 | `attachment: Option<AttachmentRecord>` | provenance, capabilities, process identities, timestamps (below); `None` for every native run |
 | `outcome` while active | `lifecycle: Working, work_result: Pending, verification: NotRun, review: NotRequested, phase: Executing` |
@@ -79,8 +79,7 @@ below). A binary built before this exists refuses a state directory that has alr
 been migrated to schema 21.
 
 What attached Work cannot do: `dispatch refresh` (refused — see "Review of attached
-work" below); it never produces allocation feedback or a routing observation, so an
-attached result never becomes routing evidence.
+work" below).
 
 ## S0 and confidence
 
@@ -333,13 +332,12 @@ above.
 
 ## Review of attached work
 
-`dispatch accept`/`dispatch reject`, and the review menu's equivalents, gain a third
-branch for `RunMode::Attached` (next to the existing allocation and routing branches):
-`outcome.review` is set and a `review.accepted`/`review.rejected` event is committed
-with `{"reasons": [...], "explanation": ...}` — no `goal_feedback_revisions` row, no
-routing evaluation, because attached results never become routing evidence. The apply
-itself then goes through the same `apply_locked(..., ApplyAuthority::Human)` every
-other human accept uses.
+`dispatch accept`/`dispatch reject`, and the review menu's equivalents, record a
+review of attached work exactly as they do for native work (since 0.4.1): one
+`goal_feedback_revisions` row with the reasons and the verbatim explanation,
+`outcome.review`, and a `review.accepted`/`review.rejected` event. The review and, on
+accept, `apply_locked(..., ApplyAuthority::Human)` run under one hold of the run's
+operation lock.
 
 - `load_latest_unresolved_single` (the target of a bare `dispatch accept`/`dispatch
   reject` with no id) also returns an attached run whose review is still `Pending`.
@@ -375,7 +373,7 @@ that turns a `Validity` into a stored verdict: it calls `remember_validity` (sta
 `first_invalid_at` the first time a run becomes invalid) and commits
 `coherence.checked` (for `Continue`) or `coherence.invalidated` (otherwise) through the
 same transition path every other event uses. The allocation-run mid-run watcher
-(`phase3::apply_watch`), the wrapped attach owner loop, and `serve` all call it
+(`native::apply_watch`), the wrapped attach owner loop, and `serve` all call it
 directly; none of them re-implement `mid_run: stop` — `apply_watch` is the only caller
 that still does, and only for native allocation runs.
 

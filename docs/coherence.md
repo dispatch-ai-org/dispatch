@@ -329,15 +329,14 @@ disagreeing with a CONTINUE verdict that was acted on automatically.
 
 ## The mid-run watcher (`watch.rs`)
 
-For runs that use included-resource allocation, `phase3` starts one `Watcher` per
-attempt (planned, legacy, routed and comparison runs have none). It stops when the
+For native runs, the native engine starts one `Watcher` per attempt. It stops when the
 attempt returns or the watcher is dropped.
 
 Attached work uses this same `Watcher` type, not a different mechanism: the wrapped
 attach owner loop starts one for the agent it spawned, and `serve` re-observes every
 foreign or orphaned attached run on its own tick. Both persist through the same
 `apply::persist_verdict` step described above (`remember_validity` plus
-`coherence.checked`/`coherence.invalidated`) — only `phase3::apply_watch` still
+`coherence.checked`/`coherence.invalidated`) — only `native::apply_watch` still
 implements `mid_run: stop`, and it never applies to attached work. See
 [attach.md](attach.md#shared-verdict-persistence) for the wrapped owner loop and
 `serve`'s reevaluation loop.

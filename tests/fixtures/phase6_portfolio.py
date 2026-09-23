@@ -152,7 +152,7 @@ def scenario(binary, name):
             assert output.returncode!=0 and f.count()<=1,(output.stdout,output.stderr)
             assert result is not None,(output.stdout,output.stderr)
             assert len(result['attempts'])<=1
-            assert f.stored(result['run_id'])['phase3']['failure']=='deadline'
+            assert f.stored(result['run_id'])['execution']['failure']=='deadline'
             no_lease(f)
         elif name=='protocol':
             agent=f.root/'claude';original=agent.read_text()
@@ -172,7 +172,7 @@ def scenario(binary, name):
                 assert output.returncode!=0,(replacement,result,output.stderr)
                 assert f.count()==before+1
                 assert len(result['attempts'])==1 and result['outcome']['work_result']=='failed'
-                assert not f.stored(result['run_id'])['phase3']['questions']
+                assert not f.stored(result['run_id'])['execution']['questions']
                 no_lease(f)
         elif name=='launch_change':
             # Account checks: selection, then the preflight at the spawn boundary.

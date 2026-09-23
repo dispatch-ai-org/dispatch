@@ -372,7 +372,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
             lines.push(q.report.choices.join(" / "));
         }
     }
-    if let Some(failure) = run.phase3.as_ref().and_then(|p| p.failure) {
+    if let Some(failure) = run.execution.as_ref().and_then(|p| p.failure) {
         let reason = match failure {
             FailureKind::InvocationLimit => {
                 "The two-invocation limit leaves no continuation budget."
@@ -408,7 +408,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
 }
 
 pub fn pending_question(run: &RunRecord) -> Option<&Clarification> {
-    run.phase3
+    run.execution
         .as_ref()?
         .questions
         .last()
@@ -434,7 +434,7 @@ pub fn review_command(run: &RunRecord) -> Result<ReviewCommand> {
 }
 
 fn launch_accounting(state: &State, run: &RunRecord) -> String {
-    let maximum = run.phase3.as_ref().map_or(2, |p| p.max_invocations);
+    let maximum = run.execution.as_ref().map_or(2, |p| p.max_invocations);
     let counts = (|| -> Result<(u32, u32)> {
         let db = crate::db::Database::open_read_only(state.db_path())?;
         db.connection().busy_timeout(Duration::from_millis(10))?;
@@ -1589,7 +1589,7 @@ async fn run_goal(
     loop {
         if let Some(command) = question_command(&run) {
             let deadline = run
-                .phase3
+                .execution
                 .as_ref()
                 .map(|p| {
                     format!(
