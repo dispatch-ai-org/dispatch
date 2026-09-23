@@ -51,6 +51,12 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.2
+
+0.4.2 fixes `dispatch setup` in 0.4.1, which could not save a profile once the state
+directory had a database: it reported `no such table: capacity_authorizations`. No
+migration; the schema stays at 24. If setup failed under 0.4.1, run it again.
+
 ### Upgrading to 0.4.1
 
 0.4.1 removes sync, public priors and routing, capacity and admission, the control
