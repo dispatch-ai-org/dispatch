@@ -56,7 +56,6 @@ pub(crate) fn artifact(
                     == Some(attempt_id),
                 "unauthorized final artifact identity"
             );
-            crate::planning::verify_delivery(&run)?;
             &run.candidates
                 .first()
                 .context("not_ready: no final delivery")?
@@ -108,7 +107,7 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
         run.outcome.lifecycle == LifecycleState::Finished,
         "not_ready: execution has not finished"
     );
-    let mut artifacts: Vec<Value> = run
+    let artifacts: Vec<Value> = run
         .attempts
         .iter()
         .filter(|a| a.detail.result.is_some())
@@ -121,11 +120,6 @@ pub(crate) fn result(scope: &Scope, state: &State, id: &str) -> Result<Value> {
             .map(|kind| json!({"run_id":id,"attempt_id":a.id,"kind":kind}))
         })
         .collect();
-    if let Some(p) = crate::planning::planning(&run)
-        && p.final_candidate.is_some()
-    {
-        artifacts.push(json!({"run_id":id,"attempt_id":run.phase3.as_ref().unwrap().final_attempt_id,"kind":"final_diff"}));
-    }
     let mut value = json!({"result_id":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"delivery_revision":run.phase3.as_ref().and_then(|p|p.final_attempt_id.as_ref()),"result":orchestrator::run_result(&crate::coherence::with_live_validity(&run)),"candidates":run.candidates,"baseline_checks":run.baseline_checks,"artifacts":artifacts});
     remove_paths(&mut value);
     Ok(value)

@@ -149,7 +149,6 @@ where
     let mut worker_request: Option<String> = None;
     let mut active: Option<String> = None;
     let mut cancel = CancellationToken::new();
-    let mut question_deadline = None;
     let mut failure = None;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     loop {
@@ -158,12 +157,6 @@ where
             _=closed.cancelled()=>{failure=Some("output closed or stalled");break},
             _=orchestrator::shutdown_signal()=>break,
             _=tick.tick()=>{
-                if worker.is_none() && question_deadline.is_some_and(|d|chrono::Utc::now() >= d) {
-                    if let Some(id) = active.as_deref() { let _ = state.load_run(id)?; }
-                    active = None;
-                    question_deadline = None;
-                }
-
                 if let Some(rx) = committed.as_mut()
                     && let Ok(value) = rx.try_recv()
                 {
@@ -196,7 +189,6 @@ where
                     if let Some(id) = active.as_deref()
                         && let Ok(run) = session.scope.run(&state, id)
                     {
-                        question_deadline = run.phase3.as_ref().filter(|p|p.planning.is_some() && run.outcome.waiting_on == crate::WaitingOn::Human).map(|p|p.deadline_at);
                         if cancel.is_cancelled() {
                             let _ = commands::close_question(&state, &session, &run);
                         }
@@ -384,7 +376,6 @@ where
                     }
                     let state = state.clone();
                     let scope = session.scope.clone();
-                    question_deadline = None;
                     cancel = CancellationToken::new();
                     let cancellation = cancel.clone();
                     let (updates, _) = tokio::sync::watch::channel(None);

@@ -1017,8 +1017,6 @@ pub struct RunResult {
 /// Local execution policy and delivery lineage, never part of v1 sync envelopes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalExecution {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub planning: Option<crate::planning::Planning>,
     pub max_invocations: u32,
     pub deadline_at: DateTime<Utc>,
     pub no_retry: bool,

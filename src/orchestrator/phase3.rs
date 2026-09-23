@@ -52,7 +52,6 @@ fn unresolved_admission(db: &Database, id: &str) -> Result<bool> {
 }
 
 fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str) -> Result<()> {
-    crate::planning::stop_active(run, reason);
     run.status = RunStatus::Interrupted;
     run.completed_at = Some(Utc::now());
     run.outcome.lifecycle = LifecycleState::Finished;
@@ -112,45 +111,6 @@ pub(super) fn finish_error<T>(
 }
 
 pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord) -> Result<()> {
-    if run
-        .phase3
-        .as_ref()
-        .is_some_and(|p| p.planning.is_some() && Utc::now() >= p.deadline_at)
-        && run.outcome.lifecycle == LifecycleState::Waiting
-        && run.outcome.waiting_on == WaitingOn::Human
-        && let Ok(_lock) = OperationLock::acquire(
-            &state.run_dir(&run.id).join(".operation.lock"),
-            "run is supervised",
-        )
-        && let Some(mut current) = db.committed_run_projection(&run.id)?
-        && current.outcome.waiting_on == WaitingOn::Human
-    {
-        let policy = current.phase3.as_mut().unwrap();
-        for question in policy
-            .questions
-            .iter_mut()
-            .filter(|q| q.state == QuestionState::Pending)
-        {
-            question.state = QuestionState::Cancelled;
-            question.revision += 1;
-            question.resolved_at = Some(Utc::now());
-            question.actor_uid = Some(policy.owner_uid);
-            question.actor = Some("original_deadline".into());
-        }
-        if let Some(p) = policy.planning.as_mut() {
-            p.error = Some("original deadline expired while awaiting clarification".into());
-        }
-        let mut writer = Database::open_control(state.db_path())?;
-        stop(
-            state,
-            &mut writer,
-            &mut current,
-            FailureKind::Deadline,
-            "original deadline expired while awaiting clarification",
-        )?;
-        *run = current;
-        return Ok(());
-    }
     if !expects_execution(run) {
         return Ok(());
     }
@@ -188,10 +148,9 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
     // leave that uncertainty to the existing supervision/reconciliation path.
     if expects_execution(run)
         && gone
-        && (run.phase3.as_ref().is_some_and(|p| p.planning.is_some())
-            || (!run.attempts.is_empty()
-                && run.attempts.iter().all(|a| a.completed_at.is_some())
-                && !unresolved_admission(db, &run.id)?))
+        && !run.attempts.is_empty()
+        && run.attempts.iter().all(|a| a.completed_at.is_some())
+        && !unresolved_admission(db, &run.id)?
     {
         interrupt_run(
             state,
@@ -317,7 +276,6 @@ pub(super) fn stop(
     failure: FailureKind,
     reason: &str,
 ) -> Result<()> {
-    crate::planning::stop_active(run, reason);
     if RUN_OUTPUT_MODE.load(Ordering::Relaxed) != RunOutputMode::Silent.code() {
         eprintln!("{reason}");
     }
@@ -1176,10 +1134,6 @@ pub async fn answer_question(
     let cancellation = operation_cancellation();
     let _signals = SignalListener::install(cancellation.clone());
     let _deadline = DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
-    if run.phase3.as_ref().is_some_and(|p| p.planning.is_some()) {
-        return super::planned::drive(state, &mut db, run, config, resources, cancellation, output)
-            .await;
-    }
     drive(state, &mut db, run, config, resources, cancellation, output).await
 }
 

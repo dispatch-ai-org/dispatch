@@ -259,7 +259,11 @@ pub(super) fn apply_locked(
         run.id,
         run.status.as_str()
     );
-    crate::planning::verify_delivery(&run)?;
+    anyhow::ensure!(
+        !was_planned(&run),
+        "run {} is a planned goal from an earlier Dispatch whose delivery can no longer be verified; refresh it instead",
+        run.id
+    );
     let candidate = find_candidate(&run, candidate_label)?;
     let normalized_label = candidate.label.clone();
     let _source_lock = OperationLock::acquire(
@@ -462,6 +466,14 @@ fn decide(
 /// between authorization and the real `git apply`. Matched by text because
 /// the fence is inside `anyhow::ensure!`, same as `apply_locked` already does
 /// for the human path.
+/// Planned goals (removed in 0.4.1) delivered through an integrity chain this
+/// version no longer verifies, so their results are never applied.
+fn was_planned(run: &RunRecord) -> bool {
+    run.phase3
+        .as_ref()
+        .is_some_and(|goal| goal.provenance == "planned_policy_chain")
+}
+
 fn is_fence_failure(message: &str) -> bool {
     message.contains("source changed during apply validation")
         || message.contains("source has changed since this run was created")
@@ -506,7 +518,7 @@ pub fn auto_apply(state: &State, run_id: &str) -> Result<ApplyOutcome> {
     if run.candidates.len() != 1 {
         return persist_skip(state, run, "not_sole_candidate");
     }
-    if crate::planning::verify_delivery(&run).is_err() {
+    if was_planned(&run) {
         return persist_skip(state, run, "delivery_unverifiable");
     }
     let Some(config) = run_config(&run_dir) else {

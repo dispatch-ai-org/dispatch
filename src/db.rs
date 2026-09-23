@@ -1541,7 +1541,6 @@ impl Database {
             .expect("normalized event object")
             .insert("outcome".into(), serde_json::to_value(&run.outcome)?);
         persist_questions(transaction, run)?;
-        crate::planning::persist(transaction, run)?;
         let outcome_json = serde_json::to_string(&run.outcome)?;
         validate_terminal_write(transaction, run, event.event_type == "review.accepted")?;
         let mut projection = run.clone();
@@ -2531,8 +2530,7 @@ mod tests {
                 .phase3
                 .is_none()
         );
-        let scope: crate::commands::Scope = serde_json::from_value(grant)?;
-        assert!(!scope.allow_plan);
+        let _: crate::commands::Scope = serde_json::from_value(grant)?;
         assert_eq!(
             database
                 .connection

@@ -283,7 +283,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
         String::new(),
         label(run, event).to_owned(),
     ];
-    if crate::planning::planning(run).is_none() {
+    {
         lines.push(if width < 40 {
             format!("{work_mark} {model}\n{verify_mark} checks  {review_mark} review")
         } else {
@@ -304,7 +304,7 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
     }
     // One attempt is already represented by the work node. Show branches only
     // when the committed history contains recovery or clarification continuation.
-    if crate::planning::planning(run).is_none() && run.attempts.len() > 1 {
+    if run.attempts.len() > 1 {
         for attempt in &run.attempts {
             let prefix = match attempt.detail.reason.as_deref() {
                 Some("target_verification_failure") => "Recovery · ",
@@ -364,60 +364,6 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
             diff.lines_removed
         ));
     }
-    if let Some(p) = crate::planning::planning(run) {
-        lines.push("Planned work · sequential execution".into());
-        if p.plan.is_none() {
-            lines.push(format!("Planner · {model}"));
-        }
-        for task in p
-            .tasks
-            .iter()
-            .filter(|_| run.outcome.work_result != WorkResult::Ready)
-        {
-            let spec = p
-                .plan
-                .as_ref()
-                .and_then(|p| p.tasks.iter().find(|s| s.id == task.id));
-            let mark = match task.state {
-                crate::planning::TaskState::Integrated => done,
-                crate::planning::TaskState::Failed => failed,
-                _ => pending,
-            };
-            let title = spec.map(|s| s.objective.as_str()).unwrap_or(&task.id);
-            let state = match task.state {
-                crate::planning::TaskState::Pending => "queued",
-                crate::planning::TaskState::Working => "working",
-                crate::planning::TaskState::Waiting => "needs attention",
-                crate::planning::TaskState::Integrated => "checked + integrated",
-                crate::planning::TaskState::Failed => "failed",
-            };
-            lines.push(format!("{mark} {}", clip(title, width.saturating_sub(3))));
-            lines.push(format!(
-                "  {} · {state}",
-                model_name(&task.decision.selected.resolved_model)
-            ));
-            if let Some(spec) =
-                spec.filter(|_| task.state != crate::planning::TaskState::Integrated)
-            {
-                let dependencies = spec
-                    .prerequisites
-                    .iter()
-                    .chain(task.pending_prerequisite.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !dependencies.is_empty() {
-                    lines.push(format!(
-                        "  requires checked output: {}",
-                        dependencies.join(", ")
-                    ));
-                }
-            }
-        }
-        if let Some(error) = &p.error {
-            lines.push(format!("Stopped: {}", clip(error, 240)));
-        }
-        lines.push("One shared extra for the entire goal".into());
-    }
     if let Some(q) = pending_question(run) {
         lines.push(
             "Decision needed · answering continues this goal within its remaining limit.".into(),
@@ -429,9 +375,6 @@ pub fn projection(run: &RunRecord, event: Option<&EventRecord>, width: u16, asci
     }
     if let Some(failure) = run.phase3.as_ref().and_then(|p| p.failure) {
         let reason = match failure {
-            FailureKind::InvocationLimit if crate::planning::planning(run).is_some() => {
-                "The shared invocation limit leaves no continuation budget."
-            }
             FailureKind::InvocationLimit => {
                 "The two-invocation limit leaves no continuation budget."
             }
@@ -492,14 +435,7 @@ pub fn review_command(run: &RunRecord) -> Result<ReviewCommand> {
 }
 
 fn launch_accounting(state: &State, run: &RunRecord) -> String {
-    let maximum = run.phase3.as_ref().map_or(2, |p| {
-        p.planning
-            .as_ref()
-            .and_then(|p| p.plan.as_ref())
-            .map_or(p.max_invocations, |plan| {
-                p.max_invocations.min(plan.tasks.len() as u32 + 2)
-            })
-    });
+    let maximum = run.phase3.as_ref().map_or(2, |p| p.max_invocations);
     let counts = (|| -> Result<(u32, u32)> {
         let db = crate::db::Database::open_read_only(state.db_path())?;
         db.connection().busy_timeout(Duration::from_millis(10))?;
@@ -520,23 +456,6 @@ fn details(run: &RunRecord) -> String {
     );
     if let Some(decision) = &run.allocation {
         text.push_str(&format!("\nAllocation: {}", decision.reason));
-    }
-    if let Some(p) = crate::planning::planning(run) {
-        text.push_str(&format!(
-            "\nPlan revision: {} · sequential execution",
-            p.revision
-        ));
-        if let Some(error) = &p.error {
-            text.push_str(&format!("\nStopped: {error}"));
-        }
-        for task in &p.tasks {
-            text.push_str(&format!("\nTask {}: {:?}\n  Suitability: {}\n  Selection: {}\n  Input: {}\n  Checked artifact: {}", task.id, task.state, task.feature_provenance, task.decision.reason, task.input.as_deref().unwrap_or("not assigned"), task.artifact.as_deref().unwrap_or("not integrated")));
-        }
-        for artifact in &p.artifacts {
-            if !artifact.verification_changes.is_empty() {
-                text.push_str(&format!("\nVerification files changed: {}. Checks used the original owner-approved files.", artifact.verification_changes.join(", ")));
-            }
-        }
     }
     for attempt in &run.attempts {
         text.push_str(&format!(
@@ -1526,8 +1445,7 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
         let prompt = if ui.reviewed.is_some() {
             "Next goal: What do you want to accomplish?\n[i] Details"
         } else {
-            "What do you want to accomplish?\nDirect by default · /plan for sequential work
-/resources accounts · /checks project checks"
+            "What do you want to accomplish?\n/resources accounts · /checks project checks"
         };
         let prompt = if options.plain && ui.auto_apply {
             prompt.replacen("accomplish?", "accomplish? (auto-apply on)", 1)
@@ -1640,14 +1558,7 @@ async fn run_goal(
             setup::checks(ui, source).await?;
         }
     }
-    let plan = task.starts_with("/plan ");
-    let task = task.strip_prefix("/plan ").unwrap_or(&task).to_owned();
-    if plan {
-        ui.commit("Planned mode: one planner, up to four sequential tasks, one shared extra; maximum six invocations under one deadline. One final human review.")?;
-    }
     let request = RunRequest {
-        plan,
-        max_invocations: None,
         source: source.to_path_buf(),
         task,
         harnesses: vec![],
@@ -1685,22 +1596,7 @@ async fn run_goal(
                 "{}\n{deadline}Your answer (Ctrl+C cancels this goal)",
                 ui.launch_line
             );
-            let answer = if let Some(policy) = run.phase3.as_ref().filter(|p| p.planning.is_some())
-            {
-                let remaining = (policy.deadline_at - chrono::Utc::now())
-                    .to_std()
-                    .unwrap_or_default();
-                match tokio::time::timeout(remaining, ui.prompt(&prompt)).await {
-                    Ok(answer) => answer?,
-                    Err(_) => {
-                        run = state.load_run(&run.id)?;
-                        ui.commit(&projection(&run, None, ui.width(), options.ascii))?;
-                        continue;
-                    }
-                }
-            } else {
-                ui.prompt(&prompt).await?
-            };
+            let answer = ui.prompt(&prompt).await?;
             match answer {
                 Input::Submit(answer) if !answer.trim().is_empty() => {
                     run = ui
@@ -2030,38 +1926,6 @@ mod tests {
             label(&r, None),
             "Attached agent's owner is gone; finish or reject"
         );
-    }
-
-    #[test]
-    fn planned_review_keeps_verification_visible_before_long_task_list() {
-        let mut r = run();
-        let decision = serde_json::json!({
-            "version":1,"policy_version":"planned-contract-v1","task_features":crate::TaskFeatures::default(),
-            "selected":{"provider":"fixture","funding_source":"fixture","harness":"codex","requested_model":"fixture-standard","resolved_model":"fixture-standard","service_mode":"standard","runtime":"local","pool":"fixture","tier":"standard","no_overage_verified":true,"internal_composition":"controlled"},
-            "reason":"fixture","capability":{"version":1,"source":"fixture","harness":"codex","observed_at":r.created_at,"models":[]},"alternatives":[]
-        });
-        let tasks = (0..4)
-            .map(|i| {
-                serde_json::json!({
-                    "id":format!("task-{i}"),"state":"integrated","decision":decision,
-                    "feature_provenance":"validated contract"
-                })
-            })
-            .collect::<Vec<_>>();
-        r.phase3 = Some(serde_json::from_value(serde_json::json!({
-            "max_invocations":6,"deadline_at":r.created_at,"no_retry":false,"priority":0,"owner_uid":0,
-            "contributing_attempts":[],"provenance":"planned_policy_chain","questions":[],
-            "planning":{"version":1,"revision":"fixture","approved_checks":{},"owner_policy":{},"plan":{"version":1,"tasks":[]},"tasks":tasks,"snapshots":[],"artifacts":[],"root_checks":[]}
-        })).unwrap());
-        r.outcome.work_result = WorkResult::Ready;
-        r.outcome.verification = VerificationState::Passed;
-        r.outcome.review = ReviewState::Pending;
-        // Eight visible content rows model the limited space above narrow review controls.
-        for width in [24, 35] {
-            let visible = render(&projection(&r, None, width, true), width);
-            assert!(visible.contains("Ready for review"), "{visible}");
-            assert!(visible.contains("Verification passed"), "{visible}");
-        }
     }
 
     #[test]

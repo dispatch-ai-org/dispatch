@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    #[serde(skip_serializing_if = "crate::planning::PlanningConfig::is_empty")]
-    pub planning: crate::planning::PlanningConfig,
     #[serde(skip_serializing_if = "CoherenceConfig::is_default")]
     pub coherence: CoherenceConfig,
     pub execution: ExecutionConfig,

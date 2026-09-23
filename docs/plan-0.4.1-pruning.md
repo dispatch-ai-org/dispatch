@@ -98,3 +98,11 @@ the progress log.
   609 passed, 3 failed in `phase8_planning`: `private_attribution` (its
   behavior was removed here, case deleted) and the two load-sensitive deadline
   fixtures, which pass in isolation.
+- 2026-09-22 — S2b: removed planning (`--plan`, `/plan`, `--max-invocations`,
+  `control-grant --allow-plan`, `planning.rs`, `planned.rs`, the planning
+  hooks in the event commit, apply, admission fence and TUI, and the
+  planned-only source helpers). A planned goal from 0.4.0 that is still
+  awaiting review is refused at apply (its delivery chain can no longer be
+  verified) rather than applied unverified; refresh it instead. `cargo test`:
+  543 passed, 1 failed (`claude_control_slow_output`, a known load-sensitive
+  control fixture; control is removed in S3).

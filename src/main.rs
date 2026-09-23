@@ -59,9 +59,6 @@ enum Command {
     },
     /// Authorize a fixed machine scope as the local human owner; prints a private key path.
     ControlGrant {
-        /// Explicitly authorize planned goals, within the shared invocation limit.
-        #[arg(long)]
-        allow_plan: bool,
         source: PathBuf,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -211,12 +208,6 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Opt in: one planner, up to four sequential tasks, one shared extra (six calls maximum).
-    #[arg(long, conflicts_with = "harnesses")]
-    plan: bool,
-    /// Smaller goal-wide invocation limit; planned default 6, direct default 2.
-    #[arg(long)]
-    max_invocations: Option<u32>,
     /// Desired software change. The source defaults to the current directory.
     task_or_legacy_source: Option<String>,
 
@@ -479,7 +470,6 @@ async fn run() -> Result<()> {
             read_only,
         } => dispatch::control::stdio(state, grant_fd, read_only).await,
         Command::ControlGrant {
-            allow_plan,
             source,
             timeout,
             max_invocations,
@@ -493,7 +483,6 @@ async fn run() -> Result<()> {
                 max_invocations,
                 allow_unsafe_local,
                 delegate_factual,
-                allow_plan,
             )?;
             println!("{}", path.display());
             Ok(())
@@ -582,8 +571,6 @@ async fn run() -> Result<()> {
             let jsonl = args.jsonl;
             let (source, task) = read_run_input(&args)?;
             let request = orchestrator::RunRequest {
-                plan: args.plan,
-                max_invocations: args.max_invocations,
                 source,
                 task,
                 harnesses: args.harnesses.unwrap_or_default(),
