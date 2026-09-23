@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -12,14 +12,10 @@ use rusqlite::{
 };
 
 use crate::models::{
-    AdmissionState, AdmissionSummary, AttemptRecord, BenchmarkPrior, CandidateRecord,
-    CapacityObservation, CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord,
-    GoalFeedbackRevision, RoutingHumanEvaluation, RoutingObservation, RunMode, RunRecord,
-    TaskFeatures,
+    AdmissionState, AdmissionSummary, AttemptRecord, CandidateRecord, CapacityObservation,
+    CheckResult, EvaluationOutcome, EvaluationRecord, EventRecord, GoalFeedbackRevision,
+    RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation, RunMode, RunRecord,
 };
-use crate::public_priors::PublicPriorSnapshotV1;
-use crate::sync::{RoutingFeedbackV1, RoutingObservationV1};
-use crate::{RoutingHumanOutcome, evidence::LocalRoutingEvidence};
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
@@ -790,14 +786,6 @@ BEGIN SELECT RAISE(ABORT,'private decision snapshot is immutable'); END;
     ),
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DistributedPublicPriorSnapshot {
-    pub snapshot_id: String,
-    pub generated_at: DateTime<Utc>,
-    pub installed_at: DateTime<Utc>,
-    pub installed_from: String,
-}
-
 /// The compact row used by `dispatch history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
@@ -808,67 +796,6 @@ pub struct RunSummary {
     pub created_at: String,
     pub candidate_count: usize,
     pub evaluated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncSettings {
-    pub enabled: bool,
-    pub contributor_id: Option<String>,
-    pub enabled_at: Option<String>,
-    pub consent_version: u32,
-    pub routing_observation_enabled_at: Option<String>,
-}
-
-impl SyncSettings {
-    pub fn routing_observations_enabled(&self) -> bool {
-        self.enabled
-            && self.consent_version >= ROUTING_OBSERVATION_CONSENT_VERSION
-            && self.routing_observation_enabled_at.is_some()
-    }
-}
-
-pub const ROUTING_OBSERVATION_CONSENT_VERSION: u32 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncRecordType {
-    EvaluationV1,
-    RoutingObservationV1,
-    RoutingFeedbackV1,
-}
-
-impl SyncRecordType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::EvaluationV1 => "evaluation-v1",
-            Self::RoutingObservationV1 => "routing-observation-v1",
-            Self::RoutingFeedbackV1 => "routing-feedback-v1",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "evaluation-v1" => Ok(Self::EvaluationV1),
-            "routing-observation-v1" => Ok(Self::RoutingObservationV1),
-            "routing-feedback-v1" => Ok(Self::RoutingFeedbackV1),
-            _ => anyhow::bail!("unknown sync record type {value:?}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncOutboxRecord {
-    pub record_id: String,
-    pub run_id: String,
-    pub record_type: SyncRecordType,
-    pub payload_json: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncOutboxCounts {
-    pub pending: usize,
-    pub failed: usize,
-    pub conflict: usize,
-    pub synced: usize,
 }
 
 /// Dispatch's durable structured store. Large artifacts remain on disk and are
@@ -1155,164 +1082,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn upsert_benchmark_prior(&self, prior: &BenchmarkPrior) -> Result<()> {
-        insert_benchmark_prior(&self.connection, prior, "manual")
-    }
-
-    pub fn replace_benchmark_prior(&mut self, prior: &BenchmarkPrior) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            r#"DELETE FROM benchmark_priors
-               WHERE source = ?1
-                 AND dataset = ?2
-                 AND harness = ?3
-                 AND model IS ?4
-                 AND language IS ?5
-                 AND task_kind = ?6
-                 AND scope = ?7
-                 AND origin = 'manual'"#,
-            params![
-                prior.source,
-                prior.dataset,
-                prior.harness,
-                prior.model,
-                prior.language,
-                prior.task_kind.as_str(),
-                prior.scope.as_str(),
-            ],
-        )?;
-        insert_benchmark_prior(&transaction, prior, "manual")?;
-        transaction
-            .commit()
-            .context("failed to replace benchmark prior")
-    }
-
-    pub fn matching_benchmark_priors(
-        &self,
-        features: &TaskFeatures,
-        harness: &str,
-    ) -> Result<Vec<BenchmarkPrior>> {
-        let mut statement = self.connection.prepare(
-            r#"SELECT source, dataset, dataset_version, harness, model, language,
-                      successes, attempts, updated_at
-               FROM benchmark_priors
-               WHERE harness = ?1
-                 AND language IS ?2
-                 AND task_kind = ?3
-                 AND scope = ?4
-               ORDER BY source, dataset, dataset_version, model"#,
-        )?;
-        let rows = statement.query_map(
-            params![
-                harness,
-                features.language,
-                features.task_kind.as_str(),
-                features.scope.as_str(),
-            ],
-            |row| {
-                let updated_at = timestamp_from_sql(8, row.get(8)?)?;
-                Ok(BenchmarkPrior {
-                    source: row.get(0)?,
-                    dataset: row.get(1)?,
-                    dataset_version: row.get(2)?,
-                    harness: row.get(3)?,
-                    model: row.get(4)?,
-                    language: row.get(5)?,
-                    task_kind: features.task_kind.clone(),
-                    scope: features.scope.clone(),
-                    successes: row.get(6)?,
-                    attempts: row.get(7)?,
-                    updated_at,
-                })
-            },
-        )?;
-        rows.collect::<rusqlite::Result<_>>()
-            .context("failed to read matching benchmark priors")
-    }
-
-    pub fn replace_distributed_public_priors(
-        &mut self,
-        snapshot: &PublicPriorSnapshotV1,
-        installed_from: &str,
-    ) -> Result<()> {
-        snapshot.validate()?;
-        anyhow::ensure!(
-            matches!(installed_from, "bundled" | "downloaded"),
-            "invalid public prior installation source"
-        );
-        if self
-            .distributed_public_prior_snapshot()?
-            .is_some_and(|current| current.snapshot_id == snapshot.snapshot_id)
-        {
-            return Ok(());
-        }
-
-        let installed_at = Utc::now();
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM benchmark_priors WHERE origin = 'distributed'",
-            [],
-        )?;
-        for entry in &snapshot.entries {
-            insert_benchmark_prior(
-                &transaction,
-                &entry.to_prior(snapshot.generated_at),
-                "distributed",
-            )?;
-        }
-        transaction.execute(
-            r#"INSERT INTO distributed_public_prior_snapshot(
-                    id, snapshot_id, generated_at, installed_at, installed_from
-                ) VALUES (1, ?1, ?2, ?3, ?4)
-                ON CONFLICT(id) DO UPDATE SET
-                    snapshot_id = excluded.snapshot_id,
-                    generated_at = excluded.generated_at,
-                    installed_at = excluded.installed_at,
-                    installed_from = excluded.installed_from"#,
-            params![
-                snapshot.snapshot_id,
-                timestamp(snapshot.generated_at),
-                timestamp(installed_at),
-                installed_from,
-            ],
-        )?;
-        transaction
-            .commit()
-            .context("failed to replace distributed public priors")
-    }
-
-    pub fn distributed_public_prior_snapshot(
-        &self,
-    ) -> Result<Option<DistributedPublicPriorSnapshot>> {
-        self.connection
-            .query_row(
-                "SELECT snapshot_id, generated_at, installed_at, installed_from \
-                 FROM distributed_public_prior_snapshot WHERE id = 1",
-                [],
-                |row| {
-                    Ok(DistributedPublicPriorSnapshot {
-                        snapshot_id: row.get(0)?,
-                        generated_at: timestamp_from_sql(1, row.get(1)?)?,
-                        installed_at: timestamp_from_sql(2, row.get(2)?)?,
-                        installed_from: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .context("failed to read distributed public prior snapshot")
-    }
-
-    pub fn distributed_public_prior_count(&self) -> Result<usize> {
-        let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM benchmark_priors WHERE origin = 'distributed'",
-            [],
-            |row| row.get(0),
-        )?;
-        usize::try_from(count).context("distributed public prior count is invalid")
-    }
-
     pub fn append_capacity_observation(&self, observation: &CapacityObservation) -> Result<()> {
         let payload = serde_json::to_string(observation)?;
         let transaction = self.connection.unchecked_transaction()?;
@@ -1357,18 +1126,6 @@ impl Database {
 
     pub fn admission_summary_for_run(&self, run_id: &str) -> Result<Option<AdmissionSummary>> {
         authoritative_admission(&self.connection, run_id)
-    }
-
-    pub fn manual_benchmark_priors(&self) -> Result<Vec<BenchmarkPrior>> {
-        let mut statement = self.connection.prepare(
-            "SELECT source, dataset, dataset_version, harness, model, language, \
-                    task_kind, scope, successes, attempts, updated_at \
-             FROM benchmark_priors WHERE origin = 'manual' \
-             ORDER BY source, dataset, dataset_version, harness, model, language, task_kind, scope",
-        )?;
-        let rows = statement.query_map([], prior_from_row)?;
-        rows.collect::<rusqlite::Result<_>>()
-            .context("failed to read public benchmark priors")
     }
 
     /// Replace all structured state for a run in one transaction. Events are an
@@ -1930,70 +1687,6 @@ impl Database {
             .collect()
     }
 
-    /// Derive source-local counts in one SQLite read snapshot. `source` is the
-    /// canonical location already stored by run preparation, not a repository ID.
-    /// No sync preparation, outbox writes, public priors or Cloud queries occur.
-    pub fn local_routing_evidence(&self, source: &Path) -> Result<Vec<LocalRoutingEvidence>> {
-        let mut statement = self.connection.prepare(
-            "SELECT o.observation_json, f.id, f.run_id, f.revision, f.payload_json \
-             FROM routing_observations o JOIN runs r ON r.id = o.run_id \
-             JOIN sources s ON s.id = r.source_id \
-             LEFT JOIN routing_feedback_events f ON f.id = (\
-                 SELECT id FROM routing_feedback_events WHERE observation_id = o.id \
-                 ORDER BY revision DESC LIMIT 1) \
-             WHERE s.path = ?1 ORDER BY o.id",
-        )?;
-        let mut rows = statement.query([path_text(source)])?;
-        let mut groups = BTreeMap::new();
-        while let Some(row) = rows.next()? {
-            let observation = deserialize_routing_observation(row.get(0)?)?;
-            if !observation.candidate_status.is_terminal() {
-                continue;
-            }
-            let latest = row.get::<_, Option<String>>(4)?;
-            let human = if let Some(json) = latest {
-                let event: RoutingFeedbackV1 =
-                    serde_json::from_str(&json).context("invalid local routing feedback event")?;
-                anyhow::ensure!(
-                    event.schema_version == 1
-                        && event.revision > 0
-                        && event.consent.scope == "routing-observation-v1"
-                        && event.feedback_event_id == row.get::<_, String>(1)?
-                        && event.observation_id == observation.id
-                        && row.get::<_, String>(2)? == observation.run_id
-                        && i64::from(event.revision) == row.get::<_, i64>(3)?,
-                    "local routing feedback identity or version mismatch"
-                );
-                Some(match event.outcome.as_str() {
-                    "accept" => RoutingHumanOutcome::Accepted,
-                    "reject" => RoutingHumanOutcome::Rejected,
-                    _ => anyhow::bail!("invalid local routing feedback outcome"),
-                })
-            } else {
-                observation
-                    .human_evaluation
-                    .as_ref()
-                    .map(|human| human.outcome.clone())
-            };
-            let features = &observation.prediction.task_features;
-            let key = (
-                features.language.clone(),
-                features.task_kind.as_str(),
-                features.scope.as_str(),
-                observation.prediction.selected_harness.clone(),
-            );
-            groups
-                .entry(key)
-                .or_insert_with(|| LocalRoutingEvidence {
-                    task_features: features.clone(),
-                    harness: observation.prediction.selected_harness.clone(),
-                    ..Default::default()
-                })
-                .count(&observation, human.as_ref());
-        }
-        Ok(groups.into_values().collect())
-    }
-
     pub fn save_routing_human_evaluation(
         &mut self,
         run_id: &str,
@@ -2011,8 +1704,6 @@ impl Database {
             .optional()?
             .with_context(|| format!("run {run_id} has no routing observation"))?;
         let mut observation = deserialize_routing_observation(json)?;
-        // Recover a known state left by an older binary before applying a new revision.
-        record_routing_feedback(&transaction, &observation)?;
         if observation
             .human_evaluation
             .as_ref()
@@ -2031,73 +1722,10 @@ impl Database {
              WHERE run_id = ?3",
             params![timestamp(observation.updated_at), json, run_id],
         )?;
-        record_routing_feedback(&transaction, &observation)?;
         transaction
             .commit()
             .context("failed to commit routing evaluation")?;
         Ok(observation)
-    }
-
-    pub fn synced_routing_payload(&self, run_id: &str) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox WHERE run_id = ?1 \
-             AND record_type = 'routing-observation-v1' AND status = 'synced'",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("failed to read synced routing parent")
-    }
-
-    pub fn routing_feedback_for_run(&self, run_id: &str) -> Result<Vec<RoutingFeedbackV1>> {
-        let mut statement = self.connection.prepare(
-            "SELECT payload_json FROM routing_feedback_events WHERE run_id = ?1 ORDER BY revision",
-        )?;
-        let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
-        rows.map(|row| serde_json::from_str(&row?).context("invalid routing feedback event"))
-            .collect()
-    }
-
-    pub fn reconcile_routing_feedback(&self, run_id: Option<&str>) -> Result<usize> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut statement = transaction.prepare(
-            "SELECT o.observation_json FROM routing_observations o JOIN sync_outbox s \
-             ON s.record_id = o.id WHERE s.record_type = 'routing-observation-v1' AND s.status = 'synced' \
-             AND (?1 IS NULL OR o.run_id = ?1)",
-        )?;
-        let observations = statement
-            .query_map([run_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        let mut created = 0;
-        for json in observations {
-            created += usize::from(record_routing_feedback(
-                &transaction,
-                &deserialize_routing_observation(json)?,
-            )?);
-        }
-        // The semantic event survives independently of outbox retention.
-        transaction.execute(
-            "INSERT OR IGNORE INTO sync_outbox(record_id, run_id, record_type, payload_json, status) \
-             SELECT f.id, f.run_id, 'routing-feedback-v1', f.payload_json, 'pending' \
-             FROM routing_feedback_events f JOIN sync_outbox p ON p.record_id = f.observation_id \
-             WHERE p.record_type = 'routing-observation-v1' AND p.status = 'synced' \
-             AND (?1 IS NULL OR f.run_id = ?1)", [run_id],
-        )?;
-        transaction.commit()?;
-        Ok(created)
-    }
-
-    pub(crate) fn sync_payload_for_record(&self, record_id: &str) -> Result<String> {
-        self.connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox WHERE record_id = ?1",
-                [record_id],
-                |row| row.get(0),
-            )
-            .context("sync payload is missing")
     }
 
     fn read_routing_observation(
@@ -2110,310 +1738,6 @@ impl Database {
             .optional()?
             .map(deserialize_routing_observation)
             .transpose()
-    }
-
-    pub fn sync_settings(&self) -> Result<SyncSettings> {
-        let (enabled, contributor_id, enabled_at, consent_version, routing_enabled_at) = self
-            .connection
-            .query_row(
-                "SELECT enabled, contributor_id, enabled_at, consent_version, \
-                 routing_observation_enabled_at FROM sync_settings WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .context("failed to read sync settings")?;
-        Ok(SyncSettings {
-            enabled,
-            contributor_id,
-            enabled_at,
-            consent_version: u32::try_from(consent_version)
-                .context("sync consent version is invalid")?,
-            routing_observation_enabled_at: routing_enabled_at,
-        })
-    }
-
-    pub fn enable_sync(
-        &mut self,
-        contributor_id: &str,
-        enabled_at: DateTime<Utc>,
-    ) -> Result<SyncSettings> {
-        self.connection.execute(
-            "UPDATE sync_settings SET enabled = 1, \
-             contributor_id = COALESCE(contributor_id, ?1), \
-             enabled_at = COALESCE(enabled_at, ?2), \
-             consent_version = MAX(consent_version, ?3), \
-             routing_observation_enabled_at = COALESCE(routing_observation_enabled_at, ?2) \
-             WHERE id = 1",
-            params![
-                contributor_id,
-                timestamp(enabled_at),
-                ROUTING_OBSERVATION_CONSENT_VERSION
-            ],
-        )?;
-        self.sync_settings()
-    }
-
-    pub fn disable_sync(&self) -> Result<()> {
-        self.connection
-            .execute("UPDATE sync_settings SET enabled = 0 WHERE id = 1", [])?;
-        Ok(())
-    }
-
-    pub fn set_sync_token(&self, token: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sync_settings SET ingestion_token = ?1 WHERE id = 1",
-            [token],
-        )?;
-        Ok(())
-    }
-
-    pub fn sync_token(&self) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT ingestion_token FROM sync_settings WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .context("failed to read Dispatch Cloud ingestion token")
-    }
-
-    pub fn clear_sync_token(&self) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sync_settings SET ingestion_token = NULL WHERE id = 1",
-            [],
-        )?;
-        Ok(())
-    }
-
-    pub fn evaluation_id(&self, run_id: &str) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT public_id FROM evaluations WHERE run_id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("failed to read evaluation identity")
-    }
-
-    pub fn evaluation_count(&self) -> Result<usize> {
-        let count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM evaluations", [], |row| row.get(0))?;
-        usize::try_from(count).context("evaluation count is invalid")
-    }
-
-    pub fn enqueue_sync(
-        &self,
-        record_type: SyncRecordType,
-        record_id: &str,
-        run_id: &str,
-        payload_json: &str,
-    ) -> Result<bool> {
-        let source_exists = match record_type {
-            SyncRecordType::EvaluationV1 => self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM evaluations WHERE public_id = ?1 AND run_id = ?2)",
-                params![record_id, run_id],
-                |row| row.get::<_, bool>(0),
-            )?,
-            SyncRecordType::RoutingObservationV1 => self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM routing_observations WHERE id = ?1 AND run_id = ?2)",
-                params![record_id, run_id],
-                |row| row.get::<_, bool>(0),
-            )?,
-            SyncRecordType::RoutingFeedbackV1 => self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM routing_feedback_events WHERE id = ?1 AND run_id = ?2 AND payload_json = ?3)",
-                params![record_id, run_id, payload_json], |row| row.get::<_, bool>(0),
-            )?,
-        };
-        anyhow::ensure!(
-            source_exists,
-            "run {run_id} has no persisted {} record {record_id}",
-            record_type.as_str()
-        );
-
-        let transaction = self.connection.unchecked_transaction()?;
-        let existing = transaction
-            .query_row(
-                "SELECT record_type, payload_json, status FROM sync_outbox WHERE record_id = ?1",
-                [record_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let changed = if let Some((stored_type, stored_payload, status)) = existing {
-            anyhow::ensure!(
-                stored_type == record_type.as_str(),
-                "sync record {record_id} already has type {stored_type}"
-            );
-            if stored_payload == payload_json {
-                false
-            } else if record_type == SyncRecordType::EvaluationV1 {
-                // Preserve the original evaluation outbox's first-snapshot behavior.
-                false
-            } else {
-                anyhow::ensure!(
-                    record_type != SyncRecordType::RoutingFeedbackV1
-                        && !matches!(status.as_str(), "synced" | "conflict"),
-                    "{} {record_id} is already {status}; its Cloud payload is immutable",
-                    record_type.as_str()
-                );
-                transaction.execute(
-                    "UPDATE sync_outbox SET payload_json = ?2, status = 'pending', \
-                     last_attempt = NULL, last_error = NULL, synced_at = NULL \
-                     WHERE record_id = ?1",
-                    params![record_id, payload_json],
-                )?;
-                true
-            }
-        } else {
-            transaction.execute(
-                "INSERT INTO sync_outbox(\
-                     record_id, run_id, record_type, payload_json, status\
-                 ) VALUES (?1, ?2, ?3, ?4, 'pending')",
-                params![record_id, run_id, record_type.as_str(), payload_json],
-            )?;
-            true
-        };
-        transaction.commit()?;
-        Ok(changed)
-    }
-
-    pub fn sync_payload_for_run(
-        &self,
-        run_id: &str,
-        record_type: SyncRecordType,
-    ) -> Result<Option<String>> {
-        anyhow::ensure!(
-            record_type != SyncRecordType::RoutingFeedbackV1,
-            "routing feedback requires a revision selector"
-        );
-        self.connection
-            .query_row(
-                "SELECT payload_json FROM sync_outbox WHERE run_id = ?1 AND record_type = ?2",
-                params![run_id, record_type.as_str()],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("failed to read sync preview")
-    }
-
-    pub fn pending_sync_records(&self) -> Result<Vec<SyncOutboxRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT s.record_id, s.run_id, s.record_type, s.payload_json FROM sync_outbox s \
-             LEFT JOIN routing_feedback_events f ON f.id = s.record_id \
-             WHERE s.status IN ('pending', 'failed') ORDER BY s.run_id, COALESCE(f.revision, 0), s.record_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let rows = rows
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to read sync outbox")?;
-        rows.into_iter()
-            .map(|(record_id, run_id, record_type, payload_json)| {
-                Ok(SyncOutboxRecord {
-                    record_id,
-                    run_id,
-                    record_type: SyncRecordType::parse(&record_type)?,
-                    payload_json,
-                })
-            })
-            .collect()
-    }
-
-    pub fn mark_sync_failed(
-        &self,
-        record_id: &str,
-        attempted_at: DateTime<Utc>,
-        error: &str,
-    ) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sync_outbox SET status = 'failed', last_attempt = ?2, \
-             last_error = ?3, synced_at = NULL WHERE record_id = ?1",
-            params![record_id, timestamp(attempted_at), error],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_sync_conflict(
-        &self,
-        record_id: &str,
-        attempted_at: DateTime<Utc>,
-        error: &str,
-    ) -> Result<()> {
-        self.connection.execute(
-            "UPDATE sync_outbox SET status = 'conflict', last_attempt = ?2, \
-             last_error = ?3, synced_at = NULL WHERE record_id = ?1",
-            params![record_id, timestamp(attempted_at), error],
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_sync_succeeded(&self, record_id: &str, attempted_at: DateTime<Utc>) -> Result<()> {
-        let at = timestamp(attempted_at);
-        self.connection.execute(
-            "UPDATE sync_outbox SET status = 'synced', last_attempt = ?2, \
-             last_error = NULL, synced_at = ?2 WHERE record_id = ?1",
-            params![record_id, at],
-        )?;
-        Ok(())
-    }
-
-    pub fn sync_outbox_counts(&self) -> Result<SyncOutboxCounts> {
-        self.read_sync_outbox_counts(None)
-    }
-
-    pub fn sync_outbox_counts_for_type(
-        &self,
-        record_type: SyncRecordType,
-    ) -> Result<SyncOutboxCounts> {
-        self.read_sync_outbox_counts(Some(record_type))
-    }
-
-    fn read_sync_outbox_counts(
-        &self,
-        record_type: Option<SyncRecordType>,
-    ) -> Result<SyncOutboxCounts> {
-        let mut counts = SyncOutboxCounts::default();
-        let mut statement = self.connection.prepare(
-            "SELECT status, COUNT(*) FROM sync_outbox \
-             WHERE ?1 IS NULL OR record_type = ?1 GROUP BY status",
-        )?;
-        let record_type = record_type.map(SyncRecordType::as_str);
-        let rows = statement.query_map([record_type], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (status, count) = row?;
-            let count = usize::try_from(count).context("sync outbox count is invalid")?;
-            match status.as_str() {
-                "pending" => counts.pending = count,
-                "failed" => counts.failed = count,
-                "conflict" => counts.conflict = count,
-                "synced" => counts.synced = count,
-                _ => {}
-            }
-        }
-        Ok(counts)
     }
 
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunSummary>> {
@@ -2764,100 +2088,6 @@ fn same_routing_human_evaluation(
         && left.explanation == right.explanation
 }
 
-/// Called only inside an immediate transaction: state change, revision and outbox
-/// become durable together. The wire snapshot is also the local semantic event.
-fn record_routing_feedback(
-    transaction: &Transaction<'_>,
-    observation: &RoutingObservation,
-) -> Result<bool> {
-    let Some(human) = &observation.human_evaluation else {
-        return Ok(false);
-    };
-    let parent = transaction
-        .query_row(
-            "SELECT payload_json FROM sync_outbox WHERE record_id = ?1 \
-         AND record_type = 'routing-observation-v1' AND status = 'synced'",
-            [&observation.id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let Some(parent) = parent else {
-        return Ok(false);
-    };
-    let parent: RoutingObservationV1 =
-        serde_json::from_str(&parent).context("invalid synced routing parent")?;
-    anyhow::ensure!(
-        parent.schema_version == 1
-            && parent.observation_id == observation.id
-            && parent.run_id == observation.run_id
-            && parent.consent.scope == "routing-observation-v1",
-        "synced routing parent identity or version mismatch"
-    );
-    let latest = transaction.query_row(
-        "SELECT payload_json FROM routing_feedback_events WHERE observation_id = ?1 ORDER BY revision DESC LIMIT 1",
-        [&observation.id], |row| row.get::<_, String>(0),
-    ).optional()?;
-    let (previous_revision, previous_state) = if let Some(latest) = latest {
-        let latest: RoutingFeedbackV1 = serde_json::from_str(&latest)?;
-        (
-            latest.revision,
-            Some((latest.outcome, latest.reasons, latest.explanation)),
-        )
-    } else {
-        let previous = parent
-            .human_evaluation
-            .map(|old| -> Result<_> {
-                let outcome = match old.outcome.as_str() {
-                    "accepted" => "accept",
-                    "rejected" => "reject",
-                    _ => anyhow::bail!("invalid human outcome in synced routing parent"),
-                };
-                Ok((outcome.to_owned(), old.reasons, old.explanation))
-            })
-            .transpose()?;
-        (0, previous)
-    };
-    let outcome = match human.outcome {
-        crate::RoutingHumanOutcome::Accepted => "accept",
-        crate::RoutingHumanOutcome::Rejected => "reject",
-    };
-    if previous_state
-        .as_ref()
-        .is_some_and(|(old_outcome, reasons, explanation)| {
-            old_outcome == outcome && reasons == &human.reasons && explanation == &human.explanation
-        })
-    {
-        return Ok(false);
-    }
-    let revision = previous_revision
-        .checked_add(1)
-        .context("routing feedback revision exhausted")?;
-    let event = RoutingFeedbackV1 {
-        schema_version: 1,
-        feedback_event_id: format!("routing-feedback-{}-{revision}", observation.run_id),
-        observation_id: observation.id.clone(),
-        contributor_id: parent.contributor_id,
-        revision,
-        consent: parent.consent,
-        outcome: outcome.into(),
-        reasons: human.reasons.clone(),
-        explanation: human.explanation.clone(),
-        evaluated_at: human.evaluated_at,
-    };
-    let payload = serde_json::to_string_pretty(&event)?;
-    transaction.execute(
-        "INSERT INTO routing_feedback_events(id, observation_id, run_id, revision, created_at, payload_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![event.feedback_event_id, observation.id, observation.run_id, revision, timestamp(Utc::now()), payload],
-    )?;
-    transaction.execute(
-        "INSERT INTO sync_outbox(record_id, run_id, record_type, payload_json, status) \
-         VALUES (?1, ?2, 'routing-feedback-v1', ?3, 'pending')",
-        params![event.feedback_event_id, observation.run_id, payload],
-    )?;
-    Ok(true)
-}
-
 fn insert_evaluation(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -2934,79 +2164,6 @@ fn path_text(path: &Path) -> String {
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Nanos, true)
-}
-
-fn insert_benchmark_prior(
-    connection: &Connection,
-    prior: &BenchmarkPrior,
-    origin: &str,
-) -> Result<()> {
-    anyhow::ensure!(
-        prior.successes <= prior.attempts,
-        "benchmark prior successes cannot exceed attempts"
-    );
-    connection.execute(
-        r#"INSERT INTO benchmark_priors(
-                source, dataset, dataset_version, harness, model, language,
-                task_kind, scope, successes, attempts, updated_at, origin
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            ON CONFLICT DO UPDATE SET
-                successes = excluded.successes,
-                attempts = excluded.attempts,
-                updated_at = excluded.updated_at"#,
-        params![
-            prior.source,
-            prior.dataset,
-            prior.dataset_version,
-            prior.harness,
-            prior.model,
-            prior.language,
-            prior.task_kind.as_str(),
-            prior.scope.as_str(),
-            unsigned(prior.successes, "benchmark prior successes")?,
-            unsigned(prior.attempts, "benchmark prior attempts")?,
-            timestamp(prior.updated_at),
-            origin,
-        ],
-    )?;
-    Ok(())
-}
-
-fn prior_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BenchmarkPrior> {
-    Ok(BenchmarkPrior {
-        source: row.get(0)?,
-        dataset: row.get(1)?,
-        dataset_version: row.get(2)?,
-        harness: row.get(3)?,
-        model: row.get(4)?,
-        language: row.get(5)?,
-        task_kind: parse_task_kind(row.get(6)?)?,
-        scope: parse_task_scope(row.get(7)?)?,
-        successes: row.get(8)?,
-        attempts: row.get(9)?,
-        updated_at: timestamp_from_sql(10, row.get(10)?)?,
-    })
-}
-
-fn parse_task_kind(value: String) -> rusqlite::Result<crate::TaskKind> {
-    match value.as_str() {
-        "bug_fix" => Ok(crate::TaskKind::BugFix),
-        "feature" => Ok(crate::TaskKind::Feature),
-        "refactor" => Ok(crate::TaskKind::Refactor),
-        "tests" => Ok(crate::TaskKind::Tests),
-        "unknown" => Ok(crate::TaskKind::Unknown),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
-}
-
-fn parse_task_scope(value: String) -> rusqlite::Result<crate::TaskScope> {
-    match value.as_str() {
-        "localized" => Ok(crate::TaskScope::Localized),
-        "multi_file" => Ok(crate::TaskScope::MultiFile),
-        "broad" => Ok(crate::TaskScope::Broad),
-        "unknown" => Ok(crate::TaskScope::Unknown),
-        _ => Err(rusqlite::Error::InvalidQuery),
-    }
 }
 
 fn timestamp_from_sql(column: usize, value: String) -> rusqlite::Result<DateTime<Utc>> {
@@ -3952,116 +3109,6 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_legacy_evaluation_consent_and_outbox_without_expanding_scope()
-    -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("legacy.db");
-        let connection = Connection::open(&path)?;
-        connection.execute_batch(
-            "PRAGMA foreign_keys = ON;\
-             CREATE TABLE schema_migrations (\
-                 version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL\
-             );",
-        )?;
-        for (version, name, sql) in MIGRATIONS.iter().take(8) {
-            connection.execute_batch(sql)?;
-            connection.execute(
-                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
-                params![version, name, timestamp(at(1))],
-            )?;
-        }
-        insert_legacy_run(&connection, "run-legacy-sync")?;
-        let mut legacy = Database { connection };
-        legacy.save_evaluation(
-            "run-legacy-sync",
-            &EvaluationRecord {
-                outcome: EvaluationOutcome::Tie,
-                reasons: vec![],
-                explanation: None,
-                created_at: at(5),
-                blind: true,
-            },
-        )?;
-        legacy.connection.execute(
-            "UPDATE sync_settings SET enabled = 1, contributor_id = ?1, enabled_at = ?2",
-            params!["legacy-contributor", timestamp(at(6))],
-        )?;
-        legacy.connection.execute(
-            "INSERT INTO sync_outbox(evaluation_id, run_id, payload_json, status) \
-             VALUES (?1, ?2, ?3, 'pending')",
-            params![
-                "evaluation-run-legacy-sync",
-                "run-legacy-sync",
-                "{\"schema_version\":1}"
-            ],
-        )?;
-        drop(legacy);
-
-        let database = Database::open(&path)?;
-        let settings = database.sync_settings()?;
-        assert!(settings.enabled);
-        assert_eq!(settings.consent_version, 1);
-        assert!(!settings.routing_observations_enabled());
-        assert!(settings.routing_observation_enabled_at.is_none());
-        let records = database.pending_sync_records()?;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].record_id, "evaluation-run-legacy-sync");
-        assert_eq!(records[0].record_type, SyncRecordType::EvaluationV1);
-        assert_eq!(records[0].payload_json, "{\"schema_version\":1}");
-        Ok(())
-    }
-
-    #[test]
-    fn feedback_migration_preserves_typed_outbox_bytes_status_and_retry_metadata() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = temp.path().join("v9.db");
-        let connection = Connection::open(&path)?;
-        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);")?;
-        for (version, name, sql) in MIGRATIONS.iter().take(9) {
-            connection.execute_batch(sql)?;
-            connection.execute(
-                "INSERT INTO schema_migrations VALUES (?1, ?2, ?3)",
-                params![version, name, timestamp(at(1))],
-            )?;
-        }
-        insert_legacy_run(&connection, "migration-run")?;
-        let mut previous = Database { connection };
-        previous.enable_sync("migration-contributor", at(6))?;
-        for status in ["pending", "failed", "conflict", "synced"] {
-            for record_type in ["evaluation-v1", "routing-observation-v1"] {
-                previous.connection.execute(
-                    "INSERT INTO sync_outbox VALUES (?1, 'migration-run', ?2, ?3, ?4, 'attempt', 'error', 'synced-at')",
-                    params![format!("{record_type}-{status}"), record_type, format!("{{\n  \"state\": \"{status}\"\n}}"), status],
-                )?;
-            }
-        }
-        let settings = previous.sync_settings()?;
-        drop(previous);
-        let migrated = Database::open(&path)?;
-        assert_eq!(migrated.schema_version()?, 21);
-        assert_eq!(migrated.sync_settings()?, settings);
-        for status in ["pending", "failed", "conflict", "synced"] {
-            for record_type in ["evaluation-v1", "routing-observation-v1"] {
-                let row: (String, String, String, String, String) = migrated.connection.query_row(
-                    "SELECT payload_json, status, last_attempt, last_error, synced_at FROM sync_outbox WHERE record_id = ?1",
-                    [format!("{record_type}-{status}")], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
-                )?;
-                assert_eq!(
-                    row,
-                    (
-                        format!("{{\n  \"state\": \"{status}\"\n}}"),
-                        status.into(),
-                        "attempt".into(),
-                        "error".into(),
-                        "synced-at".into()
-                    )
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
     fn syncs_run_candidates_checks_and_blind_harness_mapping() -> Result<()> {
         let mut database = Database::open_in_memory()?;
         let record = run("run-1");
@@ -4162,84 +3209,6 @@ mod tests {
         assert_eq!(reasons, evaluation.reasons);
         assert_eq!(database.list_runs(1)?[0].status, "evaluated");
         assert!(database.list_runs(1)?[0].evaluated);
-        assert_eq!(
-            database.evaluation_id("run-eval")?.as_deref(),
-            Some("evaluation-run-eval")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn sync_consent_is_off_by_default_and_identity_is_stable() -> Result<()> {
-        let mut database = Database::open_in_memory()?;
-        assert_eq!(
-            database.sync_settings()?,
-            SyncSettings {
-                enabled: false,
-                contributor_id: None,
-                enabled_at: None,
-                consent_version: 1,
-                routing_observation_enabled_at: None,
-            }
-        );
-        let first = database.enable_sync("install-first", at(1))?;
-        assert!(first.enabled);
-        assert!(first.routing_observations_enabled());
-        assert_eq!(first.contributor_id.as_deref(), Some("install-first"));
-        database.disable_sync()?;
-        assert!(!database.sync_settings()?.enabled);
-        let second = database.enable_sync("install-replacement", at(2))?;
-        assert_eq!(second.contributor_id, first.contributor_id);
-        assert_eq!(second.enabled_at, first.enabled_at);
-        assert_eq!(
-            second.routing_observation_enabled_at,
-            first.routing_observation_enabled_at
-        );
-
-        database.sync_run(&run("run-sync"))?;
-        database.save_evaluation(
-            "run-sync",
-            &EvaluationRecord {
-                outcome: EvaluationOutcome::Tie,
-                reasons: vec![],
-                explanation: None,
-                created_at: at(5),
-                blind: true,
-            },
-        )?;
-        let evaluation_id = database.evaluation_id("run-sync")?.unwrap();
-        assert!(database.enqueue_sync(
-            SyncRecordType::EvaluationV1,
-            &evaluation_id,
-            "run-sync",
-            "{\"v\":1}"
-        )?);
-        assert!(!database.enqueue_sync(
-            SyncRecordType::EvaluationV1,
-            &evaluation_id,
-            "run-sync",
-            "{\"v\":1}"
-        )?);
-        assert!(!database.enqueue_sync(
-            SyncRecordType::EvaluationV1,
-            &evaluation_id,
-            "run-sync",
-            "different"
-        )?);
-        assert_eq!(
-            database.pending_sync_records()?[0].payload_json,
-            "{\"v\":1}"
-        );
-        database.mark_sync_failed(&evaluation_id, at(6), "offline")?;
-        assert_eq!(database.sync_outbox_counts()?.failed, 1);
-        database.mark_sync_succeeded(&evaluation_id, at(7))?;
-        assert_eq!(database.sync_outbox_counts()?.synced, 1);
-        assert!(!database.enqueue_sync(
-            SyncRecordType::EvaluationV1,
-            &evaluation_id,
-            "run-sync",
-            "changed-after-sync"
-        )?);
         Ok(())
     }
 
@@ -4262,7 +3231,6 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(outcome, "tie");
-        let public_id = database.evaluation_id("run-outcomes")?;
 
         // Later lifecycle transitions retain the evaluation without having the
         // embedded evaluation overwrite the authoritative run status.
@@ -4270,7 +3238,6 @@ mod tests {
         record.applied_candidate = Some("A".to_owned());
         database.sync_run(&record)?;
         assert_eq!(database.list_runs(1)?[0].status, "applied");
-        assert_eq!(database.evaluation_id("run-outcomes")?, public_id);
 
         database.save_evaluation(
             "run-outcomes",

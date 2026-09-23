@@ -320,9 +320,5 @@ fn existing_single_candidate_evaluation_remains_separate_from_the_observation() 
     assert_eq!(after.id, before.id);
     assert_eq!(after.created_at, before.created_at);
     assert!(after.human_evaluation.is_none());
-    assert_eq!(
-        database.evaluation_id(&run.id)?.as_deref(),
-        Some("evaluation-run-evaluated")
-    );
     Ok(())
 }

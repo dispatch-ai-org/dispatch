@@ -148,21 +148,6 @@ pub struct RoutingObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BenchmarkPrior {
-    pub source: String,
-    pub dataset: String,
-    pub dataset_version: String,
-    pub harness: String,
-    pub model: Option<String>,
-    pub language: Option<String>,
-    pub task_kind: TaskKind,
-    pub scope: TaskScope,
-    pub successes: u64,
-    pub attempts: u64,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Git,

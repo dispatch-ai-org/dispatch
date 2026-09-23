@@ -32,9 +32,9 @@ use crate::{
     AdmissionState, AllocationDecision, ApplicationState, AppliedBy, AttemptRecord,
     CandidateRecord, CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision,
     DiffStats, EnvironmentRecord, EvaluationOutcome, EvaluationRecord, EventRecord, LifecycleState,
-    ReviewState, RoutingAlternative, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome,
-    RoutingObservation, RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus,
-    SelectionBasis, VERSION, Validity, VerificationState, WaitingOn, WorkResult,
+    ReviewState, RoutingDecision, RoutingHumanEvaluation, RoutingHumanOutcome, RoutingObservation,
+    RunMode, RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, SelectionBasis, VERSION,
+    Validity, VerificationState, WaitingOn, WorkResult,
     admission::{
         AcquireResult, AdmissionBinding, AdmissionCoordinator, AdmissionLeaseObserver, LeaseToken,
         canonical_pool_identity,
@@ -46,11 +46,7 @@ use crate::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
         run_checks_with_observer, trusted_host_executable,
     },
-    harness::{
-        HarnessRunRequest, SUPPORTED_HARNESSES, adapter_for, build_prompt, probe_version,
-        run_harness,
-    },
-    router::rank_harnesses,
+    harness::{HarnessRunRequest, adapter_for, build_prompt, probe_version, run_harness},
     source,
     state::{State, write_text},
 };
@@ -123,7 +119,6 @@ pub struct RunRequest {
     pub source: PathBuf,
     pub task: String,
     pub harnesses: Vec<String>,
-    pub route: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -337,165 +332,6 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     Ok(())
 }
 
-pub fn recommend(state: &State, source_path: &Path, task: &str) -> Result<()> {
-    anyhow::ensure!(!task.trim().is_empty(), "task must not be empty");
-    let source_path = source::resolve_source(Some(source_path))?;
-    let projected_state_root = canonicalize_allow_missing(&state.root)?;
-    anyhow::ensure!(
-        !projected_state_root.starts_with(&source_path),
-        "Dispatch state directory must be outside the source tree: {}",
-        state.root.display()
-    );
-    let features = classify_task(&source_path, task)?;
-    state.initialize()?;
-    let database = crate::public_priors::open_database(state)?;
-    let supported_real_harnesses = supported_real_harnesses();
-    let ranked = rank_harnesses(&database, &features, &supported_real_harnesses)?;
-
-    println!("Task");
-    println!(
-        "  language: {}",
-        features.language.as_deref().unwrap_or("unknown")
-    );
-    println!("  kind: {}", features.task_kind.as_str());
-    println!("  scope: {}", features.scope.as_str());
-
-    let recommendations = ranked
-        .iter()
-        .filter(|prediction| prediction.evidence.is_some())
-        .collect::<Vec<_>>();
-    if recommendations.is_empty() {
-        println!("\nNo compatible routing evidence is available.");
-        return Ok(());
-    }
-
-    println!("\nRecommendations");
-    for (index, prediction) in recommendations.into_iter().enumerate() {
-        let evidence = prediction
-            .evidence
-            .as_ref()
-            .expect("recommendations contain evidence");
-        let specificity = specificity_label(evidence.specificity);
-        println!("\n{}. {}", index + 1, prediction.harness);
-        println!(
-            "   benchmark success: {}/{} ({:.1}%)",
-            prediction.successes,
-            prediction.attempts,
-            prediction.score.expect("evidence has a score") * 100.0
-        );
-        println!(
-            "   evidence specificity: {}/3 ({specificity})",
-            evidence.specificity
-        );
-        println!("   source: {}", evidence.prior.source);
-        println!("   dataset: {}", evidence.prior.dataset);
-        println!("   dataset version: {}", evidence.prior.dataset_version);
-        println!(
-            "   model: {}",
-            evidence.prior.model.as_deref().unwrap_or("<unknown>")
-        );
-    }
-    Ok(())
-}
-
-fn supported_real_harnesses() -> Vec<String> {
-    SUPPORTED_HARNESSES
-        .iter()
-        .filter(|harness| !harness.starts_with("fake-"))
-        .map(|harness| (*harness).to_owned())
-        .collect()
-}
-
-async fn select_automatic_harness(
-    state: &State,
-    source_path: &Path,
-    task: &str,
-    config: &Config,
-) -> Result<RoutingDecision> {
-    anyhow::ensure!(
-        config.execution.backend == "local",
-        "--route requires the local backend so harness execution eligibility can be established; use --harnesses for Docker execution"
-    );
-    let features = classify_task(source_path, task)?;
-    state.initialize()?;
-    let database = crate::public_priors::open_database(state)?;
-    let mut eligible = Vec::new();
-    for harness in supported_real_harnesses() {
-        let adapter = adapter_for(&harness, &config.harnesses)?;
-        if adapter.detect().await.available {
-            eligible.push(harness);
-        }
-    }
-    anyhow::ensure!(
-        !eligible.is_empty(),
-        "No supported coding agent is available. Install and authenticate Claude Code, Codex, or Cursor, then try again."
-    );
-    let ranked = rank_harnesses(&database, &features, &eligible)?;
-    let alternatives = ranked
-        .iter()
-        .map(|prediction| match &prediction.evidence {
-            Some(evidence) => RoutingAlternative {
-                harness: prediction.harness.clone(),
-                successes: prediction.successes,
-                attempts: prediction.attempts,
-                specificity: Some(evidence.specificity),
-                source: Some(evidence.prior.source.clone()),
-                dataset: Some(evidence.prior.dataset.clone()),
-                dataset_version: Some(evidence.prior.dataset_version.clone()),
-                model: evidence.prior.model.clone(),
-            },
-            None => RoutingAlternative {
-                harness: prediction.harness.clone(),
-                successes: 0,
-                attempts: 0,
-                specificity: None,
-                source: None,
-                dataset: None,
-                dataset_version: None,
-                model: None,
-            },
-        })
-        .collect::<Vec<_>>();
-
-    // One observed result is not a comparison against unknown performance.
-    let mut evidenced = ranked
-        .iter()
-        .filter(|prediction| prediction.evidence.is_some());
-    if let (Some(prediction), Some(_)) = (evidenced.next(), evidenced.next()) {
-        let evidence = prediction.evidence.as_ref().expect("checked above");
-        return Ok(RoutingDecision {
-            version: 1,
-            task_features: features,
-            selected_harness: prediction.harness.clone(),
-            successes: prediction.successes,
-            attempts: prediction.attempts,
-            specificity: evidence.specificity,
-            source: evidence.prior.source.clone(),
-            dataset: evidence.prior.dataset.clone(),
-            dataset_version: evidence.prior.dataset_version.clone(),
-            model: evidence.prior.model.clone(),
-            selection_basis: SelectionBasis::Evidence,
-            alternatives,
-        });
-    }
-
-    let selected_harness = eligible[0].clone();
-    Ok(RoutingDecision {
-        version: 1,
-        task_features: features,
-        selected_harness,
-        successes: 0,
-        attempts: 0,
-        specificity: 0,
-        source: String::new(),
-        dataset: String::new(),
-        dataset_version: String::new(),
-        model: None,
-        selection_basis: SelectionBasis::Default,
-        alternatives,
-    })
-}
-
 fn override_decision(source_path: &Path, task: &str, harness: String) -> Result<RoutingDecision> {
     Ok(RoutingDecision {
         version: 1,
@@ -679,7 +515,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         anyhow::ensure!(
             resources.allocation_enabled
                 && resources.capacity.admission
-                && !request.route
                 && request.harnesses.is_empty(),
             "planned mode requires included-resource allocation and shared admission"
         );
@@ -694,12 +529,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             "direct mode permits at most two invocations"
         );
     }
-    let allocation_requested =
-        (resources.allocation_enabled && !request.route && request.harnesses.is_empty())
-            || request.model.is_some()
-            || request.effort.is_some();
-    let automatic = request.route
-        || (request.harnesses.is_empty() && request.agent.is_none() && !allocation_requested);
+    let allocation_requested = (resources.allocation_enabled && request.harnesses.is_empty())
+        || request.model.is_some()
+        || request.effort.is_some();
+    anyhow::ensure!(
+        allocation_requested || request.agent.is_some() || !request.harnesses.is_empty(),
+        "no coding agent is configured: run `dispatch setup` to configure one, or pass --agent claude|codex|cursor"
+    );
     let fixed_harness = request.agent.clone();
     let mut local_authorized = request.allow_unsafe_local;
     if allocation_requested && config.execution.backend == "local" && !local_authorized {
@@ -733,14 +569,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             vec![decision.selected.harness.clone()],
             None,
             Some(decision),
-        )
-    } else if automatic {
-        let decision =
-            select_automatic_harness(state, &source_path, &request.task, &config).await?;
-        (
-            vec![decision.selected_harness.clone()],
-            Some(decision),
-            None,
         )
     } else if let Some(agent) = request.agent {
         let decision = override_decision(&source_path, &request.task, agent)?;
@@ -3793,7 +3621,6 @@ pub fn refresh_request(
                 .map(|candidate| candidate.harness_id.clone())
                 .collect()
         },
-        route: false,
         agent: fixed(goal.and_then(|goal| goal.fixed_harness.as_ref())),
         model: fixed(goal.and_then(|goal| goal.fixed_model.as_ref())),
         effort: fixed(goal.and_then(|goal| goal.fixed_effort.as_ref())),
@@ -4987,7 +4814,6 @@ mod tests {
                             source: project,
                             task: "Deterministic handoff fixture".into(),
                             harnesses: vec![],
-                            route: false,
                             agent: Some("codex".into()),
                             model: Some("fixture".into()),
                             effort: Some("medium".into()),

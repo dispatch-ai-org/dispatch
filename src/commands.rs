@@ -363,7 +363,6 @@ pub(crate) fn validate_submission(
                     && request.backend.is_none()
                     && request.agent.is_none()
                     && request.harnesses.is_empty()
-                    && !request.route
                     && !request.allow_forwarded_env
                     && request.priority == 0,
                 "unauthorized submit scope"
@@ -798,7 +797,6 @@ pub(crate) async fn execute(state: &State, scope: &Scope, command: Operation) ->
                     source: scope.source.clone(),
                     task,
                     harnesses: vec![],
-                    route: false,
                     agent: None,
                     model,
                     effort,

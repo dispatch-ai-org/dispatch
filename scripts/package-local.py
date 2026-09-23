@@ -17,7 +17,7 @@ tracked=subprocess.check_output(['git','ls-files','-z','--cached','--others','--
 paths=sorted(set(p.decode() for p in tracked if p))
 # Freeze runtime source, fixtures and build contract, excluding generated evidence/reports.
 source={p:hashof((ROOT/p).read_bytes()) for p in paths if (ROOT/p).is_file() and
-        (p.startswith(('src/','tests/','examples/','public-priors/','schemas/','assets/','scripts/','.github/workflows/')) or p in ('Cargo.toml','Cargo.lock','AGENTS.md','LICENSE','docs/release-install.md','docs/captures/phase4-refinement/render-capture.py'))}
+        (p.startswith(('src/','tests/','examples/','assets/','scripts/','.github/workflows/')) or p in ('Cargo.toml','Cargo.lock','AGENTS.md','LICENSE','docs/release-install.md','docs/captures/phase4-refinement/render-capture.py'))}
 source_digest=hashof(json.dumps(source,sort_keys=True,separators=(',',':')).encode())
 manifest={'version':version,'platform':platform_name,'architecture':arch,'binary_sha256':hashof(binary.read_bytes()),'source_sha256':source_digest,'source_files':source,'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),'publication':False,'fixture_validation_does_not_certify_live_providers':True}
 files={'dispatch':binary.read_bytes(),'LICENSE':(ROOT/'LICENSE').read_bytes(),'INSTALL.md':(ROOT/'docs/release-install.md').read_bytes(),'BUILD.json':(json.dumps(manifest,indent=2,sort_keys=True)+'\n').encode()}

@@ -1668,7 +1668,6 @@ async fn run_goal(
         source: source.to_path_buf(),
         task,
         harnesses: vec![],
-        route: false,
         agent: None,
         model: None,
         effort: None,
