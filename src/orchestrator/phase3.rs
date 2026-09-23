@@ -551,7 +551,6 @@ async fn recovery_route(
             Some(&p.harness),
             Some(&p.model),
             p.effort.as_deref(),
-            false,
             None,
         )
         .await

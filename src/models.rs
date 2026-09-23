@@ -849,7 +849,11 @@ pub struct AllocationAlternative {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllocationDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub private_evidence: Option<crate::private_evidence::DecisionEvidence>,
+    /// Opaque decision-time evidence written by the removed private-evidence
+    /// policy (0.4.0 and earlier). Kept verbatim so older run projections
+    /// round-trip: the `private_decision_immutable` trigger refuses any rewrite
+    /// that changes it, until migration 22 drops that trigger.
+    pub private_evidence: Option<serde_json::Value>,
     pub version: u32,
     pub policy_version: String,
     pub task_features: TaskFeatures,

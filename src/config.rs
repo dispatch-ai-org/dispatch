@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(skip_serializing_if = "crate::planning::PlanningConfig::is_empty")]
     pub planning: crate::planning::PlanningConfig,
-    #[serde(skip_serializing_if = "crate::private_evidence::EvidenceConfig::is_disabled")]
-    pub private_evidence: crate::private_evidence::EvidenceConfig,
     #[serde(skip_serializing_if = "CoherenceConfig::is_default")]
     pub coherence: CoherenceConfig,
     pub execution: ExecutionConfig,

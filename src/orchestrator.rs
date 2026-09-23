@@ -561,7 +561,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
-            !request.plan,
             request.plan.then_some(crate::ResourceTier::Strong),
         )
         .await?;
@@ -1924,7 +1923,6 @@ async fn select_available_resource(
     agent: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
-    new_goal: bool,
     minimum: Option<crate::ResourceTier>,
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
@@ -2053,7 +2051,6 @@ async fn select_available_resource(
         };
         exclusions.push(reason);
     }
-    let frozen_exclusions = exclusions.clone();
     if exclusions.iter().all(Option::is_some) {
         for exclusion in &mut exclusions {
             if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
@@ -2061,7 +2058,7 @@ async fn select_available_resource(
             }
         }
     }
-    let mut decision = crate::router::select_resource_filtered_lane(
+    crate::router::select_resource_filtered_lane(
         resources,
         features,
         &config.execution.backend,
@@ -2081,31 +2078,7 @@ async fn select_available_resource(
                 .collect::<Vec<_>>()
                 .join("; ")
         )
-    })?;
-    if !new_goal {
-        return Ok(decision);
-    }
-    // The base path may bind a blocked choice so admission records its deferral.
-    // That disposition does not make a capacity-blocked alternative a trial target.
-    for (alternative, exclusion) in decision.alternatives.iter_mut().zip(frozen_exclusions) {
-        if exclusion.as_deref() == Some("retained capacity restriction excludes this pool") {
-            alternative.eligible = false;
-            alternative.exclusion = exclusion;
-        }
-    }
-    crate::private_evidence::select(
-        state,
-        source,
-        config,
-        decision,
-        agent.is_some()
-            || model.is_some()
-            || effort.is_some()
-            || resources.profiles.iter().any(|p| {
-                let h = config.harnesses.get(&p.harness);
-                h.model.is_some() || h.effort.is_some()
-            }),
-    )
+    })
 }
 
 async fn observe_capacity(
@@ -3748,7 +3721,7 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
         }
         return Ok(());
     }
-    let selection = explain_selection(state, &run);
+    let selection = explain_selection(&run);
     let coherence = print_coherence_details(&run);
     match selection {
         Err(error) if coherence => {
@@ -3793,13 +3766,10 @@ fn print_attachment_details(run: &RunRecord) {
     }
 }
 
-fn explain_selection(state: &State, run: &RunRecord) -> Result<()> {
+fn explain_selection(run: &RunRecord) -> Result<()> {
     if let Some(decision) = &run.allocation {
         print_allocation_details(decision);
         print_capacity_details(run.capacity.as_ref(), run.admission.as_ref());
-        if let Err(error) = crate::private_evidence::explain(state, &run.id) {
-            println!("Private evidence unavailable: {error}");
-        }
         return Ok(());
     }
     let decision = run

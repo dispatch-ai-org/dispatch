@@ -47,8 +47,6 @@ pub struct Scope {
     pub source: PathBuf,
     pub state_root: PathBuf,
     pub config_digest: String,
-    #[serde(default)]
-    pub private_policy_revision: u64,
     pub profiles: Vec<Value>,
     pub timeout_secs: u64,
     pub max_invocations: u32,
@@ -145,7 +143,6 @@ pub fn grant_mode(
         source: source.clone(),
         state_root: root.clone(),
         config_digest: digest(&config)?,
-        private_policy_revision: crate::private_evidence::policy_revision(state, &source)?,
         profiles,
         timeout_secs: timeout_secs.min(config.execution.timeout_secs),
         max_invocations,
@@ -330,9 +327,6 @@ pub(crate) fn actor() -> Option<String> {
         .try_with(|c| format!("machine:{}", c.scope.principal))
         .ok()
 }
-pub(crate) fn private_policy_revision() -> Option<u64> {
-    CALLER.try_with(|c| c.scope.private_policy_revision).ok()
-}
 pub(crate) fn invocation_limit(planned: bool) -> u32 {
     CALLER
         .try_with(|c| c.scope.max_invocations)
@@ -351,11 +345,6 @@ pub(crate) fn validate_submission(
             ensure!(
                 !request.plan || c.scope.allow_plan,
                 "authorization_required: grant does not permit planned execution"
-            );
-            ensure!(
-                c.scope.private_policy_revision
-                    == crate::private_evidence::policy_revision(state, &c.scope.source)?,
-                "authorization_required: private policy changed; issue a new grant for new work"
             );
             ensure!(
                 request.source.canonicalize()? == c.scope.source

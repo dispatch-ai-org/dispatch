@@ -84,7 +84,6 @@ async fn route(
         policy.fixed_harness.as_deref(),
         policy.fixed_model.as_deref(),
         policy.fixed_effort.as_deref(),
-        false,
         Some(minimum),
     )
     .await?;

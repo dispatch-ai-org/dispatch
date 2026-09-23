@@ -12,7 +12,6 @@ pub mod harness;
 pub mod models;
 pub mod orchestrator;
 pub mod presenter;
-pub mod private_evidence;
 pub mod reviewer;
 pub mod router;
 pub mod setup;

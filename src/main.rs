@@ -126,12 +126,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect observed local outcomes without changing routing.
-    #[command(hide = true)]
-    Evidence {
-        #[command(subcommand)]
-        command: EvidenceCommand,
-    },
     /// Show the state of one run (or the latest run).
     Status {
         run_id: Option<String>,
@@ -213,39 +207,6 @@ enum Command {
     Apply { run_id: String, candidate: String },
     /// Print the Dispatch version.
     Version,
-}
-
-#[derive(Debug, Subcommand)]
-enum EvidenceCommand {
-    /// Inspect attributable private evidence and immutable decision-time metadata.
-    Private { run_id: String },
-    /// Build an inspectable trial proposal; does not activate it.
-    Propose { run_id: String },
-    /// Attest origin/review provenance for an existing outcome; creates no feedback.
-    Annotate {
-        run_id: String,
-        #[arg(long)]
-        origin: String,
-        #[arg(long, default_value = "unknown")]
-        review: String,
-        #[arg(long)]
-        repair_minutes: Option<u64>,
-    },
-    /// Inspect exact versioned proposal content and validity.
-    Policy { proposal_id: String },
-    /// Owner-controlled future preference change, with a stale-revision fence.
-    Activate {
-        source: PathBuf,
-        proposal_id: String,
-        #[arg(long)]
-        expected_revision: u64,
-    },
-    /// Restore the deterministic policy for future goals.
-    Rollback {
-        source: PathBuf,
-        #[arg(long)]
-        expected_revision: u64,
-    },
 }
 
 #[derive(Debug, Args)]
@@ -656,33 +617,6 @@ async fn run() -> Result<()> {
             };
             let run = orchestrator::run_dispatch(&state, request).await?;
             finish_run(&state, run, auto_apply, json, jsonl)
-        }
-        Command::Evidence { command } => {
-            use dispatch::private_evidence as private;
-            let value = match command {
-                EvidenceCommand::Private { run_id } => private::inspect(&state, &run_id)?,
-                EvidenceCommand::Propose { run_id } => private::propose(&state, &run_id)?,
-                EvidenceCommand::Annotate {
-                    run_id,
-                    origin,
-                    review,
-                    repair_minutes,
-                } => private::annotate(&state, &run_id, &origin, &review, repair_minutes)?,
-                EvidenceCommand::Policy { proposal_id } => {
-                    private::policy_inspect(&state, &proposal_id)?
-                }
-                EvidenceCommand::Activate {
-                    source,
-                    proposal_id,
-                    expected_revision,
-                } => private::transition(&state, &source, Some(&proposal_id), expected_revision)?,
-                EvidenceCommand::Rollback {
-                    source,
-                    expected_revision,
-                } => private::transition(&state, &source, None, expected_revision)?,
-            };
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
         }
         Command::Status {
             run_id,

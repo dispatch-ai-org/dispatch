@@ -77,7 +77,6 @@ cases!(
     no_checks,
     no_planner,
     tight_repair,
-    private_attribution,
     manifest_tamper,
     question_deadline,
     pty_question_deadline,

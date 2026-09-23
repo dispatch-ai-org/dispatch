@@ -998,10 +998,7 @@ struct Ui {
     /// Session-scoped only: off at every start, never persisted. See
     /// `docs/plan-0.3-auto-apply-and-attach.md` part 5.5.
     auto_apply: bool,
-    reviewed: Option<(
-        RunRecord,
-        std::result::Result<crate::private_evidence::AnnotationRequest, String>,
-    )>,
+    reviewed: Option<RunRecord>,
     #[cfg(unix)]
     term: tokio::signal::unix::Signal,
     #[cfg(unix)]
@@ -1527,7 +1524,7 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
     ui.commit(&context)?;
     loop {
         let prompt = if ui.reviewed.is_some() {
-            "Next goal: What do you want to accomplish?\n[f] Use this review for local routing   [i] Details"
+            "Next goal: What do you want to accomplish?\n[i] Details"
         } else {
             "What do you want to accomplish?\nDirect by default · /plan for sequential work
 /resources accounts · /checks project checks"
@@ -1566,22 +1563,8 @@ pub async fn session(state: &State, mut options: Options) -> Result<()> {
                 }
                 continue;
             }
-            Input::Submit(task) if ui.reviewed.is_some() && task.trim() == "f" => {
-                let (run, request) = ui.reviewed.as_ref().unwrap().clone();
-                if let Err(error) = attest_review(&mut ui, state, &run, request).await {
-                    ui.commit(&format!("Local feedback not recorded: {}. Review and application are unchanged. Choose f to inspect this run again and explicitly confirm, or continue to the next goal.", clip(&format!("{error:#}"), 240)))?;
-                    // Refresh only this displayed identity, never another session's latest run.
-                    if let Ok(current) = state.load_run(&run.id) {
-                        let request =
-                            crate::private_evidence::prepare_review_annotation(state, &current)
-                                .map_err(|error| format!("{error:#}"));
-                        ui.reviewed = Some((current, request));
-                    }
-                }
-                continue;
-            }
             Input::Submit(task) if ui.reviewed.is_some() && task.trim() == "i" => {
-                let (run, _) = ui.reviewed.as_ref().unwrap().clone();
+                let run = ui.reviewed.as_ref().unwrap().clone();
                 ui.diagnostics(&run).await?;
                 continue;
             }
@@ -1904,9 +1887,7 @@ async fn review_goal(
                     ui.commit(&format!("{error:#}"))?;
                 }
                 if matches!(run.outcome.review, ReviewState::Accepted | ReviewState::Rejected) {
-                    let request = crate::private_evidence::prepare_review_annotation(state, &run)
-                        .map_err(|error| format!("{error:#}"));
-                    ui.reviewed = Some((run, request));
+                    ui.reviewed = Some(run);
                 }
                 if action == "aa" && result.is_ok() {
                     ui.auto_apply = true;
@@ -1921,33 +1902,6 @@ async fn review_goal(
             _ => notice = "Choose Review changes, Open in editor, Accept & apply, Reject, Leave pending, or Details.".into(),
         }
     }
-}
-
-async fn attest_review(
-    ui: &mut Ui,
-    state: &State,
-    run: &RunRecord,
-    request: std::result::Result<crate::private_evidence::AnnotationRequest, String>,
-) -> Result<()> {
-    let request = request.map_err(anyhow::Error::msg)?;
-    ui.input_boundary().await?;
-    let body = format!(
-        "{}\nReview: {:?}\n\nThis was ordinary work and reflects my own review. Record it as local routing evidence. Routing will not change automatically.\n\n[c] Confirm this statement   [b] Back without recording",
-        projection(run, None, ui.width().saturating_sub(3), ui.options.ascii)
-            .lines()
-            .filter(|line| !line.is_empty() && !line.contains(" ━━ ") && !line.contains(" == "))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        run.outcome.review
-    );
-    match ui.command_prompt(&body).await? {
-        Input::Submit(action) if action.trim() == "c" => {
-            crate::private_evidence::commit_annotation(state, &request)?;
-            ui.commit("Local routing evidence recorded. Routing is unchanged.")?;
-        }
-        _ => ui.commit("No local feedback recorded. Review and application are unchanged.")?,
-    }
-    Ok(())
 }
 
 #[cfg(test)]

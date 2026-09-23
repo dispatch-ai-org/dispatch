@@ -89,3 +89,12 @@ the progress log.
   lines, tests −3.6K. `cargo test`: 635 passed, 2 failed, both passing on rerun
   (`phase4_pty_intent_answer_recovery_review_and_restoration`, a known
   load-sensitive PTY fixture; the converted unsafe-local test, fixed).
+- 2026-09-22 — S2a: removed private evidence (`evidence private|propose|
+  annotate|policy|activate|rollback`, trial selection, the TUI "use this review
+  for local routing" prompt, `private_evidence` config, control-grant policy
+  pinning). `AllocationDecision.private_evidence` stays as an opaque JSON value
+  because the `private_decision_immutable` trigger refuses any projection
+  rewrite that changes it; migration 22 drops the trigger. `cargo test`:
+  609 passed, 3 failed in `phase8_planning`: `private_attribution` (its
+  behavior was removed here, case deleted) and the two load-sensitive deadline
+  fixtures, which pass in isolation.
