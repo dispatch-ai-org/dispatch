@@ -40,7 +40,6 @@ pub struct Options {
     pub plain: bool,
     pub ascii: bool,
     pub no_color: bool,
-    pub no_retry: bool,
 }
 
 pub fn suitable() -> bool {
@@ -1570,7 +1569,6 @@ async fn run_goal(
         timeout_secs: None,
         max_parallel: None,
         priority: 0,
-        no_retry: options.no_retry,
         allow_unsafe_local: local,
         allow_forwarded_env: false,
         output: RunOutputMode::Silent,

@@ -229,84 +229,6 @@ fn initial_success_selects_first_without_recovery() -> Result<()> {
 }
 
 #[test]
-fn recovery_success_retains_failed_workspace_original_diff_and_fresh_permissions() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let output = f.run(&[])?;
-    let r = Fixture::result(&output)?;
-    assert!(output.status.success(), "{r}");
-    assert_eq!(f.count(), 2);
-    let a = &r["attempts"][0];
-    let b = &r["attempts"][1];
-    assert_eq!(a["resource"]["tier"], "light");
-    assert_eq!(b["resource"]["tier"], "strong");
-    assert_eq!(b["detail"]["parent_attempt_id"], a["id"]);
-    assert_eq!(b["detail"]["reason"], "target_verification_failure");
-    assert_ne!(
-        a["detail"]["admission"]["request_id"],
-        b["detail"]["admission"]["request_id"]
-    );
-    assert_ne!(
-        a["detail"]["admission"]["authorization_id"],
-        b["detail"]["admission"]["authorization_id"]
-    );
-    assert!(
-        b["detail"]["admission"]["fence"].as_u64() > a["detail"]["admission"]["fence"].as_u64()
-    );
-    assert_eq!(a["detail"]["admission"]["state"], "released");
-    assert_eq!(r["phase3"]["final_attempt_id"], b["id"]);
-    assert_eq!(r["phase3"]["provenance"], "mixed_attempt_context");
-    let failed = Path::new(a["detail"]["result"]["workspace_path"].as_str().unwrap());
-    assert_eq!(
-        fs::read_to_string(failed.join("src/lib.rs"))?,
-        "// failed-light\n"
-    );
-    let run = f.loaded(r["run_id"].as_str().unwrap())?;
-    assert_eq!(run.candidates.len(), 1);
-    assert_eq!(run.candidates[0].harness_id, "mixed");
-    assert!(run.candidates[0].model.is_none());
-    let diff = fs::read_to_string(&run.candidates[0].diff_path)?;
-    assert!(diff.contains("-// baseline"));
-    assert!(diff.contains("+// delivered"));
-    assert!(!diff.contains("failed-light"));
-    assert_eq!(
-        fs::read_to_string(f.source.join("src/lib.rs"))?,
-        "// baseline\n"
-    );
-    let conn = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM attempts", [], |r| r.get::<_, i64>(0))?,
-        2
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM routing_observations", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r
-            .get::<_, i64>(0))?,
-        0
-    );
-    assert_eq!(serde_json::to_value(&run.attempts)?, r["attempts"]);
-    f.no_leases()
-}
-
-#[test]
-fn recovery_failure_stops_after_two_and_no_retry_stops_after_one() -> Result<()> {
-    for no_retry in [false, true] {
-        let f = Fixture::new("both-fail")?;
-        let o = f.run(if no_retry { &["--no-retry"] } else { &[] })?;
-        let r = Fixture::result(&o)?;
-        assert_eq!(o.status.code(), Some(3));
-        assert_eq!(f.count(), if no_retry { 1 } else { 2 });
-        assert_eq!(r["outcome"]["verification"], "failed");
-        assert_eq!(r["phase3"]["failure"], "target_verification");
-        f.no_leases()?;
-    }
-    Ok(())
-}
-
-#[test]
 fn no_suitable_stronger_route_and_fixed_model_do_not_escalate() -> Result<()> {
     for fixed in [false, true] {
         let f = Fixture::new("both-fail")?;
@@ -350,55 +272,6 @@ fn baseline_failure_and_harness_failure_do_not_escalate() -> Result<()> {
                 "harness_process"
             }
         );
-    }
-    Ok(())
-}
-
-#[test]
-fn shared_capacity_or_funding_changes_block_recovery_before_spawn() -> Result<()> {
-    for funding in [false, true] {
-        let f = Fixture::new("recovery")?;
-        fs::write(f.root.join("gate"), "")?;
-        let child = f
-            .run_command(&[])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let until = Instant::now() + Duration::from_secs(12);
-        while !f.root.join("verification-waiting").exists() && Instant::now() < until {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(f.root.join("verification-waiting").exists());
-        f.no_leases()?;
-        let db = Database::open(f.state.join("dispatch.db"))?;
-        let mut observation =
-            unknown_observation("shared", "default", Utc::now(), 300, "between attempts");
-        if funding {
-            observation.credits_available = CapacityValue::Reported { value: true };
-        } else {
-            let c = &mut observation.constraints[0];
-            c.provider_bucket_id = Some("codex".into());
-            c.window_id = Some("primary".into());
-            c.scope = CapacityValue::Reported {
-                value: "shared".into(),
-            };
-            c.remaining = CapacityValue::Reported { value: 10.0 };
-        }
-        db.append_capacity_observation(&observation)?;
-        fs::write(f.root.join("continue"), "")?;
-        let o = child.wait_with_output()?;
-        let r = Fixture::result(&o)?;
-        assert_eq!(f.count(), 1);
-        assert!(!o.status.success());
-        assert_eq!(
-            r["phase3"]["failure"],
-            if funding {
-                "authorization"
-            } else {
-                "capacity_admission"
-            }
-        );
-        f.no_leases()?;
     }
     Ok(())
 }
@@ -637,7 +510,7 @@ fn continuation_rechecks_configuration_and_shared_funding() -> Result<()> {
 
 #[test]
 fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() -> Result<()> {
-    for mode in ["recovery", "clarify"] {
+    for mode in ["success", "clarify"] {
         let f = Fixture::new(mode)?;
         let result = Fixture::result(&f.run(&[])?)?;
         let id = result["run_id"].as_str().unwrap();
@@ -670,7 +543,7 @@ fn reload_repairs_missing_and_higher_stale_projections_without_replaying_work() 
 
 #[test]
 fn completed_attempt_evidence_and_rejection_cannot_be_rewritten() -> Result<()> {
-    let f = Fixture::new("recovery")?;
+    let f = Fixture::new("success")?;
     let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     let original = f.loaded(id)?;
@@ -710,8 +583,8 @@ fn completed_attempt_evidence_and_rejection_cannot_be_rewritten() -> Result<()> 
         )
         .is_err()
     );
-    assert_eq!(f.count(), 2);
-    // Review remains local; accepting/rejecting mixed work creates no legacy observation/upload.
+    assert_eq!(f.count(), 1);
+    // Review remains local; accepting/rejecting creates no legacy observation/upload.
     let conn = rusqlite::Connection::open(f.state.join("dispatch.db"))?;
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM routing_observations", [], |r| r
@@ -744,83 +617,8 @@ fn verification_infrastructure_failure_does_not_trigger_recovery() -> Result<()>
 }
 
 #[test]
-fn jsonl_exposes_both_attempts_and_delivery() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let output = f
-        .command()
-        .arg("run")
-        .arg(&f.source)
-        .args([
-            "--task",
-            "Add tests in src/lib.rs",
-            "--allow-unsafe-local",
-            "--jsonl",
-        ])
-        .output()?;
-    assert!(output.status.success());
-    let lines = String::from_utf8(output.stdout)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let events = lines
-        .iter()
-        .filter(|v| v["type"] == "event")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|v| v["event"]["event_type"] == "attempt.started")
-            .count(),
-        2
-    );
-    let result = &lines.last().unwrap()["result"];
-    assert_eq!(result["attempts"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        result["phase3"]["final_attempt_id"],
-        result["attempts"][1]["id"]
-    );
-    Ok(())
-}
-
-#[test]
-fn recovery_uses_remaining_goal_deadline_instead_of_a_new_budget() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    let agent = f.root.join("codex");
-    let script = fs::read_to_string(&agent)?.replace(
-        "mode=$(cat",
-        "if [ \"$model\" = 'strong-model' ]; then sleep 40; else sleep 8; fi\nmode=$(cat",
-    );
-    executable(&agent, &script)?;
-    let mut child = OwnedChild(
-        f.run_command(&["--timeout", "30"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    wait_until(|| Ok(f.count() == 2 || child.0.try_wait()?.is_some()))?;
-    assert_eq!(f.count(), 2, "deadline test never reached recovery");
-    let output = child.output()?;
-    let result = Fixture::result(&output)?;
-    assert_eq!(f.count(), 2);
-    assert_eq!(result["phase3"]["failure"], "deadline");
-    assert_eq!(result["attempts"][1]["detail"]["failure"], "deadline");
-    assert_eq!(output.status.code(), Some(124));
-    // Eight seconds spent by Attempt 1 must not be added to the goal's
-    // thirty-second deadline. Leave ample startup headroom under parallel load.
-    assert!(result["elapsed_ms"].as_i64().unwrap() < 34_000);
-    assert!(
-        result["attempts"][1]["detail"]["result"]["duration_ms"]
-            .as_u64()
-            .unwrap()
-            < 26_000
-    );
-    f.no_leases()
-}
-
-#[test]
-fn recovery_delivery_applies_from_original_baseline_and_pending_question_is_not_reviewable()
--> Result<()> {
-    let f = Fixture::new("recovery")?;
+fn delivery_applies_from_original_baseline_and_pending_question_is_not_reviewable() -> Result<()> {
+    let f = Fixture::new("success")?;
     let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     assert!(f.command().args(["accept", id]).output()?.status.success());
@@ -932,30 +730,6 @@ fn any_infrastructure_or_unknown_check_blocks_other_target_failures() -> Result<
 }
 
 #[test]
-fn one_or_multiple_known_target_failures_still_recover() -> Result<()> {
-    for count in [1, 2] {
-        let f = Fixture::new("recovery")?;
-        f.checks(&vec!["test \"$(cat result.txt)\" = ok"; count])?;
-        let output = f.run(&[])?;
-        let result = Fixture::result(&output)?;
-        assert!(output.status.success());
-        assert_eq!(f.count(), 2);
-        assert_eq!(
-            result["attempts"][0]["detail"]["failure"],
-            "target_verification"
-        );
-        let checks = result["attempts"][0]["detail"]["result"]["checks"]
-            .as_array()
-            .unwrap();
-        assert_eq!(checks.len(), count);
-        assert!(checks.iter().all(|c| c["exit_code"] == 1));
-        assert_eq!(result["outcome"]["verification"], "passed");
-        f.no_leases()?;
-    }
-    Ok(())
-}
-
-#[test]
 fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
     let checkpoint = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":serde_json::json!({"dispatch_checkpoint":{"version":1,"question":"Which label?","choices":[]}}).to_string()}});
     let malformed =
@@ -1006,20 +780,6 @@ fn only_a_valid_final_agent_message_can_checkpoint() -> Result<()> {
 // Fixtures block on a FIFO only after the relevant durable transition. The
 // guard kills/reaps the owner even if a regression causes an assertion panic.
 struct OwnedChild(std::process::Child);
-impl OwnedChild {
-    fn output(mut self) -> Result<Output> {
-        use std::io::Read;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        self.0.stdout.take().unwrap().read_to_end(&mut stdout)?;
-        self.0.stderr.take().unwrap().read_to_end(&mut stderr)?;
-        Ok(Output {
-            status: self.0.wait()?,
-            stdout,
-            stderr,
-        })
-    }
-}
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -1101,7 +861,7 @@ fn committed_attempt_owner_fixture() -> Result<()> {
 #[test]
 fn dead_owner_after_attempt_finish_is_repaired_but_live_owner_is_not() -> Result<()> {
     let f = Fixture::new("both-fail")?;
-    let result = Fixture::result(&f.run(&["--no-retry"])?)?;
+    let result = Fixture::result(&f.run(&[])?)?;
     let id = result["run_id"].as_str().unwrap();
     let mut child = OwnedChild(
         Command::new(std::env::current_exe()?)
@@ -1192,36 +952,6 @@ fn answer_setup_error_records_interruption_and_preserves_the_committed_answer() 
 }
 
 #[test]
-fn recovery_setup_error_records_interruption_before_returning() -> Result<()> {
-    let f = Fixture::new("recovery")?;
-    fs::write(f.root.join("gate"), "")?;
-    let child = OwnedChild(
-        f.run_command(&[])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
-    wait_until(|| Ok(f.root.join("verification-waiting").exists()))?;
-    fs::write(f.state.join("resources.yml"), "invalid: [\n")?;
-    fs::write(f.root.join("continue"), "")?;
-    let mut child = child;
-    assert!(!child.0.wait()?.success());
-    let id = fs::read_dir(f.state.join("runs"))?
-        .next()
-        .unwrap()?
-        .file_name()
-        .to_string_lossy()
-        .into_owned();
-    let stopped = f.loaded(&id)?;
-    assert!(stopped.attempts[0].completed_at.is_some());
-    assert_eq!(
-        stopped.attempts[0].detail.failure,
-        Some(dispatch::FailureKind::TargetVerification)
-    );
-    f.assert_interrupted(&stopped)
-}
-
-#[test]
 fn reload_requires_positive_owner_and_cleanup_evidence() -> Result<()> {
     for evidence in ["live", "missing", "legacy", "unresolved", "unlocked-dead"] {
         let f = Fixture::new("success")?;
@@ -1299,7 +1029,6 @@ fn phase4_pty_intent_answer_recovery_review_and_restoration() -> Result<()> {
         ("accept", "success"),
         ("reject", "success"),
         ("clarify", "clarify"),
-        ("recovery", "recover"),
         ("drift", "success"),
         ("cancel", "timeout"),
         ("active-eof", "timeout"),
@@ -1480,7 +1209,7 @@ fn phase4_follow_registration_racing_completion_cannot_lose_it() -> Result<()> {
     let f = Fixture::new("both-fail")?;
     fs::write(f.root.join("gate"), "")?;
     let mut worker = f
-        .run_command(&["--no-retry"])
+        .run_command(&[])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

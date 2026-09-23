@@ -39,7 +39,6 @@ use crate::{
         canonical_pool_identity,
     },
     capacity::{authorize_observation, needs_refresh, probe_codex, supports_codex_account_probe},
-    classifier::classify_task,
     db::Database,
     executor::{
         CancellationToken, CheckLifecycleEvent, ExecutionStatus, Executor,
@@ -125,7 +124,6 @@ pub struct RunRequest {
     pub timeout_secs: Option<u64>,
     pub max_parallel: Option<usize>,
     pub priority: i32,
-    pub no_retry: bool,
     pub allow_unsafe_local: bool,
     pub allow_forwarded_env: bool,
     pub output: RunOutputMode,
@@ -330,10 +328,10 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     Ok(())
 }
 
-fn override_decision(source_path: &Path, task: &str, harness: String) -> Result<RoutingDecision> {
+fn override_decision(harness: String) -> Result<RoutingDecision> {
     Ok(RoutingDecision {
         version: 1,
-        task_features: classify_task(source_path, task)?,
+        task_features: crate::TaskFeatures::default(),
         selected_harness: harness,
         successes: 0,
         attempts: 0,
@@ -450,6 +448,106 @@ fn print_allocation_decision(decision: &AllocationDecision) {
     println!("Why:\n  {}\n", decision.reason);
 }
 
+/// The one selection rule: the first configured profile, in file order, that
+/// is eligible, matches the backend and any explicit model or effort, and was
+/// not excluded by `select_available_resource`'s availability, preflight and
+/// funding checks. The decision records every profile and why it was not
+/// chosen.
+fn choose_profile(
+    resources: &crate::config::ResourceConfig,
+    backend: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    exclusions: &[Option<String>],
+) -> Result<crate::AllocationDecision> {
+    let alternatives = resources
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            let exclusion = if let Some(reason) = exclusions.get(index).and_then(Option::as_ref) {
+                Some(reason.clone())
+            } else if let Err(error) = profile.eligibility() {
+                Some(error.to_string())
+            } else if profile.runtime != backend {
+                Some(format!(
+                    "profile runtime does not match the {backend} execution backend"
+                ))
+            } else if model.is_some_and(|model| profile.model != model) {
+                Some("model does not satisfy the explicit constraint".to_owned())
+            } else if effort.is_some_and(|effort| profile.effort.as_deref() != Some(effort)) {
+                Some("effort does not satisfy the explicit constraint".to_owned())
+            } else {
+                None
+            };
+            crate::AllocationAlternative {
+                choice: crate::ResourceChoice {
+                    provider: profile.provider.clone(),
+                    funding_source: profile.funding_source.clone(),
+                    harness: profile.harness.clone(),
+                    requested_model: profile.model.clone(),
+                    resolved_model: profile.model.clone(),
+                    effort: profile.effort.clone(),
+                    service_mode: profile.service_mode.clone(),
+                    runtime: profile.runtime.clone(),
+                    pool: profile.pool.clone(),
+                    tier: profile.tier.clone(),
+                    no_overage_verified: profile.no_overage_verified,
+                    internal_composition: "unknown".into(),
+                },
+                eligible: exclusion.is_none(),
+                exclusion,
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = alternatives
+        .iter()
+        .find(|alternative| alternative.eligible)
+        .map(|alternative| alternative.choice.clone())
+        .with_context(|| match (model, effort) {
+            (None, None) => {
+                "no included, no-overage-verified resource profile is available".to_owned()
+            }
+            _ => format!(
+                "no included, no-overage-verified resource profile matches{}{}",
+                model.map(|m| format!(" model {m:?}")).unwrap_or_default(),
+                effort.map(|e| format!(" effort {e:?}")).unwrap_or_default()
+            ),
+        })?;
+    let capability = crate::CapabilitySnapshot {
+        version: 1,
+        source: "user_validated_profile".into(),
+        harness: selected.harness.clone(),
+        observed_at: Utc::now(),
+        models: resources
+            .profiles
+            .iter()
+            .filter(|profile| profile.harness == selected.harness)
+            .map(|profile| crate::ModelCapability {
+                model: profile.model.clone(),
+                efforts: profile.effort.iter().cloned().collect(),
+                included: profile.included,
+                no_overage_verified: profile.no_overage_verified,
+            })
+            .collect(),
+    };
+    let reason = if model.is_some() || effort.is_some() {
+        "The explicit model or effort constraint selected this profile."
+    } else {
+        "The first available configured profile was selected."
+    };
+    Ok(crate::AllocationDecision {
+        private_evidence: None,
+        version: 1,
+        policy_version: "first-available-profile-v1".into(),
+        task_features: crate::TaskFeatures::default(),
+        selected,
+        reason: reason.into(),
+        capability,
+        alternatives,
+    })
+}
+
 /// Why a profile whose funding was refused cannot launch until setup
 /// re-authorizes it (a new `authorization_revision`).
 fn funding_refused_message(profile: &crate::config::ResourceProfile, reason: &str) -> String {
@@ -540,17 +638,14 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         local_authorized = true;
     }
     let (mut harnesses, routing, allocation) = if allocation_requested {
-        let features = classify_task(&source_path, &request.task)?;
         let decision = select_available_resource(
             state,
             &source_path,
             &resources,
-            &features,
             &config,
             request.agent.as_deref(),
             request.model.as_deref(),
             request.effort.as_deref(),
-            None,
         )
         .await?;
         (
@@ -559,7 +654,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             Some(decision),
         )
     } else if let Some(agent) = request.agent {
-        let decision = override_decision(&source_path, &request.task, agent)?;
+        let decision = override_decision(agent)?;
         (
             vec![decision.selected_harness.clone()],
             Some(decision),
@@ -749,7 +844,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 + chrono::TimeDelta::seconds(
                     i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
                 ),
-            no_retry: request.no_retry,
             fixed_harness,
             fixed_model,
             fixed_effort,
@@ -1842,12 +1936,10 @@ async fn select_available_resource(
     state: &State,
     source: &Path,
     resources: &crate::config::ResourceConfig,
-    features: &crate::TaskFeatures,
     config: &Config,
     agent: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
-    minimum: Option<crate::ResourceTier>,
 ) -> Result<crate::AllocationDecision> {
     let mut exclusions = Vec::new();
     let db = Database::open(state.db_path())?;
@@ -1991,16 +2083,12 @@ async fn select_available_resource(
             }
         }
     }
-    crate::router::select_resource_filtered_lane(
+    choose_profile(
         resources,
-        features,
         &config.execution.backend,
         model,
         effort,
-        None,
-        None,
         &exclusions,
-        minimum,
     )
     .map_err(|e| {
         anyhow::anyhow!(
@@ -3277,7 +3365,6 @@ pub fn refresh_request(
         timeout_secs: Some(run.environment.timeout_secs),
         max_parallel: Some(run.environment.max_parallel),
         priority: goal.map_or(0, |goal| goal.priority),
-        no_retry: goal.is_some_and(|goal| goal.no_retry),
         allow_unsafe_local: options.allow_unsafe_local,
         allow_forwarded_env: options.allow_forwarded_env,
         output: options.output,
@@ -4466,7 +4553,6 @@ mod tests {
                             timeout_secs: None,
                             max_parallel: None,
                             priority: 0,
-                            no_retry: false,
                             allow_unsafe_local: true,
                             allow_forwarded_env: false,
                             output: RunOutputMode::Json,

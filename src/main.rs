@@ -29,9 +29,6 @@ struct Cli {
     /// Keep native terminal colors (also respects NO_COLOR).
     #[arg(long, global = true)]
     no_color: bool,
-    /// Disable bounded recovery in the interactive session.
-    #[arg(long, hide = true)]
-    no_retry: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -230,10 +227,6 @@ struct RunArgs {
     #[arg(long, hide = true)]
     max_parallel: Option<usize>,
 
-    /// Disable the single automatic stronger recovery.
-    #[arg(long, hide = true)]
-    no_retry: bool,
-
     /// Admission priority within the shared local subscription pool.
     #[arg(long, value_parser = ["background", "normal", "urgent"], default_value = "normal", hide = true)]
     priority: String,
@@ -419,7 +412,6 @@ async fn run() -> Result<()> {
                 plain: cli.plain,
                 ascii: cli.ascii,
                 no_color: cli.no_color,
-                no_retry: cli.no_retry,
             },
         )
         .await;
@@ -438,7 +430,6 @@ async fn run() -> Result<()> {
                     plain: cli.plain,
                     ascii: cli.ascii,
                     no_color: cli.no_color,
-                    no_retry: cli.no_retry,
                 },
             )
             .await
@@ -537,7 +528,6 @@ async fn run() -> Result<()> {
                 backend: args.backend,
                 timeout_secs: args.timeout,
                 max_parallel: args.max_parallel,
-                no_retry: args.no_retry,
                 priority: match args.priority.as_str() {
                     "background" => -1,
                     "urgent" => 1,

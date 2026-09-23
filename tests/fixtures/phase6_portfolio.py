@@ -175,44 +175,6 @@ def scenario(binary, name):
                 assert len(result['attempts'])==1 and result['outcome']['work_result']=='failed'
                 assert not f.stored(result['run_id'])['phase3']['questions']
                 no_lease(f)
-        elif name=='recovery':
-            peer=add_peer(f,binary)
-            path=f.state/'resources.yml';original_profiles=path.read_text()
-            config=f.source/'dispatch.yml';config.write_text(config.read_text().replace('test -f result.txt', 'test "$(cat result.txt)" = ok'))
-            claude=f.root/'claude';codex=peer.root/'codex'
-            originals={claude:claude.read_text(),codex:codex.read_text()}
-            for first in ('claude','codex'):
-                # The first lane fails a check known to pass on the original baseline.
-                for agent,text in originals.items():
-                    if agent.name==first:
-                        text=text.replace("write_text('ok\\n')", "write_text('bad\\n')")
-                    agent.write_text(text)
-                text=original_profiles
-                if first=='claude':
-                    text=text.replace('model: codex-fixed\n    effort: low','model: codex-fixed\n    effort: low').replace('pool: codex-pool\n    provider_buckets: [codex]\n    tier: light','pool: codex-pool\n    provider_buckets: [codex]\n    tier: strong')
-                else:
-                    text=text.replace('pool: claude-pool\n    provider_buckets: [codex]\n    tier: light','pool: claude-pool\n    provider_buckets: [codex]\n    tier: strong')
-                path.write_text(text);proof(f)
-                output,result=run(f)
-                checked(output,result)
-                assert [a['harness_id'] for a in result['attempts']]==[first,'codex' if first=='claude' else 'claude'],result
-                a,b=result['attempts'];assert b['detail']['parent_attempt_id']==a['id']
-                assert a['detail']['input_baseline']==b['detail']['input_baseline']
-                assert Path(a['detail']['result']['workspace_path'],'result.txt').read_text()=='bad\n'
-                assert (f.source/'result.txt').read_text()=='ok\n'
-                no_lease(f)
-                before=f.count()+peer.count()
-                out,limited=run(f,'--no-retry')
-                assert out.returncode!=0 and len(limited['attempts'])==1 and f.count()+peer.count()==before+1
-                before=f.count()+peer.count()
-                out,limited=run(f,'--agent',first)
-                assert out.returncode!=0 and len(limited['attempts'])==1 and f.count()+peer.count()==before+1
-                for agent,script in originals.items():
-                    agent.write_text(script.replace("write_text('ok\\n')", "write_text('bad\\n')"))
-                proof(f);before=f.count()+peer.count()
-                out,failed=run(f)
-                assert out.returncode!=0 and len(failed['attempts'])==2 and f.count()+peer.count()==before+2
-                no_lease(f)
         elif name=='launch_change':
             (f.root/'auth-boundary').write_text('3')
             output,result=run(f)

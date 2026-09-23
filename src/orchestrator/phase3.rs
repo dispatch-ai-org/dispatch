@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    AttemptDetail, Clarification, FailureKind, GoalExecution, QuestionState, ResourceTier,
+    AttemptDetail, Clarification, FailureKind, GoalExecution, QuestionState,
     coherence::watch::{WatchMsg, WatchSpec, Watcher},
     config::MidRunMode,
 };
@@ -370,14 +370,6 @@ fn apply_watch(
     Ok(())
 }
 
-fn rank(tier: &ResourceTier) -> u8 {
-    match tier {
-        ResourceTier::Light => 0,
-        ResourceTier::Standard => 1,
-        ResourceTier::Strong => 2,
-    }
-}
-
 pub(super) fn verification_failure(
     run: &RunRecord,
     candidate: &CandidateRecord,
@@ -418,88 +410,6 @@ pub(super) fn verification_failure(
     } else {
         Some(FailureKind::BaselineInfrastructure)
     }
-}
-
-async fn recovery_route(
-    state: &State,
-    run: &RunRecord,
-    resources: &crate::config::ResourceConfig,
-    config: &Config,
-) -> Option<AllocationDecision> {
-    let policy = run.phase3.as_ref()?;
-    if policy.no_retry || run.attempts.len() >= policy.max_invocations.min(2) as usize {
-        return None;
-    }
-    let previous = run.attempts.last()?.detail.decision.as_ref()?;
-    let mut profiles = resources
-        .profiles
-        .iter()
-        .filter(|p| {
-            p.enabled
-                && rank(&p.tier) > rank(&previous.selected.tier)
-                && policy
-                    .fixed_harness
-                    .as_deref()
-                    .is_none_or(|h| h == p.harness)
-                && policy.fixed_model.as_deref().is_none_or(|m| m == p.model)
-                && policy
-                    .fixed_effort
-                    .as_deref()
-                    .is_none_or(|e| Some(e) == p.effort.as_deref())
-        })
-        .collect::<Vec<_>>();
-    profiles.sort_by_key(|p| rank(&p.tier));
-    let mut config = config.clone();
-    // Dynamic selection is not a project constraint on a subsequent attempt.
-    let old = if previous.selected.harness == "claude" {
-        &mut config.harnesses.claude
-    } else {
-        &mut config.harnesses.codex
-    };
-    old.model = policy.fixed_model.clone();
-    old.effort = policy.fixed_effort.clone();
-    let mut blocked = None;
-    for p in profiles {
-        // Keep a bound recovery disposition for the existing admission authority
-        // when every suitable resource is blocked; it records the specific cause.
-        if blocked.is_none() {
-            let mut constrained = resources.clone();
-            constrained
-                .profiles
-                .retain(|candidate| candidate.harness == p.harness);
-            blocked = crate::router::select_resource(
-                &constrained,
-                &previous.task_features,
-                &run.environment.execution_backend,
-                Some(&p.model),
-                p.effort.as_deref(),
-                policy.fixed_model.as_deref(),
-                policy.fixed_effort.as_deref(),
-            )
-            .ok();
-        }
-        if let Ok(mut decision) = super::select_available_resource(
-            state,
-            &run.source_path,
-            resources,
-            &previous.task_features,
-            &config,
-            Some(&p.harness),
-            Some(&p.model),
-            p.effort.as_deref(),
-            None,
-        )
-        .await
-        {
-            if rank(&decision.selected.tier) <= rank(&previous.selected.tier) {
-                continue;
-            }
-            decision.policy_version = "bounded-recovery-v1".into();
-            decision.reason = "One stronger recovery after a target check that passed on the original baseline failed after implementation.".into();
-            return Some(decision);
-        }
-    }
-    blocked
 }
 
 pub(super) fn diagnostics(attempt: &AttemptRecord) -> String {
@@ -644,7 +554,7 @@ async fn drive_inner(
     db: &mut Database,
     mut run: RunRecord,
     mut config: Config,
-    mut resources: crate::config::ResourceConfig,
+    resources: crate::config::ResourceConfig,
     cancellation: CancellationToken,
     output: RunOutputMode,
 ) -> Result<RunRecord> {
@@ -671,7 +581,7 @@ async fn drive_inner(
         emit(&run, output)?;
         return Ok(run);
     }
-    let mut decision = if initial {
+    let decision = if initial {
         run.allocation.clone().unwrap()
     } else {
         run.attempts
@@ -683,7 +593,7 @@ async fn drive_inner(
             .context("continuation route missing")?
     };
     let mut reason = (!initial).then(|| "clarification_answer".to_owned());
-    loop {
+    'attempt: {
         if cancellation.is_cancelled() || Utc::now() >= run.phase3.as_ref().unwrap().deadline_at {
             let failure = interrupted(&run);
             stop(
@@ -693,7 +603,7 @@ async fn drive_inner(
                 failure,
                 "goal cancelled or deadline expired",
             )?;
-            break;
+            break 'attempt;
         }
         if run.attempts.len() >= run.phase3.as_ref().unwrap().max_invocations.min(2) as usize {
             stop(
@@ -703,7 +613,7 @@ async fn drive_inner(
                 FailureKind::InvocationLimit,
                 "goal invocation limit reached",
             )?;
-            break;
+            break 'attempt;
         }
         if source::fingerprint_tree(&run.source_path)? != run.source_fingerprint {
             stop(
@@ -713,7 +623,7 @@ async fn drive_inner(
                 FailureKind::SourceDrift,
                 "source drift before fresh attempt",
             )?;
-            break;
+            break 'attempt;
         }
         let selected = &decision.selected;
         let Some(profile) = resources.profiles.iter().find(|p| {
@@ -736,7 +646,7 @@ async fn drive_inner(
                 FailureKind::Authorization,
                 "selected route is no longer authorized by the current resource configuration",
             )?;
-            break;
+            break 'attempt;
         };
         let profile = profile.clone();
         if let Some(refusal) =
@@ -744,7 +654,7 @@ async fn drive_inner(
         {
             let message = super::funding_refused_message(&profile, &refusal);
             stop(state, db, &mut run, FailureKind::Authorization, &message)?;
-            break;
+            break 'attempt;
         }
         config.harnesses.bind(&decision.selected, &resources);
         run.phase3.as_mut().unwrap().final_attempt_id = None;
@@ -795,7 +705,7 @@ async fn drive_inner(
                 if failure == FailureKind::InternalState {
                     bail!(message);
                 }
-                break;
+                break 'attempt;
             }
         };
         #[cfg(test)]
@@ -826,7 +736,7 @@ async fn drive_inner(
             drop(guard);
             run.admission = db.admission_summary_for_run(&run.id)?;
             stop(state, db, &mut run, FailureKind::Authorization, &message)?;
-            break;
+            break 'attempt;
         }
         let attempt_id = update_attempt_started(&mut run, &candidate.id);
         run.attempts.last_mut().unwrap().detail.admission =
@@ -926,7 +836,6 @@ async fn drive_inner(
         } else {
             verification_failure(&run, &candidate)
         };
-        let target_failure = failure == Some(FailureKind::TargetVerification);
         let last = run.attempts.last_mut().unwrap();
         last.detail.result = Some(candidate.clone());
         last.detail.admission = run.admission.clone();
@@ -952,7 +861,7 @@ async fn drive_inner(
                     .unwrap_or_else(|| "attempt did not safely complete".into()),
             };
             stop(state, db, &mut run, failure, &message)?;
-            break;
+            break 'attempt;
         }
         if let Some(Ok(report)) = execution.checkpoint {
             let question = Clarification {
@@ -977,7 +886,7 @@ async fn drive_inner(
             let payload =
                 serde_json::json!({"question":run.phase3.as_ref().unwrap().questions.last()});
             transition(state, db, &mut run, "question.pending", payload)?;
-            break;
+            break 'attempt;
         }
         let policy = run.phase3.as_mut().unwrap();
         policy.final_attempt_id = Some(final_id);
@@ -994,26 +903,6 @@ async fn drive_inner(
         }
         refresh_outcome(&mut run);
         run.phase3.as_mut().unwrap().failure = failure;
-        if target_failure {
-            resources = crate::config::ResourceConfig::load(&state.root)?;
-        }
-        if target_failure && let Some(next) = recovery_route(state, &run, &resources, &config).await
-        {
-            run.outcome.lifecycle = LifecycleState::Preparing;
-            run.outcome.work_result = WorkResult::Pending;
-            run.outcome.review = ReviewState::NotRequested;
-            run.outcome.phase = RunPhase::Preparing;
-            transition(
-                state,
-                db,
-                &mut run,
-                "recovery.selected",
-                serde_json::json!({"decision":next,"limit":2}),
-            )?;
-            decision = next;
-            reason = Some("target_verification_failure".into());
-            continue;
-        }
         run.completed_at = Some(Utc::now());
         run.status = if run.outcome.work_result == WorkResult::Ready {
             RunStatus::ReadyForEvaluation
@@ -1022,7 +911,7 @@ async fn drive_inner(
         };
         let payload = serde_json::json!({"outcome":run.outcome});
         sync_transition(state, db, &mut run, "run.finished", payload)?;
-        break;
+        break 'attempt;
     }
     emit(&run, output)?;
     Ok(run)

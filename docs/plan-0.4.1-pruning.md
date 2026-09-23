@@ -233,3 +233,14 @@ again at admission. After S6b it must run immediately before spawn.
   `harness::codex` unit tests (11). Found and recorded a pre-existing 0.4.0
   defect (a rejected profile stays refused after re-authorization in the
   capacity path). `cargo test`: 512 passed, 0 failed.
+- 2026-09-23 — S5b: one selection rule (`choose_profile`): the first configured
+  profile, in file order, that is enabled, eligible, matches the backend and
+  any explicit `--agent`/`--model`/`--effort`, and passes the availability,
+  preflight and funding checks. Removed `router.rs`, `classifier.rs`, tier
+  policy, the automatic stronger-model retry and `--no-retry`; the native
+  engine's attempt loop is now a single attempt (a clarification answer
+  re-enters it). Tests: removed the retry cases (phase3 ×8, the portfolio
+  `recovery` scenario, the PTY `recovery` scenario, `classification.rs`);
+  retry-incidental tests now use a successful single attempt; fixtures no
+  longer assert classifier output or tier choice. The capacity checks at
+  selection are unchanged until S6b. `cargo test`: 479 passed, 0 failed.

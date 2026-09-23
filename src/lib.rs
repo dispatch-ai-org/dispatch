@@ -1,6 +1,5 @@
 pub mod admission;
 pub mod capacity;
-pub mod classifier;
 pub mod coherence;
 pub mod config;
 pub mod db;
@@ -13,7 +12,6 @@ pub mod orchestrator;
 pub mod presenter;
 pub mod process;
 pub mod reviewer;
-pub mod router;
 pub mod setup;
 pub mod source;
 pub mod state;

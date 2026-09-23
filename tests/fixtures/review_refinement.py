@@ -180,7 +180,6 @@ def run_fixture(binary, source, state, scenario):
                     assert len(runs) == number
                     for run in runs:
                         assert Path(run['source_path']).resolve() == source.resolve()
-                        assert run['allocation']['task_features'] == {'language':'c','task_kind':'tests','scope':'localized'}
                         assert run['outcome']['review'] == 'pending'
                         assert run['outcome']['verification'] == 'passed'
                         assert db.execute("SELECT count(*) FROM events WHERE run_id=? AND event_type='run.finished'", (run['id'],)).fetchone()[0] == 1
