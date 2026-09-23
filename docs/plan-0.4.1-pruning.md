@@ -261,3 +261,26 @@ again at admission. After S6b it must run immediately before spawn.
   attempt leaves `cleaned`; a SIGKILLed supervisor leaves `spawned` with the
   running agent's identity and the run stays open). Real-agent dogfood is
   deferred to the S10 release gate. `cargo test`: 491 passed, 0 failed.
+- 2026-09-23 — Real-agent dogfood (S6b gate), Claude Code 2.1.280, profile
+  `claude-sonnet-5`, scratch project `/private/tmp/dispatch-dogfood/project`,
+  isolated state directories (the real `~/.dispatch` was not migrated):
+  - Refusal path on real binaries, before re-attestation: every profile
+    refused before any model call (Codex: account evidence missing; Claude:
+    executable changed since its evidence). The Claude refusal was recorded as
+    sticky against revision 4. No run was created.
+  - After Jese re-attested the profile through `dispatch setup` (revision 5,
+    fresh evidence): the new path allowed it, but the capacity path refused it
+    ("funding revalidation failed: authentication changed to
+    adapter_preflight_rejected"): the pre-existing 0.4.0 defect recorded under
+    S5a, reproduced live. Continued in a fresh state with the same
+    re-attested configuration.
+  - Normal run: one real attempt completed, verification passed, delivered
+    exactly the requested docstring. Launch record `cleaned` with the child
+    pid; admission `released`/`cleanup_confirmed`; no disagreement.
+  - Killed supervisor: SIGKILL while `claude -p` was running. The record read
+    `spawned` with the agent's pid and process group, and the agent was still
+    alive; `dispatch status` left the run open; admission agreed
+    (`admitted`/`child_recorded`). The orphaned agent exited about a second
+    later (its output pipe was gone); the record then reads not alive. The run
+    stays open because its attempt never completed, as in 0.4.0. No
+    disagreement logged; the source was untouched.
