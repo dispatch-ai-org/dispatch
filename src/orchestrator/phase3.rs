@@ -190,16 +190,18 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
                     q.report.question, q.id, q.revision, run.id, q.id, q.revision
                 );
             } else if !run.candidates.is_empty() {
-                print_single_result_summary(
-                    run,
-                    if run.outcome.verification == VerificationState::Passed {
-                        "Ready for review"
-                    } else {
-                        "Work stopped; inspect verification and attempt details"
-                    },
-                    false,
-                    None,
-                );
+                let human = match run.outcome.review {
+                    ReviewState::Accepted => Some(crate::RoutingHumanOutcome::Accepted),
+                    ReviewState::Rejected => Some(crate::RoutingHumanOutcome::Rejected),
+                    _ => None,
+                };
+                let heading = match (run.outcome.work_result, run.outcome.verification) {
+                    _ if human.is_some() => "Reviewed",
+                    (WorkResult::Ready, VerificationState::Failed) => "Verification failed",
+                    (WorkResult::Ready, _) => "Ready for review",
+                    _ => "Work stopped; inspect verification and attempt details",
+                };
+                print_single_result_summary(run, heading, false, human.as_ref());
             } else {
                 println!(
                     "Work stopped: {:?}",
@@ -424,7 +426,7 @@ pub(super) fn diagnostics(attempt: &AttemptRecord) -> String {
 fn prepare(
     state: &State,
     run: &mut RunRecord,
-    decision: AllocationDecision,
+    decision: Option<AllocationDecision>,
     reason: Option<String>,
 ) -> Result<CandidateRecord> {
     let mut prompt = run.exact_prompt.clone();
@@ -453,18 +455,38 @@ fn prepare(
 pub(super) fn prepare_input(
     state: &State,
     run: &mut RunRecord,
-    decision: AllocationDecision,
+    decision: Option<AllocationDecision>,
     reason: Option<String>,
     input: &Path,
     prompt: &str,
 ) -> Result<CandidateRecord> {
+    // A profile-bound attempt runs the profile's resource; an explicit agent
+    // runs its project configuration.
+    let goal = run
+        .phase3
+        .as_ref()
+        .context("native run without execution policy")?;
+    let (harness, model, effort) = match &decision {
+        Some(decision) => (
+            decision.selected.harness.clone(),
+            Some(decision.selected.resolved_model.clone()),
+            decision.selected.effort.clone(),
+        ),
+        None => (
+            goal.fixed_harness
+                .clone()
+                .context("native run without an agent")?,
+            goal.fixed_model.clone(),
+            goal.fixed_effort.clone(),
+        ),
+    };
     let id = Ulid::new().to_string();
     let dir = state.run_dir(&run.id).join("attempts").join(&id);
     let workspace = source::create_candidate_workspace(input, &dir.join("workspace"))?;
     let candidate = CandidateRecord {
         id: id.clone(),
         label: "A".into(),
-        harness_id: decision.selected.harness.clone(),
+        harness_id: harness,
         harness_version: None,
         model: None,
         status: CandidateStatus::Preparing,
@@ -489,7 +511,7 @@ pub(super) fn prepare_input(
             parent_attempt_id: run.attempts.last().map(|a| a.id.clone()),
             reason,
             input_baseline: Some(input.to_path_buf()),
-            decision: Some(decision.clone()),
+            decision: decision.clone(),
             ..Default::default()
         },
         id,
@@ -500,17 +522,17 @@ pub(super) fn prepare_input(
         generation: 1,
         harness_id: candidate.harness_id.clone(),
         harness_version: None,
-        requested_model: Some(decision.selected.requested_model.clone()),
-        resolved_model: Some(decision.selected.resolved_model.clone()),
+        requested_model: model.clone(),
+        resolved_model: model,
         observed_model: None,
-        requested_effort: decision.selected.effort.clone(),
-        resolved_effort: decision.selected.effort.clone(),
+        requested_effort: effort.clone(),
+        resolved_effort: effort,
         observed_effort: None,
         started_at: Utc::now(),
         completed_at: None,
         outcome: "preparing".into(),
         raw_telemetry_path: dir.join("harness.jsonl"),
-        resource: Some(decision.selected),
+        resource: decision.map(|decision| decision.selected),
     });
     run.candidates = vec![candidate.clone()];
     Ok(candidate)
@@ -564,16 +586,22 @@ async fn drive_inner(
         emit(&run, output)?;
         return Ok(run);
     }
-    let decision = if initial {
-        run.allocation.clone().unwrap()
+    // A run bound to a configured profile carries a funding contract; an
+    // explicit `--agent` run without a profile has none.
+    let decision = if run.allocation.is_none() {
+        None
+    } else if initial {
+        run.allocation.clone()
     } else {
-        run.attempts
-            .last()
-            .unwrap()
-            .detail
-            .decision
-            .clone()
-            .context("continuation route missing")?
+        Some(
+            run.attempts
+                .last()
+                .unwrap()
+                .detail
+                .decision
+                .clone()
+                .context("continuation route missing")?,
+        )
     };
     let mut reason = (!initial).then(|| "clarification_answer".to_owned());
     'attempt: {
@@ -608,38 +636,46 @@ async fn drive_inner(
             )?;
             break 'attempt;
         }
-        let selected = &decision.selected;
-        let Some(profile) = resources.profiles.iter().find(|p| {
-            p.provider == selected.provider
-                && p.funding_source == selected.funding_source
-                && p.pool == selected.pool
-                && p.model == selected.resolved_model
-                && p.effort == selected.effort
-                && p.harness == selected.harness
-                && p.enabled
-                && p.runtime == selected.runtime
-                && p.service_mode == selected.service_mode
-                && p.included
-                && p.no_overage_verified
-        }) else {
-            stop(
-                state,
-                db,
-                &mut run,
-                FailureKind::Authorization,
-                "selected route is no longer authorized by the current resource configuration",
-            )?;
-            break 'attempt;
+        let profile = match &decision {
+            None => None,
+            Some(decision) => {
+                let selected = &decision.selected;
+                let Some(profile) = resources.profiles.iter().find(|p| {
+                    p.provider == selected.provider
+                        && p.funding_source == selected.funding_source
+                        && p.pool == selected.pool
+                        && p.model == selected.resolved_model
+                        && p.effort == selected.effort
+                        && p.harness == selected.harness
+                        && p.enabled
+                        && p.runtime == selected.runtime
+                        && p.service_mode == selected.service_mode
+                        && p.included
+                        && p.no_overage_verified
+                }) else {
+                    stop(
+                        state,
+                        db,
+                        &mut run,
+                        FailureKind::Authorization,
+                        "selected route is no longer authorized by the current resource configuration",
+                    )?;
+                    break 'attempt;
+                };
+                let profile = profile.clone();
+                if let Some(refusal) =
+                    db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
+                {
+                    let message = super::funding_refused_message(&profile, &refusal);
+                    stop(state, db, &mut run, FailureKind::Authorization, &message)?;
+                    break 'attempt;
+                }
+                Some(profile)
+            }
         };
-        let profile = profile.clone();
-        if let Some(refusal) =
-            db.funding_refusal(&profile.funding_key(), profile.authorization_revision)?
-        {
-            let message = super::funding_refused_message(&profile, &refusal);
-            stop(state, db, &mut run, FailureKind::Authorization, &message)?;
-            break 'attempt;
+        if let Some(decision) = &decision {
+            config.harnesses.bind(&decision.selected, &resources);
         }
-        config.harnesses.bind(&decision.selected, &resources);
         run.phase3.as_mut().unwrap().final_attempt_id = None;
         run.phase3.as_mut().unwrap().failure = None;
         let candidate = prepare(state, &mut run, decision.clone(), reason.take())?;
@@ -691,9 +727,9 @@ async fn drive_inner(
             Some(super::LaunchContext {
                 db_path: state.db_path(),
                 run_id: run.id.clone(),
-                guard: Some(crate::launch::LaunchGuard {
+                guard: profile.clone().map(|profile| crate::launch::LaunchGuard {
                     state_root: state.root.clone(),
-                    profile: profile.clone(),
+                    profile,
                 }),
             }),
         );
@@ -728,7 +764,7 @@ async fn drive_inner(
             persist_check_lifecycle(state, db, &mut run, event)?;
         }
         // A refused preflight is sticky for this authorization revision.
-        if let Some(reason) = &execution.preflight_refusal {
+        if let (Some(reason), Some(profile)) = (&execution.preflight_refusal, &profile) {
             db.record_funding_refusal(
                 &profile.funding_key(),
                 profile.authorization_revision,
@@ -742,7 +778,9 @@ async fn drive_inner(
         run.outcome.work_result = WorkResult::Pending;
         run.outcome.review = ReviewState::NotRequested;
         update_attempt_finished(&mut run, &candidate, &execution);
-        let failure = if cancellation.is_cancelled() {
+        // Only an execution failure stops the goal. A completed attempt whose
+        // checks failed is delivered for review; its classification is kept.
+        let stopped = if cancellation.is_cancelled() {
             Some(interrupted_by(&run, stale.is_some()))
         } else if !execution.cleanup_confirmed {
             Some(FailureKind::InternalState)
@@ -755,8 +793,9 @@ async fn drive_inner(
         {
             Some(FailureKind::InvocationLimit)
         } else {
-            verification_failure(&run, &candidate)
+            None
         };
+        let failure = stopped.or_else(|| verification_failure(&run, &candidate));
         let last = run.attempts.last_mut().unwrap();
         last.detail.result = Some(candidate.clone());
         last.detail.failure = failure;
@@ -770,7 +809,7 @@ async fn drive_inner(
             "attempt.finished",
             serde_json::json!({"failure":failure}),
         )?;
-        if let Some(failure) = failure.filter(|f| *f != FailureKind::TargetVerification) {
+        if let Some(failure) = stopped {
             let message = match (&stale, failure) {
                 (Some(detail), FailureKind::StaleWork) => {
                     format!("work stopped: the source changed underneath it ({detail})")

@@ -204,7 +204,7 @@ struct RunArgs {
     harnesses: Option<Vec<String>>,
 
     /// Deliberately choose one supported coding agent.
-    #[arg(long, value_parser = ["claude", "codex", "cursor"], conflicts_with = "harnesses")]
+    #[arg(long, value_parser = agent_id, conflicts_with = "harnesses")]
     agent: Option<String>,
 
     /// Select a configured model resource.
@@ -777,6 +777,16 @@ fn finish_run(
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+/// A supported coding agent. The deterministic `fake-*` adapters are accepted
+/// but not advertised; they make the complete workflow testable offline.
+fn agent_id(value: &str) -> std::result::Result<String, String> {
+    match value {
+        "claude" | "codex" | "cursor" => Ok(value.to_owned()),
+        fake if fake.starts_with("fake-") => Ok(fake.to_owned()),
+        _ => Err("possible values: claude, codex, cursor".into()),
+    }
 }
 
 fn read_run_input(args: &RunArgs) -> Result<(PathBuf, String)> {

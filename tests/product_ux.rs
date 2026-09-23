@@ -72,7 +72,7 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
         .stdout
         .clone();
     let override_output = String::from_utf8(override_output)?;
-    assert!(override_output.contains("Selection\n  Agent override"));
+    assert!(override_output.contains("Chosen explicitly with --agent"));
     assert!(fs::read_to_string(&marker)?.ends_with("cursor\n"));
     Ok(())
 }
@@ -115,7 +115,7 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
         .arg("explain")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Task classification"));
+        .stdout(predicates::str::contains("Chosen explicitly with --agent"));
     base()
         .arg("accept")
         .assert()

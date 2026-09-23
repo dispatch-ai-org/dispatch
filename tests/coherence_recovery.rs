@@ -336,7 +336,7 @@ fn killed_supervisor_mid_run_leaves_a_loadable_run_that_cannot_be_accepted() -> 
     let message = Fixture::stderr(&accept);
     assert!(!message.contains("panicked"), "{message}");
     assert!(!message.is_empty());
-    let apply = f.command().args(["apply", &id, "A"]).output()?;
+    let apply = f.command().args(["accept", &id]).output()?;
     assert!(!apply.status.success());
     assert!(!Fixture::stderr(&apply).contains("panicked"));
     assert_eq!(tree(&f.source), source_before, "no partial writes");
@@ -408,7 +408,7 @@ impl FakeGood {
                 "--allow-unsafe-local",
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .output()?;

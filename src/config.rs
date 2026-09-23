@@ -493,5 +493,4 @@ mod tests {
         assert_eq!(config.profiles.len(), 2);
         assert_eq!(config.profiles[1].provider, "anthropic");
     }
-
 }

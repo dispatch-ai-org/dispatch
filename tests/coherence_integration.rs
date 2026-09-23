@@ -14,7 +14,6 @@ struct Fixture {
     source: PathBuf,
     state: PathBuf,
     run_id: String,
-    label: String,
 }
 
 impl Fixture {
@@ -76,7 +75,7 @@ impl Fixture {
             .args([
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .assert()
@@ -89,18 +88,12 @@ impl Fixture {
             .find_map(|line| line.strip_prefix("RUN "))
             .expect("run output includes an ID")
             .to_owned();
-        let fixture = Self {
+        Self {
             _temp: temp,
             source,
             state,
             run_id,
-            label: String::new(),
-        };
-        let label = fixture.metadata()["candidates"][0]["label"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        Self { label, ..fixture }
+        }
     }
 
     fn run_dir(&self) -> PathBuf {
@@ -115,7 +108,7 @@ impl Fixture {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
             .arg(&self.state)
-            .args(["apply", &self.run_id, &self.label])
+            .args(["accept", &self.run_id])
             .assert()
     }
 

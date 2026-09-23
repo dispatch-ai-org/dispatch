@@ -22,7 +22,6 @@ struct Fixture {
     source: PathBuf,
     state: PathBuf,
     run_id: String,
-    label: String,
 }
 
 impl Fixture {
@@ -48,7 +47,7 @@ impl Fixture {
             .args([
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .assert()
@@ -61,18 +60,12 @@ impl Fixture {
             .find_map(|line| line.strip_prefix("RUN "))
             .expect("run output includes an ID")
             .to_owned();
-        let mut fixture = Self {
+        Self {
             _temp: temp,
             source: fs::canonicalize(source).unwrap(),
             state,
             run_id,
-            label: String::new(),
-        };
-        fixture.label = fixture.metadata()["candidates"][0]["label"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        fixture
+        }
     }
 
     fn metadata_path(&self) -> PathBuf {
@@ -276,9 +269,7 @@ fn a_run_without_coherence_data_reads_as_coherence_capable_with_no_migration() {
     assert_eq!(check["validity"]["reasons"][0]["code"], "patch_conflict");
 
     // A blocked accept stores the verdict on the old run; explain then shows it.
-    let blocked = fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .failure();
+    let blocked = fixture.dispatch(&["accept", &fixture.run_id]).failure();
     assert!(Fixture::stderr(&blocked).contains("stale"));
     let explain = Fixture::stdout(&fixture.dispatch(&["explain", &fixture.run_id]).success());
     assert!(explain.contains("\nCoherence\n"), "{explain}");
@@ -321,9 +312,7 @@ fn a_run_without_coherence_data_applies_after_an_unrelated_edit() {
     fs::write(fixture.source.join("notes.txt"), "someone else's work\n").unwrap();
     fs::write(fixture.source.join("original.txt"), "edited elsewhere\n").unwrap();
 
-    fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .success();
+    fixture.dispatch(&["accept", &fixture.run_id]).success();
 
     assert!(fixture.source.join("dispatch-fake-good.txt").is_file());
     assert_eq!(
@@ -352,9 +341,7 @@ fn a_run_without_coherence_data_is_blocked_as_stale_by_a_conflicting_edit() {
     fs::write(&occupied, "someone else wrote this first\n").unwrap();
     let before = fixture.source_files();
 
-    let blocked = fixture
-        .dispatch(&["apply", &fixture.run_id, &fixture.label])
-        .failure();
+    let blocked = fixture.dispatch(&["accept", &fixture.run_id]).failure();
 
     let stderr = Fixture::stderr(&blocked);
     assert!(stderr.contains("stale"), "{stderr}");

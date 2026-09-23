@@ -4,15 +4,11 @@
 //! yet (that is a later work package), so every test calls the library
 //! function directly.
 //!
-//! `Fixture` (a `fake-good`, comparison-mode run) is modeled on
-//! `tests/coherence_accept.rs` and covers the eligibility rows and the
-//! Legacy/Compatible/Blocked gate rows. `dispatch accept`/`dispatch reject`
-//! refuse a comparison-mode run that was never routed (they require
-//! `RunMode::Allocation` or a routed run), so the post-hoc review guard is
-//! exercised on `AllocationFixture`, an immediate-delivery allocation run
-//! modeled on `tests/phase1_allocation.rs`, and the "human accept path
-//! unchanged" case uses the hidden `dispatch apply <id> <label>` command
-//! instead of `dispatch accept` for the same reason.
+//! `Fixture` (a `fake-good` native run) is modeled on
+//! `tests/coherence_accept.rs` and covers the eligibility rows, the
+//! Legacy/Compatible/Blocked gate rows and the human accept path.
+//! `AllocationFixture`, an immediate-delivery profile-bound run modeled on
+//! `tests/phase1_allocation.rs`, covers the post-hoc review guard.
 #![cfg(unix)]
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, path::PathBuf, process::Command};
@@ -72,7 +68,6 @@ struct Fixture {
     source: PathBuf,
     state_dir: PathBuf,
     run_id: String,
-    label: String,
 }
 
 impl Fixture {
@@ -122,7 +117,7 @@ impl Fixture {
             .args([
                 "--task",
                 "Create the fake artifact.",
-                "--harnesses",
+                "--agent",
                 "fake-good",
             ])
             .assert()
@@ -134,18 +129,12 @@ impl Fixture {
             .find_map(|line| line.strip_prefix("RUN "))
             .expect("run output includes an ID")
             .to_owned();
-        let fixture = Self {
+        Self {
             _temp: temp,
             source,
             state_dir,
             run_id,
-            label: String::new(),
-        };
-        let label = metadata(&fixture.state_dir, &fixture.run_id)["candidates"][0]["label"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        Self { label, ..fixture }
+        }
     }
 
     fn state(&self) -> State {
@@ -166,14 +155,13 @@ impl Fixture {
         self.source.join("dispatch-fake-good.txt")
     }
 
-    /// The hidden `dispatch apply <id> <label>` command: a human-typed apply
-    /// that records no accept/reject feedback (`apply_locked` with
-    /// `ApplyAuthority::Human`).
+    /// `dispatch accept <id>`: a human review that applies the result
+    /// (`apply_locked` with `ApplyAuthority::Human`).
     fn apply_cli(&self) -> assert_cmd::assert::Assert {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
             .arg(&self.state_dir)
-            .args(["apply", &self.run_id, &self.label])
+            .args(["accept", &self.run_id])
             .assert()
     }
 }
@@ -427,10 +415,8 @@ fn run_lock_held_by_a_foreground_owner_skips_without_persisting() {
     drop(lock_file);
 }
 
-/// A never-auto-applied result taken through the hidden `dispatch apply <id>
-/// <label>` command: `dispatch accept` refuses a comparison-mode run that was
-/// never routed, so this exercises the same `ApplyAuthority::Human` path
-/// `accept`/`review_delivery` use.
+/// A never-auto-applied result accepted by a human: `accept` applies it
+/// through the `ApplyAuthority::Human` path.
 #[test]
 fn human_apply_still_records_human_authority_and_accepted_review() {
     let fixture = Fixture::new("checks:\n  verify: ['true']\n");

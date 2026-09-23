@@ -305,3 +305,20 @@ again at admission. After S6b it must run immediately before spawn.
   re-authorization), confirming the 0.4.0 stuck-profile defect is gone. The
   S5a/S6a proof files are unchanged. `cargo test`: 437 passed, 0 failed after
   the pool-split config test was removed with its validation.
+- 2026-09-23 — S7a: every native run goes through the one native engine. An
+  explicit `--agent X` run with no matching profile is an unbound native run
+  (`allocation: None`, `phase3.fixed_harness`): no funding contract, but the
+  same launch record, watcher, questions, crash repair and run lock.
+  `--agent` also accepts the unadvertised `fake-*` adapters. The test
+  substrate moved from `--harnesses fake-* … apply <id> A` to
+  `--agent fake-* … accept <id>` (13 files); only the multi-candidate
+  comparison cases still use `--harnesses` until S7b. Behavior decisions:
+  (1) only execution failures stop a native attempt; a completed attempt whose
+  checks fail, including on a baseline that already fails, is delivered for
+  review with its verification state and its classification is kept in
+  `phase3.failure` (the old stop existed to decide whether to spend the
+  removed retry; auto-apply still requires passed verification); (2) Ctrl-C on
+  a native run is recorded as cancelled work, as the TUI always did;
+  (3) `explain` on a native run reports the explicitly chosen agent;
+  (4) the native status summary reports the human review outcome.
+  `cargo test`: 437 passed, 0 failed (PTY fixture on rerun).

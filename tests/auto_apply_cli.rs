@@ -78,7 +78,7 @@ impl Fixture {
             "--allow-unsafe-local",
             "--task",
             "Create the fake artifact.",
-            "--harnesses",
+            "--agent",
             "fake-good",
         ];
         args.extend_from_slice(extra);

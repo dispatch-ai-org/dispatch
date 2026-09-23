@@ -321,23 +321,6 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
     Ok(())
 }
 
-fn override_decision(harness: String) -> Result<RoutingDecision> {
-    Ok(RoutingDecision {
-        version: 1,
-        task_features: crate::TaskFeatures::default(),
-        selected_harness: harness,
-        successes: 0,
-        attempts: 0,
-        specificity: 0,
-        source: String::new(),
-        dataset: String::new(),
-        dataset_version: String::new(),
-        model: None,
-        selection_basis: SelectionBasis::Override,
-        alternatives: Vec::new(),
-    })
-}
-
 fn specificity_label(specificity: u8) -> &'static str {
     match specificity {
         0 => "generic",
@@ -621,7 +604,10 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         authorize_local_commands("configured coding-agent commands", request.output)?;
         local_authorized = true;
     }
-    let (mut harnesses, routing, allocation) = if allocation_requested {
+    // Every run except an explicit multi-harness comparison is native: one
+    // agent, one engine, whether a configured profile or `--agent` chose it.
+    let native = allocation_requested || request.agent.is_some();
+    let (mut harnesses, allocation) = if allocation_requested {
         let decision = select_available_resource(
             state,
             &source_path,
@@ -632,18 +618,9 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             request.effort.as_deref(),
         )
         .await?;
-        (
-            vec![decision.selected.harness.clone()],
-            None,
-            Some(decision),
-        )
+        (vec![decision.selected.harness.clone()], Some(decision))
     } else if let Some(agent) = request.agent {
-        let decision = override_decision(agent)?;
-        (
-            vec![decision.selected_harness.clone()],
-            Some(decision),
-            None,
-        )
+        (vec![agent], None)
     } else {
         (
             request
@@ -653,13 +630,13 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                 .filter(|id| !id.is_empty())
                 .collect::<Vec<_>>(),
             None,
-            None,
         )
     };
     let fixed_config = config.harnesses.get(
         allocation
             .as_ref()
             .map(|decision| decision.selected.harness.as_str())
+            .or(fixed_harness.as_deref())
             .unwrap_or("codex"),
     );
     let fixed_model = request.model.clone().or(fixed_config.model.clone());
@@ -696,11 +673,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     );
 
     if request.output == RunOutputMode::Human
-        && let Some(decision) = &routing
-    {
-        print_routing_decision(decision);
-    }
-    if request.output == RunOutputMode::Human
         && let Some(decision) = &allocation
     {
         print_allocation_decision(decision);
@@ -712,7 +684,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     let run_dir = state.run_dir(&run_id);
     fs::create_dir(&run_dir)
         .with_context(|| format!("failed to create run directory {}", run_dir.display()))?;
-    let _run_lock = if allocation.is_some() {
+    let _run_lock = if native {
         Some(OperationLock::acquire(
             &run_dir.join(".operation.lock"),
             "run is already supervised",
@@ -762,10 +734,8 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_path: snapshot.baseline_path,
         baseline_commit: snapshot.baseline_commit,
         status: RunStatus::Preparing,
-        mode: if allocation.is_some() {
+        mode: if native {
             RunMode::Allocation
-        } else if routing.is_some() {
-            RunMode::Routed
         } else {
             RunMode::Comparison
         },
@@ -804,7 +774,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         baseline_checks: Vec::new(),
         candidates: Vec::new(),
         attempts: Vec::new(),
-        routing,
+        routing: None,
         allocation,
         capacity: None,
         admission: None,
@@ -1410,10 +1380,12 @@ fn print_single_result_summary(
             "  Allocation trial · {} tier\n",
             decision.selected.tier.as_str()
         );
-    } else {
-        let decision = run.routing.as_ref().expect("caller checked selection");
+    } else if let Some(decision) = &run.routing {
         println!("Agent\n  {}", harness_name(&decision.selected_harness));
         println!("  {} selection\n", selection_label(decision));
+    } else if let Some(candidate) = run.candidates.first() {
+        println!("Agent\n  {}", harness_name(&candidate.harness_id));
+        println!("  Chosen explicitly with --agent\n");
     }
     if let Some(attempt) = run.attempts.last()
         && (attempt.requested_model.is_some() || attempt.observed_model.is_some())
@@ -2910,6 +2882,17 @@ fn explain_selection(run: &RunRecord) -> Result<()> {
         print_allocation_details(decision);
         return Ok(());
     }
+    if let Some(agent) = run
+        .phase3
+        .as_ref()
+        .and_then(|goal| goal.fixed_harness.as_deref())
+    {
+        println!(
+            "Agent\n  {}\n\nSelection\n  Chosen explicitly with --agent",
+            harness_name(agent)
+        );
+        return Ok(());
+    }
     let decision = run
         .routing
         .as_ref()
@@ -3064,8 +3047,8 @@ fn record_allocation_feedback_locked(
     quiet: bool,
 ) -> Result<()> {
     anyhow::ensure!(
-        run.mode == RunMode::Allocation && run.allocation.is_some(),
-        "run {} is not an allocation run",
+        run.mode == RunMode::Allocation,
+        "run {} is not a native run",
         run.id
     );
     anyhow::ensure!(
@@ -3322,7 +3305,10 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
         let run = state.load_run(&projected.id)?;
         if run.source_path != source_path
             || run.candidates.len() != 1
-            || (run.routing.is_none() && run.allocation.is_none() && run.mode != RunMode::Attached)
+            || (run.routing.is_none()
+                && run.allocation.is_none()
+                && run.phase3.is_none()
+                && run.mode != RunMode::Attached)
         {
             continue;
         }

@@ -244,7 +244,7 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
         .args([
             "--task",
             "Create another fake artifact.",
-            "--harnesses",
+            "--agent",
             "fake-bad",
         ])
         .assert()
@@ -287,7 +287,7 @@ fn non_git_fake_harness_evaluation_and_safe_apply_work_end_to_end() {
     cargo_bin_cmd!("dispatch")
         .args(["--state-dir"])
         .arg(&state)
-        .args(["apply", second_run, "A"])
+        .args(["accept", second_run])
         .assert()
         .failure()
         .stderr(predicates::str::contains("this work is stale"));
@@ -331,7 +331,7 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
         .args([
             "--task",
             "Wait until interrupted.",
-            "--harnesses",
+            "--agent",
             "fake-timeout",
         ])
         .stdout(Stdio::piped())
@@ -370,9 +370,10 @@ fn interrupt_cancels_children_and_persists_terminal_status() {
     assert!(!status.success());
 
     let metadata: Value = serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["status"], "interrupted");
+    // The native engine records a user interrupt as cancelled work.
+    assert_eq!(metadata["phase3"]["failure"], "cancelled");
     assert_eq!(metadata["outcome"]["lifecycle"], "finished");
-    assert_eq!(metadata["outcome"]["work_result"], "interrupted");
+    assert_eq!(metadata["outcome"]["work_result"], "cancelled");
     assert_eq!(metadata["outcome"]["verification"], "not_run");
     assert_eq!(metadata["candidates"][0]["status"], "cancelled");
     assert_eq!(metadata["attempts"][0]["outcome"], "cancelled");

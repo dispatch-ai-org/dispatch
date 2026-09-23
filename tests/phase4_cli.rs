@@ -34,7 +34,7 @@ fn presentation_flags_do_not_pollute_machine_results() {
             "--source",
         ])
         .arg(source)
-        .args(["--harnesses", "fake-good", "--jsonl"])
+        .args(["--agent", "fake-good", "--jsonl"])
         .output()
         .unwrap();
     assert!(
