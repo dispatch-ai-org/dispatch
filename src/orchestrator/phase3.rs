@@ -982,7 +982,7 @@ async fn drive_inner(
         refresh_outcome(&mut run);
         run.phase3.as_mut().unwrap().failure = failure;
         if target_failure {
-            resources = crate::commands::resources(state)?;
+            resources = crate::config::ResourceConfig::load(&state.root)?;
         }
         if target_failure && let Some(next) = recovery_route(state, &run, &resources, &config).await
         {
@@ -1029,18 +1029,13 @@ fn resolve(
     state: &State,
     command: &QuestionCommand,
     answer: Option<String>,
-) -> Result<(RunRecord, OperationLock, Option<OperationLock>)> {
-    crate::commands::authorize_question_target(state, &command.run_id)?;
+) -> Result<(RunRecord, OperationLock)> {
     let id = state.resolve_run_id(&command.run_id)?;
-    let grant_lock = crate::commands::local_question_ownership(state, &id)?;
     let lock = OperationLock::acquire(
         &state.run_dir(&id).join(".operation.lock"),
         "run has a foreground owner",
     )?;
     let mut run = state.load_run(&id)?;
-    if answer.is_some() {
-        crate::commands::authorize_answer(state, &run, &command.question_id)?;
-    }
     let policy = run
         .phase3
         .as_mut()
@@ -1088,7 +1083,7 @@ fn resolve(
     question.revision += 1;
     question.resolved_at = Some(Utc::now());
     question.actor_uid = Some(local_uid());
-    question.actor = crate::commands::actor();
+    question.actor = None;
     run.outcome.waiting_on = WaitingOn::None;
     if question.state == QuestionState::Cancelled {
         run.outcome.lifecycle = LifecycleState::Finished;
@@ -1111,7 +1106,7 @@ fn resolve(
         serde_json::json!({"question_id":command.question_id,"revision":command.revision+1,"actor_uid":local_uid()}),
     );
     finish_error(state, &db, &run.id, result)?;
-    Ok((run, lock, grant_lock))
+    Ok((run, lock))
 }
 
 pub async fn answer_question(
@@ -1121,14 +1116,14 @@ pub async fn answer_question(
     output: RunOutputMode,
 ) -> Result<RunRecord> {
     RUN_OUTPUT_MODE.store(output.code(), Ordering::Relaxed);
-    let (run, _lock, _grant_lock) = resolve(state, &command, Some(answer))?;
+    let (run, _lock) = resolve(state, &command, Some(answer))?;
     let mut db = Database::open(state.db_path())?;
     let setup = (|| -> Result<_> {
         let config: Config = serde_yaml::from_str(&fs::read_to_string(
             state.run_dir(&run.id).join("config.snapshot.yml"),
         )?)?;
         config.validate()?;
-        Ok((config, crate::commands::resources(state)?))
+        Ok((config, crate::config::ResourceConfig::load(&state.root)?))
     })();
     let (config, resources) = finish_error(state, &db, &run.id, setup)?;
     let cancellation = operation_cancellation();
@@ -1143,76 +1138,7 @@ pub fn cancel_question(
     output: RunOutputMode,
 ) -> Result<RunRecord> {
     RUN_OUTPUT_MODE.store(output.code(), Ordering::Relaxed);
-    let (run, _lock, _grant_lock) = resolve(state, &command, None)?;
+    let (run, _lock) = resolve(state, &command, None)?;
     emit(&run, output)?;
     Ok(run)
-}
-
-/// Acquire an abandoned completed checkpoint, or continue its committed answer.
-/// An interrupted invocation is never replayed.
-pub(crate) async fn recover_checkpoint(
-    state: &State,
-    scope: &crate::commands::Scope,
-    id: &str,
-    revision: u64,
-) -> Result<RunRecord> {
-    scope.run(state, id)?; // Authorize before resolving or creating any lock path.
-    let _lock = OperationLock::acquire(
-        &state.run_dir(id).join(".operation.lock"),
-        "run has a foreground owner",
-    )?;
-    let mut run = scope.run(state, id)?;
-    crate::commands::ensure_recoverable(state, scope, &run, revision)?;
-    let config: Config = serde_yaml::from_str(&fs::read_to_string(
-        state.run_dir(id).join("config.snapshot.yml"),
-    )?)?;
-    config.validate()?;
-    let resources = crate::commands::resources(state)?;
-    run.phase3.as_mut().unwrap().supervisor = Some(crate::admission::ProcessIdentity::current());
-    run.phase3.as_mut().unwrap().failure = None;
-    let pending = run
-        .phase3
-        .as_ref()
-        .unwrap()
-        .questions
-        .last()
-        .is_some_and(|q| q.state == QuestionState::Pending);
-    run.outcome.lifecycle = if pending {
-        LifecycleState::Waiting
-    } else {
-        LifecycleState::Preparing
-    };
-    run.outcome.phase = RunPhase::Preparing;
-    run.outcome.work_result = WorkResult::Pending;
-    run.outcome.waiting_on = if pending {
-        WaitingOn::Human
-    } else {
-        WaitingOn::None
-    };
-    run.status = RunStatus::Preparing;
-    run.completed_at = None;
-    let mut db = Database::open_control(state.db_path())?;
-    transition(
-        state,
-        &db,
-        &mut run,
-        "run.recovered",
-        serde_json::json!({"explicit":true}),
-    )?;
-    if pending {
-        return Ok(run);
-    }
-    let cancellation = operation_cancellation();
-    let _signals = SignalListener::install(cancellation.clone());
-    let _deadline = DeadlineGuard::new(run.phase3.as_ref(), cancellation.clone());
-    drive(
-        state,
-        &mut db,
-        run,
-        config,
-        resources,
-        cancellation,
-        RunOutputMode::Silent,
-    )
-    .await
 }

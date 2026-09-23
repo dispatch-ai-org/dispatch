@@ -48,27 +48,6 @@ enum Command {
         #[arg(value_parser = ["codex", "claude"])]
         provider: Option<String>,
     },
-    /// Foreground, scoped bidirectional JSON Lines (requires a human-issued grant).
-    Control {
-        #[arg(long, required = true)]
-        stdio: bool,
-        #[arg(long)]
-        grant_fd: i32,
-        #[arg(long)]
-        read_only: bool,
-    },
-    /// Authorize a fixed machine scope as the local human owner; prints a private key path.
-    ControlGrant {
-        source: PathBuf,
-        #[arg(long, default_value_t = 600)]
-        timeout: u64,
-        #[arg(long, default_value_t = 2)]
-        max_invocations: u32,
-        #[arg(long)]
-        allow_unsafe_local: bool,
-        #[arg(long)]
-        delegate_factual: bool,
-    },
     /// Follow committed semantic events (advanced, read-only JSON Lines).
     #[command(hide = true)]
     Events {
@@ -463,29 +442,6 @@ async fn run() -> Result<()> {
                 },
             )
             .await
-        }
-        Command::Control {
-            stdio: _,
-            grant_fd,
-            read_only,
-        } => dispatch::control::stdio(state, grant_fd, read_only).await,
-        Command::ControlGrant {
-            source,
-            timeout,
-            max_invocations,
-            allow_unsafe_local,
-            delegate_factual,
-        } => {
-            let path = dispatch::commands::grant_mode(
-                &state,
-                &source,
-                timeout,
-                max_invocations,
-                allow_unsafe_local,
-                delegate_factual,
-            )?;
-            println!("{}", path.display());
-            Ok(())
         }
         Command::Events {
             run_id,

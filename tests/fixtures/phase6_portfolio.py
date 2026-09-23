@@ -13,7 +13,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 sys.dont_write_bytecode = True
-from phase5_control import Fixture, finish, assert_error
+from provider_fixture import Fixture
 
 
 def proof(f):
@@ -51,10 +51,6 @@ def add_peer(f, binary, first='claude'):
     codex=codex.replace('model: fixture-model','model: codex-fixed')
     path.write_text('version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n'+(claude+codex if first=='claude' else codex+claude))
     return peer
-
-
-def grant(f):
-    f.key=Path(f.command('control-grant',f.source,'--allow-unsafe-local','--delegate-factual').stdout.decode().strip())
 
 
 def checked(output, result):
@@ -239,45 +235,6 @@ def scenario(binary, name):
             (Path(os.environ['HOME'])/'.claude').mkdir()
             (Path(os.environ['HOME'])/'.claude/managed-settings.json').write_text('{}')
             output,_=run(f);assert output.returncode!=0 and f.count()==1
-        elif name=='grants':
-            peer=add_peer(f,binary)
-            path=f.state/'resources.yml';both=path.read_text()
-            path.write_text(both.replace('harness: claude','harness: claude\n    enabled: false'))
-            grant(f)
-            path.write_text(both)
-            c=f.client()
-            accepted=c.call('submit',request_id='one',task='Add tests in src/lib.rs')
-            result=finish(c,accepted['run_id'])['result'];assert result['allocation']['selected']['harness']=='codex'
-            count=peer.count()+f.count()
-            path.write_text(both.replace('model: codex-fixed','model: changed'))
-            assert c.call('submit',request_id='one',task='Add tests in src/lib.rs')==accepted
-            assert peer.count()+f.count()==count
-            path.write_text(both);grant(f);broader=f.client()
-            accepted=broader.call('submit',task='Add tests in src/lib.rs')
-            result=finish(broader,accepted['run_id'])['result'];assert result['allocation']['selected']['harness']=='claude'
-        elif name=='pools':
-            peer=add_peer(f,binary)
-            grant(f)
-            f.mode.write_text('wait')
-            ready=os.open(f.ready,os.O_RDONLY|os.O_NONBLOCK)
-            c=f.client();a=c.call('submit',task='Add tests in src/lib.rs',model='fixture-model')
-            assert select.select([ready],[],[],10)[0];assert os.read(ready,1)==b'R'
-            grant(f);c2=f.client();queued=c2.call('submit',task='Add tests in src/lib.rs',model='fixture-model')
-            # Durable admission state is the barrier, not elapsed sleep.
-            deadline=time.monotonic()+10
-            while True:
-                with sqlite3.connect(f.state/'dispatch.db') as db:
-                    waiting=db.execute("SELECT COUNT(*) FROM admission_requests WHERE status='queued'").fetchone()[0]
-                if waiting: break
-                assert time.monotonic()<deadline
-                time.sleep(.01)
-            output,result=run(f,'--agent','codex');checked(output,result)
-            assert f.count()==1 and peer.count()==1
-            status=c2.call('status',run_id=queued['run_id'])
-            c2.call('cancel',run_id=queued['run_id'],revision=status['state_revision'])
-            with f.barrier.open('wb',buffering=0) as gate: gate.write(b'R')
-            finish(c,a['run_id']);finish(c2,queued['run_id']);os.close(ready)
-            no_lease(f)
         elif name=='capacity':
             peer=add_peer(f,binary)
             output,result=run(f);checked(output,result)

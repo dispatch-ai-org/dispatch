@@ -449,6 +449,15 @@ fn print_allocation_decision(decision: &AllocationDecision) {
     println!("Why:\n  {}\n", decision.reason);
 }
 
+/// Canonical digest of a resource profile, recorded with capacity
+/// authorizations. serde_json's default map is sorted, so the round-trip
+/// canonicalizes struct and map key order.
+fn digest(value: &impl serde::Serialize) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let value = serde_json::to_value(value)?;
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&value)?)))
+}
+
 fn harness_name(id: &str) -> &str {
     match id {
         "claude" => "Claude Code",
@@ -487,7 +496,6 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         state.root.display()
     );
     let (mut config, config_path) = Config::discover(&source_path, request.config_path.as_deref())?;
-    crate::commands::validate_submission(state, &request, &config)?;
     if let Some(backend) = request.backend {
         config.execution.backend = backend;
     }
@@ -506,7 +514,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         names = config.execution.forwarded_env.join(", ")
     );
 
-    let resources = crate::commands::resources(state)?;
+    let resources = crate::config::ResourceConfig::load(&state.root)?;
     let allocation_requested = (resources.allocation_enabled && request.harnesses.is_empty())
         || request.model.is_some()
         || request.effort.is_some();
@@ -726,7 +734,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
     };
     if run.mode == RunMode::Allocation {
         run.phase3 = Some(crate::GoalExecution {
-            max_invocations: crate::commands::invocation_limit(),
+            max_invocations: 2,
             deadline_at: run.created_at
                 + chrono::TimeDelta::seconds(
                     i64::try_from(config.execution.timeout_secs).unwrap_or(i64::MAX),
@@ -1894,7 +1902,7 @@ async fn select_available_resource(
                             value: "adapter_preflight_rejected".into(),
                         };
                         db.append_capacity_observation(&observation)?;
-                        let revision = crate::commands::digest(profile)?;
+                        let revision = digest(profile)?;
                         let _ = authorize_observation(
                             &db,
                             &pool,
@@ -2340,7 +2348,6 @@ fn persist_event(
 }
 
 fn publish_event(state: &State, event: EventRecord, run: &RunRecord) -> Result<()> {
-    crate::commands::notify_commit(run, &event);
     state.save_run(run)?;
     state.append_event(&event)?;
     let _ = PRESENTATION.try_with(|p| {
@@ -3219,7 +3226,6 @@ pub(crate) fn review_target(
     state: &State,
     command: &ReviewCommand,
 ) -> Result<(RunRecord, OperationLock)> {
-    crate::commands::ensure_machine_review_denied()?;
     let id = state.resolve_run_id(&command.run_id)?;
     anyhow::ensure!(
         id == command.run_id,

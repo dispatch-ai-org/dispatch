@@ -106,3 +106,13 @@ the progress log.
   verified) rather than applied unverified; refresh it instead. `cargo test`:
   543 passed, 1 failed (`claude_control_slow_output`, a known load-sensitive
   control fixture; control is removed in S3).
+- 2026-09-22 — S3: removed the control protocol (`control --stdio`,
+  `control-grant`, sessions, grants, receipts, `commands/inspection.rs`, the
+  receipt and actor hooks in the event commit, control-only checkpoint
+  recovery, `examples/control_client.py`, `docs/control-protocol.md`). The
+  question-authorization helpers were all control-scoped no-ops for local
+  callers; `dispatch answer`/`cancel` keep their OS-owner check in the native
+  engine. The fake-provider fixture moved to `tests/fixtures/provider_fixture.py`;
+  the control-driven portfolio scenarios (`grants`, `pools`) were deleted
+  (same-pool admission exclusion is removed in S6b). `cargo test`: 489 passed,
+  0 failed.

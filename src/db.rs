@@ -1521,9 +1521,6 @@ impl Database {
             .context("run state revision overflow")?;
         event.protocol_version = 1;
         event.sequence = u64::try_from(sequence).context("event sequence is invalid")?;
-        if let Some(actor) = crate::commands::actor() {
-            event.actor = actor;
-        }
         if event.actor.is_empty() {
             event.actor = "orchestrator".into();
         }
@@ -1581,7 +1578,6 @@ impl Database {
                 event.actor,
             ],
         )?;
-        crate::commands::commit_receipt(transaction, run, &mut event)?;
         // Keep immediate JSON/results and the file projection consistent with
         // the same admission authority used by subsequent status reads.
         run.admission = projection.admission;
@@ -2530,7 +2526,6 @@ mod tests {
                 .phase3
                 .is_none()
         );
-        let _: crate::commands::Scope = serde_json::from_value(grant)?;
         assert_eq!(
             database
                 .connection
