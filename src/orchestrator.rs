@@ -301,11 +301,11 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
 }
 
 fn print_allocation_decision(decision: &AllocationDecision) {
-    println!("Resource");
+    println!("Profile");
     println!(
         "  {} · {} · {} effort",
+        decision.selected.harness,
         decision.selected.requested_model,
-        decision.selected.tier.as_str(),
         decision.selected.effort.as_deref().unwrap_or("default")
     );
     println!("Why:\n  {}\n", decision.reason);
@@ -2244,26 +2244,19 @@ fn print_allocation_details(decision: &AllocationDecision) {
         "  effort: {}",
         decision.selected.effort.as_deref().unwrap_or("default")
     );
-    println!("  tier: {}", decision.selected.tier.as_str());
     println!("  service mode: {}", decision.selected.service_mode);
     println!("  runtime: {}", decision.selected.runtime);
-    println!("  pool: {}", decision.selected.pool);
     println!(
         "  profile no-overage assertion: {}",
         decision.selected.no_overage_verified
     );
-    println!(
-        "  internal composition: {}",
-        decision.selected.internal_composition
-    );
     println!("\nSelection reason\n  {}", decision.reason);
-    println!("Policy\n  {}", decision.policy_version);
     println!("Capability provenance\n  {}", decision.capability.source);
-    println!("\nConfigured alternatives");
+    println!("\nConfigured profiles");
     for alternative in &decision.alternatives {
         println!(
             "  {} / {} / {}: {}",
-            alternative.choice.tier.as_str(),
+            alternative.choice.harness,
             alternative.choice.requested_model,
             alternative.choice.effort.as_deref().unwrap_or("default"),
             alternative
@@ -2416,7 +2409,8 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
 
 fn print_run_header(run: &RunRecord) {
     println!("RUN {}", run.id);
-    println!("Status           {}", run.status.as_str());
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    println!("Status           {}", work_line(run, validity).state);
     println!("Source           {}", run.source_path.display());
     println!("Source type      {}", run.source_kind.as_str());
     println!("Baseline         {}", run.baseline_commit);

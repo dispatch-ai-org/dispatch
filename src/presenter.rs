@@ -465,7 +465,7 @@ fn details(run: &RunRecord) -> String {
         run.task, run.id, run.state_revision
     );
     if let Some(decision) = &run.allocation {
-        text.push_str(&format!("\nAllocation: {}", decision.reason));
+        text.push_str(&format!("\nProfile choice: {}", decision.reason));
     }
     for attempt in &run.attempts {
         text.push_str(&format!(

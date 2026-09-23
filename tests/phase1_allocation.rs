@@ -144,6 +144,8 @@ fn enabled_trial_allocation_reaches_argv_and_persists_identity() -> anyhow::Resu
         .clone();
     let explanation = String::from_utf8(explanation)?;
     assert!(explanation.contains("Capability provenance"));
+    assert!(explanation.contains("Configured profiles"));
+    assert!(!explanation.contains("tier"));
     assert!(explanation.contains("user_validated_profile"));
     Ok(())
 }

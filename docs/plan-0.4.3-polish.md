@@ -446,3 +446,15 @@ decided). New languages for symbol facts.
     failed once in the full suite ("activity indicator did not update") and
     passed alone.
   - `cargo test`: 428 passed, 0 failed after those fixes.
+- 2026-09-23 — Stage 5. Allocation-era wording is out of human output:
+  - The run-start line reads `Profile · <harness> · <model> · <effort>`.
+  - `explain` lists the selected profile without tier, pool, composition or
+    policy version, and names "Configured profiles".
+  - The TUI details say "Profile choice".
+  - `show` derives its status from `outcome` through `work_line`.
+  - The README profile example has `tier: standard`, commented as unused.
+  - Kept: "Capability provenance" (still true: user-validated profile), and the
+    apply refusal's status word (`apply.rs` is on the untouched list; it names
+    only terminal states).
+  - Tests: `explain` has no "tier" and lists "Configured profiles".
+  - `cargo test`: 428 passed, 0 failed.

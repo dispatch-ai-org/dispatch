@@ -362,7 +362,7 @@ profiles:
     service_mode: standard
     runtime: local
     pool: chatgpt-codex
-    tier: light
+    tier: standard        # written for older versions; nothing selects on it
     included: true
     no_overage_verified: true
     authorization_revision: 1
