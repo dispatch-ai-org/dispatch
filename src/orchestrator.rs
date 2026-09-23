@@ -25,7 +25,7 @@ use ulid::Ulid;
 use crate::{
     AllocationDecision, ApplicationState, AppliedBy, AttemptRecord, CandidateRecord,
     CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
-    EnvironmentRecord, EventRecord, LifecycleState, ReviewState, RoutingHumanOutcome, RunMode,
+    EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
     db::Database,
@@ -818,7 +818,7 @@ fn print_single_result_summary(
     run: &RunRecord,
     heading: &str,
     show_status: bool,
-    human_outcome: Option<&RoutingHumanOutcome>,
+    human_outcome: Option<&ReviewOutcome>,
 ) {
     let candidate = run
         .candidates
@@ -873,8 +873,8 @@ fn print_single_result_summary(
         println!("Result\n  Applied to the source tree");
     } else if let Some(outcome) = human_outcome {
         match outcome {
-            RoutingHumanOutcome::Accepted => println!("Result\n  Accepted; not applied"),
-            RoutingHumanOutcome::Rejected => {
+            ReviewOutcome::Accepted => println!("Result\n  Accepted; not applied"),
+            ReviewOutcome::Rejected => {
                 println!("Result\n  Rejected; source tree unchanged")
             }
         }
@@ -2287,9 +2287,9 @@ fn review_locked(
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
     let outcome = if accept {
-        RoutingHumanOutcome::Accepted
+        ReviewOutcome::Accepted
     } else {
-        RoutingHumanOutcome::Rejected
+        ReviewOutcome::Rejected
     };
     let mut database = Database::open(state.db_path())?;
     let feedback = database.save_goal_feedback(&run.id, outcome, reasons, explanation)?;
@@ -2841,7 +2841,7 @@ mod tests {
             )?;
             fs::write(
                 state.root.join("resources.yml"),
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
+                "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
             )?;
             let db = Database::open(state.db_path())?;
             let result = CANCEL_AT_HANDOFF

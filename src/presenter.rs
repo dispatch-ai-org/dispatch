@@ -2456,7 +2456,7 @@ mod tests {
             let output = std::process::Command::new("python3")
                 .arg(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/phase4_session.py"
+                    "/tests/fixtures/tui_session.py"
                 ))
                 .arg(std::env::current_exe().unwrap())
                 .arg(temp.path())

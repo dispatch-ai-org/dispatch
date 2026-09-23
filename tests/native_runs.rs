@@ -101,9 +101,7 @@ test "$(cat result.txt)" = 'ok'
         let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")).concat();
         fs::write(
             state.join("resources.yml"),
-            format!(
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n{profiles}"
-            ),
+            format!("version: 1\nallocation_enabled: true\nprofiles:\n{profiles}"),
         )?;
         Ok(Self {
             _temp: temp,
@@ -1010,7 +1008,7 @@ fn phase4_natural_goal_reaches_review_with_light_and_standard_profiles_only() ->
     let output = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/phase4_session.py"
+            "/tests/fixtures/tui_session.py"
         ))
         .arg(assert_cmd::cargo_bin!("dispatch"))
         .arg(&f.source)
@@ -1056,7 +1054,7 @@ fn phase4_pty_intent_answer_recovery_review_and_restoration() -> Result<()> {
         let output = Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/phase4_session.py"
+                "/tests/fixtures/tui_session.py"
             ))
             .arg(assert_cmd::cargo_bin!("dispatch"))
             .arg(&f.source)
@@ -1161,7 +1159,7 @@ fn phase4_two_foreground_sessions_keep_their_own_deliveries() -> Result<()> {
         Ok(Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/phase4_session.py"
+                "/tests/fixtures/tui_session.py"
             ))
             .arg(assert_cmd::cargo_bin!("dispatch"))
             .arg(source)

@@ -471,3 +471,15 @@ decided). New languages for symbol facts.
     failed once in the full suite. Its fixture run hit its goal deadline under
     load (exit 124) before any projection code ran; it passed 3 of 3 alone.
   - `cargo test`: 428 passed plus that flake.
+- 2026-09-23 — Stage 7a. Names and fixtures.
+  - Test files are named by topic: `outcomes`, `profile_selection`,
+    `native_runs`, `cli_modes`, `review_session`, `claude_profiles`; fixtures
+    `tui_session.py` and `claude_profiles.py`.
+  - `RoutingHumanOutcome` is `ReviewOutcome` (serde unchanged).
+  - Test `resources.yml` strings drop the ignored `capacity:` block, except in
+    the funding and launch-record proof suites, which stay untouched and keep
+    proving old keys are ignored.
+  - `scripts/capture-product.py` is deleted: nothing references it, and it
+    imported the planning fixture removed in 0.4.1. `render-product.py` loses
+    its "planned" scenario and still renders setup-journey captures.
+  - `cargo test`: 429 passed, 0 failed.

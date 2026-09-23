@@ -7,12 +7,12 @@ use crate::process::ProcessIdentity;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum RoutingHumanOutcome {
+pub enum ReviewOutcome {
     Accepted,
     Rejected,
 }
 
-impl RoutingHumanOutcome {
+impl ReviewOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
@@ -712,7 +712,7 @@ pub struct GoalFeedbackRevision {
     pub id: String,
     pub run_id: String,
     pub revision: u32,
-    pub outcome: RoutingHumanOutcome,
+    pub outcome: ReviewOutcome,
     #[serde(default)]
     pub reasons: Vec<String>,
     pub explanation: Option<String>,

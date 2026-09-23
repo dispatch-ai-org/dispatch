@@ -49,7 +49,7 @@ def add_peer(f, binary, first='claude'):
     claude=path.read_text().split('profiles:\n')[1].replace('pool: shared','pool: claude-pool')
     codex=(peer.state/'resources.yml').read_text().split('profiles:\n')[1].replace('pool: shared','pool: codex-pool')
     codex=codex.replace('model: fixture-model','model: codex-fixed')
-    path.write_text('version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n'+(claude+codex if first=='claude' else codex+claude))
+    path.write_text('version: 1\nallocation_enabled: true\nprofiles:\n'+(claude+codex if first=='claude' else codex+claude))
     return peer
 
 

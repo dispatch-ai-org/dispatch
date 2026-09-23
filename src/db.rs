@@ -12,8 +12,8 @@ use rusqlite::{
 };
 
 use crate::models::{
-    AttemptRecord, CandidateRecord, CheckResult, EventRecord, GoalFeedbackRevision,
-    RoutingHumanOutcome, RunRecord,
+    AttemptRecord, CandidateRecord, CheckResult, EventRecord, GoalFeedbackRevision, ReviewOutcome,
+    RunRecord,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -1436,7 +1436,7 @@ impl Database {
     pub fn save_goal_feedback(
         &mut self,
         run_id: &str,
-        outcome: RoutingHumanOutcome,
+        outcome: ReviewOutcome,
         reasons: Vec<String>,
         explanation: Option<String>,
     ) -> Result<GoalFeedbackRevision> {
@@ -1480,8 +1480,8 @@ impl Database {
                 [run_id],
                 |row| {
                     let outcome = match row.get::<_, String>(2)?.as_str() {
-                        "accepted" => RoutingHumanOutcome::Accepted,
-                        "rejected" => RoutingHumanOutcome::Rejected,
+                        "accepted" => ReviewOutcome::Accepted,
+                        "rejected" => ReviewOutcome::Rejected,
                         value => return Err(rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("invalid goal feedback outcome {value}").into())),
                     };
                     let reasons_json: String = row.get(3)?;

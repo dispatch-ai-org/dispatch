@@ -197,8 +197,8 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
                 );
             } else if !run.candidates.is_empty() {
                 let human = match run.outcome.review {
-                    ReviewState::Accepted => Some(crate::RoutingHumanOutcome::Accepted),
-                    ReviewState::Rejected => Some(crate::RoutingHumanOutcome::Rejected),
+                    ReviewState::Accepted => Some(crate::ReviewOutcome::Accepted),
+                    ReviewState::Rejected => Some(crate::ReviewOutcome::Rejected),
                     _ => None,
                 };
                 let heading = match (run.outcome.work_result, run.outcome.verification) {
