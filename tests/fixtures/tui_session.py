@@ -90,8 +90,12 @@ try:
             resize(100,28);send(b'\r')
         wait('[y/N]');send(b'y\r')
         if scenario=='activity':
-            wait('elapsed');activity_start=len(transcript);pump(1.2)
-            assert sum(c.encode() in transcript[activity_start:] for c in '◐◓◑◒')>=2, 'activity indicator did not update'
+            wait('elapsed');activity_start=len(transcript)
+            # The indicator must move; a loaded machine may draw frames slowly.
+            frames=lambda: sum(c.encode() in transcript[activity_start:] for c in '◐◓◑◒')
+            end=time.time()+10
+            while frames()<2 and time.time()<end: pump(.2)
+            assert frames()>=2, 'activity indicator did not update'
             resize(38,16);resize(100,28)
         if scenario in ('cancel','active-eof','hangup'):
             end=time.time()+10

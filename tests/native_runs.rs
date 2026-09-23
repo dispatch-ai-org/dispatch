@@ -423,9 +423,16 @@ fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
     f.no_live_launches()?;
+    // Room for the first attempt to ask its question even on a loaded
+    // machine; then wait out the run's own recorded deadline before answering.
     let g = Fixture::new("clarify")?;
-    let r = Fixture::result(&g.run(&["--timeout", "5"])?)?;
-    thread::sleep(Duration::from_secs(5));
+    let r = Fixture::result(&g.run(&["--timeout", "20"])?)?;
+    assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
+    let deadline: chrono::DateTime<chrono::Utc> =
+        r["execution"]["deadline_at"].as_str().unwrap().parse()?;
+    while chrono::Utc::now() <= deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
     let answer = Fixture::result(&g.answer(&r, "1")?)?;
     assert_eq!(answer["execution"]["failure"], "deadline");
     assert_eq!(g.count(), 1);

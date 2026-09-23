@@ -64,8 +64,7 @@ fn configure_with_check(
         source.join("dispatch.yml"),
         format!(
             r#"execution:
-  timeout_secs: 2
-  max_parallel: 3
+  timeout_secs: 30
 {checks}harnesses:
   claude:
     executable: "{}"

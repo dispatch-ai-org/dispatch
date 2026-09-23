@@ -2835,7 +2835,7 @@ mod tests {
             fs::write(
                 project.join("dispatch.yml"),
                 format!(
-                    "execution:\n  timeout_secs: 3\nchecks:\n  baseline: ['true']\n  verify: ['true']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                    "execution:\n  timeout_secs: 60\nchecks:\n  baseline: ['true']\n  verify: ['true']\nharnesses:\n  codex:\n    executable: '{}'\n",
                     agent.display()
                 ),
             )?;
@@ -2866,10 +2866,14 @@ mod tests {
                     ),
                 )
                 .await;
+            // The run is stopped and its result delivered, never launched.
+            let run = result?;
+            assert_eq!(run.outcome.lifecycle, LifecycleState::Finished);
             assert!(
-                result.is_err(),
-                "fault point {point} must interrupt the run"
+                run.execution.as_ref().unwrap().failure.is_some(),
+                "fault point {point} must stop the run"
             );
+            assert!(run.attempts.iter().all(|a| a.completed_at.is_some()));
             assert!(!marker.exists(), "fault point {point} spawned a model");
             let launches: i64 =
                 db.connection()

@@ -483,3 +483,31 @@ decided). New languages for symbol facts.
     imported the planning fixture removed in 0.4.1. `render-product.py` loses
     its "planned" scenario and still renders setup-journey captures.
   - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 7b. Flake measurement and fixes.
+  - Measured on `2a96f38`, 10 cores: ten full suites at default threads, 272-321 s
+    each. Nine were clean. Run 1 failed
+    `claude_deadline_bounds_preflight_and_attempt` and
+    `phase4_pty_intent_answer_recovery_review_and_restoration`.
+  - The load phase as planned (32 test threads plus a CPU hog on every core) was
+    stopped. Its first suite ran over 45 minutes, unit tests took over 60 s, and
+    23 tests failed across attach, serve and auto-apply because even 30 s goal
+    deadlines expired. That is saturation, not something per-test fixes should
+    target. Load is redefined as 32 test threads (3x oversubscription) without
+    hogs.
+  - Product fix found by the Claude deadline flake: a cancel or deadline noticed
+    at the native engine's handoff recorded the stop and then returned an
+    error, so `dispatch run --json` printed no result. The same condition one
+    check earlier delivered the result. The handoff now records the stop and
+    leaves the attempt loop too, so the result and the deadline's exit code
+    (124) always reach the caller. The unit test keeps its invariants (nothing
+    spawned, no launch recorded) and adds that the stop is recorded and
+    delivered.
+  - Test fixes:
+    - Goal deadlines of 2-5 s in tests that do not test deadlines are now 30-60 s
+      (`outcomes.rs`, `unsafe_local.rs`, `e2e.rs`, the handoff unit test).
+    - The PTY activity check polls up to 10 s for two spinner frames instead of
+      sampling 1.2 s.
+    - The native deadline test gives the clarifying run 20 s, checks that its
+      question is pending, and waits for the run's own `deadline_at` instead of
+      sleeping a fixed 5 s.
+  - `cargo test`: 429 passed, 0 failed.

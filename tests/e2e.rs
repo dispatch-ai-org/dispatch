@@ -19,7 +19,7 @@ fn non_git_native_run_applies_safely_end_to_end() {
     fs::write(source.join("original.txt"), "unchanged baseline\n").unwrap();
     fs::write(
         source.join("dispatch.yml"),
-        "execution:\n  timeout_secs: 5\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
+        "execution:\n  timeout_secs: 30\nchecks:\n  verify:\n    - test -f dispatch-fake-good.txt || test -f dispatch-fake-bad.txt\n",
     )
     .unwrap();
     let run = |task: &str, agent: &str| {
