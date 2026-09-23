@@ -50,7 +50,7 @@ pub(super) async fn accounts(
         let login_row = choices.len();
         choices.push(Choice::new("Provider login…"));
         choices.push(Choice::new("Back"));
-        let body = "Accounts / Resources\nLocal operation · no Dispatch login required";
+        let body = "Accounts / Resources\nLocal operation · no Dispatch login required\nA resource is needed only for Dispatch to launch an agent; attach, check, serve and review work without one.";
         let Some(choice) = ui.select(body, &choices, 0).await? else {
             return Ok(());
         };

@@ -50,7 +50,10 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "run `dispatch setup` to configure one, or pass --agent",
+            "run `dispatch setup`, or pass --agent",
+        ))
+        .stderr(predicates::str::contains(
+            "To protect work you run yourself, use `dispatch attach` (no setup needed)",
         ));
     assert!(
         !marker.exists(),

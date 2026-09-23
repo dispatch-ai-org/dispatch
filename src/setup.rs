@@ -133,7 +133,10 @@ pub fn status(state: &State) -> Result<String> {
         "Local operation · no Dispatch login required".into(),
     ];
     if !config.allocation_enabled {
-        lines.push("Included-resource allocation is not configured.".into());
+        lines.push(
+            "No resource is set up. One is needed only for Dispatch to launch an agent; attach, check, serve and review work without one."
+                .into(),
+        );
     }
     for provider in ["codex", "claude"] {
         lines.push(format!(

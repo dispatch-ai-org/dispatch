@@ -36,7 +36,8 @@ for line in sys.stdin:
     # Setup is chosen, not typed. Rows with no profiles: 1 Add Claude Code,
     # 2 Add Codex, 3 Provider login…, 4 Back. A digit moves focus; Enter chooses.
     with session('fresh') as ui:
-        ui.wait('accomplish?');ui.send('Update main.c safely\r');ui.wait('Add Codex');ui.mark('missing')
+        ui.wait('accomplish?');ui.send('Update main.c safely\r');ui.wait('Protect work I run myself');ui.mark('first-goal')
+        ui.send('\r');ui.wait('Add Codex');ui.mark('missing')
         ui.send('2\r');ui.wait('Other model ID');ui.mark('models');ui.send('\r')
         ui.wait('Effort for fixture-codex-model');ui.send('\r')
         # Focus starts on Cancel: Enter alone never authorizes.
@@ -46,6 +47,13 @@ for line in sys.stdin:
         ui.wait('Add Codex');ui.send('4\r');ui.wait('accomplish?');ui.mark('preserved');ui.pump(.1)
         assert 'Update main.c safely' in ui.clean
         ui.send(b'\x03');ui.finish()
+    # Observing needs no setup: the second choice explains attach and serve,
+    # changes nothing and returns to the preserved goal.
+    with session('observe') as ui:
+        ui.wait('accomplish?');ui.send('Update main.c safely\r');ui.wait('Protect work I run myself')
+        ui.send('2\r');ui.wait('no setup needed');ui.wait('dispatch attach --workspace');ui.wait('accomplish?');ui.mark('observe')
+        ui.send(b'\x03');ui.finish()
+    assert not state.exists()
     # A new resource: the listed (or suggested) model, its default effort, Authorize.
     with session('cli-codex',['setup','codex']) as ui:
         ui.wait('Other model ID');ui.send('\r');ui.wait('Effort for');ui.send('\r')

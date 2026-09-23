@@ -476,7 +476,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         resources.allocation_enabled || request.model.is_some() || request.effort.is_some();
     anyhow::ensure!(
         allocation_requested || request.agent.is_some(),
-        "no coding agent is configured: run `dispatch setup` to configure one, or pass --agent claude|codex|cursor"
+        "no coding agent is set up for Dispatch to launch: run `dispatch setup`, or pass --agent claude|codex|cursor. To protect work you run yourself, use `dispatch attach` (no setup needed)."
     );
     let fixed_harness = request.agent.clone();
     let mut local_authorized = request.allow_unsafe_local;

@@ -488,6 +488,9 @@ fn details(run: &RunRecord) -> String {
 }
 
 const INPUT_LIMIT: usize = 16 * 1024;
+
+/// How to use Dispatch on work it does not launch: no resource setup needed.
+const OBSERVE_HELP: &str = "Protect work you run yourself · no setup needed\n  dispatch attach -- <agent command>         run your agent in its own worktree under Dispatch\n  dispatch attach --workspace <dir>           observe an agent already working there\n  dispatch finish <run>                       freeze its result, verify it, make it reviewable\n  dispatch serve                              watch this project in the foreground\n  dispatch check / accept / reject            judge and apply a result against the source now";
 /// One row of a selection menu. A disabled row is shown with its reason and
 /// cannot be chosen.
 struct Choice {
@@ -1678,10 +1681,26 @@ async fn run_goal(
     if !resources.allocation_enabled || !resources.profiles.iter().any(|p| p.eligibility().is_ok())
     {
         ui.commit(&format!(
-            "{}\nSetup needed · your goal is preserved.",
+            "{}\nNo agent is set up for Dispatch to launch · your goal is preserved.",
             goal_heading(&task, ui.width().saturating_sub(3))
         ))?;
-        setup::accounts(ui, state, None).await?;
+        let choices = [
+            Choice::new("Set up an agent for Dispatch to launch"),
+            Choice::new("Protect work I run myself"),
+            Choice::new("Back to my goal"),
+        ];
+        match ui
+            .select(
+                "Dispatch launches an agent only with a set-up resource.",
+                &choices,
+                0,
+            )
+            .await?
+        {
+            Some(0) => setup::accounts(ui, state, None).await?,
+            Some(1) => ui.commit(OBSERVE_HELP)?,
+            _ => {}
+        }
         ui.draft = task;
         ui.commit("Return to your goal. Submit explicitly when ready.")?;
         return Ok(());

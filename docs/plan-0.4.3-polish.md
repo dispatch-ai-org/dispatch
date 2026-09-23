@@ -414,3 +414,15 @@ decided). New languages for symbol facts.
     with the real Claude Code CLI on a copy of the dogfood state: menu, model,
     effort, and Enter cancelled; `resources.yml` unchanged.
   - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 3. Observe versus launch.
+  - Submitting a goal with no agent set up now offers *Set up an agent for
+    Dispatch to launch*, *Protect work I run myself* (prints the attach, finish,
+    serve and check commands; changes nothing) or *Back to my goal*. The goal is
+    preserved each way.
+  - The setup header, `dispatch resources`, the `run` refusal and `serve` help
+    say a resource is needed only for Dispatch to launch an agent.
+  - The README gains "Two ways to use Dispatch" and "Watching a project today"
+    (foreground only; nothing watches in the background).
+  - Tests: a setup journey for the observe choice; the `run` refusal wording in
+    `product_ux.rs`.
+  - `cargo test`: 429 passed, 0 failed.

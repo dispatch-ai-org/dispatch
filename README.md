@@ -37,6 +37,24 @@ and a stale result is never applied.
 Everything Dispatch does is local. Provider execution requires the provider’s
 service; Dispatch itself needs no account, no network service and no upload.
 
+## Two ways to use Dispatch
+
+- **Let Dispatch launch the agent.** `dispatch run "<task>"` runs your coding
+  agent from a frozen snapshot in an isolated workspace. This needs a resource
+  set up with `dispatch setup`, or an explicit `--agent`.
+- **Protect work you run yourself.** `dispatch attach -- <agent command>` runs
+  your agent in its own worktree under Dispatch; `dispatch attach --workspace
+  <dir>` observes one that is already working. `dispatch finish` freezes the
+  result. No resource setup is needed.
+
+Either way, the result is judged the same way: `dispatch check`, `accept` and
+`reject` work on it against the source as it is now.
+
+**Watching a project today.** `dispatch serve` watches one project in the
+foreground and shows each Work item's coherence state. `check` and `status`
+answer on demand. Nothing watches in the background: when `serve` stops,
+watching stops.
+
 ## Work coherence: keeping results valid while the code moves
 
 Before 0.2.0 any difference anywhere in the tree refused `dispatch accept`, even
