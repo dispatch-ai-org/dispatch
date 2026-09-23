@@ -121,6 +121,24 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
             "Work\n  native codex · began against snapshot",
         ))
         .stdout(predicates::str::contains("tier").not());
+    // Reading a run never rewrites its projection when nothing changed.
+    let metadata = fs::read_dir(state.join("runs"))?
+        .next()
+        .unwrap()?
+        .path()
+        .join("metadata.json");
+    let before = fs::metadata(&metadata)?.modified()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&metadata)?);
+    for _ in 0..2 {
+        base().arg("status").assert().success();
+    }
+    assert_eq!(fs::metadata(&metadata)?.modified()?, before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&metadata)?),
+        inode
+    );
     base()
         .arg("history")
         .assert()

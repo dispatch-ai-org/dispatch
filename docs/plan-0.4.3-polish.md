@@ -458,3 +458,16 @@ decided). New languages for symbol facts.
     only terminal states).
   - Tests: `explain` has no "tier" and lists "Configured profiles".
   - `cargo test`: 428 passed, 0 failed.
+- 2026-09-23 — Stage 6. `State::save_run` skips writing `metadata.json` when the
+  bytes are unchanged.
+  - Verified first: each `serve` tick loads every run in the state through
+    `load_run`, up to four times, and every load rewrote the projection.
+  - Tests: a unit test that the file keeps its inode on an identical save and is
+    replaced on a change; `product_ux.rs` checks that repeated `status` leaves
+    `metadata.json` untouched, and it fails without the fix.
+  - The failed-projection-write recovery test still passes: a directory in place
+    of the file fails the read, so the write is attempted and errors.
+  - Flake data point: `phase0_outcomes::committed_transition_recovers_after_projection_write_failure`
+    failed once in the full suite. Its fixture run hit its goal deadline under
+    load (exit 124) before any projection code ran; it passed 3 of 3 alone.
+  - `cargo test`: 428 passed plus that flake.

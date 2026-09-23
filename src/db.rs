@@ -2154,6 +2154,31 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn saving_an_unchanged_projection_leaves_the_file_alone() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir()?;
+        let state = crate::state::State {
+            root: temp.path().into(),
+        };
+        let mut record = run("unchanged");
+        state.save_run(&record)?;
+        let path = state.metadata_path(&record.id);
+        let first = fs::metadata(&path)?.ino();
+        state.save_run(&record)?;
+        assert_eq!(
+            fs::metadata(&path)?.ino(),
+            first,
+            "identical bytes were rewritten"
+        );
+        record.task = "changed".into();
+        state.save_run(&record)?;
+        assert_ne!(fs::metadata(&path)?.ino(), first);
+        assert!(fs::read_to_string(&path)?.contains("\"changed\""));
+        Ok(())
+    }
+
     #[test]
     fn older_run_fields_load_and_survive_a_rewrite() {
         // A 0.4.0 projection: `phase3` is now `execution`, and fields no
