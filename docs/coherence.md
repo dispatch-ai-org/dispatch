@@ -364,8 +364,7 @@ implements `mid_run: stop`, and it never applies to attached work. See
   The existing supervisor kills the process group and confirms cleanup. The run ends
   `Interrupted` with work result `cancelled`, `FailureKind::StaleWork` and exit code 1.
   If the goal deadline had already passed, the failure is `Deadline` instead. The partial
-  patch is kept; no routing observation, goal feedback or evaluation is recorded
-  (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
+  patch is kept; no review is recorded (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
   ended is recorded but can no longer stop anything.
 
 ## Refresh (`orchestrator::refresh_request`)
@@ -375,13 +374,13 @@ implements `mid_run: stop`, and it never applies to attached work. See
 
 - the task is the original text with a fixed addendum naming the earlier run and up to
   ten reasons (from a fresh evaluation), replacing any earlier addendum;
-- launch choices are repeated: the backend, timeout, parallelism, priority and
-  no-retry setting; a fixed agent, model, effort and invocation cap for allocation
-  runs; the same harnesses for other runs;
+- launch choices are repeated: the backend and timeout, and an explicit agent, model
+  or effort (a run made before 0.4.1 without a profile redoes the agent that produced
+  its result);
 - `--allow-unsafe-local` and `--allow-forwarded-env` must be passed again if the original
   run needed them; without them the command fails before any launch;
 - the new run's `coherence.refreshed_from` names the old run; the old run is unchanged;
-- it goes through `run_dispatch` like any other run (new admission, budget and authorization).
+- it goes through `run_dispatch` like any other run (a new launch, budget and funding check).
 
 There is no automatic refresh and no retry loop.
 
@@ -443,13 +442,12 @@ such a run gets coherence checking at accept time because everything needed
 - Strict mode and unmoved sources use the pre-existing `safe_apply` unchanged.
 - Nothing launches an agent except an explicit `run` or `refresh`; refresh needs the same acknowledgements again.
 - Local execution is still not a sandbox; integration checks add no authority beyond the run's own approval.
-- The original-baseline lineage, completed-attempt evidence, admission and cancellation fencing are untouched. Coherence-stopped runs are not counted as agent failures.
+- The original-baseline lineage, completed-attempt evidence, the launch record and cancellation fencing are untouched. Coherence-stopped runs are not counted as agent failures.
 - Auto-apply reuses `gate` and `apply_validated`/`safe_apply` verbatim; it adds a
   stricter authorization predicate on top, never a weaker one, and applies through
   the same digest and fingerprint fences as human accept.
-- Auto-apply never calls `record_allocation_feedback*` or
-  `record_routing_evaluation*`; it never writes `review.accepted` and never changes
-  `outcome.review`. Human evidence stays human.
+- Auto-apply never records a review: it never writes a review revision or
+  `review.accepted` and never changes `outcome.review`. Human evidence stays human.
 - A run whose operation lock is held by another owner (a live process, or a human
   review) is left untouched by an auto-apply attempt: nothing is persisted and
   nothing is applied out from under that owner.
@@ -505,8 +503,8 @@ How to read it:
 - `dispatch check`, `status` and `explain` evaluate L0 and L1 only; an integration failure appears at accept.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
-- Planned (`--plan`) runs keep the strict whole-tree drift stop between tasks; only accepting the finished delivery uses the coherence gate. Direct runs also compare the whole-tree fingerprint before starting a fresh attempt, including the bounded recovery attempt, and stop with source drift if the tree differs.
-- The mid-run watcher covers allocation runs only, observes by default, and while the agent works builds a work-in-progress patch with a temporary Git index each time the signal moves (at most every `poll_secs`).
+- A native run compares the whole-tree fingerprint before starting a fresh attempt (the continuation after a clarification answer) and stops with source drift if the tree differs.
+- The mid-run watcher covers native runs, observes by default, and while the agent works builds a work-in-progress patch with a temporary Git index each time the signal moves (at most every `poll_secs`).
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
 - Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured. What is claimed today, what is recorded during real use, and what would falsify the thesis are in [coherence-validation.md](coherence-validation.md).

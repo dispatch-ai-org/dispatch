@@ -427,10 +427,8 @@ that still does, and only for native allocation runs.
   session's own watcher notices a landing by `serve` on its next poll, and vice versa.
 - Nothing in the standalone path reads the `serve` lock or requires `serve` to be
   running.
-- Attached Work is visible over the [control protocol](control-protocol.md) exactly
-  like any other run (`status`/`result`, `mode: "attached"`); the protocol has no
-  attach operation and does not need one, since attach is always a foreground,
-  human-typed command.
+- Attached Work appears in `status --json` like any other run, with
+  `mode: "attached"`. Attach is always a foreground, human-typed command.
 
 ## Migration 21
 

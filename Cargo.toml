@@ -1,8 +1,8 @@
 [package]
 name = "dispatch"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
-description = "Local-first execution and evaluation for coding-agent harnesses"
+description = "Keep coding-agent work valid while the code moves: isolated runs and coherence-checked apply"
 license = "MIT"
 repository = "https://github.com/dispatch-ai-org/dispatch"
 

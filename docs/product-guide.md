@@ -1,8 +1,8 @@
 # Work with Dispatch
 
 Start from your project directory using the candidate's **absolute binary path**.
-Ordinary goals are direct, with at most two supervised invocations. `/plan <goal>`
-is an explicit sequential experiment, not a mandatory stage of every task.
+A goal is one supervised agent invocation, plus one continuation if the agent asks
+an essential clarification question.
 
 ## Setup and resources
 
@@ -37,7 +37,7 @@ advances its epoch; retained conflicts and actual account/funding evidence are
 still checked by core at launch. Disabled profiles, explicit pool mappings,
 unsupported service modes and changed Claude account scope require deliberate
 advanced configuration or a separately confirmed new resource. Setup does not
-change machine grants, global provider settings or live private policy.
+change global provider settings.
 
 `--plain`, `--ascii`, `--no-color` and `TERM=dumb` apply to setup too. Non-TTY setup
 refuses to prompt. There is no Dispatch login for ordinary local work.
@@ -50,11 +50,11 @@ known choices from existing `verify.sh`, `Cargo.toml`, or `Makefile`. Choosing o
 explicitly approves saving and later executing it. The command may execute project
 code and is not proof of task-specific correctness. No script or tool is installed.
 Use `/checks` or `dispatch setup --checks` to do this independently. Advanced
-`checks.verify` and planning verification-path configuration remain supported.
+`checks.verify` configuration remains supported.
 
 Work shows the actual selected resource, committed phase, elapsed time and launch
 accounting. Recorded launches, uncertain spawn and configured limits are distinct;
-counts are sampled from committed admission state. The elapsed indicator covers
+counts are read from the committed per-attempt launch record. The elapsed indicator covers
 this foreground work call, not full submission latency or only provider time.
 Tool output remains in private logs; Dispatch does not invent file-reading activity
 or turn a provider's tool success into authoritative verification.
@@ -68,9 +68,9 @@ that preserved goal because cooked line input cannot prefill an editor.
 ## Decisions and review
 
 A durable clarification is answered inside the same goal, targeting its exact
-question/revision/generation. Waiting holds no model lease. Ctrl+C cancels;
-answers never reset limits or authorize spending. Planned questions end at the
-original deadline. Planned crash recovery is unsupported.
+question/revision/generation. No agent process runs while a question waits. Ctrl+C
+cancels; answers never reset limits or authorize spending. A question ends at the
+goal's original deadline.
 
 Review separates configured verification, human acceptance, and application:
 `Unverified — no checks configured` is attention, not success. Enter/d opens native
@@ -215,8 +215,8 @@ cancels the attempt through the normal cancellation path, and so does `REFRESH`
 if `stop_on_refresh: true`. The run then ends interrupted with work result
 `cancelled`, failure kind `stale_work` and exit code 1; the message reads "work
 stopped: the source changed underneath it (...)". The partial patch is kept, the
-result cannot be accepted, and nothing is recorded as a routing observation, goal
-feedback or evaluation, so the agent is not counted as having failed. The deadline
+result cannot be accepted, and no review is recorded, so the agent is not counted
+as having failed. The deadline
 still takes precedence if it had already passed.
 
 ### `status --json`
@@ -225,8 +225,7 @@ still takes precedence if it had already passed.
 source moved or the verdict is not `CONTINUE`: `decision` (`continue`, `refresh`
 or `stop`), `analysis`, `changed_files`, and `reasons` (at most five, each with
 `code`, `fact_id`, `path` and `detail`). It is absent for a run whose source did
-not move, so existing consumers are unaffected. Over the control protocol the
-same object is described in [control-protocol.md](control-protocol.md).
+not move, so existing consumers are unaffected.
 
 Small diffs have an inline preview. Large sets open a file index: arrows/j/k select,
 `/` filters, Enter opens, Esc returns to files, and q returns to the same review.
@@ -244,14 +243,8 @@ inspection. Use an explicit private `reviewer.json` preference as documented in
 [review adapter details](phase4-ux-refinement.md); `$EDITOR` receives only supported
 file arguments. Repository-supplied shell reviewer commands are never automatic.
 
-After acceptance/rejection, optional `f` then `c` attests that this was ordinary
-work and reflects your own review. This is private, explicit evidence; ordinary
-acceptance never fabricates this label or activates a policy.
-
-One-shot JSON/JSONL and [machine control](control-protocol.md) use the existing
-foreground core independently of the renderer. Machine clients cannot issue human
-acceptance or funding attestations through this setup surface. Disconnect triggers
-cleanup; no daemon or detached work is introduced.
+One-shot JSON/JSONL uses the same foreground core independently of the renderer.
+No daemon or detached work is introduced.
 
 ## Using your own agent
 
@@ -317,10 +310,8 @@ work** section (workspace, root, where S0 came from and with what confidence, th
 agent, who owns the work, what it may do) in place of a selection explanation, then
 the verdict. `dispatch refresh` has no
 target for attached work (there is no Dispatch task to relaunch) and is refused;
-review it and `dispatch attach` again if you want another pass. Over the [control
-protocol](control-protocol.md) and `--json`, an attached run appears with
-`mode: "attached"` like any other run; there is no attach operation for a machine
-client, because attach is always something a human types.
+review it and `dispatch attach` again if you want another pass. In `--json`, an
+attached run appears with `mode: "attached"`; every other run is `mode: "native"`.
 
 No foreign process is ever signaled or killed by Dispatch, and a `REFRESH`/`STOP`
 verdict on attached work is only ever recorded, never enforced against the agent.

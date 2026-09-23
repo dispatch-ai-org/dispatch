@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.0 — experimental developer preview**
+**Dispatch 0.4.1 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -28,15 +28,14 @@ CONTINUE / REFRESH / STOP, with reasons
 review → accept or reject
 ```
 
-Dispatch chooses the agent from observed performance evidence, runs it in an
-isolated workspace, verifies the result when checks are configured, and lets you
-review and accept it. Those are how Dispatch carries the work. Coherence is what
-it adds: the verdict is always recomputed from the snapshot, the patch and the
-source now, and a stale result is never applied.
+Dispatch runs the coding agent you configured in an isolated workspace,
+verifies the result when checks are configured, and lets you review and accept
+it. Those are how Dispatch carries the work. Coherence is what it adds: the
+verdict is always recomputed from the snapshot, the patch and the source now,
+and a stale result is never applied.
 
-Orchestration and evidence stay local. Provider execution requires the provider’s
-service. A release contains a compact public-evidence snapshot, normal runs never
-fetch benchmark data, and Dispatch Cloud is optional.
+Everything Dispatch does is local. Provider execution requires the provider’s
+service; Dispatch itself needs no account, no network service and no upload.
 
 ## Work coherence: keeping results valid while the code moves
 
@@ -53,7 +52,7 @@ themselves. When you accept, Dispatch observes the current source (ignoring what
 still hold. The answer is a verdict, always recomputed from S0, Δ and the source as
 it is now. Nothing about it is trusted from an earlier moment.
 
-| Verdict | Meaning | At accept time | Mid-run (allocation runs) |
+| Verdict | Meaning | At accept time | Mid-run |
 |---|---|---|---|
 | `CONTINUE` | The source did not move, or nothing the work relied on changed. | Applies against the current source, after your `checks.verify` pass on the merged result if the source moved. | Nothing, unless it follows an earlier invalid verdict (`coherence.checked`). |
 | `REFRESH` | Δ no longer applies, a relied-on fact changed, or a check failed on the merged tree. | Nothing is applied and the source is left unchanged; the message names `dispatch refresh`. | `coherence.invalidated` is recorded and the agent continues. Only with `mid_run: stop` and `stop_on_refresh: true` is it stopped. |
@@ -127,9 +126,7 @@ coherence:
 - Transitive behavior changes (a callee's callee) are caught only if your checks
   cover them.
 - Nested repositories and submodules are not analysed.
-- Planned (`--plan`) runs keep the strict drift stop between tasks; accepting a
-  finished planned delivery uses the same accept-time gate.
-- Mid-run verdicts are advisory by default and are computed for allocation runs only.
+- Mid-run verdicts are advisory by default.
 
 ### Auto-apply
 
@@ -173,7 +170,7 @@ dispatch                      # direct goal → work → verification → review
 ```
 
 Enter the outcome, then approve local execution for that goal. Dispatch displays
-allocation, work, verification, and any bounded recovery. A durable clarification
+the chosen resource, work and verification. A durable clarification
 appears directly in the session; submitting its answer continues automatically.
 At review, enter `d` for the diff, `a` to accept and safely apply, `r` to reject,
 `i` for artifact details, or `n` to leave the result pending and start another goal.
@@ -189,7 +186,6 @@ Input entered while work is active is discarded rather than queued as another go
 Use `dispatch --plain` for ordinary line input, `--ascii` for ASCII graph marks,
 and `--no-color` (or `NO_COLOR`) for native colors. `TERM=dumb` selects plain mode.
 Plain input is line-oriented; the integrated editor supports multiline paste.
-`dispatch --no-retry` disables automatic recovery for the interactive session.
 Bare invocation without terminal input and output prints help and exits 2.
 
 Use `/resources` for Accounts / Resources and `/checks` for project checks.
@@ -198,29 +194,13 @@ call. Discovery never authorizes spending. Codex and Claude use their own suppor
 CLI login; no Dispatch account is required. Confirm the exact model, effort and
 included funding. Claude assertions expire after at most 24 hours and have an
 explicit refresh path. Changed/rejected funding epochs need fresh owner consent.
-No paid fallback, credits, account switch or private-policy activation is automatic.
+No paid fallback, credits or account switch is automatic.
 See [setup and review](docs/product-guide.md), [visual system](docs/design-system.md)
 and [candidate validation](docs/product-rc-validation.md).
 
-For an explicitly multipart goal, opt in with `/plan <goal>` in the composer or
-`dispatch run --source /path/to/project 'Goal' --plan`. Planning uses one planner,
-up to four sequential tasks and one shared extra under one deadline, with one
-final review. It requires an owner-approved check contract and suitable included
-profiles. Ordinary goals remain direct. See [bounded planned work](docs/planning.md).
-
-## Machine control
-
-`dispatch control --stdio` provides scoped, foreground JSONL requests, replayable
-events, semantic waits, and durable retries. A human provisions the scope with
-`dispatch control-grant`; the client inherits a private grant handle. Human
-acceptance and application remain in the existing review workflow.
-
-See the [protocol and standalone client guide](docs/control-protocol.md) and
-[Phase 5 validation report](docs/phase5-validation.md). Neither requires Herdr.
-
 ## One-shot CLI
 
-The included-resource path supports configured Codex and Claude contracts. Legacy explicit harness overrides remain advanced; they do not inherit an included-funding guarantee. From a repository or plain directory:
+From a repository or plain directory:
 
 ```bash
 cd my-project
@@ -242,56 +222,28 @@ Or reject it without changing the source tree:
 dispatch reject
 ```
 
-The legacy one-shot path without allocation profiles uses benchmark performance to choose only when at least two execution-eligible agents have compatible, nonzero evidence. It compares that evidenced subset using the existing Router; agents without evidence remain unknown, not inferior. Otherwise it uses the first available agent in the fixed order Claude Code → Codex → Cursor, independently of benchmark availability. A sole eligible agent is labeled “Only available agent.”
-
-To deliberately override Dispatch's choice:
+To run a specific agent:
 
 ```bash
-dispatch run "Fix the retry race" --agent cursor
+dispatch run "Fix the retry race" --agent claude
 ```
 
-To inspect the last choice in more detail:
-
-```bash
-dispatch explain
-```
-
-No `init`, `doctor`, dataset import, Cloud account, or routing flag is required for this workflow.
+`dispatch explain` shows which agent and resource the last task used.
 
 ## How Dispatch chooses an agent
 
-An evidence-based selection is described as observed benchmark performance, not as confidence or a probability of success. For example, with two compatible fixture results:
+Each run uses exactly one agent:
 
-```text
-Agent
-  Cursor
-Selection
-  Evidence-based
-Why:
-  Cursor had the strongest relevant observed benchmark performance
-  among eligible agents with compatible evidence.
-Available benchmark evidence:
-  Cursor: 158/330
-  Codex: 123/330
-```
+- With profiles in `resources.yml` (written by `dispatch setup`), Dispatch uses
+  the first eligible profile in file order. `--agent`, `--model` and `--effort`
+  only narrow the choice. If no eligible profile matches, the run is refused
+  with each profile's reason; it never falls back to an unchecked agent.
+- With no profiles configured (no `resources.yml`, or `allocation_enabled:
+  false`), `--agent claude|codex|cursor` runs that agent with its own login and
+  no funding contract is checked.
+- With neither, `dispatch run` refuses: run `dispatch setup`, or pass `--agent`.
 
-The current bundled snapshot contains only Codex evidence. On a fresh installation with Codex and Cursor available, that is not comparative evidence; the fixed default selects Codex:
-
-```text
-Agent
-  Codex
-Selection
-  Dispatch default
-Why:
-  Dispatch did not have enough comparable public performance data
-  to make an evidence-based choice.
-  Available benchmark evidence did not determine the selection.
-Available benchmark evidence:
-  Codex: 123/330
-  Cursor: no compatible public evidence
-```
-
-After execution, Dispatch leads with the task, selected agent, selection basis, verification result, and next action. Mechanical verification, human acceptance, and the routing prediction remain separate facts. A passing check never silently accepts or applies a result.
+There is no ranking, benchmark data or automatic fallback to another agent.
 
 ## Install
 
@@ -326,7 +278,7 @@ dispatch resources
 dispatch run "<task>" [--source path] [--agent claude|codex|cursor]
 dispatch run "<task>" --json|--jsonl
 dispatch status [run-id] [--json|--jsonl]
-dispatch diff [run-id] [candidate]
+dispatch diff [run-id]
 dispatch accept [run-id]
 dispatch reject [run-id]
 dispatch explain [run-id]
@@ -334,8 +286,9 @@ dispatch check [run-id] [--json]
 dispatch refresh [run-id] [--allow-unsafe-local] [--json|--jsonl]
 dispatch answer <run-id> <question-id> --revision n --answer text [--json]
 dispatch cancel <run-id> <question-id> --revision n [--json]
-dispatch control --stdio --grant-fd fd [--read-only]
-dispatch control-grant <source> [--timeout secs] [--max-invocations n] [--allow-unsafe-local] [--allow-plan] [--delegate-factual]
+dispatch attach [--workspace path] [--auto-apply] [-- command...]
+dispatch finish <run-id>
+dispatch serve [--root path]
 dispatch history [--limit count]
 dispatch version
 ```
@@ -366,36 +319,22 @@ One-shot exit codes are:
 - `0`: a result is ready for review and verification passed or was not configured;
 - `3`: a result is ready for review, but configured verification failed;
 - `4`: the goal is waiting on a human (a durable clarification);
-- `5`: required subscription capacity is deferred without a model launch;
 - `124`: the goal-wide deadline expired;
 - `1`: execution or orchestration failed (including work stopped by the mid-run coherence watcher);
 - `2`: command-line usage error.
 
 The result keeps execution, verification, review, and application as separate fields. Attempt records also keep requested, resolved, and harness-observed model/effort values separate; an unknown or mismatched observed identity is not replaced by configuration.
 
-### Model allocation
+### Resource profiles
 
-`dispatch run --agent codex --model <id> --effort <level> "<task>"` selects one
-declared Codex resource through the normal isolated execution path. Dispatch
-validates the choice against the user-level `$DISPATCH_HOME/resources.yml`
-file (normally `~/.dispatch/resources.yml`); project configuration cannot
-enable allocation.
-
-To opt into deterministic light/standard/strong selection for ordinary runs,
-create that file with `allocation_enabled: true` and the verified profiles you
-actually have:
+`dispatch setup codex` or `dispatch setup claude` writes a profile to the
+user-level `$DISPATCH_HOME/resources.yml` (normally `~/.dispatch/resources.yml`);
+project configuration cannot enable one. A profile names the exact model, effort
+and included funding you confirmed, and the account it was confirmed for:
 
 ```yaml
 version: 1
 allocation_enabled: true
-capacity:
-  codex_probe: true
-  probe_timeout_secs: 5
-  freshness_secs: 300
-  admission: true
-  lease_secs: 20
-  heartbeat_secs: 5
-  aging_secs: 60
 profiles:
   - provider: openai
     funding_source: chatgpt-plus
@@ -405,94 +344,48 @@ profiles:
     service_mode: standard
     runtime: local
     pool: chatgpt-codex
-    provider_buckets: [your-observed-codex-limit-id]
     tier: light
     included: true
     no_overage_verified: true
     authorization_revision: 1
+    codex_account: {account_sha256: "…", checked_at: "…"}   # recorded by setup
 ```
 
-The deterministic policy uses standard when task type or scope is unknown; ordinary
-requests do not need to name a file or use a special opening phrase. Recognized
-feature/refactor work and known broad scope still require strong. Unknown inputs
-remain recorded as unknown and do not qualify a task for light. Explicit model
-constraints and funding checks still apply.
+`no_overage_verified` is an explicit assertion that the account cannot fall
+through to paid overage; an included model name or visible credits are not
+enough. Profiles without it are shown in `dispatch explain` but are ineligible.
 
-Add suitable `standard` or `strong` profiles when available. `no_overage_verified` is an
-explicit assertion that the account or invocation cannot fall through to paid
-overage; an included model name or visible credits are not enough. Profiles
-without that assertion are shown in `dispatch explain` but are ineligible.
-Before launching a selected model, Dispatch uses the optional read-only Codex
-account/rate-limit probe to check fresh authentication, plan, credit, service,
-pool, and window facts. A reported change invalidates the earlier assertion;
-unavailable quota telemetry remains explicitly unknown and does not fabricate
-capacity. Reset timestamps only schedule another observation.
+Immediately before each launch, the adapter checks the funding identity it can
+observe. Codex: authentication must be ChatGPT, no paid credits available, the
+standard service tier, the configured plan, and the account setup recorded; an
+identity that cannot be observed is refused. Claude: the subscription evidence
+must be current, and the executable, CLI version, account and settings must
+match it. A refusal names the reason and is sticky: that
+`authorization_revision` stays refused, even if the account switches back,
+until `dispatch setup` re-authorizes the profile with a new revision.
 
-`authorization_revision` is an explicit local funding-authorization epoch. If
-fresh evidence reports a changed account, plan, service tier, credit capability,
-or pool/window identity, that epoch remains rejected on later runs even though
-the raw observation is retained. Increment it only after affirmatively checking
-and accepting the new subscription-only account state. When an applicable
-window enters Reserve, background and standard work are deferred with exit 5;
-only an explicitly urgent (`--priority urgent`) request may proceed.
+Claude assertions expire after at most 24 hours; revalidate the profile with
+`dispatch setup`. A bounded live run passed with Claude Code 2.1.274, personal
+Pro, `claude-sonnet-5` at medium effort and usage credits disabled; this is
+specific to that account state and configuration. See
+[provider support](docs/provider-support.md).
 
-Profiles backed by the same subscription allowance must use the same `pool`
-and opaque `provider_buckets` mapping. Foreground Dispatch processes sharing a
-state directory use a fair, fenced SQLite admission lease and initially allow
-one active model invocation per pool. The lease is released after child cleanup
-is confirmed and before local verification or review. This coordinates only
-cooperating local Dispatch processes; other applications, machines, and mixed
-provider activity remain outside its guarantee and quota changes are not
-attributed to an individual attempt without supporting evidence. `dispatch
-explain` and JSON output retain the detailed field-level observation.
-Setting `capacity.admission: false` does not bypass shared coordination for an
-allocation run. Dispatch rejects that run; disable allocation after coordinated
-owners have drained if a single uncoordinated session is intentionally desired.
-Allocation decisions and goal feedback remain local and never enter the v1
-routing sync envelope. Remove the file or set `allocation_enabled: false` to
-return ordinary runs to legacy agent routing; explicit model controls remain
-available when they match a verified profile.
+### Clarification
 
-
-Claude Code can use the same allocation, admission, recovery and review paths.
-Its included-only profiles additionally require private, time-bound account and
-invocation evidence; configuring a login or a model name alone is insufficient.
-See the [Phase 6 setup/support matrix](docs/phase6-validation.md) before enabling
-one. A bounded live smoke passed with Claude Code 2.1.274, personal Pro,
-`claude-sonnet-5` at medium effort, and usage credits disabled; this is specific
-to the tested account state and configuration. Keep Codex first in profile order
-to preserve that default. Either provider can be configured alone, and explicit
-`--agent` choices never fall back.
-
-### Bounded recovery and clarification
-
-Allocation runs allow at most two model invocations in total. After a target
-check fails, Dispatch may make one stronger attempt if that exact check passed
-on the original baseline, all baseline checks passed, and a suitable verified
-profile satisfies the original constraints. `--no-retry` disables this automatic
-recovery. An explicit fixed model/effort is never silently overridden. Ordinary
-pre-existing baseline check failures permit initial work but disable recovery;
-missing tools and baseline infrastructure failures stop before model work.
-
-Every attempt uses fresh authorization, shared admission and a new fence. Failed
-workspaces and per-attempt evidence are retained. Recovery starts from the
-original baseline with bounded failure diagnostics; the final diff remains
-relative to that baseline. Mixed attribution is explicit and stays local.
-`--timeout` is one goal-wide deadline covering baseline checks, attempts,
-verification and human waiting; it does not reset for recovery or continuation.
-
-Codex may request an essential clarification using this exact JSON envelope in
-its final `agent_message` event, followed by a successful process exit:
+A goal is one agent invocation. Codex may ask one essential clarification
+question with this exact JSON envelope in its final `agent_message` event,
+followed by a successful process exit:
 
 ```json
 {"dispatch_checkpoint":{"version":1,"question":"Which behavior is required?","choices":["A","B"]}}
 ```
 
-Dispatch validates the report after child cleanup and admission release, then
-persists a question with `lifecycle=waiting` and `waiting_on=human`. It never
-pauses a live model process. Malformed, non-final or unsuccessful reports do not
-create a question. Answer or cancel the specific question with its current
-revision (available in `dispatch status <run-id> --json`):
+Dispatch validates the report after the agent's process has been cleaned up,
+then persists a question with `lifecycle=waiting` and `waiting_on=human`. It
+never pauses a live model process, and it never asks while an agent it launched
+may still be running. Malformed, non-final or unsuccessful reports do not create
+a question. Answer or cancel the specific question with its current revision
+(available in `dispatch status <run-id> --json`):
 
 ```bash
 dispatch answer <run-id> <question-id> --revision 1 --answer "A" --json
@@ -500,33 +393,13 @@ dispatch cancel <run-id> <question-id> --revision 1 --json
 ```
 
 Answers are authorized by the local run owner's OS identity and accepted once.
-The answer command owns a fresh foreground continuation using the original
-baseline and answer. That invocation consumes the remaining slot in the same
-two-invocation budget. A second checkpoint cannot create a third invocation.
-There is no daemon, automatic crash replay or separate human `resume` command.
-Pending questions and all attempt evidence survive process exit and reload.
-JSON/JSONL includes each attempt, its bindings and checks, the final delivery
-pointer, elapsed time, normalized failures, and question state.
-
-## Public routing data
-
-Dispatch releases embed `PublicPriorSnapshotV1`, a small normalized snapshot containing only the evidence the Router needs: benchmark provenance, harness and model identity, task morphology, successes, and attempts. It contains no raw benchmark tasks, source code, trajectories, patches, logs, or local Dispatch observations.
-
-On first routing use, the bundled snapshot is installed idempotently into the existing SQLite state. Routing remains entirely local. A newer compact snapshot can be fetched explicitly:
-
-```bash
-dispatch data refresh
-```
-
-Refresh is optional. It validates the entire versioned snapshot before transactionally replacing the current distributed-public rows. An invalid response or offline Cloud leaves the prior working snapshot intact and never blocks a run. No raw Harbor, Terminal-Bench, or SWE-bench data is downloaded by this path.
-
-The detailed `dispatch recommend`, `dispatch evidence`, and `dispatch datasets` commands remain advanced research and maintainer surfaces. Manual import still accepts local SWE-bench Verified and Harbor/Terminal-Bench results, preserves their raw normalization inputs for reproducibility, and keeps agent and model identity distinct. Maintainers can export only normalized public priors with:
-
-```bash
-dispatch datasets export-public-priors public-priors-v1.json
-```
-
-Export is deterministic for identical normalized input and excludes local observations and private run data.
+The answer command runs one continuation from the original baseline with the
+answer; a second question cannot start a third invocation. `--timeout` is one
+goal-wide deadline covering baseline checks, the invocations, verification and
+human waiting. There is no automatic retry, daemon, crash replay or separate
+`resume` command. Pending questions and all attempt evidence survive process
+exit and reload, and every launch is recorded durably, so a run is never closed
+while an agent it launched may still be alive.
 
 ## Configuration and verification
 
@@ -536,7 +409,6 @@ Configuration is optional. Dispatch discovers `dispatch.yml`, `dispatch.yaml`, `
 execution:
   backend: local
   timeout_secs: 1800
-  max_parallel: 3
   forwarded_env: []
 
 checks:
@@ -558,52 +430,22 @@ harnesses:
 
 Use the command that actually verifies the project, such as `pytest`, `npm test`, or `go test ./...`. Repository configuration cannot grant itself local-execution or environment-forwarding permission.
 
-## Advanced comparison and inspection
-
-The normal path selects one agent. Existing multi-candidate tournament behavior remains available through the hidden advanced `--harnesses` option and the `compare`, `inspect`, `show`, and explicit `apply` commands.
-
-Blind comparison has different semantics from single-result acceptance: it records Candidate A/B/Tie/Neither preference without exposing the harness label first. Routed or manually overridden single results use accept/reject semantics instead. Dispatch never converts one model into the other.
-
-`dispatch evidence local <source>` derives observational counts from durable local routing observations and the latest append-only human feedback revision. It does not rank agents, modify public priors, or affect Router decisions. These counts describe tasks selected by Dispatch's prior policy and optional developer feedback; they are not unbiased or calibrated estimates.
-
-## Optional data contribution
-
-Uploads are off by default. Normal runs, review, acceptance, recommendation, history, and public-data refresh do not upload observations.
-
-Contribution requires both a separate ingestion token and explicit versioned consent:
-
-```bash
-dispatch sync token set <server-issued-token>
-dispatch sync enable
-dispatch sync preview <run-id> --type routing-observation
-dispatch sync
-```
-
-`sync enable` records consent and prepares eligible local records; it does not transmit them. `sync preview` prints the exact versioned body. Bare `dispatch sync` is the only upload action. Existing legacy `evaluation-v1` consent does not authorize `routing-observation-v1`; the expanded scope must be accepted explicitly.
-
-Contributed routing observations preserve prediction, actual agent, mechanical outcome, and optional explicit accept/reject feedback independently. Human explanations are uploaded verbatim when present and may contain proprietary information. This is contributed data, not anonymous telemetry.
-
-V1 routing payloads exclude task text, source files and paths, snapshots, patches, logs, changed filenames, artifact paths, Git remotes, environment data, credentials, verification command text, and exact agent prompts. The public wire contracts live under [schemas/](schemas/). The durable SQLite outbox retains retryable failures and immutable idempotency identities.
-
 ## Local state and artifacts
 
 Normalized state lives in `~/.dispatch/dispatch.db`; `--state-dir` or `DISPATCH_HOME` overrides that location. Per-run evidence lives under `~/.dispatch/runs/<run-id>/`, including the frozen baseline, candidate workspace, bounded stdout/stderr, structured agent output, checks, patch, events, and inspectable metadata.
 
-No Cloud service is required to create, execute, inspect, accept, or reject a task. Public-data refresh and contribution sync are explicit, separate network actions.
+No network service is required to create, execute, inspect, accept, or reject a task, and Dispatch uploads nothing.
 
 ## Current boundaries
 
 - Experimental developer preview, not a stable 1.0 service.
-- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent remains available as an explicit legacy `--agent cursor` choice. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
-- Public evidence is observational benchmark evidence, not ground truth, a quality label, confidence, or calibrated probability.
-- If no compatible public evidence exists, the deterministic fallback order is the existing real-adapter order: Claude Code, then Codex, then Cursor, restricted to agents detected as locally executable.
-- Phase 7 private evidence supports explicit owner-controlled trials; no private policy is activated automatically.
+- Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent remains available as an explicit `--agent cursor` choice without a funding contract. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- Direct allocation has bounded recovery. Task decomposition is opt-in and sequential; no agent racing, learned planner, ML, embeddings, LLM judging, background refresh, daemon, or Cloud routing lookup is added. Planning effectiveness remains unmeasured.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh, daemon or network service.
 
 ## Development
 
-Rust owns local classification, routing, execution, persistence, review, and the explicit sync client. Dispatch Cloud is optional and distributes one compact public snapshot plus explicit contribution endpoints.
+Rust owns execution, persistence, coherence and review. There is no server component.
 
 ```bash
 cargo fmt --check

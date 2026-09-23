@@ -48,8 +48,7 @@ fn fixture(root: &Path) -> anyhow::Result<(std::path::PathBuf, std::path::PathBu
 }
 
 #[test]
-fn enabled_trial_allocation_reaches_argv_persists_identity_and_stays_out_of_v1_sync()
--> anyhow::Result<()> {
+fn enabled_trial_allocation_reaches_argv_and_persists_identity() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let (source, state) = fixture(temp.path())?;
     let output = cargo_bin_cmd!("dispatch")
@@ -205,6 +204,40 @@ fn allocation_review_is_append_only_and_safe_apply_is_unchanged() -> anyhow::Res
         revisions,
         vec![(1, "rejected".into()), (2, "accepted".into())]
     );
+    Ok(())
+}
+
+/// With profiles configured, `--agent` only narrows the choice: an agent
+/// with no eligible profile is refused, never run without a funding contract.
+#[test]
+fn explicit_agent_without_an_eligible_profile_is_refused_not_run_unbound() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (source, state) = fixture(temp.path())?;
+    let error = cargo_bin_cmd!("dispatch")
+        .args(["--state-dir"])
+        .arg(&state)
+        .arg("run")
+        .arg(&source)
+        .args([
+            "--task",
+            "Implement a new requested feature.",
+            "--agent",
+            "claude",
+            "--allow-unsafe-local",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let error = String::from_utf8(error)?;
+    assert!(
+        error.contains("no included, no-overage-verified resource profile is available")
+            && error.contains("explicit harness constraint"),
+        "{error}"
+    );
+    assert!(!state.join("runs").exists());
+    assert!(!source.join("allocated.txt").exists());
     Ok(())
 }
 

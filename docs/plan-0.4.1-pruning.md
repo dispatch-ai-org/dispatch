@@ -401,3 +401,19 @@ again at admission. After S6b it must run immediately before spawn.
   leaves an accepted review on a stale result (as in 0.4.0); the judgment is
   the human's, and the blocked application is recorded separately.
   `cargo test`: 426 passed, 0 failed.
+- 2026-09-23 — S10: README, product guide, coherence, attach, validation and
+  install docs describe 0.4.1: one agent per run from a profile or `--agent`,
+  no routing, sync, planning, control protocol, retry, capacity or
+  comparison. The docs that only described removed features are deleted
+  (planning, private evidence, phase 5/7/8 reports and captures, the
+  allocation plan); the dated RC validation report stays as a historical
+  record. `execution.max_parallel` is no longer configuration (existing
+  files that set it still load); runs record `max_parallel: 1`. CLI `about`,
+  `run`/`explain` help and the package description state the product. New
+  test: with profiles configured, `--agent` for an agent with no eligible
+  profile is refused, never run unbound (the README states this rule).
+  Release notes in `.github/release-notes.md`; version 0.4.1. Not changed:
+  `AGENTS.md`, whose sync and public-evidence policy paragraphs now describe
+  removed features, is left for the owner to revise. Pending: a real-agent
+  dogfood run of the finished branch (needs the owner's go-ahead, since it
+  uses the subscription). `cargo test`: 427 passed, 0 failed.

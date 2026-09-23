@@ -1,75 +1,85 @@
-## Dispatch 0.4.0 — Dispatch service and attach
+## Dispatch 0.4.1 — one path
 
-**Attach.** Work an external coding agent produces — Claude Code, Codex, Cursor, a
-script, anything with a terminal — can now be observed, judged and, if you ask,
-applied under the same coherence model as work Dispatch launches itself, without
-Dispatch ever driving that agent. This release ships:
+0.4.1 is a subtractive release. It removes the machinery that decided how a native
+run starts, what a run record holds and what the database commit does, and it keeps
+the coherence and integration substrate unchanged. Production code is about a third
+smaller (29,076 → about 18,900 lines of Rust outside test modules).
 
-- A repo-scoped local service, `dispatch serve`: one foreground process per
-  integration root, no daemon, coordinating through the SQLite state and `flock`
-  files the codebase already trusts.
-- A shared view of the integration world: one line per run — attached and native
-  together — `<id> · agent · CONTINUE/REFRESH/STOP · working/ready/applied/blocked ·
-  reason`, redrawn in place, that renders every tick but prints only what changed.
-- Attached Claude/Codex/other-agent work, in two forms: `dispatch attach -- <command>`
-  wraps and owns the agent's own terminal session silently, and `dispatch attach
-  --workspace <path>` observes an agent already running in its own worktree, finished
-  explicitly with `dispatch finish`.
-- Dispatch-native and foreign Work participating in the same coherence model: an
-  attached run is an ordinary `RunRecord` (`mode: attached`), so `check`, `explain`,
-  `accept`, `reject`, `apply`, `auto_apply` and the watcher all treat it exactly like
-  work Dispatch launched, with one added rule — an attached run's gate never takes the
-  unmoved-fingerprint shortcut, because its S0 is a Git merge-base commit rather than
-  the tree its fingerprint was taken from.
-- Serialized coherent integration: `serve`, the wrapped attach owner loop, the TUI and
-  the CLI all apply through the same `auto_apply`, serialized by the same per-source
-  lock; whoever holds it validates against the current world and the rest wait or fail
-  closed.
-- Restart/recovery semantics: a `serve` restart reads active attached Work back from
-  the database and re-checks each owner's process identity — a live wrapper is left
-  alone, a gone one is honestly adopted (`attach.adopted`) — without finishing,
-  applying or relaunching anything.
+**One way to run.** Every native run uses exactly one agent: the first eligible
+profile in `resources.yml` (written by `dispatch setup`), narrowed by `--agent`,
+`--model` and `--effort`. With no profiles configured, `--agent claude|codex|cursor`
+runs that agent without a funding contract. With neither, `dispatch run` refuses and
+says to run `dispatch setup` or pass `--agent`; there is no silent fallback. Every
+run goes through the same native engine, with the same launch record, mid-run
+watcher, clarification questions, crash repair and run lock.
 
-**Defects found and fixed on the way**, by the S6 scenario tests and by two rounds of
-real-agent dogfood:
+**Removed.**
 
-- `serve` re-rendered its project view only on its own verdicts or applies, so a run
-  attached or finished by another process never appeared until something of `serve`'s
-  own changed. Fixed: the view renders every tick regardless.
-- `auto_apply` applied an empty Δ (an agent that edited nothing, or touched only
-  ignored paths) as "0 files changed" instead of leaving it reviewable. Fixed with a
-  new `empty_delta` skip reason.
-- `dispatch explain` showed no coherence verdict for an applied attached run: the gate
-  took the unmoved-fingerprint shortcut meant for native runs, whose fingerprint is
-  taken from the same tree S0 was copied from — an attached run's S0 is a merge-base
-  commit instead, so the shortcut silently skipped evaluation and the integration
-  checks. Fixed: attached runs always evaluate.
-- A projection-write race: `State::save_run` and the event-projection repair every
-  unlocked reader (`serve`'s view, `status`) performs both wrote to a fixed temporary
-  file name, so two processes finishing or observing at once could consume each
-  other's temporary file and fail with a bare `ENOENT` mid-finish. Fixed with a
-  uniquely named temporary file and an atomic rename per write.
+- Cloud contribution sync, public benchmark priors, `recommend`, `evidence`,
+  `datasets`, `data refresh`, `--route` and automatic evidence-based routing.
+- Private evidence and controlled trials.
+- Planning (`--plan`, `/plan`, `--max-invocations`).
+- The machine-control protocol (`control`, `control-grant`). `dispatch events`
+  remains the read-only journal follower.
+- The automatic stronger-model retry (`--no-retry`). Clarification questions stay.
+- Capacity observation, shared admission leases, pools and `--priority`.
+- The multi-candidate comparison path: `--harnesses`, `--max-parallel`, blind labels,
+  `compare`, `evaluate`, `inspect` and the hidden `apply <id> <label>`.
 
-**Not included in this release.** No socket and no daemon — coordination stays SQLite
-plus `flock`, and `serve` discovers new or changed Work on its next poll tick, not
-instantly. No process control of foreign agents: no PID is ever signaled or killed,
-`--pid` is liveness-only, and `mid_run: stop` does not apply to attached work — a
-`STOP`/`REFRESH` verdict on it is recorded, never enforced. No PR or GitHub/GitLab
-integration. No automatic refresh: `dispatch refresh` stays refused for attached work
-entirely (there is no Dispatch task to relaunch); finish or reject it instead.
+**Safety invariants kept, by replacement proven first.** Each removed subsystem that
+enforced an invariant was replaced by a smaller mechanism before it was deleted, and
+the deletion did not modify the replacement's tests.
 
-**Upgrading.** Migration 21 (`attached_work_mode`) rebuilds `runs` the way migration
-13 did, to widen its `run_mode` `CHECK` to admit `'attached'`; a `dispatch.schema-20-
-*.db` backup is created first, and an older binary refuses the upgraded schema. No
-existing run is rewritten beyond the table rebuild itself. See `docs/release-install.md`.
+- Funding identity. The Codex adapter now checks, immediately before launch, that
+  authentication is ChatGPT, no paid credits are available, the service tier is
+  standard, the plan matches and the account is the one setup recorded. An identity
+  it cannot observe is refused. Claude keeps its adapter preflight. A refusal is
+  sticky per `authorization_revision` until setup re-authorizes the profile, and a
+  profile changed between selection and launch is refused (`tests/funding_safety.rs`).
+- Crash repair. Every agent launch is recorded durably (intent, spawned with the
+  child's process identity, cleaned or uncertain), and a run is never closed while
+  an agent it launched may still be alive (`tests/launch_record.rs`). This replaced
+  the admission lease as the evidence crash repair relies on.
 
-**Evidence.** Real-agent attach with Claude Code (`claude-sonnet-5`, print mode) in a
-linked worktree of a Python scratch project, `serve --json` watching the root: the
-agent created a module and its test; `dispatch finish` froze a two-file Δ and ran the
-unittest check; the root had moved four files ahead of S0; `--auto-apply` evaluated
-the moved world, ran the integration checks on the merged tree, and applied
-(`analysis: integration`); `serve` showed the run go `working` → `applied` with
-verdict `continue`; the root's tests pass. Everything else — the scenario suites, the
-restart and adoption tests, the migration tests — is fixture evidence with scripted
-agents, not a claim about real-agent behavior at scale; see
+**Also changed.**
+
+- One review record: every human review, attached work included, is one review
+  revision with its reasons and verbatim explanation. `accept` records the review
+  and applies under one hold of the run lock. The `cleaner-change` reason is gone.
+- Only a failed execution stops a native attempt; a completed attempt whose checks
+  fail is delivered for review with its verification state. Ctrl-C records the work
+  as cancelled.
+- `--json` names the execution policy `execution` (it was `phase3`) and the run mode
+  `native` or `attached`. `execution.max_parallel` and the `capacity:` block of
+  `resources.yml` are ignored.
+
+**Defects found and fixed on the way.**
+
+- In 0.4.0, a profile refused once stayed refused after it was re-authorized,
+  because capacity kept a stale rejected observation. Reproduced with real agents;
+  gone with capacity (`tests/reauthorization.rs`).
+- During this release, the attempt types lost fields that no longer mean anything,
+  and completed-attempt evidence was compared byte for byte with its new
+  serialization. Accepting a run recorded by 0.4.0 then modified the source and failed
+  to record the application. Found by upgrading a state directory made by the real
+  0.4.0 binary; completed attempts are now compared through the current type and
+  their stored rows are never rewritten.
+
+**Upgrading.** Migration 24 drops the removed features' tables and triggers and
+rebuilds `runs` to allow only `native` and `attached`; a `dispatch.schema-21-*.db`
+backup keeps every row. Human judgments stay in the database: reviews, and the blind
+evaluations and routed-run feedback recorded before 0.4.1. Earlier runs keep loading,
+and fields 0.4.1 no longer uses stay in their metadata as they were. Finish, accept
+or reject work started by 0.4.0 before upgrading: a run still queued or executing is
+not closed by 0.4.1, because Dispatch never closes a run whose attempt may still have
+a live agent. A Codex profile needs the account evidence `dispatch setup codex`
+records, so run setup again for an existing one. See `docs/release-install.md`.
+
+**Evidence.** The funding and launch-record proof suites run the real binary against
+fixture provider executables. Before capacity and admission were deleted, real Claude
+Code runs (`claude-sonnet-5`) completed through the new launch record, a killed
+supervisor left a correct record, and refusals worked against the real binaries. A
+state directory made by the real 0.4.0 binary (a two-candidate comparison with a
+blind evaluation, and a single-candidate run) upgraded to schema 24, and `accept`
+applied and recorded the review. Coherence claims are unchanged; see
 `docs/coherence-validation.md` for what is claimed and what would falsify it.

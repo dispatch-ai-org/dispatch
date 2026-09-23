@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "dispatch",
     version,
-    about = "Dispatch — give a software task to the best available coding agent"
+    about = "Dispatch — keep coding-agent work valid while the code moves"
 )]
 struct Cli {
     /// Override ~/.dispatch (also available as DISPATCH_HOME).
@@ -73,7 +73,7 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Work on a software task with the best available coding agent.
+    /// Work on a software task with your configured coding agent (or --agent).
     Run(RunArgs),
     /// Answer a durable clarification and continue within the existing goal limit.
     Answer {
@@ -114,7 +114,7 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
-    /// Explain why Dispatch chose the agent for the latest task.
+    /// Explain which agent and resource the latest task used.
     Explain { run_id: Option<String> },
     /// Check whether a finished result is still valid against the source as it is now.
     Check {

@@ -157,7 +157,7 @@ fn default_help_leads_with_task_completion_commands() -> anyhow::Result<()> {
         .stdout
         .clone();
     let help = String::from_utf8(output)?;
-    assert!(help.contains("give a software task to the best available coding agent"));
+    assert!(help.contains("keep coding-agent work valid while the code moves"));
     for command in [
         "run", "status", "diff", "accept", "reject", "history", "explain",
     ] {

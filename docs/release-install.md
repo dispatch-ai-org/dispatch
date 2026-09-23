@@ -44,14 +44,33 @@ Stop all Dispatch sessions before upgrading. Back up the complete private state
 directory and keep the matching binary. SQLite migrations now preserve a consistent
 600-permission `dispatch.schema-N-*.db` backup beside the database before upgrading
 historical schemas. These backups preserve database state, not artifact files; keep
-a full state-directory copy as well. Schema is 21 as of 0.4.0. Newer schemas are
+a full state-directory copy as well. Schema is 24 as of 0.4.1. Newer schemas are
 refused.
 
 To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
-Old grant scope does not expand: issue a new grant explicitly if changed resource
-configuration invalidates it. Planned crash recovery remains unsupported.
+
+### Upgrading to 0.4.1
+
+0.4.1 removes sync, public priors and routing, capacity and admission, the control
+protocol, private evidence, planning, blind comparison and the automatic retry. Its
+first open migrates the database to schema 24 and leaves a `dispatch.schema-21-*.db`
+backup. Migration 24 drops the tables of the removed features; the backup keeps
+every row. Human judgments stay in the database: reviews, and the blind evaluations
+and routed-run feedback recorded before 0.4.1. Earlier runs keep loading; their run
+mode reads as `native`, and fields that 0.4.1 no longer uses are kept in their
+metadata as they were.
+
+Finish, accept or reject work started by 0.4.0 before upgrading. A 0.4.0 run still
+queued or executing when you upgrade is not closed by 0.4.1, because Dispatch never
+closes a run whose attempt may still have a live agent. It stays unfinished.
+
+In `resources.yml`, the `capacity:` block is ignored. A Codex profile now needs the
+account evidence that `dispatch setup codex` records, so run setup again for an
+existing Codex profile. In `dispatch.yml`, `execution.max_parallel` is ignored.
+`--json` output names the execution policy `execution` (it was `phase3`) and the run
+mode `native`.
 
 ### Upgrading to 0.2.0
 

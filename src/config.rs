@@ -70,7 +70,6 @@ pub struct ExecutionConfig {
     pub timeout_secs: u64,
     pub cpus: f64,
     pub memory: String,
-    pub max_parallel: usize,
     pub docker_image: String,
     pub forwarded_env: Vec<String>,
 }
@@ -82,7 +81,6 @@ impl Default for ExecutionConfig {
             timeout_secs: 1800,
             cpus: 2.0,
             memory: "4g".into(),
-            max_parallel: 3,
             docker_image: "ubuntu:24.04".into(),
             forwarded_env: Vec::new(),
         }
@@ -197,10 +195,6 @@ impl Config {
         );
         anyhow::ensure!(self.execution.cpus > 0.0, "execution.cpus must be positive");
         anyhow::ensure!(
-            self.execution.max_parallel > 0,
-            "execution.max_parallel must be positive"
-        );
-        anyhow::ensure!(
             !self.execution.memory.trim().is_empty(),
             "execution.memory must not be empty"
         );
@@ -222,7 +216,7 @@ impl Config {
     }
 
     pub fn example_yaml() -> &'static str {
-        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  max_parallel: 3\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
+        "execution:\n  backend: local\n  timeout_secs: 1800\n  cpus: 2\n  memory: 4g\n  docker_image: ubuntu:24.04\n  forwarded_env: []\nchecks:\n  baseline: []\n  # Replace [] with your project's verification commands, such as [cargo test].\n  verify: []\nharnesses:\n  claude:\n    model: null\n    effort: null\n    extra_args: []\n  codex:\n    model: null\n    effort: null\n    extra_args: []\n  cursor:\n    model: null\n    effort: null\n    extra_args: []\n"
     }
 }
 

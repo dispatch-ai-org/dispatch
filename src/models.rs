@@ -321,6 +321,7 @@ pub struct EnvironmentRecord {
     pub timeout_secs: u64,
     pub cpus: f64,
     pub memory: String,
+    /// Agents run at once for this run: always 1 since 0.4.1.
     pub max_parallel: usize,
     #[serde(default)]
     pub docker_image: Option<String>,

@@ -606,7 +606,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             timeout_secs: config.execution.timeout_secs,
             cpus: config.execution.cpus,
             memory: config.execution.memory.clone(),
-            max_parallel: config.execution.max_parallel,
+            max_parallel: 1,
             docker_image: (config.execution.backend == "docker")
                 .then(|| config.execution.docker_image.clone()),
             resource_limits_enforced: config.execution.backend == "docker",
