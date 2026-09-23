@@ -6,6 +6,7 @@ pub mod db;
 pub mod executor;
 pub mod follow;
 pub mod harness;
+pub mod launch;
 pub mod lock;
 pub mod models;
 pub mod orchestrator;

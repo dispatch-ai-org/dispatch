@@ -244,3 +244,20 @@ again at admission. After S6b it must run immediately before spawn.
   retry-incidental tests now use a successful single attempt; fixtures no
   longer assert classifier output or tier choice. The capacity checks at
   selection are unchanged until S6b. `cargo test`: 479 passed, 0 failed.
+- 2026-09-23 — S6a (additive; admission untouched): `src/launch.rs` and
+  migration 23 (`attempt_launches`). The launch record lives in its own table,
+  not in the attempt row, because the run projection writer rewrites attempt
+  rows while the executor's observer is writing. `LaunchObserver` records
+  `intent` durably before spawn, then `spawned` with the child's identity, then
+  `cleaned`, `uncertain` or `spawn_failed`; it wraps admission's observer until
+  S6b. At `authorize_launch` it also re-checks the bound profile and funding
+  refusals, closing the window between the spawn-time preflight and the spawn
+  (typed `LaunchRefused`). `repair_abandoned` keeps "every attempt completed"
+  (that is what proves verification returned) and replaces the unresolved-lease
+  test with "no launch may be alive"; during S6a it requires both to agree and
+  logs any disagreement at info level. Proof suite: 10 unit tests in
+  `dispatch::launch` (every kill point against real process groups, the
+  observer sequence, the guard) and `tests/launch_record.rs` (a completed
+  attempt leaves `cleaned`; a SIGKILLed supervisor leaves `spawned` with the
+  running agent's identity and the run stays open). Real-agent dogfood is
+  deferred to the S10 release gate. `cargo test`: 491 passed, 0 failed.

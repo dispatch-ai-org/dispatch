@@ -800,6 +800,26 @@ CREATE TABLE funding_refusals (
 );
 "#,
     ),
+    (
+        23,
+        "attempt_launches",
+        r#"
+-- The durable record of an agent launch, written by the executor's observer:
+-- `intent` is committed before spawn, then `spawned` with the child's
+-- identity, then `cleaned`, `uncertain` (cleanup not confirmed) or
+-- `spawn_failed`. Crash repair never closes a run while a launch may be alive.
+CREATE TABLE attempt_launches (
+    attempt_id       TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    state            TEXT NOT NULL
+        CHECK (state IN ('intent', 'spawn_failed', 'spawned', 'cleaned', 'uncertain')),
+    child_json       TEXT,
+    backend_identity TEXT,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX attempt_launches_run_idx ON attempt_launches(run_id);
+"#,
+    ),
 ];
 
 /// The compact row used by `dispatch history`.

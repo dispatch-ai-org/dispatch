@@ -51,13 +51,21 @@ fn unresolved_admission(db: &Database, id: &str) -> Result<bool> {
     )?)
 }
 
+/// Whether any agent this run launched may still be running.
+fn any_launch_alive(db: &Database, id: &str) -> Result<bool> {
+    Ok(crate::launch::launches_for_run(db, id)?
+        .iter()
+        .any(crate::launch::LaunchRecord::possibly_alive))
+}
+
 fn interrupt_run(state: &State, db: &Database, run: &mut RunRecord, reason: &str) -> Result<()> {
     run.status = RunStatus::Interrupted;
     run.completed_at = Some(Utc::now());
     run.outcome.lifecycle = LifecycleState::Finished;
     run.outcome.work_result = WorkResult::Interrupted;
     run.outcome.phase = RunPhase::Finished;
-    run.outcome.waiting_on = if unresolved_admission(db, &run.id)? {
+    run.outcome.waiting_on = if unresolved_admission(db, &run.id)? || any_launch_alive(db, &run.id)?
+    {
         WaitingOn::Reconciliation
     } else {
         WaitingOn::None
@@ -144,14 +152,23 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
         )
     });
     // Completed attempts affirm that verification has also returned. An
-    // unfinished attempt or unresolved lease can still have a live child;
-    // leave that uncertainty to the existing supervision/reconciliation path.
-    if expects_execution(run)
-        && gone
-        && !run.attempts.is_empty()
-        && run.attempts.iter().all(|a| a.completed_at.is_some())
-        && !unresolved_admission(db, &run.id)?
-    {
+    // unfinished attempt, or a launch that may still be alive, can still be
+    // writing; leave that uncertainty to supervision and reconciliation.
+    // Until admission is removed, both the admission lease and the launch
+    // record must agree that nothing can still be running.
+    let completed =
+        !run.attempts.is_empty() && run.attempts.iter().all(|a| a.completed_at.is_some());
+    let admission_settled = !unresolved_admission(db, &run.id)?;
+    let launches_settled = !any_launch_alive(db, &run.id)?;
+    if gone && completed && admission_settled != launches_settled {
+        tracing::info!(
+            run = %run.id,
+            admission_settled,
+            launches_settled,
+            "admission and launch records disagree about abandoned work"
+        );
+    }
+    if expects_execution(run) && gone && completed && admission_settled && launches_settled {
         interrupt_run(
             state,
             db,
@@ -770,6 +787,14 @@ async fn drive_inner(
             cancellation.clone(),
             (tx, attempt_id),
             Some((coordinator, token, resources.capacity.heartbeat_secs)),
+            Some(super::LaunchContext {
+                db_path: state.db_path(),
+                run_id: run.id.clone(),
+                guard: Some(crate::launch::LaunchGuard {
+                    state_root: state.root.clone(),
+                    profile: profile.clone(),
+                }),
+            }),
         );
         tokio::pin!(work);
         let execution = loop {

@@ -1178,6 +1178,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
                     candidate_cancellation,
                     (candidate_check_tx, attempt_id),
                     candidate_admission,
+                    None,
                 )
                 .await
             }));
@@ -2130,6 +2131,16 @@ async fn observe_capacity(
     Ok(observation)
 }
 
+/// Where and for which run an attempt's launch is recorded, and the profile
+/// re-checked at the launch boundary.
+pub(super) struct LaunchContext {
+    pub db_path: PathBuf,
+    pub run_id: String,
+    pub guard: Option<crate::launch::LaunchGuard>,
+}
+
+// The admission argument goes away with admission (0.4.1 S6b).
+#[allow(clippy::too_many_arguments)]
 async fn execute_candidate(
     mut candidate: CandidateRecord,
     prompt: String,
@@ -2141,6 +2152,7 @@ async fn execute_candidate(
         String,
     ),
     admission: Option<(AdmissionCoordinator, LeaseToken, u64)>,
+    launch: Option<LaunchContext>,
 ) -> CandidateExecution {
     let (check_observer, attempt_id) = verification;
     let candidate_dir = candidate
@@ -2180,11 +2192,25 @@ async fn execute_candidate(
             .with_timeout(timeout)
             .with_cancellation(cancellation.clone());
         request.read_only = config.harnesses.get(&candidate.harness_id).read_only;
-        if let Some((coordinator, token, _)) = &admission {
-            request = request.with_observer(Arc::new(AdmissionLeaseObserver::new(
+        let admission_observer = admission.as_ref().map(|(coordinator, token, _)| {
+            Arc::new(AdmissionLeaseObserver::new(
                 coordinator.clone(),
                 token.clone(),
-            )));
+            )) as Arc<dyn crate::executor::ExecutionObserver>
+        });
+        let observer = match launch {
+            Some(launch) => Some(Arc::new(crate::launch::LaunchObserver::new(
+                &launch.db_path,
+                &launch.run_id,
+                &attempt_id,
+                launch.guard,
+                admission_observer,
+            ))
+                as Arc<dyn crate::executor::ExecutionObserver>),
+            None => admission_observer,
+        };
+        if let Some(observer) = observer {
+            request = request.with_observer(observer);
         }
         run_harness(adapter.as_ref(), &executor, request).await
     }
@@ -2282,6 +2308,9 @@ async fn execute_candidate(
             failure = Some(if error.downcast_ref::<rusqlite::Error>().is_some() {
                 crate::FailureKind::InternalState
             } else if preflight_refusal.is_some()
+                || error
+                    .downcast_ref::<crate::launch::LaunchRefused>()
+                    .is_some()
                 || error.to_string().contains("funding revalidation")
             {
                 crate::FailureKind::Authorization
