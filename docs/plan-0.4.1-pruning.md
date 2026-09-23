@@ -116,3 +116,10 @@ the progress log.
   the control-driven portfolio scenarios (`grants`, `pools`) were deleted
   (same-pool admission exclusion is removed in S6b). `cargo test`: 489 passed,
   0 failed.
+- 2026-09-22 — S4 (moves only, no behavior change): process identity and
+  liveness (`ProcessIdentity`, `identity_state`, `process_group_exists`,
+  `identity_from_row`) moved from `admission.rs` to `src/process.rs`;
+  `OperationLock`, `SignalListener` and `shutdown_signal` moved to
+  `src/lock.rs`; the event helper `transition` moved next to `persist_event`;
+  `attach`, `serve` and `apply` import named items instead of `super::*`.
+  `cargo test`: 489 passed, 0 failed.

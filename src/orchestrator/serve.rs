@@ -8,13 +8,28 @@
 //! kills or refreshes anything; wrapped attach (S4) and human review remain
 //! the only things that do.
 
-use std::{collections::HashMap, io::IsTerminal, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
-use super::*;
+use anyhow::{Context, Result};
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+
+use super::{ApplyOutcome, apply, auto_apply, persist_event};
 use crate::{
-    OwnerState, ReasonCode, SourceKind,
-    admission::{IdentityState, ProcessIdentity, identity_state},
+    ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReasonCode,
+    ReviewState, RunMode, RunRecord, SourceKind, Validity, WorkResult,
     coherence::{self, WorkView, watch::Policy, world},
+    db::Database,
+    lock::{OperationLock, shutdown_signal},
+    process::{IdentityState, ProcessIdentity, identity_state},
+    source,
+    state::State,
 };
 
 /// `dispatch serve [--root <path>] [--json]`. Loops until Ctrl+C, SIGTERM or

@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncReadExt, process::Command, sync::Notify};
 
 use crate::{
-    admission::ProcessIdentity,
     config::ExecutionConfig,
     models::{CheckPhase, CheckResult, CheckStatus},
+    process::ProcessIdentity,
 };
 
 #[cfg(not(test))]
@@ -320,7 +320,7 @@ impl Executor {
         };
 
         let mut process_group = ProcessGroupGuard::new(child.id());
-        let child_identity = child.id().map(crate::admission::process_identity);
+        let child_identity = child.id().map(crate::process::process_identity);
         if let (Some(observer), Some(identity)) = (&request.observer, &child_identity)
             && let Err(error) = observer.child_spawned(identity, container_name.as_deref())
         {
@@ -820,12 +820,12 @@ async fn terminate_child(child: &mut tokio::process::Child, group: &mut ProcessG
 
 pub(crate) async fn confirm_process_group_gone(group: i32) -> bool {
     for _ in 0..20 {
-        if crate::admission::process_group_exists(Some(group)) == Some(false) {
+        if crate::process::process_group_exists(Some(group)) == Some(false) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    crate::admission::process_group_exists(Some(group)) == Some(false)
+    crate::process::process_group_exists(Some(group)) == Some(false)
 }
 
 async fn cleanup_docker_container(name: &str) -> bool {

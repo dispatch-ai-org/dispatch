@@ -12,11 +12,31 @@ use std::process::Stdio;
 
 use tokio::signal::unix::{SignalKind, signal};
 
-use super::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use ulid::Ulid;
+
+use super::{
+    ApplyOutcome, apply, auto_apply, persist_event, publish_event, refresh_outcome,
+    result_verification,
+};
 use crate::{
-    AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail, BaselineProvenance,
-    FinishReason, OwnerState, admission,
+    ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
+    AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
+    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, OwnerState,
+    ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, VerificationState, WaitingOn,
+    WorkResult,
     coherence::watch::{WatchSpec, Watcher},
+    db::Database,
+    lock::OperationLock,
+    process, source,
+    state::{State, write_text},
 };
 
 /// Request to attach external work Dispatch did not launch. See part 14.3.
@@ -219,8 +239,8 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         confidence,
         agent: request.agent.clone(),
         command: request.command.clone(),
-        owner: is_wrapped.then(admission::ProcessIdentity::current),
-        agent_process: request.pid.map(admission::process_identity),
+        owner: is_wrapped.then(process::ProcessIdentity::current),
+        agent_process: request.pid.map(process::process_identity),
         owner_state: if is_wrapped {
             OwnerState::Live
         } else {
@@ -431,7 +451,7 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
         }
     };
     let child_pid = child.id();
-    let agent_process = admission::process_identity(child_pid);
+    let agent_process = process::process_identity(child_pid);
 
     let mut db = Database::open(state.db_path())?;
     if let Some(attachment) = run.attachment.as_mut() {

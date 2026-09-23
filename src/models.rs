@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::admission::ProcessIdentity;
+use crate::process::ProcessIdentity;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1027,7 +1027,7 @@ pub struct GoalExecution {
     pub priority: i32,
     pub owner_uid: u32,
     #[serde(default)]
-    pub supervisor: Option<crate::admission::ProcessIdentity>,
+    pub supervisor: Option<crate::process::ProcessIdentity>,
     pub final_attempt_id: Option<String>,
     pub contributing_attempts: Vec<String>,
     pub provenance: String,

@@ -1066,7 +1066,7 @@ fn committed_attempt_owner_fixture() -> Result<()> {
     run.outcome.work_result = dispatch::WorkResult::Pending;
     run.outcome.review = dispatch::ReviewState::NotRequested;
     let policy = run.phase3.as_mut().unwrap();
-    policy.supervisor = Some(dispatch::admission::ProcessIdentity::current());
+    policy.supervisor = Some(dispatch::process::ProcessIdentity::current());
     policy.final_attempt_id = None;
     policy.failure = None;
     let attempt_id = run.attempts[0].id.clone();
@@ -1221,9 +1221,9 @@ fn reload_requires_positive_owner_and_cleanup_evidence() -> Result<()> {
         run.outcome.lifecycle = dispatch::LifecycleState::Working;
         run.outcome.work_result = dispatch::WorkResult::Pending;
         run.phase3.as_mut().unwrap().supervisor = match evidence {
-            "live" => Some(dispatch::admission::ProcessIdentity::current()),
+            "live" => Some(dispatch::process::ProcessIdentity::current()),
             "missing" | "legacy" => None,
-            _ => Some(dispatch::admission::process_identity(u32::MAX)),
+            _ => Some(dispatch::process::process_identity(u32::MAX)),
         };
         let mut db = Database::open(f.state.join("dispatch.db"))?;
         db.sync_run(&run)?;

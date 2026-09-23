@@ -6,11 +6,26 @@
 //! is now, and applies through the digest or fingerprint fence. What differs
 //! is the authority: a human decision records acceptance, a policy never does.
 
-use super::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use anyhow::Result;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+
+use super::{find_candidate, persist_event, sole_candidate, transition};
 use crate::{
-    AnalysisLevel, AppliedBy,
+    AnalysisLevel, ApplicationState, AppliedBy, CoherenceRecord, Decision, EventRecord,
+    LifecycleState, ReviewState, RunPhase, RunRecord, RunStatus, Validity, VerificationState,
+    WorkResult,
     coherence::{AcceptGate, CoherenceBlocked, run_config},
-    source::ApplyReport,
+    db::Database,
+    lock::OperationLock,
+    source::{self, ApplyReport},
+    state::State,
 };
 
 /// Who is applying. This is threaded into the persisted outcome and events so
@@ -128,7 +143,7 @@ pub(super) fn persist_verdict(
     } else {
         "coherence.invalidated"
     };
-    super::phase3::transition(
+    transition(
         state,
         db,
         run,

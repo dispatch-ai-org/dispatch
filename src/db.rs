@@ -2798,7 +2798,7 @@ mod tests {
                 database.connection.execute("UPDATE pool_leases SET launch_lifecycle='spawn_may_have_occurred' WHERE pool_id='pool'",[])?;
                 coordinator.cleanup_after_unrecorded_spawn(
                     &token,
-                    &crate::admission::ProcessIdentity::current(),
+                    &crate::process::ProcessIdentity::current(),
                     None,
                     false,
                 )?;
@@ -2899,7 +2899,7 @@ mod tests {
             }
             connection.execute_batch("INSERT INTO resource_pools(id,provider,funding_source,provider_buckets_json,max_active,next_fence,created_at,updated_at) VALUES('pool','openai','chatgpt-plus','[\"codex\"]',1,1,'2020-01-01','2020-01-01');
                 INSERT INTO admission_requests(id,run_id,pool_id,owner_session,generation,priority,enqueued_at,heartbeat_at,expires_at,status) VALUES('request','old-run','pool','dead-owner',1,0,'2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z','admitted');")?;
-            let child = crate::admission::ProcessIdentity::current();
+            let child = crate::process::ProcessIdentity::current();
             connection.execute("INSERT INTO pool_leases(pool_id,request_id,owner_session,generation,fence,state,start_intent_at,heartbeat_at,expires_at,owner_pid,child_pid,child_start_identity,child_boot_identity,child_process_group) VALUES('pool','request','dead-owner',1,1,'running',?1,?1,?1,4294967295,?2,?3,?4,?5)",params![timestamp(at(1)),child.pid,child.start,child.boot,child.process_group])?;
             drop(connection);
             let migrated = Database::open(&path)?;

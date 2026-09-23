@@ -133,14 +133,14 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
         supervisor = db.connection().query_row(
             "SELECT owner_pid,owner_start_identity,owner_boot_identity FROM admission_requests WHERE run_id=?1 ORDER BY enqueued_at DESC,id DESC LIMIT 1",
             [&run.id], |row| {
-                Ok(crate::admission::identity_from_row(row.get(0)?, row.get(1)?, row.get(2)?, None))
+                Ok(crate::process::identity_from_row(row.get(0)?, row.get(1)?, row.get(2)?, None))
             },
         ).optional()?.flatten();
     }
     let gone = supervisor.as_ref().is_some_and(|owner| {
         matches!(
-            crate::admission::identity_state(owner),
-            crate::admission::IdentityState::Gone | crate::admission::IdentityState::Reused
+            crate::process::identity_state(owner),
+            crate::process::IdentityState::Gone | crate::process::IdentityState::Reused
         )
     });
     // Completed attempts affirm that verification has also returned. An
@@ -160,28 +160,6 @@ pub(crate) fn repair_abandoned(state: &State, db: &Database, run: &mut RunRecord
         )?;
     }
     Ok(())
-}
-
-pub(super) fn transition(
-    state: &State,
-    db: &Database,
-    run: &mut RunRecord,
-    kind: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
-    persist_event(
-        state,
-        db,
-        EventRecord {
-            run_id: run.id.clone(),
-            attempt_id: run.attempts.last().map(|a| a.id.clone()),
-            event_type: kind.into(),
-            timestamp: Utc::now(),
-            payload,
-            ..Default::default()
-        },
-        run,
-    )
 }
 
 pub(super) fn sync_transition(
@@ -1095,7 +1073,7 @@ fn resolve(
     } else {
         run.outcome.lifecycle = LifecycleState::Preparing;
         run.outcome.phase = RunPhase::Preparing;
-        policy.supervisor = Some(crate::admission::ProcessIdentity::current());
+        policy.supervisor = Some(crate::process::ProcessIdentity::current());
     }
     let db = Database::open(state.db_path())?;
     let result = transition(
