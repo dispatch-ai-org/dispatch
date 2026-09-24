@@ -1,5 +1,6 @@
 mod apply;
 pub mod attach;
+pub mod background;
 pub(crate) mod native;
 pub mod serve;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};
@@ -1515,20 +1516,23 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
     if run.execution.is_some() {
-        return native::emit(&run, RunOutputMode::Human);
-    }
-    if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
+        native::emit(&run, RunOutputMode::Human)?;
+    } else if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
         let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
         let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
         print_single_result_summary(&run, "Latest task", true, human_outcome);
-        return Ok(());
+    } else {
+        print_run_header(&run);
+        println!("\nTask\n  {}\n", one_line(&run.task, 120));
+        print_candidates(&run);
+        if let Some(line) = coherence_line(&run) {
+            println!("{line}");
+        }
     }
-    print_run_header(&run);
-    println!("\nTask\n  {}\n", one_line(&run.task, 120));
-    print_candidates(&run);
-    if let Some(line) = coherence_line(&run) {
-        println!("{line}");
-    }
+    println!(
+        "\nProject: {}",
+        background::describe(state, &run.source_path)
+    );
     Ok(())
 }
 
@@ -1982,6 +1986,17 @@ pub fn refresh_request(
     })
 }
 
+/// A reason on one line: Git's multi-line complaints included.
+fn line_reason(detail: &str) -> String {
+    detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(60)
+        .collect()
+}
+
 /// The Coherence line for a Ready run that carries a validity, else `None`.
 /// One Work item as every list shows it: where it came from and what it
 /// began against, the verdict and why, and where verification, review and
@@ -2038,7 +2053,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             "overridden",
             overridden
                 .and_then(|v| v.reasons.first())
-                .map(|r| r.detail.chars().take(60).collect()),
+                .map(|r| line_reason(&r.detail)),
         ),
         // Applied with no stored verdict: accept found the source unmoved.
         None if run.outcome.application == ApplicationState::Applied => ("unmoved", None),
@@ -2046,9 +2061,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(v) if v.decision == Decision::Continue && !v.world_changed => ("unmoved", None),
         Some(v) => (
             crate::coherence::verdict(v.decision),
-            v.reasons
-                .first()
-                .map(|r| r.detail.chars().take(60).collect()),
+            v.reasons.first().map(|r| line_reason(&r.detail)),
         ),
     };
     let state = if run.outcome.waiting_on == WaitingOn::Human {
@@ -2690,6 +2703,14 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::Validity;
+
+    #[test]
+    fn a_work_line_reason_is_one_line() {
+        assert_eq!(
+            line_reason("error: patch failed: a.py:3\nerror: a.py: patch does not apply"),
+            "error: patch failed: a.py:3 error: a.py: patch does not appl"
+        );
+    }
 
     fn reason(detail: &str) -> crate::Reason {
         crate::Reason {

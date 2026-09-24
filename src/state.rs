@@ -217,7 +217,7 @@ impl State {
 /// `load_run` reader repairing a stale copy), and a shared temporary name let
 /// one rename consume the other's file. Every writer produces the committed
 /// projection, so whichever rename lands last leaves a complete, current file.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("projection path has no parent")?;
     fs::create_dir_all(parent)?;
     let name = path

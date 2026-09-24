@@ -248,6 +248,97 @@ fn check_failing_only_on_the_merged_tree_blocks_apply() {
     assert_eq!(shown["validity"]["decision"], "continue", "{shown}");
 }
 
+/// `dispatch serve --json` on the fixture's source, killed on drop.
+struct Serve(
+    std::process::Child,
+    std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+);
+
+impl Serve {
+    fn spawn(fixture: &Fixture) -> Self {
+        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
+            .arg("--state-dir")
+            .arg(&fixture.state)
+            .args(["serve", "--json", "--root"])
+            .arg(&fixture.source)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let lines = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()));
+        Self(child, lines)
+    }
+
+    /// Blocks until serve reports a world, which it does after its tick.
+    fn world(&mut self) {
+        for line in self.1.by_ref() {
+            if line.unwrap().contains(r#""type":"world""#) {
+                return;
+            }
+        }
+        panic!("serve exited");
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_owner_keeps_a_refusal_by_the_checks_until_the_world_moves() {
+    let fixture = Fixture::new(&format!(
+        "{VERIFY_NO_FORBIDDEN}coherence:\n  poll_secs: 1\n"
+    ));
+    add_forbidden(&fixture);
+    fixture.apply().failure();
+
+    let mut serve = Serve::spawn(&fixture);
+    serve.world();
+    // A few more ticks with the world unmoved leave the refusal in place.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let validity = &fixture.metadata()["coherence"]["validity"];
+    assert_eq!(
+        validity["reasons"][0]["code"], "integration_check_failed",
+        "{validity}"
+    );
+
+    fs::write(fixture.source.join("unrelated.txt"), "moved\n").unwrap();
+    wait_for("the owner to record CONTINUE", || {
+        fixture.metadata()["coherence"]["validity"]["decision"] == "continue"
+    });
+}
+
+#[test]
+fn the_owner_marks_a_ready_native_result_stale_when_the_world_moves() {
+    let fixture = Fixture::new("coherence:\n  poll_secs: 1\n");
+    let mut serve = Serve::spawn(&fixture);
+    serve.world();
+    // The world creates the file the result adds, with other content.
+    fs::write(
+        fixture.source.join("dispatch-fake-good.txt"),
+        "someone else's\n",
+    )
+    .unwrap();
+    wait_for("the owner to record REFRESH", || {
+        fixture.metadata()["coherence"]["validity"]["decision"] == "refresh"
+    });
+    assert_eq!(fixture.metadata()["outcome"]["review"], "pending");
+}
+
 #[test]
 fn disabling_integration_checks_skips_the_oracle() {
     let fixture = Fixture::new(&format!(

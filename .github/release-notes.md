@@ -1,65 +1,78 @@
-## Dispatch 0.4.4 — verdicts you can trust and act on
+## Dispatch 0.4.5 — Dispatch in the background
 
-A multi-agent trial ran eleven Work items, from Claude, Claude Code and Cursor,
-against one project while it changed underneath them. Dispatch caught stale work
-where plain `git apply` would have let it through. The trial also showed where its
-verdicts could not yet be trusted or acted on. 0.4.4 fixes those places and lets a
-human overrule a verdict the analysis got wrong.
+Turn watching on and get on with your work:
+
+```text
+$ dispatch start
+✓ Watching ~/src/project
+  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop
+```
+
+While it runs, Dispatch keeps the verdict of every Work item it knows about current
+as the code moves:
+- results waiting for your review, native or attached;
+- attached work still in progress;
+- attached work it may apply.
+
+No agent needs to be set up to watch a project.
+
+**New commands.**
+- **`dispatch start`** watches the project in the background and returns at once.
+  It is one local process per project, in its own session, so closing the
+  terminal does not stop it.
+- **`dispatch watch`** shows the project's Work live, under a line saying who
+  watches. Leaving it (Ctrl+C) does not stop watching.
+- **`dispatch stop`** stops exactly this project's watcher.
+
+`dispatch status` now ends with a `Project:` line saying whether the project is
+watched.
+
+**Trustworthy lifecycle.**
+- "Watched" means the project's lock is held, and the operating system releases
+  that lock when the watcher exits, crashes or the machine reboots. So nothing
+  claims a project is watched when it is not, and `start` recovers after a crash.
+- `stop` signals a process only when its recorded identity (pid, start time and
+  boot) still matches.
+- Two `start`s at once leave one watcher.
+- After a reboot, run `dispatch start` again.
 
 **Fixed.**
+- The project owner re-checks results waiting for review when the code moves. A
+  Ready result used to keep the verdict it finished with, so the project view
+  could say CONTINUE while `check` said REFRESH. They now agree, and a refusal by
+  the merged-tree checks still stands until the code moves.
+- A verdict that flipped back within a minute was never recorded, and a restarted
+  `serve` ignored a stored verdict that no longer held. The owner now compares
+  each verdict with the one stored on the run.
+- Attached work with no live owner is re-checked when that work changes, not only
+  when the project moves (the gap 0.4.4 closed for native runs).
+- Following attached work used to re-hash the whole workspace every tick. The
+  owner now keeps a Git index per Work item, cutting the cost fourfold (about
+  50 ms per item on a 2,000-file project).
+- Results waiting for your review stay in the project view until you decide.
+  Reasons quoting Git's errors stay on one line.
 
-- **A refused accept no longer records an acceptance.** When coherence refuses an
-  accept, nothing is applied, no review is recorded, and the result stays pending
-  for you to refresh or reject. Accept now applies first and records your review
-  only once the change has landed.
-- **Every surface shows the same verdict.** After the checks on the merged tree
-  refused a result, `check` and `status` showed CONTINUE, and `check` advised accept
-  again, while `serve` showed REFRESH. They now all show the refusal until the
-  source moves. `refresh` passes the failure on to the new agent.
-- **Integration failures say what failed.** The reason quotes the failing check in
-  its own words, for example `ERROR: test_admin_token (…) / TypeError: validate()
-  missing 1 required positional argument: 'token'`, not only a log path.
-- **The mid-run watcher also follows the agent's work.** It used to re-evaluate only
-  when the source moved. A change that landed before the agent touched the same
-  code was therefore never reported mid-run. It now re-evaluates when either the
-  source or the agent's work so far changes. The work is fingerprinted with the
-  trusted baseline repository, so ignored build output never counts.
-- **Adding an optional Python parameter keeps callers valid.** A referenced Python
-  function that gains only defaulted parameters, `*args` or `**kwargs` no longer
-  marks every caller `fact_broken`. Any other signature change still does, and
-  Rust signatures compare exactly.
-- **Clearer words:**
-  - attached work is told to run its agent again, not to `dispatch refresh`;
-  - native S0 shows the project commit;
-  - a result applied to an unmoved source shows `unmoved`;
-  - STOP names the run that already landed the same change;
-  - a run waiting for your answer shows `question`, not `working`.
-- **Answering a question no longer ends the run when the source moved.** A native
-  run stopped with `source_drift` when it was answered after any change to the
-  project, even though the accept gate judges the result against the source as it
-  is then. The continuation now proceeds from the run's snapshot like any attempt.
+**Evidence.** A real-agent trial on a small Python service:
+- `dispatch start` returned in 0.1 s.
+- On its first tick the watcher found the four results left waiting for review
+  that morning and marked them correctly: two REFRESH `patch_conflict`, one
+  REFRESH `fact_broken` (a caller of `validate(token)` after the API became
+  `validate(ctx, token)`), and one STOP (already landed).
+- A native Claude Code result and a foreign-attached Cursor session then ran in
+  parallel. Two seconds after a teammate's commit touched the same code,
+  `dispatch watch` showed the Claude result as REFRESH, with no command run.
+- After SIGKILL, `status` and `watch` said "not watched", `stop` signalled
+  nothing, and `start` recovered.
 
-**New: recorded human override.** `dispatch accept <run> --despite-refresh
---explanation "<why>"` applies a REFRESH that comes only from the file and symbol
-analysis, when you have checked that the work still holds.
-- Your checks must still run and pass on the merged tree.
-- The overridden verdict and your explanation are recorded (`coherence.overridden`).
-- It never overrides STOP, a patch that no longer applies, or a failing check.
-- Auto-apply never uses it.
+**Cost** (measured on a 2,000-file Git project; no telemetry is collected):
+- An idle tick costs about 50 ms for the project signal, plus about 50 ms for
+  each attached Work item in progress.
+- When the code moves, each affected item takes about 0.4-0.5 s to re-evaluate.
 
-**Evidence.** The same trial was re-run with real agents on this release:
-- The Claude Code patch that still called `validate(token)` after the API changed
-  was refused as before. An override attempt was refused too, because the merged
-  tree's tests failed with that `TypeError`, which the refusal quotes.
-- The redundant timeout change was STOP, "landed by" the run that applied it first.
-- The format change that broke a landed test was refused by the checks, and
-  `check`, `status` and `serve` agreed afterwards. The refused accepts stayed
-  pending.
-- The Cursor caller of `format_user(user)` now applies after the optional parameter
-  landed; 0.4.3 refused it.
-- Given the failing test, the refreshed agent asked whether it could update that
-  test, where 0.4.3's refresh repeated the failure.
+**Not built.** Dispatch does not discover agents it did not launch or that you did
+not attach, and it does not start at login. There is still no network service,
+protocol or automatic refresh.
 
-**Upgrading.** No migration; the schema stays at 24. `CoherenceRecord` gains an
-optional `overridden` field. `serve --json` gains `overridden`, and `check --json`
-gains `landed_by` for STOP.
+**Upgrading.** No migration; the schema stays at 24. The state directory gains
+`watchers/`. `watch --json` adds a `watcher` object, and `serve --json` is
+unchanged.

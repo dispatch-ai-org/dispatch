@@ -407,6 +407,92 @@ fn serve_reevaluates_foreign_work_when_the_root_moves() {
     });
 }
 
+fn stored_decision(fixture: &Fixture, id: &str) -> Value {
+    fixture.metadata(id)["coherence"]["validity"]["decision"].clone()
+}
+
+/// Foreign work edits line 2 of `src/lib.rs`; the root edits the same line
+/// to another value, so the work goes stale.
+fn conflict_in_root(fixture: &Fixture) {
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+}
+
+fn restore_root(fixture: &Fixture) {
+    git(&fixture.root, &["checkout", "--", "src/lib.rs"]);
+}
+
+fn stale_foreign_work(fixture: &Fixture) -> String {
+    let id = fixture.attach(&[]);
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    id
+}
+
+#[test]
+fn a_verdict_that_changes_back_within_a_minute_is_still_recorded() {
+    let fixture = Fixture::new();
+    let id = stale_foreign_work(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    conflict_in_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+    // The root moves back at once and then stays put: the owner must record
+    // CONTINUE without waiting for yet another move.
+    restore_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "continue"
+    });
+}
+
+#[test]
+fn a_restarted_owner_records_a_change_the_old_one_never_saw() {
+    let fixture = Fixture::new();
+    let id = stale_foreign_work(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    conflict_in_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+    drop(serve);
+
+    restore_root(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "continue"
+    });
+}
+
+#[test]
+fn serve_follows_foreign_work_that_edits_into_a_change_already_made() {
+    let fixture = Fixture::new();
+    let id = fixture.attach(&[]);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    // The root moves first, while the work has not touched the code yet.
+    conflict_in_root(&fixture);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    // Then the work edits the same line, and the root stays put.
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+}
+
 #[test]
 fn serve_auto_applies_ready_foreign_work_with_integrate() {
     let fixture = Fixture::new();
@@ -560,4 +646,107 @@ fn serve_view_lists_native_and_attached_runs() {
         "{attached}"
     );
     assert!(attached["verification"].is_string(), "{attached}");
+}
+
+/// A `dispatch -vv serve --background` owner whose `tick:` diagnostics are
+/// streamed to a channel; killed on drop.
+struct Diagnosed {
+    child: Child,
+    ticks: mpsc::Receiver<String>,
+}
+
+impl Diagnosed {
+    fn spawn(fixture: &Fixture) -> Self {
+        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
+            .arg("--state-dir")
+            .arg(&fixture.state)
+            .args(["-vv", "serve", "--background", "--root"])
+            .arg(&fixture.root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(tick) = line.split_once("tick: ").map(|(_, tick)| tick.to_owned())
+                    && tx.send(tick).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { child, ticks: rx }
+    }
+
+    fn next(&self) -> String {
+        self.ticks
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a tick line")
+    }
+}
+
+impl Drop for Diagnosed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn an_idle_tick_evaluates_nothing() {
+    let fixture = Fixture::new();
+    let _id = stale_foreign_work(&fixture);
+    let owner = Diagnosed::spawn(&fixture);
+    let first = owner.next();
+    assert!(first.contains("1 evaluated"), "{first}");
+    for _ in 0..3 {
+        let idle = owner.next();
+        assert!(idle.contains("1 followed"), "{idle}");
+        assert!(idle.contains("0 evaluated"), "{idle}");
+        assert!(idle.contains("0 rechecked"), "{idle}");
+    }
+}
+
+/// Where the owner's time goes as a project grows: a Git root of 2,000 files
+/// with 1, 5 and 20 foreign attached Work items, idle and after the root
+/// moves. Prints its measurements; asserts nothing about time.
+/// `cargo test --test serve serve_tick_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn serve_tick_cost() {
+    for items in [1, 5, 20] {
+        let fixture = Fixture::new();
+        for n in 0..2000 {
+            let dir = fixture.root.join(format!("pkg{}", n / 100));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("m{n}.rs")),
+                format!("pub fn f{n}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(&fixture.root, &["add", "-A"]);
+        git(&fixture.root, &["commit", "--quiet", "-m", "grow"]);
+        for item in 0..items {
+            let workspace = fixture.extra_worktree(&format!("w{item}"));
+            fixture.attach_workspace(&workspace, &[]);
+            fs::write(
+                workspace.join(format!("pkg0/m{item}.rs")),
+                "pub fn changed() {}\n",
+            )
+            .unwrap();
+        }
+        let owner = Diagnosed::spawn(&fixture);
+        let first = owner.next();
+        let idle: Vec<String> = (0..3).map(|_| owner.next()).collect();
+        fs::write(fixture.root.join("pkg1/m100.rs"), "pub fn moved() {}\n").unwrap();
+        let moved = owner.next();
+        println!("{items} items, first: {first}");
+        for line in idle {
+            println!("{items} items, idle:  {line}");
+        }
+        println!("{items} items, moved: {moved}");
+    }
 }

@@ -310,14 +310,23 @@ plain (non-Git) directory, only the wrapped form works, and S0 is a snapshot tak
 the moment of attach — partial confidence: anything already changed before that moment
 is invisible to the patch Dispatch judges.
 
-**`dispatch serve [--root <path>]`** is a foreground process, one per repository, that
-watches every attached run with no live owner (a foreign attachment, or a wrapped
-attach whose wrapper process died) and applies the ones you marked `--auto-apply` once
-they are ready and coherent. It also prints a one-line-per-run project view —
-`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason` — that
-redraws in place as things change, and includes your ordinary Dispatch runs on the
-same source alongside attached ones. Run it alongside a foreign attachment so it gets
-observed and, if eligible, applied; wrapped attach and the TUI need no `serve` at all.
+**`dispatch start`** watches the project in the background, one owner per
+repository, and returns your shell. The owner:
+- keeps every attached run with no live owner observed: a foreign attachment, or a
+  wrapped attach whose wrapper process died;
+- keeps the verdict of every result waiting for your review current as the code
+  moves, native or attached;
+- applies the attached work you marked `--auto-apply` once it is ready and coherent.
+
+**`dispatch watch`** shows a one-line-per-run project view,
+`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason`,
+under a line saying who watches. It redraws in place as things change, and leaving
+it does not stop watching. **`dispatch stop`** ends watching. `dispatch serve` is
+the same owner in the foreground, with the view.
+
+Watching needs no agent profile. It covers the Work Dispatch launched or that you
+attached, and nothing else on your machine. Wrapped attach and the TUI need no
+owner at all.
 
 What shows in the CLI: `dispatch status` and `dispatch check` treat an attached run
 exactly like any other single-result run once it is finished — same `Coherence`

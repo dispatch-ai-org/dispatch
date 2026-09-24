@@ -486,22 +486,40 @@ pub fn snapshot_delta(baseline_path: &Path, workspace: &Path, out_patch: &Path) 
         .prefix("dispatch-index-")
         .tempdir()
         .context("failed to create a temporary Git index")?;
-    let index_path = index_directory.path().join("index");
+    snapshot_delta_indexed(
+        baseline_path,
+        workspace,
+        out_patch,
+        &index_directory.path().join("index"),
+    )
+}
 
-    let mut read_tree = comparison_git_command(baseline_path, workspace);
-    read_tree
-        .env("GIT_INDEX_FILE", &index_path)
-        .args(["read-tree", "HEAD"]);
-    checked_output(read_tree, "failed to initialize temporary Git index")?;
+/// `snapshot_delta` with an index the caller keeps between snapshots of the
+/// same workspace: Git's stat cache then re-hashes only files that changed,
+/// which is what makes following work every tick affordable. The baseline's
+/// HEAD never moves, so the index is initialized from it only once.
+pub fn snapshot_delta_indexed(
+    baseline_path: &Path,
+    workspace: &Path,
+    out_patch: &Path,
+    index_path: &Path,
+) -> Result<()> {
+    if !index_path.exists() {
+        let mut read_tree = comparison_git_command(baseline_path, workspace);
+        read_tree
+            .env("GIT_INDEX_FILE", index_path)
+            .args(["read-tree", "HEAD"]);
+        checked_output(read_tree, "failed to initialize temporary Git index")?;
+    }
 
     let mut add = comparison_git_command(baseline_path, workspace);
-    add.env("GIT_INDEX_FILE", &index_path)
+    add.env("GIT_INDEX_FILE", index_path)
         .args(["add", "-A", "--", "."])
         .args(dispatch_exclusion_pathspecs());
     checked_output(add, "failed to stage the work in progress")?;
 
     let mut diff = comparison_git_command(baseline_path, workspace);
-    diff.env("GIT_INDEX_FILE", &index_path).args([
+    diff.env("GIT_INDEX_FILE", index_path).args([
         "diff",
         "--cached",
         "--binary",
@@ -2301,6 +2319,46 @@ mod tests {
         let delta = fs::read_to_string(&delta_path).unwrap();
         assert!(delta.contains("src/lib.rs"));
         assert!(!delta.contains("build/"));
+    }
+
+    #[test]
+    fn a_kept_index_snapshots_exactly_what_a_fresh_one_does() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join("src/lib.rs"), "pub fn f() {}\n");
+        write(&source.join("README.md"), "readme\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        let index = temp.path().join("kept.index");
+        let (kept, fresh) = (
+            temp.path().join("kept.patch"),
+            temp.path().join("fresh.patch"),
+        );
+        let same = || {
+            snapshot_delta_indexed(&snapshot.baseline_path, &workspace, &kept, &index).unwrap();
+            snapshot_delta(&snapshot.baseline_path, &workspace, &fresh).unwrap();
+            let kept = fs::read_to_string(&kept).unwrap();
+            assert_eq!(kept, fs::read_to_string(&fresh).unwrap());
+            kept
+        };
+
+        assert!(same().is_empty());
+        write(&workspace.join("src/lib.rs"), "pub fn f() { 1 }\n");
+        write(&workspace.join("new.txt"), "new\n");
+        assert!(same().contains("new.txt"));
+        // Same size, rewritten: the stat cache must not hide it.
+        write(&workspace.join("src/lib.rs"), "pub fn f() { 2 }\n");
+        assert!(same().contains("{ 2 }"));
+        // Reverted and deleted work leaves the patch.
+        write(&workspace.join("src/lib.rs"), "pub fn f() {}\n");
+        fs::remove_file(workspace.join("new.txt")).unwrap();
+        fs::remove_file(workspace.join("README.md")).unwrap();
+        let patch = same();
+        assert!(!patch.contains("src/lib.rs") && !patch.contains("new.txt"));
+        assert!(patch.contains("deleted file mode"));
     }
 
     #[test]

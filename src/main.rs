@@ -143,6 +143,31 @@ enum Command {
         root: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// The owner `dispatch start` runs: no view, a log on stderr.
+        #[arg(long, hide = true, conflicts_with = "json")]
+        background: bool,
+    },
+    /// Watch this project in the background and return: Work it knows about
+    /// stays checked against the source as it moves. No agent is needed.
+    Start {
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Show this project's Work live, as the watcher keeps it. Leaving the
+    /// view (Ctrl+C) does not stop watching.
+    Watch {
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop watching this project in the background.
+    Stop {
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// Show a run and its persisted signals.
     #[command(hide = true)]
@@ -352,6 +377,7 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
         .init();
 
@@ -564,7 +590,14 @@ async fn run() -> Result<()> {
             orchestrator::attach::finish(&state, &run_id, allow_unsafe_local).await?;
             Ok(())
         }
-        Command::Serve { root, json } => orchestrator::serve::serve(&state, root, json).await,
+        Command::Serve {
+            root,
+            json,
+            background,
+        } => orchestrator::serve::serve(&state, root, json, background).await,
+        Command::Start { root } => orchestrator::background::start(&state, root, cli.verbose),
+        Command::Stop { root } => orchestrator::background::stop(&state, root),
+        Command::Watch { root, json } => orchestrator::serve::watch(&state, root, json).await,
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
             run_id,

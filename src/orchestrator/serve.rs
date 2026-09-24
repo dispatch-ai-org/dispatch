@@ -1,15 +1,15 @@
-//! `dispatch serve`: the repo-scoped foreground owner loop for foreign and
-//! orphaned attached Work (part 6.7, 6.9, 14.4, 14.11 of
-//! `docs/plan-0.3-auto-apply-and-attach.md`). One process per integration
-//! root: every tick it observes the root's world, re-evaluates active
-//! attached Work whose live owner is not `Live`, auto-applies Ready attached
-//! Work whose `capabilities.integrate` is true, adopts Work whose stored
-//! owner has gone, and prints the project view. It never finishes, launches,
-//! kills or refreshes anything; wrapped attach (S4) and human review remain
-//! the only things that do.
+//! The project owner and its view (`docs/attach.md`, "The project owner").
+//! One owner per integration root, `dispatch start` in the background or
+//! `dispatch serve` in the foreground: every tick it observes the root's
+//! world, adopts attached Work whose owner has gone, follows unowned attached
+//! Work, keeps Ready results' verdicts what `check` would show, and
+//! auto-applies attached Work whose `capabilities.integrate` is true. It never
+//! finishes, launches, kills or refreshes anything; wrapped attach and human
+//! review remain the only things that do. `dispatch watch` renders the same
+//! view from canonical state and owns nothing.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line};
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
-    RunMode, RunRecord, SourceKind, WorkResult,
-    coherence::{self, WorkView, watch::Policy, world},
+    RunMode, RunRecord, SourceKind, Validity, WorkResult,
+    coherence::{self, WorkView, world},
     db::Database,
     lock::{OperationLock, shutdown_signal},
     process::{IdentityState, ProcessIdentity, identity_state},
@@ -33,114 +33,291 @@ use crate::{
 };
 
 /// `dispatch serve [--root <path>] [--json]`. Loops until Ctrl+C, SIGTERM or
-/// SIGHUP; a second `serve` on the same root refuses to start.
-pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<()> {
+/// SIGHUP; a second `serve` on the same root refuses to start. The owner
+/// decides and records; this loop only renders what it did. `background`
+/// is `dispatch start`'s owner: it renders nothing, and its stderr is a log
+/// that names each distinct error once.
+pub async fn serve(
+    state: &State,
+    root: Option<PathBuf>,
+    json: bool,
+    background: bool,
+) -> Result<()> {
     state.initialize()?;
     let root = source::resolve_source(root.as_deref())?;
-    let _serve_lock =
-        OperationLock::acquire(&serve_lock_path(state, &root), "already serving this root")?;
+    let _serve_lock = super::background::acquire(state, &root)?;
     let (kind, _head) = source::inspect_source(&root)?;
     let (config, _config_path) = Config::discover(&root, None)?;
     let poll = Duration::from_secs(config.coherence.poll_secs.max(1));
+    let mut owner = Owner::new(root.clone(), kind)?;
+    super::background::write_record(state, &root, background)?;
+    if background {
+        eprintln!(
+            "{} watching {} (pid {})",
+            Utc::now().to_rfc3339(),
+            root.display(),
+            std::process::id()
+        );
+    }
+    let result = run(state, &mut owner, poll, json, background).await;
+    super::background::remove_record(state, &root);
+    if background {
+        eprintln!("{} stopped", Utc::now().to_rfc3339());
+    }
+    result
+}
 
+async fn run(
+    state: &State,
+    owner: &mut Owner,
+    poll: Duration,
+    json: bool,
+    background: bool,
+) -> Result<()> {
     let mut ticker = tokio::time::interval(poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let mut last_signal: Option<world::Signal> = None;
-    let mut policies: HashMap<String, Policy> = HashMap::new();
-    let mut shown: HashMap<String, String> = HashMap::new();
-    let mut last_block: Vec<String> = Vec::new();
-    let mut first = true;
+    // Listening for the whole loop, so a signal that arrives mid-tick is
+    // still seen at the next select.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut view = View::default();
+    let mut last_error: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = shutdown_signal() => return Ok(()),
+            _ = &mut shutdown => return Ok(()),
         }
+        let tick = owner.tick(state);
+        if tick.cost.idle() && !tick.moved {
+            tracing::debug!("tick: {}", tick.cost);
+        } else {
+            tracing::info!("tick: {}", tick.cost);
+        }
+        if background {
+            if tick.error.is_some() && tick.error != last_error {
+                eprintln!(
+                    "{} {}",
+                    Utc::now().to_rfc3339(),
+                    tick.error.as_deref().unwrap_or_default()
+                );
+            }
+            last_error = tick.error;
+            continue;
+        }
+        if let Some(error) = &tick.error {
+            eprintln!("serve: {error}");
+        }
+        if json
+            && tick.moved
+            && let Some(digest) = &tick.digest
+        {
+            println!("{}", serde_json::json!({"type": "world", "digest": digest}));
+        }
+        // Render every tick: a run attached, finished or applied by another
+        // process changes the view without any verdict or apply of our own.
+        // `render` prints only what differs from what is already shown.
+        view.render(None, &tick.runs, json);
+        let _ = io::stdout().flush();
+    }
+}
 
-        let mut errors = TickErrors::default();
-        let mut changed = first;
-        let mut digest: Option<String> = None;
+/// `dispatch watch [--root <path>] [--json]`: the project view, live, read
+/// from canonical state. It takes no lock and records nothing, so leaving it
+/// never stops project watching. It redraws when an event is committed, when
+/// who watches changes, and every 30 s so finished Work ages out.
+pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<()> {
+    let root = source::resolve_source(root.as_deref())?;
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut view = View::default();
+    let mut shown: Option<(Option<i64>, String)> = None;
+    let mut rendered_at = Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = &mut shutdown => return Ok(()),
+        }
+        let header = format!(
+            "{} · {}",
+            root.display(),
+            super::background::describe(state, &root)
+        );
+        let journal = Database::open_read_only(state.db_path())
+            .and_then(|db| db.latest_event_id())
+            .ok()
+            .flatten();
+        let now = (journal, header);
+        if shown.as_ref() == Some(&now) && rendered_at.elapsed() < Duration::from_secs(30) {
+            continue;
+        }
+        match load_source_runs(state, &root) {
+            Ok(runs) => view.render(Some(&now.1), &runs, json),
+            Err(error) => eprintln!("watch: {error:#}"),
+        }
+        let _ = io::stdout().flush();
+        shown = Some(now);
+        rendered_at = Instant::now();
+    }
+}
 
-        let signal_now = match world::signal(&root, &kind) {
+/// The project owner for one integration root: everything `serve` decides
+/// and records, and nothing it prints. One `tick` observes the world, adopts
+/// orphaned attached Work, re-evaluates unowned Work and auto-applies what
+/// policy allows, all under the same locks as before.
+pub(crate) struct Owner {
+    root: PathBuf,
+    kind: SourceKind,
+    last_signal: Option<world::Signal>,
+    /// Each followed run's work signal when it was last evaluated.
+    work: HashMap<String, String>,
+    /// Each Ready result's world signal when it was last checked.
+    checked: HashMap<String, world::Signal>,
+    scratch: tempfile::TempDir,
+}
+
+/// What one tick did, and the root's runs as they stand after it.
+#[derive(Default)]
+pub(crate) struct Tick {
+    pub moved: bool,
+    pub adopted: bool,
+    pub persisted: bool,
+    pub applied: bool,
+    pub digest: Option<String>,
+    pub runs: Vec<RunRecord>,
+    /// The first error of the tick. SQLite busy and other transient
+    /// failures are retried on the next tick rather than ending the loop.
+    pub error: Option<String>,
+    pub cost: Cost,
+}
+
+/// Where one tick's time went, for `-v` diagnostics: the world signal,
+/// loading the root's runs, following unowned attached work (snapshotting
+/// its patch), evaluating it, re-checking Ready results, and auto-apply.
+#[derive(Default)]
+pub(crate) struct Cost {
+    pub signal: Duration,
+    pub load: Duration,
+    pub follow: Duration,
+    pub evaluate: Duration,
+    pub recheck: Duration,
+    pub apply: Duration,
+    pub runs: usize,
+    pub followed: usize,
+    pub evaluated: usize,
+    pub rechecked: usize,
+}
+
+impl Cost {
+    fn idle(&self) -> bool {
+        self.evaluated == 0 && self.rechecked == 0
+    }
+}
+
+impl std::fmt::Display for Cost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_millis();
+        write!(
+            f,
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms",
+            ms(self.signal),
+            self.runs,
+            ms(self.load),
+            self.followed,
+            ms(self.follow),
+            self.evaluated,
+            ms(self.evaluate),
+            self.rechecked,
+            ms(self.recheck),
+            ms(self.apply)
+        )
+    }
+}
+
+impl Tick {
+    fn report(&mut self, error: &anyhow::Error) {
+        self.error.get_or_insert_with(|| format!("{error:#}"));
+    }
+}
+
+impl Owner {
+    pub(crate) fn new(root: PathBuf, kind: SourceKind) -> Result<Self> {
+        Ok(Self {
+            root,
+            kind,
+            last_signal: None,
+            work: HashMap::new(),
+            checked: HashMap::new(),
+            scratch: tempfile::Builder::new()
+                .prefix("dispatch-owner-")
+                .tempdir()
+                .context("failed to create the owner's scratch directory")?,
+        })
+    }
+
+    pub(crate) fn tick(&mut self, state: &State) -> Tick {
+        let mut tick = Tick::default();
+        let started = Instant::now();
+        let signal_now = match world::signal(&self.root, &self.kind) {
             Ok(signal) => Some(signal),
             Err(error) => {
-                errors.report(&error);
+                tick.report(&error);
                 None
             }
         };
-        let moved = match (&signal_now, &last_signal) {
+        tick.moved = match (&signal_now, &self.last_signal) {
             (Some(now), Some(previous)) => now != previous,
             (Some(_), None) => true,
             (None, _) => false,
         };
         if let Some(signal_now) = &signal_now {
-            last_signal = Some(signal_now.clone());
+            self.last_signal = Some(signal_now.clone());
         }
+        tick.cost.signal = started.elapsed();
 
-        let adopted = adopt_orphans(state, &root, &mut errors);
-        if moved || adopted {
-            let pass = reevaluate(state, &root, &kind, &mut policies, &mut errors);
-            changed |= pass.changed;
-            digest = pass.digest;
-        }
-
-        for run in ready_for_auto_apply(state, &root, &mut errors) {
+        let started = Instant::now();
+        let runs = self.load(state, &mut tick);
+        tick.cost.load = started.elapsed();
+        tick.cost.runs = runs.len();
+        tick.adopted = adopt_orphans(state, &runs, &mut tick);
+        let moved = tick.moved || tick.adopted;
+        self.reevaluate(state, &runs, &mut tick, moved);
+        let started = Instant::now();
+        self.recheck_ready(state, &runs, &mut tick);
+        tick.cost.recheck = started.elapsed();
+        let started = Instant::now();
+        for run in ready_for_auto_apply(&runs) {
             match auto_apply(state, &run.id) {
                 Ok(ApplyOutcome::Applied { .. }) => {
-                    changed = true;
+                    tick.applied = true;
                     // The apply is the doorbell: re-observe immediately
                     // rather than waiting for the next tick's signal.
-                    let pass = reevaluate(state, &root, &kind, &mut policies, &mut errors);
-                    changed |= pass.changed;
-                    digest = digest.or(pass.digest);
+                    self.reevaluate(state, &runs, &mut tick, true);
                 }
                 Ok(_) => {}
-                Err(error) => errors.report(&error),
+                Err(error) => tick.report(&error),
             }
         }
-
-        if json && moved {
-            let digest = digest.clone().or_else(|| signal_now.map(|signal| signal.0));
-            if let Some(digest) = digest {
-                println!("{}", serde_json::json!({"type": "world", "digest": digest}));
-            }
+        tick.cost.apply = started.elapsed();
+        if tick.digest.is_none() {
+            tick.digest = signal_now.map(|signal| signal.0);
         }
-
-        // Render every tick: a run attached, finished or applied by another
-        // process changes the view without any verdict or apply of our own.
-        // `render_view` prints only what differs from what is already shown.
-        let _ = changed;
-        match load_source_runs(state, &root) {
-            Ok(runs) => render_view(&runs, json, &mut shown, &mut last_block),
-            Err(error) => errors.report(&error),
-        }
-        let _ = io::stdout().flush();
-
-        first = false;
+        tick.runs = if tick.adopted || tick.persisted || tick.applied {
+            self.load(state, &mut tick)
+        } else {
+            runs
+        };
+        tick
     }
-}
 
-/// Logs at most one error per tick to stderr; SQLite busy and other
-/// transient failures are retried on the next tick rather than aborting the
-/// loop (part 6.9, part 5 of the objective).
-#[derive(Default)]
-struct TickErrors {
-    logged: bool,
-}
-
-impl TickErrors {
-    fn report(&mut self, error: &anyhow::Error) {
-        if !self.logged {
-            eprintln!("serve: {error:#}");
-            self.logged = true;
-        }
+    fn load(&self, state: &State, tick: &mut Tick) -> Vec<RunRecord> {
+        load_source_runs(state, &self.root).unwrap_or_else(|error| {
+            tick.report(&error);
+            Vec::new()
+        })
     }
-}
-
-fn serve_lock_path(state: &State, root: &Path) -> PathBuf {
-    let key = hex::encode(Sha256::digest(root.to_string_lossy().as_bytes()));
-    state.root.join("locks").join(format!("serve-{key}.lock"))
 }
 
 fn run_lock_path(state: &State, run_id: &str) -> PathBuf {
@@ -148,15 +325,15 @@ fn run_lock_path(state: &State, run_id: &str) -> PathBuf {
 }
 
 /// Every run (any mode) whose `source_path` is `root`, loaded fresh from
-/// disk/DB. Mirrors `orchestrator::load_latest_for_source`'s scan.
-fn load_source_runs(state: &State, root: &Path) -> Result<Vec<RunRecord>> {
+/// disk/DB. A run's source never changes, so the projected metadata decides
+/// which runs to load; other projects' runs are never loaded.
+pub(crate) fn load_source_runs(state: &State, root: &Path) -> Result<Vec<RunRecord>> {
     let mut runs = Vec::new();
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
-        let run = state.load_run(&projected.id)?;
-        if run.source_path == root {
-            runs.push(run);
+        if projected.source_path == root {
+            runs.push(state.load_run(&projected.id)?);
         }
     }
     Ok(runs)
@@ -179,14 +356,7 @@ fn live_owner_state(owner: Option<&ProcessIdentity>) -> OwnerState {
 /// whose owner process is now gone: commit `attach.adopted` once and mark
 /// `owner_state: Adopted`. A run whose lock is held elsewhere is skipped,
 /// not forced. Returns whether anything was adopted this tick.
-fn adopt_orphans(state: &State, root: &Path, errors: &mut TickErrors) -> bool {
-    let runs = match load_source_runs(state, root) {
-        Ok(runs) => runs,
-        Err(error) => {
-            errors.report(&error);
-            return false;
-        }
-    };
+fn adopt_orphans(state: &State, runs: &[RunRecord], errors: &mut Tick) -> bool {
     let mut adopted = false;
     for candidate in runs {
         if candidate.mode != RunMode::Attached
@@ -250,153 +420,233 @@ fn adopt_orphans(state: &State, root: &Path, errors: &mut TickErrors) -> bool {
     adopted
 }
 
-/// What one reevaluation pass did: whether any verdict was persisted, and
-/// the world digest from the first `world::observe` call it made (`observe`
-/// hashes the current tree independently of which run's baseline is passed
-/// in, so every call this tick reports the same digest).
-struct ObservePass {
-    changed: bool,
-    digest: Option<String>,
+impl Owner {
+    /// Re-evaluate every active attached run whose live owner state is not
+    /// `Live` (a live wrapper owns those; part 14.4 step (b)/(c)) when the
+    /// world moved or the work did: observe the world against that run's own
+    /// baseline, evaluate, drop `analysis_uncertain`-only reasons, and persist
+    /// through `apply::persist_verdict` what is worth recording. The first
+    /// world digest observed is the tick's: `observe` hashes the current tree
+    /// whichever baseline it is given.
+    fn reevaluate(
+        &mut self,
+        state: &State,
+        runs: &[RunRecord],
+        tick: &mut Tick,
+        world_moved: bool,
+    ) {
+        let (root, kind) = (self.root.as_path(), &self.kind);
+        let mut followed = HashSet::new();
+        for candidate in runs {
+            if candidate.mode != RunMode::Attached
+                || candidate.outcome.lifecycle == LifecycleState::Finished
+            {
+                continue;
+            }
+            let Some(attachment) = candidate.attachment.as_ref() else {
+                continue;
+            };
+            if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
+                continue; // the wrapper's own business
+            }
+            // The work's signal is its patch so far, taken without the run's
+            // lock into a scratch file: `finish` takes that lock without
+            // waiting, so the owner holds it only when something moved.
+            let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
+            let started = Instant::now();
+            let index = scratch.with_extension("index");
+            let work = source::snapshot_delta_indexed(
+                &candidate.baseline_path,
+                &attachment.workspace,
+                &scratch,
+                &index,
+            )
+            .and_then(|()| Ok(hex::encode(Sha256::digest(fs::read(&scratch)?))));
+            tick.cost.follow += started.elapsed();
+            tick.cost.followed += 1;
+            let work = match work {
+                Ok(work) => work,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            followed.insert(candidate.id.clone());
+            if !world_moved && self.work.get(&candidate.id) == Some(&work) {
+                continue;
+            }
+            let Ok(_lock) = OperationLock::acquire(
+                &run_lock_path(state, &candidate.id),
+                "run has a foreground owner",
+            ) else {
+                continue; // busy: skip this tick, don't force it
+            };
+            let mut run = match state.load_run(&candidate.id) {
+                Ok(run) => run,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            if run.outcome.lifecycle == LifecycleState::Finished {
+                continue; // finished meanwhile (e.g. `dispatch finish` raced us)
+            }
+            let Some(attachment) = run.attachment.clone() else {
+                continue;
+            };
+            if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
+                continue;
+            }
+            let started = Instant::now();
+            let delta_path = state.run_dir(&run.id).join("delta-live.patch");
+            if let Err(error) =
+                source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
+            {
+                tick.report(&error);
+                continue;
+            }
+            let world = match world::observe(root, &run.baseline_path, &run.baseline_commit, kind) {
+                Ok(world) => world,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            tick.digest.get_or_insert_with(|| world.digest.clone());
+            let validity = match coherence::evaluate(
+                &world,
+                &WorkView {
+                    source: root,
+                    delta_patch: &delta_path,
+                    baseline: &run.baseline_path,
+                    baseline_commit: &run.baseline_commit,
+                },
+            ) {
+                Ok(validity) => validity,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            tick.cost.evaluate += started.elapsed();
+            tick.cost.evaluated += 1;
+            // Compared with the verdict stored on the run, not with anything
+            // this process remembers: a restarted owner still records a change.
+            let validity = coherence::watch::settle(validity);
+            let stored = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+            if !worth_storing(stored, &validity) {
+                self.work.insert(run.id.clone(), work);
+                continue;
+            }
+            let database = match Database::open(state.db_path()) {
+                Ok(database) => database,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            if let Err(error) = apply::persist_verdict(state, &database, &mut run, &validity) {
+                tick.report(&error);
+                continue;
+            }
+            self.work.insert(run.id.clone(), work);
+            tick.persisted = true;
+        }
+        self.work.retain(|id, _| followed.contains(id));
+    }
 }
 
-/// Re-evaluate every active attached run whose live owner state is not
-/// `Live` (a live wrapper owns those; part 14.4 step (b)/(c)): observe the
-/// world against that run's own baseline, evaluate, drop
-/// `analysis_uncertain`-only reasons, apply the watcher's "worth sending"
-/// rule, and persist through `apply::persist_verdict`.
-fn reevaluate(
-    state: &State,
-    root: &Path,
-    kind: &SourceKind,
-    policies: &mut HashMap<String, Policy>,
-    errors: &mut TickErrors,
-) -> ObservePass {
-    let mut pass = ObservePass {
-        changed: false,
-        digest: None,
-    };
-    let runs = match load_source_runs(state, root) {
-        Ok(runs) => runs,
-        Err(error) => {
-            errors.report(&error);
-            return pass;
-        }
-    };
-    for candidate in runs {
-        if candidate.mode != RunMode::Attached
-            || candidate.outcome.lifecycle == LifecycleState::Finished
-        {
-            continue;
-        }
-        let Some(attachment) = candidate.attachment.as_ref() else {
-            continue;
+impl Owner {
+    /// Keep the stored verdict of every Ready result awaiting review, native
+    /// or attached, what `check` would show: `coherence::live_validity`, which
+    /// keeps a refusal by the merged-tree checks for as long as the world has
+    /// not moved. A result is checked when it becomes Ready and again whenever
+    /// the world signal moves. The evaluation takes no lock; the run's lock is
+    /// held only to record a verdict that is worth storing, and only if the
+    /// run has not changed since it was read.
+    fn recheck_ready(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let Some(signal) = self.last_signal.clone() else {
+            return;
         };
-        if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
-            continue; // the wrapper's own business
-        }
-        let Ok(_lock) = OperationLock::acquire(
-            &run_lock_path(state, &candidate.id),
-            "run has a foreground owner",
-        ) else {
-            continue; // busy: skip this tick, don't force it
-        };
-        let mut run = match state.load_run(&candidate.id) {
-            Ok(run) => run,
-            Err(error) => {
-                errors.report(&error);
+        let mut waiting = HashSet::new();
+        for candidate in runs {
+            if !awaits_review(candidate) {
                 continue;
             }
-        };
-        if run.outcome.lifecycle == LifecycleState::Finished {
-            continue; // finished meanwhile (e.g. `dispatch finish` raced us)
-        }
-        let Some(attachment) = run.attachment.clone() else {
-            continue;
-        };
-        if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
-            continue;
-        }
-        let delta_path = state.run_dir(&run.id).join("delta-live.patch");
-        if let Err(error) =
-            source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
-        {
-            errors.report(&error);
-            continue;
-        }
-        let world = match world::observe(root, &run.baseline_path, &run.baseline_commit, kind) {
-            Ok(world) => world,
-            Err(error) => {
-                errors.report(&error);
+            waiting.insert(candidate.id.clone());
+            if self.checked.get(&candidate.id) == Some(&signal) {
                 continue;
             }
-        };
-        pass.digest.get_or_insert_with(|| world.digest.clone());
-        let validity = match coherence::evaluate(
-            &world,
-            &WorkView {
-                source: root,
-                delta_patch: &delta_path,
-                baseline: &run.baseline_path,
-                baseline_commit: &run.baseline_commit,
-            },
-        ) {
-            Ok(validity) => validity,
-            Err(error) => {
-                errors.report(&error);
+            // An evaluation that fails is logged by `live_validity` and
+            // tried again when the world next moves.
+            tick.cost.rechecked += 1;
+            let Some(validity) = coherence::live_validity(candidate) else {
+                self.checked.insert(candidate.id.clone(), signal.clone());
+                continue;
+            };
+            let stored = candidate
+                .coherence
+                .as_ref()
+                .and_then(|c| c.validity.as_ref());
+            if !worth_storing(stored, &validity) {
+                self.checked.insert(candidate.id.clone(), signal.clone());
                 continue;
             }
-        };
-        let validity = coherence::watch::settle(validity);
-        let policy = policies.entry(run.id.clone()).or_default();
-        let Some(worth_sending) = policy.step(Instant::now(), Some(validity)) else {
-            continue;
-        };
-        let database = match Database::open(state.db_path()) {
-            Ok(database) => database,
-            Err(error) => {
-                errors.report(&error);
-                continue;
+            let Ok(_lock) = OperationLock::acquire(
+                &run_lock_path(state, &candidate.id),
+                "run has a foreground owner",
+            ) else {
+                continue; // busy: a review or apply is under way; try next tick
+            };
+            let recorded = state.load_run(&candidate.id).and_then(|mut run| {
+                if run.state_revision != candidate.state_revision {
+                    return Ok(false); // changed since it was read; next tick
+                }
+                let database = Database::open(state.db_path())?;
+                apply::persist_verdict(state, &database, &mut run, &validity)?;
+                Ok(true)
+            });
+            match recorded {
+                Ok(true) => {
+                    self.checked.insert(candidate.id.clone(), signal.clone());
+                    tick.persisted = true;
+                }
+                Ok(false) => {}
+                Err(error) => tick.report(&error),
             }
-        };
-        if let Err(error) = apply::persist_verdict(state, &database, &mut run, &worth_sending) {
-            errors.report(&error);
-            continue;
         }
-        pass.changed = true;
+        self.checked.retain(|id, _| waiting.contains(id));
     }
-    pass
+}
+
+/// A Ready result nobody has accepted, rejected or applied yet.
+fn awaits_review(run: &RunRecord) -> bool {
+    run.outcome.review == ReviewState::Pending && coherence::is_ready_unapplied(run)
+}
+
+/// Whether the owner stores `validity` over `stored`: when it says something
+/// new (`worth_recording`), and also the first time the Work is checked at
+/// all, so the view says "unmoved" or CONTINUE rather than "not checked".
+fn worth_storing(stored: Option<&Validity>, validity: &Validity) -> bool {
+    stored.is_none() || coherence::watch::worth_recording(stored, validity)
 }
 
 /// Every attached run ready to auto-apply: finished, `Ready`, unreviewed,
 /// unapplied, and `capabilities.integrate`.
-fn ready_for_auto_apply(state: &State, root: &Path, errors: &mut TickErrors) -> Vec<RunRecord> {
-    match load_source_runs(state, root) {
-        Ok(runs) => runs
-            .into_iter()
-            .filter(|run| {
-                run.mode == RunMode::Attached
-                    && run.outcome.lifecycle == LifecycleState::Finished
-                    && run.outcome.work_result == WorkResult::Ready
-                    && run.outcome.review == ReviewState::Pending
-                    && run.outcome.application == ApplicationState::NotApplied
-                    && run
-                        .attachment
-                        .as_ref()
-                        .is_some_and(|attachment| attachment.capabilities.integrate)
-            })
-            .collect(),
-        Err(error) => {
-            errors.report(&error);
-            Vec::new()
-        }
-    }
+fn ready_for_auto_apply(runs: &[RunRecord]) -> impl Iterator<Item = &RunRecord> {
+    runs.iter().filter(|run| {
+        run.mode == RunMode::Attached
+            && run.outcome.lifecycle == LifecycleState::Finished
+            && run.outcome.work_result == WorkResult::Ready
+            && run.outcome.review == ReviewState::Pending
+            && run.outcome.application == ApplicationState::NotApplied
+            && run
+                .attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.capabilities.integrate)
+    })
 }
 
-/// `working`/`ready`/`applied`/`blocked`/`finished` (part 14.11). Not part
-/// of the frozen types: `application` already distinguishes applied and
-/// source-drift-blocked; a `Ready`, unapplied run whose last stored verdict
-/// is `Refresh`/`Stop` is shown as `blocked` too, since that is exactly why
-/// auto-apply has not (yet) applied it.
 /// The view's line for one run: the shared Work line from its stored
 /// validity. Native runs' verdicts are never recomputed here.
 fn describe(run: &RunRecord) -> (WorkLine, Option<Decision>) {
@@ -404,15 +654,16 @@ fn describe(run: &RunRecord) -> (WorkLine, Option<Decision>) {
     (work_line(run, validity), validity.map(|v| v.decision))
 }
 
-/// Runs whose `source_path` is `root` and that are still active or finished
-/// within the last hour (part 4/14.11 of the view), sorted for a stable
-/// redraw.
+/// Runs whose `source_path` is `root` and that are still active, still wait
+/// for your review, or finished within the last hour (part 4/14.11 of the
+/// view), sorted for a stable redraw.
 fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     let now = Utc::now();
     let mut rows: Vec<&RunRecord> = runs
         .iter()
         .filter(|run| {
             run.outcome.lifecycle != LifecycleState::Finished
+                || awaits_review(run)
                 || run
                     .completed_at
                     .is_some_and(|at| now - at < chrono::Duration::hours(1))
@@ -422,66 +673,84 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     rows
 }
 
-/// Print the project view. `--json` emits one `{"type":"work",...}` object
-/// per run whose displayed fields changed since the last tick; otherwise the
-/// whole block is printed, redrawn in place on a TTY and appended as lines
-/// otherwise.
-fn render_view(
-    runs: &[RunRecord],
-    json: bool,
-    shown: &mut HashMap<String, String>,
-    last_block: &mut Vec<String>,
-) {
-    let rows = view_rows(runs);
+/// The project view: what is shown, so each tick prints only what changed.
+/// Shared by `serve` in the foreground and `watch`.
+#[derive(Default)]
+pub(crate) struct View {
+    shown: HashMap<String, String>,
+    last_block: Vec<String>,
+    last_header: Option<String>,
+}
 
-    if json {
-        for run in rows {
-            let (line, decision) = describe(run);
-            let key = line.to_string();
-            if shown.get(&run.id) != Some(&key) {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "type": "work",
-                        "run_id": run.id,
-                        "agent": line.agent,
-                        "verdict": decision,
-                        "state": line.state,
-                        "reason": line.reason.as_deref().unwrap_or("—"),
-                        "origin": line.origin,
-                        "s0": line.s0,
-                        "verification": line.verification,
-                        "review": line.review,
-                        "applied_by": line.applied_by,
-                        "overridden": line.verdict == "overridden",
-                    })
-                );
-                shown.insert(run.id.clone(), key);
-            }
+impl View {
+    /// Print the project view under an optional header line. `--json`
+    /// emits one `{"type":"work",...}` object per run whose displayed fields
+    /// changed since the last tick, and a `{"type":"watcher",...}` object
+    /// when the header changed; otherwise the whole block is printed,
+    /// redrawn in place on a TTY and appended as lines otherwise.
+    pub(crate) fn render(&mut self, header: Option<&str>, runs: &[RunRecord], json: bool) {
+        if json && header.is_some() && self.last_header.as_deref() != header {
+            println!(
+                "{}",
+                serde_json::json!({"type": "watcher", "watcher": header})
+            );
         }
-        return;
-    }
+        self.last_header = header.map(str::to_owned);
+        let (shown, last_block) = (&mut self.shown, &mut self.last_block);
+        let rows = view_rows(runs);
 
-    let lines: Vec<String> = rows
-        .iter()
-        .map(|run| {
-            let id8 = &run.id[..8.min(run.id.len())];
-            format!("{id8} · {}", describe(run).0)
-        })
-        .collect();
+        if json {
+            for run in rows {
+                let (line, decision) = describe(run);
+                let key = line.to_string();
+                if shown.get(&run.id) != Some(&key) {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "work",
+                            "run_id": run.id,
+                            "agent": line.agent,
+                            "verdict": decision,
+                            "state": line.state,
+                            "reason": line.reason.as_deref().unwrap_or("—"),
+                            "origin": line.origin,
+                            "s0": line.s0,
+                            "verification": line.verification,
+                            "review": line.review,
+                            "applied_by": line.applied_by,
+                            "overridden": line.verdict == "overridden",
+                        })
+                    );
+                    shown.insert(run.id.clone(), key);
+                }
+            }
+            return;
+        }
 
-    // Rendered every tick, so redraw only when the block would differ.
-    if *last_block == lines {
-        return;
+        let empty = header.is_some() && rows.is_empty();
+        let lines: Vec<String> = header
+            .map(str::to_owned)
+            .into_iter()
+            .chain(rows.iter().map(|run| {
+                let id8 = &run.id[..8.min(run.id.len())];
+                format!("{id8} · {}", describe(run).0)
+            }))
+            .chain(empty.then(|| "no Work in the last hour".to_owned()))
+            .collect();
+
+        // Rendered every tick, so redraw only when the block would differ.
+        if *last_block == lines {
+            return;
+        }
+        let tty = std::io::stdout().is_terminal();
+        if tty && !last_block.is_empty() {
+            print!("\x1b[{}A\x1b[0J", last_block.len());
+        }
+        for line in &lines {
+            println!("{line}");
+        }
+        *last_block = lines;
     }
-    let tty = std::io::stdout().is_terminal();
-    if tty && !last_block.is_empty() {
-        print!("\x1b[{}A\x1b[0J", last_block.len());
-    }
-    for line in &lines {
-        println!("{line}");
-    }
-    *last_block = lines;
 }
 
 #[cfg(test)]
@@ -491,5 +760,28 @@ mod tests {
     #[test]
     fn live_owner_state_maps_identity_outcomes() {
         assert_eq!(live_owner_state(None), OwnerState::Unknown);
+    }
+
+    #[test]
+    fn a_result_awaiting_review_stays_in_the_view() {
+        let mut waiting: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"waiting", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"f", "baseline_path":"/baseline", "baseline_commit":"abc",
+            "status":"ready_for_evaluation", "created_at":"2026-09-17T00:00:00Z",
+            "completed_at":"2026-09-17T00:10:00Z",
+            "environment":{"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }))
+        .unwrap();
+        waiting.outcome.lifecycle = LifecycleState::Finished;
+        waiting.outcome.work_result = WorkResult::Ready;
+        waiting.outcome.review = ReviewState::Pending;
+        let mut reviewed = waiting.clone();
+        reviewed.id = "reviewed".into();
+        reviewed.outcome.review = ReviewState::Rejected;
+        let runs = [waiting, reviewed];
+        let rows: Vec<&str> = view_rows(&runs).iter().map(|run| run.id.as_str()).collect();
+        assert_eq!(rows, ["waiting"]);
     }
 }
