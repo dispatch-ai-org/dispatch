@@ -388,11 +388,8 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
         f.loaded(id)?.outcome.application,
         dispatch::ApplicationState::BlockedBySourceDrift
     );
-    // The human's review is still recorded; only the application is blocked.
-    assert_eq!(
-        f.loaded(id)?.outcome.review,
-        dispatch::ReviewState::Accepted
-    );
+    // A refused accept records no human review; the result stays pending.
+    assert_eq!(f.loaded(id)?.outcome.review, dispatch::ReviewState::Pending);
     let g = Fixture::new("success")?;
     let success = Fixture::result(&g.run(&[])?)?;
     let id = success["run_id"].as_str().unwrap();

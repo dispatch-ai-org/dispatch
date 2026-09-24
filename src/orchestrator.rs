@@ -2267,11 +2267,11 @@ fn print_allocation_details(decision: &AllocationDecision) {
     }
 }
 
-/// Record a human review of a delivered result, for every kind of work, and
-/// on accept apply it. The review is a revision (reasons and explanation
-/// verbatim), `outcome.review` and a `review.accepted|rejected` event. The
-/// caller holds the run lock from `locked_delivery`, so the review and the
-/// apply judge the same revision of the run.
+/// On accept apply a delivered result, then record the human review, for
+/// every kind of work; a reject only records the review. The review is a
+/// revision (reasons and explanation verbatim), `outcome.review` and a
+/// `review.accepted|rejected` event. The caller holds the run lock from
+/// `locked_delivery`, so the apply and the review judge the same revision.
 fn review_locked(
     state: &State,
     mut run: RunRecord,
@@ -2286,6 +2286,16 @@ fn review_locked(
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
+    // An accept is recorded only once the work has landed. When coherence or
+    // the apply refuses it, the refusal is recorded and the review stays
+    // pending: no human acceptance of work that never reached the source.
+    if accept && !already_auto_applied {
+        let id = run.id.clone();
+        apply::apply_locked(state, run, quiet, ApplyAuthority::Human)?;
+        run = Database::open(state.db_path())?
+            .committed_run_projection(&id)?
+            .context("applied run has no committed projection")?;
+    }
     let outcome = if accept {
         ReviewOutcome::Accepted
     } else {
@@ -2321,9 +2331,6 @@ fn review_locked(
     )?;
     if !quiet {
         println!("Review recorded (revision {}).", feedback.revision);
-    }
-    if accept && !already_auto_applied {
-        apply::apply_locked(state, run, quiet, ApplyAuthority::Human)?;
     }
     Ok(())
 }

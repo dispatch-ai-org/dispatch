@@ -82,10 +82,11 @@ it is now. Nothing about it is trusted from an earlier moment.
   analysis level, number of changed files, reasons and the next command. It is
   read-only, stores nothing, and exits 0 for any verdict (1 if it cannot evaluate).
   It runs the file, patch and symbol layers only; integration checks run at accept.
-- `dispatch accept [run]` records your decision and then applies. If the tree is
-  byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict
-  gates the apply. A `REFRESH` or `STOP` leaves the source untouched and the run
-  shows its application as blocked by source drift.
+- `dispatch accept [run]` applies the result and then records your acceptance. If
+  the tree is byte-identical to the snapshot, behavior is unchanged. If it moved,
+  the verdict gates the apply. A `REFRESH` or `STOP` leaves the source untouched,
+  shows the application as blocked by source drift, and records no acceptance: the
+  result stays pending until you refresh or reject it.
 - `dispatch refresh [run]` starts a **new** run of the same task against the current
   source. The task gets a fixed note naming the earlier run and up to ten reasons it
   went stale. The old run is not modified. It needs the same explicit flags as `run`

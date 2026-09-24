@@ -458,6 +458,12 @@ fn finish_then_root_moves_then_check_refreshes() {
     let stdout = Fixture::stdout(&assert);
     assert!(stdout.contains("Coherence: REFRESH"), "{stdout}");
     assert!(stdout.contains("patch_conflict"), "{stdout}");
+
+    // Accepting stale attached work is refused and records no human review.
+    f.dispatch(&["accept", &id]).failure();
+    assert_eq!(f.metadata(&id)["outcome"]["review"], "pending");
+    assert_eq!(f.goal_feedback_count(&id), 0);
+    assert_eq!(f.event_count(&id, "review.accepted"), 0);
 }
 
 #[test]

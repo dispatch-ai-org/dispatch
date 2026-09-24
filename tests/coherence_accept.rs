@@ -94,6 +94,25 @@ impl Fixture {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    /// A refused accept records no human review: the review stays pending,
+    /// with no review revision and no `review.accepted` event.
+    fn assert_review_still_pending(&self) {
+        assert_eq!(self.metadata()["outcome"]["review"], "pending");
+        let db = rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap();
+        let count =
+            |sql: &str| -> i64 { db.query_row(sql, [&self.run_id], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM goal_feedback_revisions WHERE run_id = ?1"),
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'review.accepted'"
+            ),
+            0
+        );
+    }
+
     fn apply(&self) -> assert_cmd::assert::Assert {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
@@ -160,6 +179,17 @@ fn conflicting_source_change_blocks_apply_and_leaves_source_unchanged() {
         metadata["coherence"]["validity"]["reasons"][0]["code"],
         "patch_conflict"
     );
+    fixture.assert_review_still_pending();
+    // Still the latest pending result: a bare accept finds it again.
+    let bare = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .arg("accept")
+        .current_dir(&fixture.source)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&bare.get_output().stderr).into_owned();
+    assert!(stderr.contains("stale"), "unexpected error: {stderr}");
 }
 
 #[test]
@@ -175,6 +205,7 @@ fn patch_already_present_in_source_stops() {
         fixture.metadata()["coherence"]["validity"]["decision"],
         "stop"
     );
+    fixture.assert_review_still_pending();
 }
 
 #[test]

@@ -234,3 +234,21 @@ Untouched throughout:
 - Semantic redundancy (F9) and behavior-level facts: longer-term research.
 - The daemon, and the real two-agent conflict trial under a long-lived authority.
 - A live verdict for native Work in `serve`.
+
+## Progress log
+
+- 2026-09-24 — Stage 1 (F2). An accept applies first and records the review
+  only after the change landed. A refused accept records `application.failed`
+  and leaves the review pending, with no revision and no `review.accepted`
+  event, and a bare `dispatch accept` still finds the run.
+  - Revising a rejection (reject, then accept) still works:
+    `validate_terminal_write` counts a human application (`applied`,
+    `applied_by: human`) as the human decision that may reopen rejected work. A
+    policy application may not.
+  - Tests:
+    - REFRESH and STOP refusals in `coherence_accept.rs`, and attached work in
+      `attach_cli.rs`. Both fail on 0.4.3.
+    - The drift test in `native_runs.rs` now expects `pending`.
+    - A unit test for the reopen rule.
+  - README and product guide updated.
+  - `cargo test`: 431 passed, 0 failed.

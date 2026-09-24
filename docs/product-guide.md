@@ -91,7 +91,8 @@ Review separates configured verification, human acceptance, and application:
 `Unverified — no checks configured` is attention, not success. Enter/d opens native
 changes; it never accepts. Choose `a` then Enter to accept and safely apply, `r`
 then Enter to reject, `n` to leave pending, or `i` for evidence and full paths.
-Source drift can preserve acceptance while blocking application.
+If the source moved and the result no longer holds, accepting it applies nothing,
+records no review and leaves the result pending, so you can refresh or reject it.
 
 While a result waits for review the source may keep changing. A Ready run's
 status shows one `Coherence:` line (`CONTINUE`, `REFRESH` or `STOP`), computed

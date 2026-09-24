@@ -2017,10 +2017,15 @@ fn validate_terminal_write(
                     && run.outcome.lifecycle == crate::LifecycleState::Finished),
             "cancelled work cannot reopen"
         );
+        // Only a human decision reopens rejected work: an explicit review, or
+        // the human applying it (which records the acceptance right after).
+        let human_applied = run.outcome.application == crate::ApplicationState::Applied
+            && run.outcome.applied_by == Some(crate::AppliedBy::Human);
         anyhow::ensure!(
             old.review != crate::ReviewState::Rejected
                 || run.outcome.review == crate::ReviewState::Rejected
-                || (explicit_review && run.outcome.lifecycle == crate::LifecycleState::Finished),
+                || ((explicit_review || human_applied)
+                    && run.outcome.lifecycle == crate::LifecycleState::Finished),
             "rejected work cannot automatically reopen"
         );
     }
@@ -2176,6 +2181,31 @@ mod tests {
         state.save_run(&record)?;
         assert_ne!(fs::metadata(&path)?.ino(), first);
         assert!(fs::read_to_string(&path)?.contains("\"changed\""));
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_human_decision_reopens_rejected_work() -> Result<()> {
+        let mut database = Database::open_in_memory()?;
+        let mut rejected = run("reopen");
+        rejected.outcome.lifecycle = crate::LifecycleState::Finished;
+        rejected.outcome.review = crate::ReviewState::Rejected;
+        database.sync_run(&rejected)?;
+        let reopened = |applied_by| {
+            let mut run = rejected.clone();
+            run.state_revision += 1;
+            run.outcome.review = crate::ReviewState::Accepted;
+            run.outcome.application = crate::ApplicationState::Applied;
+            run.outcome.applied_by = Some(applied_by);
+            run
+        };
+        assert!(
+            database
+                .sync_run(&reopened(crate::AppliedBy::AutoApply))
+                .is_err(),
+            "a policy application must not reopen rejected work"
+        );
+        database.sync_run(&reopened(crate::AppliedBy::Human))?;
         Ok(())
     }
 
