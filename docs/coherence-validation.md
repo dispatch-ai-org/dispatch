@@ -61,7 +61,9 @@ snapshot and the verdict.
 - **Refresh outcomes.** Whether a refreshed run was accepted, rejected or went
   stale again.
 - **Bypasses.** Every use of `coherence.accept: strict`, every accept over a
-  disagreed verdict, and every run on a path with no watcher (runs made before 0.4.1 by the legacy,
+  disagreed verdict (since 0.4.4 each is a `coherence.overridden` event carrying the
+  overridden verdict and the human's explanation, which also measures false
+  REFRESH), and every run on a path with no watcher (runs made before 0.4.1 by the legacy,
   routed, comparison or planned paths).
 - **Auto-apply outcomes and post-hoc disagreement.** Every `auto_apply.skipped` and
   `auto_apply.blocked` reason, every `result.applied`/`application.failed` with

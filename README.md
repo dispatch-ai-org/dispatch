@@ -87,6 +87,11 @@ it is now. Nothing about it is trusted from an earlier moment.
   the verdict gates the apply. A `REFRESH` or `STOP` leaves the source untouched,
   shows the application as blocked by source drift, and records no acceptance: the
   result stays pending until you refresh or reject it.
+- `dispatch accept [run] --despite-refresh --explanation "<why>"` applies a `REFRESH`
+  that comes only from the file and symbol analysis, when you have checked that the
+  work still holds. Your checks must still run and pass on the merged tree, and the
+  overridden verdict is recorded with your explanation. It never overrides `STOP`, a
+  patch that no longer applies, or a failing check, and auto-apply never uses it.
 - `dispatch refresh [run]` starts a **new** run of the same task against the current
   source. The task gets a fixed note naming the earlier run and up to ten reasons it
   went stale. The old run is not modified. It needs the same explicit flags as `run`

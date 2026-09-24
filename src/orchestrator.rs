@@ -622,6 +622,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
             refreshed_from: Some(old),
             validity: None,
             first_invalid_at: None,
+            overridden: None,
         }),
         applied_candidate: None,
         // Native runs never carry attachment provenance; only `dispatch attach`
@@ -1751,18 +1752,49 @@ pub fn review_diff(state: &State, command: &ReviewCommand) -> Result<String> {
 
 pub fn review_delivery(state: &State, command: &ReviewCommand, accept: bool) -> Result<RunRecord> {
     let (run, _lock) = review_target(state, command)?;
-    review_locked(state, run, accept, Vec::new(), None, true)?;
+    let decision = if accept {
+        ReviewDecision::Accept {
+            despite_refresh: false,
+        }
+    } else {
+        ReviewDecision::Reject
+    };
+    review_locked(state, run, decision, Vec::new(), None, true)?;
     state.load_run(&command.run_id)
+}
+
+/// A human's decision about a delivered result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// Apply it; `despite_refresh` overrides an analysis-only REFRESH.
+    Accept {
+        despite_refresh: bool,
+    },
+    Reject,
 }
 
 pub fn accept_or_reject_latest(
     state: &State,
     run_id: Option<&str>,
     source_path: &Path,
-    accept: bool,
+    decision: ReviewDecision,
     reasons: Vec<String>,
     explanation: Option<String>,
 ) -> Result<()> {
+    let accept = matches!(decision, ReviewDecision::Accept { .. });
+    let despite_refresh = matches!(
+        decision,
+        ReviewDecision::Accept {
+            despite_refresh: true
+        }
+    );
+    anyhow::ensure!(
+        !despite_refresh
+            || explanation
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+        "--despite-refresh needs --explanation or --explanation-file: say why the work still holds"
+    );
     let run = match run_id {
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
@@ -1778,7 +1810,7 @@ pub fn accept_or_reject_latest(
     let (run, _lock) = locked_delivery(state, &command)?;
     let already_auto_applied = run.outcome.application == ApplicationState::Applied
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
-    review_locked(state, run, accept, reasons, explanation, false)?;
+    review_locked(state, run, decision, reasons, explanation, false)?;
     if accept {
         if already_auto_applied {
             println!("Result was already applied by auto-apply; your review is recorded.");
@@ -1831,6 +1863,10 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     }
     match validity.decision {
         Decision::Continue => println!("Next: dispatch accept {}", run.id),
+        Decision::Refresh if run.mode == RunMode::Attached => println!(
+            "Next: run your agent again on the current source and attach it (or dispatch reject {})",
+            run.id
+        ),
         Decision::Refresh => println!(
             "Next: dispatch refresh {id}  (or dispatch reject {id})",
             id = run.id
@@ -1949,7 +1985,8 @@ pub(crate) struct WorkLine {
     pub origin: &'static str,
     pub agent: String,
     pub s0: String,
-    /// `CONTINUE`, `REFRESH`, `STOP`, `unmoved` or `not checked`.
+    /// `CONTINUE`, `REFRESH`, `STOP`, `unmoved`, `not checked`, or
+    /// `overridden` when a human applied it over a REFRESH.
     pub verdict: &'static str,
     pub reason: Option<String>,
     /// `working`, `ready`, `blocked`, `applied` or `finished`.
@@ -1979,7 +2016,18 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(crate::BaselineProvenance::SnapshotAtAttach) => "snapshot at attach (partial)".into(),
         None => format!("snapshot {}", short(&run.baseline_commit)),
     };
+    let overridden = run
+        .coherence
+        .as_ref()
+        .and_then(|record| record.overridden.as_ref())
+        .filter(|_| run.outcome.application == ApplicationState::Applied);
     let (verdict, reason) = match validity {
+        _ if overridden.is_some() => (
+            "overridden",
+            overridden
+                .and_then(|v| v.reasons.first())
+                .map(|r| r.detail.chars().take(60).collect()),
+        ),
         None => ("not checked", None),
         Some(v) if v.decision == Decision::Continue && !v.world_changed => ("unmoved", None),
         Some(v) => (
@@ -2275,11 +2323,15 @@ fn print_allocation_details(decision: &AllocationDecision) {
 fn review_locked(
     state: &State,
     mut run: RunRecord,
-    accept: bool,
+    decision: ReviewDecision,
     reasons: Vec<String>,
     explanation: Option<String>,
     quiet: bool,
 ) -> Result<()> {
+    let (accept, despite_refresh) = match decision {
+        ReviewDecision::Accept { despite_refresh } => (true, despite_refresh),
+        ReviewDecision::Reject => (false, false),
+    };
     // A run already applied by the auto-apply policy only has its human
     // review recorded here; applying again would be a second, redundant
     // application and rejection must never revert the source.
@@ -2291,10 +2343,40 @@ fn review_locked(
     // pending: no human acceptance of work that never reached the source.
     if accept && !already_auto_applied {
         let id = run.id.clone();
-        apply::apply_locked(state, run, quiet, ApplyAuthority::Human)?;
-        run = Database::open(state.db_path())?
+        let overridden =
+            apply::apply_locked(state, run, quiet, ApplyAuthority::Human, despite_refresh)?;
+        let database = Database::open(state.db_path())?;
+        run = database
             .committed_run_projection(&id)?
             .context("applied run has no committed projection")?;
+        // The override is evidence in its own right: which verdict a human
+        // set aside, and why.
+        if let Some(overridden) = overridden {
+            persist_event(
+                state,
+                &database,
+                EventRecord {
+                    run_id: run.id.clone(),
+                    candidate_label: run
+                        .candidates
+                        .first()
+                        .map(|candidate| candidate.label.clone()),
+                    event_type: "coherence.overridden".into(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::json!({
+                        "coherence": overridden,
+                        "explanation": explanation,
+                    }),
+                    ..EventRecord::default()
+                },
+                &mut run,
+            )?;
+            if !quiet {
+                println!(
+                    "Applied over REFRESH on your explanation; the checks passed on the merged tree."
+                );
+            }
+        }
     }
     let outcome = if accept {
         ReviewOutcome::Accepted
@@ -2665,6 +2747,7 @@ mod tests {
             refreshed_from: None,
             validity: Some(validity.clone()),
             first_invalid_at: None,
+            overridden: None,
         };
         run.coherence = Some(record(&validity));
         let json = serde_json::to_value(run_result(&run)).unwrap();

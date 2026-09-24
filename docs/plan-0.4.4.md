@@ -307,3 +307,28 @@ Untouched throughout:
       fails without the rule.
     - The 36-scenario matrix is unchanged.
   - `cargo test`: 435 passed, 0 failed.
+- 2026-09-24 — Stage 6 (F7 the override, and F6). `dispatch accept
+  --despite-refresh --explanation <why>`.
+  - `coherence::overridable` allows only a REFRESH whose every reason comes
+    from the analysis.
+  - `coherence::gate` then runs the checks on the merged tree regardless of
+    level. It returns `AcceptGate::Overridden` only when they ran and passed;
+    a failing check or no runnable check refuses.
+  - The apply uses the verified world digest under the usual locks and fences.
+  - The record: `CoherenceRecord.overridden` (serialized JSON, no migration),
+    a `coherence.overridden {coherence, explanation}` event before the review,
+    and `applied_by: human`. The Work line, `history` and `serve --json`
+    (`overridden: true`) show it.
+  - Auto-apply's `decide` passes no override, and auto-apply and `serve` never
+    override.
+  - F6 rides along, since it is the same refusal text: attached work is advised
+    to run the agent again and attach, in both `accept`'s refusal and `check`'s
+    next step. A non-overridable refusal says why.
+  - Deviation from the plan: the review menu does not offer the override. It
+    needs a typed explanation, and keeping it a deliberate command keeps it off
+    the default path.
+  - Tests: `coherence_override.rs` (applied with explanation and recorded; a
+    failing check refuses; STOP refuses; no checks refuses; `history` shows
+    it); the attached advice in `attach_cli.rs`; the refusal texts in unit
+    tests.
+  - `cargo test`: 439 passed, 0 failed.

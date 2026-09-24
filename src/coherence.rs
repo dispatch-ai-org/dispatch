@@ -130,6 +130,7 @@ pub fn with_live_validity(run: &RunRecord) -> RunRecord {
             refreshed_from: None,
             validity: None,
             first_invalid_at: None,
+            overridden: None,
         });
         record.validity = Some(validity);
     }
@@ -164,6 +165,10 @@ pub fn verdict(decision: Decision) -> &'static str {
 pub struct CoherenceBlocked {
     pub run_id: String,
     pub validity: Validity,
+    /// Attached work has no Dispatch task to refresh.
+    pub attached: bool,
+    /// The human asked to override (`--despite-refresh`).
+    pub despite_refresh: bool,
 }
 
 impl fmt::Display for CoherenceBlocked {
@@ -178,14 +183,27 @@ impl fmt::Display for CoherenceBlocked {
         }
         write!(f, ". The source was left unchanged. ")?;
         if self.validity.decision == Decision::Stop {
-            write!(f, "Run 'dispatch reject {}'.", self.run_id)
+            write!(f, "Run 'dispatch reject {}'.", self.run_id)?;
+        } else if self.attached {
+            write!(
+                f,
+                "Run your agent again on the current source and attach it, or run 'dispatch reject {}'.",
+                self.run_id
+            )?;
         } else {
             write!(
                 f,
                 "Run 'dispatch refresh {id}' to redo the work on the current source, or 'dispatch reject {id}'.",
                 id = self.run_id
-            )
+            )?;
         }
+        if self.despite_refresh && !overridable(&self.validity) {
+            write!(
+                f,
+                " --despite-refresh covers only a REFRESH whose every reason comes from the analysis (fact_broken, fact_missing, same_symbol_edited, analysis_uncertain); this one cannot be overridden."
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -200,6 +218,30 @@ pub enum AcceptGate {
     Compatible(Validity),
     /// The work is stale; nothing may be accepted or applied.
     Blocked(Validity),
+    /// A human overrode an analysis-only REFRESH (`--despite-refresh`) and the
+    /// merged tree's checks passed: apply against the verified world.
+    Overridden {
+        overridden: Validity,
+        verified: Validity,
+    },
+}
+
+/// Whether a human may override `validity`: a REFRESH whose every reason
+/// comes from the file and symbol analysis. STOP (already applied), a patch
+/// that no longer applies, and a check that failed on the merged tree are
+/// facts no human judgment can change.
+pub fn overridable(validity: &Validity) -> bool {
+    validity.decision == Decision::Refresh
+        && !validity.reasons.is_empty()
+        && validity.reasons.iter().all(|reason| {
+            matches!(
+                reason.code,
+                ReasonCode::FactBroken
+                    | ReasonCode::FactMissing
+                    | ReasonCode::SameSymbolEdited
+                    | ReasonCode::AnalysisUncertain
+            ) && !integration::is_integration_reason(reason)
+        })
 }
 
 /// The configuration frozen with the run, or `None` when the snapshot cannot be
@@ -219,7 +261,14 @@ pub fn run_config(run_dir: &Path) -> Option<Config> {
 /// The caller holds the per-run and per-source operation locks and has no
 /// database transaction open; the checks (each bounded by the run's execution
 /// timeout) hold only those locks.
-pub fn gate(run: &RunRecord, candidate_label: &str, run_dir: &Path) -> Result<AcceptGate> {
+/// `despite_refresh` is a human's explicit override (`dispatch accept
+/// --despite-refresh`); policy applications always pass `false`.
+pub fn gate(
+    run: &RunRecord,
+    candidate_label: &str,
+    run_dir: &Path,
+    despite_refresh: bool,
+) -> Result<AcceptGate> {
     // An unreadable snapshot means strict, so the oracle is never reached.
     let Some(config) = run_config(run_dir) else {
         return Ok(AcceptGate::Legacy);
@@ -245,6 +294,42 @@ pub fn gate(run: &RunRecord, candidate_label: &str, run_dir: &Path) -> Result<Ac
             &config,
             run_dir,
         ))??;
+    } else if despite_refresh && overridable(&validity) {
+        // The override sets aside the analysis, never the checks: they must
+        // run on the merged tree and pass.
+        let verified = block_on(integration::verify_integration(
+            run,
+            candidate_label,
+            Validity {
+                decision: Decision::Continue,
+                reasons: Vec::new(),
+                ..validity.clone()
+            },
+            &config,
+            run_dir,
+        ))??;
+        return Ok(match verified.decision {
+            Decision::Continue if verified.analysis == AnalysisLevel::Integration => {
+                AcceptGate::Overridden {
+                    overridden: validity,
+                    verified,
+                }
+            }
+            Decision::Continue => {
+                validity.reasons.push(Reason {
+                    code: ReasonCode::AnalysisUncertain,
+                    fact_id: None,
+                    path: None,
+                    detail: "an override needs checks.verify to run and pass on the merged tree, and none ran".into(),
+                });
+                AcceptGate::Blocked(validity)
+            }
+            _ => {
+                validity.reasons.extend(verified.reasons);
+                validity.reasons.truncate(MAX_REASONS);
+                AcceptGate::Blocked(validity)
+            }
+        });
     }
     Ok(match validity.decision {
         Decision::Continue => AcceptGate::Compatible(validity),
@@ -740,6 +825,8 @@ mod tests {
         let text = CoherenceBlocked {
             run_id: "RUN1".into(),
             validity: validity.clone(),
+            attached: false,
+            despite_refresh: false,
         }
         .to_string();
         assert!(text.contains("STOP") && text.contains("Run 'dispatch reject RUN1'"));
@@ -747,13 +834,37 @@ mod tests {
             run_id: "RUN1".into(),
             validity: Validity {
                 decision: Decision::Refresh,
-                ..validity
+                ..validity.clone()
             },
+            attached: false,
+            despite_refresh: false,
         }
         .to_string();
         assert!(refresh.contains(
             "Run 'dispatch refresh RUN1' to redo the work on the current source, or 'dispatch reject RUN1'."
         ));
+        // Attached work has no Dispatch task to refresh.
+        let attached = CoherenceBlocked {
+            run_id: "RUN1".into(),
+            validity: Validity {
+                decision: Decision::Refresh,
+                ..validity.clone()
+            },
+            attached: true,
+            despite_refresh: false,
+        }
+        .to_string();
+        assert!(!attached.contains("dispatch refresh"), "{attached}");
+        assert!(attached.contains("Run your agent again on the current source"));
+        // A STOP is never overridable, and the refusal says so.
+        let stop = CoherenceBlocked {
+            run_id: "RUN1".into(),
+            validity,
+            attached: false,
+            despite_refresh: true,
+        }
+        .to_string();
+        assert!(stop.contains("cannot be overridden"), "{stop}");
     }
 
     #[test]
@@ -764,7 +875,7 @@ mod tests {
         let run_dir = fixture.root.path().join("run");
         assert!(run_config(&run_dir).is_none());
         assert!(matches!(
-            gate(&run, "A", &run_dir).unwrap(),
+            gate(&run, "A", &run_dir, false).unwrap(),
             AcceptGate::Legacy
         ));
         fs::write(run_dir.join("config.snapshot.yml"), "coherence: [not a map").unwrap();
@@ -807,6 +918,7 @@ mod tests {
             refreshed_from: Some("01OLD".into()),
             validity: Some(fixture.evaluate(&patch)),
             first_invalid_at: Some(Utc::now()),
+            overridden: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"decision\":\"refresh\""));

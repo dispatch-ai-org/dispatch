@@ -117,6 +117,7 @@ pub(super) fn remember_validity(run: &mut RunRecord, validity: &Validity) {
         refreshed_from: None,
         validity: None,
         first_invalid_at: None,
+        overridden: None,
     });
     if validity.decision != Decision::Continue && record.first_invalid_at.is_none() {
         record.first_invalid_at = Some(validity.evaluated_at);
@@ -252,7 +253,8 @@ pub(super) fn apply_locked(
     mut run: RunRecord,
     quiet: bool,
     authority: ApplyAuthority,
-) -> Result<()> {
+    despite_refresh: bool,
+) -> Result<Option<Validity>> {
     anyhow::ensure!(
         matches!(
             run.status,
@@ -272,20 +274,36 @@ pub(super) fn apply_locked(
         &source_lock_path(state, &run),
         "another apply operation is already modifying this source",
     )?;
-    let applied = crate::coherence::gate(&run, &normalized_label, &state.run_dir(&run.id))
-        .and_then(|gate| match gate {
-            AcceptGate::Legacy => Ok((source::safe_apply(&run, &normalized_label)?, None)),
-            AcceptGate::Compatible(validity) => Ok((
-                source::apply_validated(&run, &normalized_label, &validity.world_digest)?,
-                Some(validity),
-            )),
-            AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
-                run_id: run.id.clone(),
-                validity,
-            }
-            .into()),
-        });
-    let (report, validity) = match applied {
+    let applied = crate::coherence::gate(
+        &run,
+        &normalized_label,
+        &state.run_dir(&run.id),
+        despite_refresh,
+    )
+    .and_then(|gate| match gate {
+        AcceptGate::Legacy => Ok((source::safe_apply(&run, &normalized_label)?, None, None)),
+        AcceptGate::Compatible(validity) => Ok((
+            source::apply_validated(&run, &normalized_label, &validity.world_digest)?,
+            Some(validity),
+            None,
+        )),
+        AcceptGate::Overridden {
+            overridden,
+            verified,
+        } => Ok((
+            source::apply_validated(&run, &normalized_label, &verified.world_digest)?,
+            Some(verified),
+            Some(overridden),
+        )),
+        AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
+            run_id: run.id.clone(),
+            validity,
+            attached: run.mode == crate::RunMode::Attached,
+            despite_refresh,
+        }
+        .into()),
+    });
+    let (report, validity, overridden) = match applied {
         Ok(applied) => applied,
         Err(error) => {
             let message = format!("{error:#}");
@@ -311,6 +329,17 @@ pub(super) fn apply_locked(
             return Err(error);
         }
     };
+    if let Some(overridden) = &overridden {
+        run.coherence
+            .get_or_insert(CoherenceRecord {
+                version: 1,
+                refreshed_from: None,
+                validity: None,
+                first_invalid_at: None,
+                overridden: None,
+            })
+            .overridden = Some(overridden.clone());
+    }
     let run = persist_applied(
         state,
         run,
@@ -327,7 +356,7 @@ pub(super) fn apply_locked(
             report.files_changed
         );
     }
-    Ok(())
+    Ok(overridden)
 }
 
 /// Commit `auto_apply.skipped {reason}`. Nothing about the outcome changes:
@@ -434,7 +463,8 @@ fn decide(
     run_dir: &Path,
 ) -> Result<Result<Authorization, (String, Option<Validity>)>> {
     Ok(
-        match crate::coherence::gate(run, candidate_label, run_dir)? {
+        // A policy never overrides a verdict.
+        match crate::coherence::gate(run, candidate_label, run_dir, false)? {
             // `config_unreadable` was already ruled out in stage 1: a config
             // that was readable there and is unreadable here would be an
             // extraordinary race, not a case this predicate distinguishes.
@@ -452,7 +482,11 @@ fn decide(
                     Err(("integration_evidence_missing".into(), Some(validity)))
                 }
             }
-            AcceptGate::Blocked(validity) => {
+            AcceptGate::Blocked(validity)
+            | AcceptGate::Overridden {
+                overridden: validity,
+                ..
+            } => {
                 let reason = if validity.decision == Decision::Stop {
                     "verdict_stop"
                 } else {

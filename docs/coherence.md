@@ -377,6 +377,28 @@ implements `mid_run: stop`, and it never applies to attached work. See
   patch is kept; no review is recorded (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
   ended is recorded but can no longer stop anything.
 
+## Human override (`dispatch accept --despite-refresh`)
+
+The file and symbol analysis can be more cautious than the work requires. A human who
+has checked that the work still holds may apply it anyway:
+
+- only a `Refresh` whose every reason is `fact_broken`, `fact_missing`,
+  `same_symbol_edited` or `analysis_uncertain` (`coherence::overridable`). `Stop`,
+  `patch_conflict` and a failed or unrunnable integration check are never
+  overridable, and the refusal says so;
+- an explanation is required (`--explanation` or `--explanation-file`);
+- `coherence::gate` then runs `checks.verify` on the merged tree regardless of the
+  analysis level (`AcceptGate::Overridden`); a failing check refuses, and so does a
+  configuration where no check can run;
+- the apply goes through `apply_validated` against the verified world digest, under
+  the same locks and fences as any accept;
+- `CoherenceRecord.overridden` keeps the overridden verdict, `coherence.validity`
+  the verification, and a `coherence.overridden {coherence, explanation}` event is
+  committed before the human review. The Work line shows the verdict `overridden`.
+
+Auto-apply and `serve` never override. The review menu does not offer it; it is a
+typed, explained command.
+
 ## Refresh (`orchestrator::refresh_request`)
 
 `dispatch refresh [run]` requires a finished, Ready, unapplied run and returns a
