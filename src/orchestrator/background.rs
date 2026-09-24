@@ -70,15 +70,23 @@ pub(crate) fn acquire(state: &State, root: &Path) -> Result<OperationLock> {
     )
 }
 
-pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Result<()> {
-    let path = record_path(state, root);
-    let directory = path.parent().expect("record has a parent");
-    fs::create_dir_all(directory)?;
+/// `watchers/`, private to the user: records and logs name paths and carry
+/// detailed errors. Made private before anything is written into it.
+fn watchers_dir(state: &State) -> Result<PathBuf> {
+    let directory = state.root.join("watchers");
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
     }
+    Ok(directory)
+}
+
+pub(crate) fn write_record(state: &State, root: &Path, background: bool) -> Result<()> {
+    watchers_dir(state)?;
+    let path = record_path(state, root);
     let record = WatcherRecord {
         version: 1,
         root: root.to_owned(),
@@ -101,15 +109,17 @@ fn read_record(state: &State, root: &Path) -> Option<WatcherRecord> {
         .filter(|record| record.root == root)
 }
 
-/// Whether `root` is watched now, by probing the serve lock.
+/// Whether `root` is watched now: whether another process holds its serve
+/// lock. Anything else that goes wrong probing the lock is an error.
 pub(crate) fn watcher(state: &State, root: &Path) -> Result<Watcher> {
     let path = lock_path(state, root);
-    if !path.exists() {
+    if fs::symlink_metadata(&path).is_err() {
         return Ok(Watcher::NotWatched);
     }
-    Ok(match OperationLock::acquire(&path, "watched") {
-        Ok(_probe) => Watcher::NotWatched,
-        Err(_) => Watcher::Watched(read_record(state, root)),
+    Ok(if OperationLock::is_held(&path)? {
+        Watcher::Watched(read_record(state, root))
+    } else {
+        Watcher::NotWatched
     })
 }
 
@@ -164,10 +174,22 @@ pub fn start(state: &State, root: Option<PathBuf>, verbose: u8) -> Result<()> {
         );
         return Ok(());
     }
+    watchers_dir(state)?;
     let log = record_path(state, &root).with_extension("log");
-    fs::create_dir_all(log.parent().expect("log has a parent"))?;
-    let file =
-        fs::File::create(&log).with_context(|| format!("failed to create {}", log.display()))?;
+    let file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&log)
+            .with_context(|| format!("failed to create {}", log.display()))?;
+        // `mode` applies only when the file is new; a log left by an earlier
+        // version keeps whatever it had.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file
+    };
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.arg("--state-dir").arg(&state.root);
     for _ in 0..verbose {

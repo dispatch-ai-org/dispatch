@@ -66,6 +66,13 @@ impl OperationLock {
         }
     }
 
+    /// Whether another process holds the lock, without keeping it: `true`
+    /// only for lock contention. A refused symlink or a filesystem error is
+    /// an error, never taken to mean someone holds the lock.
+    pub(crate) fn is_held(path: &Path) -> Result<bool> {
+        Ok(matches!(Self::try_acquire(path)?, TryAcquire::Busy(_)))
+    }
+
     fn try_acquire(path: &Path) -> Result<TryAcquire> {
         if let Some(parent) = path.parent() {
             let parent_is_new = !parent.exists();
@@ -252,6 +259,23 @@ mod operation_lock_tests {
         assert!(err.contains("another apply"), "{err}");
         assert!(err.contains("still busy after waiting 0s"), "{err}");
         assert!(elapsed >= Duration::from_millis(300));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_held_means_contention_and_nothing_else() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lock");
+        assert!(!OperationLock::is_held(&path).unwrap());
+        let holder = OperationLock::acquire(&path, "busy").unwrap();
+        assert!(OperationLock::is_held(&path).unwrap());
+        drop(holder);
+        assert!(!OperationLock::is_held(&path).unwrap());
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let error = OperationLock::is_held(&link).unwrap_err().to_string();
+        assert!(error.contains("refusing operation lock symlink"), "{error}");
     }
 
     #[test]

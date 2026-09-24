@@ -353,3 +353,42 @@ fn watch_follows_the_project_and_leaving_it_keeps_watching() {
     assert!(alive(project.owner_pid()));
     assert!(project.dispatch(&["stop"]).status.success());
 }
+
+#[test]
+fn the_watcher_directory_and_log_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = Project::new();
+    // As an earlier version could have left them.
+    let log = project.record_path().with_extension("log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::set_permissions(log.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&log, "old\n").unwrap();
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(project.dispatch(&["start"]).status.success());
+    let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(log.parent().unwrap()), 0o700);
+    assert_eq!(mode(&log), 0o600);
+    assert!(project.dispatch(&["stop"]).status.success());
+}
+
+#[test]
+fn a_lock_that_cannot_be_probed_is_an_error_not_a_watcher() {
+    let project = Project::new();
+    fs::create_dir_all(project.lock_path().parent().unwrap()).unwrap();
+    let target = project.state.join("elsewhere");
+    fs::write(&target, "").unwrap();
+    std::os::unix::fs::symlink(&target, project.lock_path()).unwrap();
+
+    for command in ["start", "stop"] {
+        let output = project.dispatch(&[command]);
+        assert!(!output.status.success(), "{command}: {}", text(&output));
+        assert!(
+            text(&output).contains("refusing operation lock symlink"),
+            "{command}: {}",
+            text(&output)
+        );
+    }
+    assert!(project.record().is_none());
+}

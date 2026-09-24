@@ -101,7 +101,7 @@ $ dispatch stop
    - stdout and stderr to `watchers/<key>.log`, truncated each start;
    - working directory: the root.
    - `-v` is passed through to the child.
-4. Wait up to 5 s:
+4. Wait up to 10 s (it took 0.1 s in the trial; the margin is for a loaded machine):
    - **Ready:** the lock is busy and the record names the spawned pid with an
      `ExactLive` identity.
    - **Child exited:** print the last log lines (for example an invalid
@@ -258,7 +258,7 @@ process, with the same output as 0.4.4.
 ## 9. Tests
 
 **New `tests/background.rs`** (Unix; reuses the helpers in `tests/serve.rs`):
-- `start` returns within 5 s, and the owner holds the lock with an `ExactLive`
+- `start` returns within 10 s, and the owner holds the lock with an `ExactLive`
   record. It works with **no `resources.yml`** and in a non-Git directory.
 - `start` twice prints "Already watching", and one owner remains.
 - Two concurrent `start`s leave exactly one owner, and both exit 0.
@@ -349,7 +349,7 @@ Use `caffeinate -i`.
 
 ## 12. Definition of done
 
-- In a project with no agent profile, `dispatch start` returns in under 5 s with
+- In a project with no agent profile, `dispatch start` returns in under 10 s with
   "✓ Watching …", and the terminal can be closed without stopping it.
 - After a change lands, `dispatch watch` shows a Ready result, native or
   attached, going REFRESH with no other command run. Ctrl+C leaves `watch`, and
@@ -494,3 +494,16 @@ Use `caffeinate -i`.
     `funding_safety::claude_refusal_is_sticky_until_reauthorized` (a fake
     Claude probe under load, on a path 0.4.5 does not touch). It passed 5/5 on
     rerun.
+- Review fixes before merge.
+  - `watchers/` is made 0700 before anything is written into it, and the owner's
+    log is created 0600. A log or directory left by an earlier build is tightened
+    too. Records and logs name paths and carry detailed errors.
+  - "Watched" now means `flock` contention and nothing else.
+    `OperationLock::is_held` returns true only when the lock is busy. A refused
+    symlink or a filesystem error is an error for `start`, `stop` and the
+    `Project:` line, where it used to read as "watched".
+  - Tests: `is_held_means_contention_and_nothing_else`,
+    `the_watcher_directory_and_log_are_private` and
+    `a_lock_that_cannot_be_probed_is_an_error_not_a_watcher`. The last two fail
+    on the previous code.
+  - The plan's start deadline now says 10 s, as implemented.
