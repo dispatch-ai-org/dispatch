@@ -101,7 +101,10 @@ impl Fixture {
     }
 }
 
-const IMPORT_CHECK: &str = "checks:\n  verify:\n    - python3 -c 'import admin'\n";
+// -B: Linux Python would otherwise write __pycache__ into the workspace, and
+// that bytecode would become part of the patch (macOS's system Python caches
+// bytecode elsewhere).
+const IMPORT_CHECK: &str = "checks:\n  verify:\n    - python3 -B -c 'import admin'\n";
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
@@ -182,7 +185,7 @@ fn a_failing_check_on_the_merged_tree_refuses_the_override() {
     let output = f.accept(&["--despite-refresh", "--explanation", "I checked"]);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("python3 -c 'import admin'` failed"),
+        stderr(&output).contains("python3 -B -c 'import admin'` failed"),
         "{}",
         stderr(&output)
     );
