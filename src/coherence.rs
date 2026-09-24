@@ -61,6 +61,31 @@ pub fn evaluate_run(run: &RunRecord, candidate_label: &str) -> Result<Validity> 
     evaluate(&world, &WorkView::of(run, candidate))
 }
 
+/// The verdict `check`, `status`, `explain` and `refresh` show: a fresh file
+/// and symbol evaluation, unless accept already refused this result on the
+/// merged tree of this same world. Only accept runs the integration checks,
+/// so a fresh evaluation of an unmoved world must not hide that refusal. Once
+/// the world moves, the fresh verdict stands. The accept gate itself always
+/// evaluates afresh, so a retry runs the checks again.
+pub fn shown_validity(run: &RunRecord, candidate_label: &str) -> Result<Validity> {
+    let live = evaluate_run(run, candidate_label)?;
+    Ok(
+        match run.coherence.as_ref().and_then(|c| c.validity.as_ref()) {
+            Some(stored)
+                if stored.decision != Decision::Continue
+                    && stored.world_digest == live.world_digest
+                    && stored
+                        .reasons
+                        .iter()
+                        .any(integration::is_integration_reason) =>
+            {
+                stored.clone()
+            }
+            _ => live,
+        },
+    )
+}
+
 /// A finished, delivered result that has not been applied. Runs created before
 /// the outcome model existed migrate with `work_result: pending`, so a
 /// `ready_for_evaluation` status (what `apply` itself requires) also counts.
@@ -76,9 +101,9 @@ pub fn is_ready_unapplied(run: &RunRecord) -> bool {
         && run.status != RunStatus::Applied
 }
 
-/// A fresh L0+L1 verdict for a finished result that has not been applied and
-/// has exactly one candidate; `None` for any other run, or when evaluation
-/// fails. Reads only; nothing is written.
+/// The shown verdict (`shown_validity`) for a finished result that has not
+/// been applied and has exactly one candidate; `None` for any other run, or
+/// when evaluation fails. Reads only; nothing is written.
 pub fn live_validity(run: &RunRecord) -> Option<Validity> {
     if !is_ready_unapplied(run) {
         return None;
@@ -86,7 +111,7 @@ pub fn live_validity(run: &RunRecord) -> Option<Validity> {
     let [candidate] = run.candidates.as_slice() else {
         return None;
     };
-    match evaluate_run(run, &candidate.label) {
+    match shown_validity(run, &candidate.label) {
         Ok(validity) => Some(validity),
         Err(error) => {
             tracing::debug!("coherence evaluation of run {} failed: {error:#}", run.id);

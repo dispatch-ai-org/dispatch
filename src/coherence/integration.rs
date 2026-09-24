@@ -84,7 +84,7 @@ pub async fn verify_integration(
             fact_id: None,
             path: None,
             detail: cap(format!(
-                "integration checks could not run: {error:#}; set coherence.integration_checks: false to skip"
+                "{COULD_NOT_RUN}: {error:#}; set coherence.integration_checks: false to skip"
             )),
         }],
     };
@@ -162,6 +162,14 @@ fn failure_reasons(results: &[CheckResult]) -> Vec<Reason> {
             }
         })
         .collect()
+}
+
+const COULD_NOT_RUN: &str = "integration checks could not run";
+
+/// Whether `reason` came from running the checks on the merged tree, which only
+/// accept does; a file and symbol evaluation can never reproduce it.
+pub fn is_integration_reason(reason: &Reason) -> bool {
+    reason.code == ReasonCode::IntegrationCheckFailed || reason.detail.starts_with(COULD_NOT_RUN)
 }
 
 fn cap(detail: String) -> String {

@@ -104,6 +104,16 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.run_dir().join("metadata.json")).unwrap()).unwrap()
     }
 
+    fn dispatch(&self, args: &[&str]) -> std::process::Output {
+        cargo_bin_cmd!("dispatch")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .args(args)
+            .current_dir(&self.source)
+            .output()
+            .unwrap()
+    }
+
     fn apply(&self) -> assert_cmd::assert::Assert {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
@@ -196,6 +206,46 @@ fn check_failing_only_on_the_merged_tree_blocks_apply() {
         "{detail}"
     );
     assert!(PathBuf::from(log).is_file(), "{detail}");
+
+    // Every surface shows that refusal for this world, and refresh passes it
+    // on to the new agent.
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"]);
+    let shown: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(shown["validity"]["decision"], "refresh", "{shown}");
+    assert_eq!(
+        shown["validity"]["reasons"][0]["code"],
+        "integration_check_failed"
+    );
+    let human = String::from_utf8(fixture.dispatch(&["check", &fixture.run_id]).stdout).unwrap();
+    assert!(human.contains("Coherence: REFRESH"), "{human}");
+    assert!(human.contains("Next: dispatch refresh"), "{human}");
+    let status = fixture.dispatch(&["status", &fixture.run_id, "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["coherence"]["decision"], "refresh", "{status}");
+    let refreshed =
+        fixture.dispatch(&["refresh", &fixture.run_id, "--allow-unsafe-local", "--json"]);
+    let refreshed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    let new_run = fixture
+        .state
+        .join("runs")
+        .join(refreshed["run_id"].as_str().unwrap())
+        .join("metadata.json");
+    let new_run: Value = serde_json::from_slice(&fs::read(new_run).unwrap()).unwrap();
+    assert!(
+        new_run["task"]
+            .as_str()
+            .unwrap()
+            .contains("check `test ! -f forbidden.txt` failed"),
+        "{}",
+        new_run["task"]
+    );
+
+    // Once the world moves again, the fresh verdict stands until the next
+    // accept runs the checks on the new merged tree.
+    fs::write(fixture.source.join("unrelated.txt"), "moved\n").unwrap();
+    let check = fixture.dispatch(&["check", &fixture.run_id, "--json"]);
+    let shown: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(shown["validity"]["decision"], "continue", "{shown}");
 }
 
 #[test]

@@ -500,7 +500,7 @@ How to read it:
 - Integration checks use your `checks.verify` on a scratch copy of the non-ignored files with no build cache
   (a `cargo test` builds from scratch unless the command points `CARGO_TARGET_DIR` elsewhere), hold the apply locks while running, and cannot be cancelled.
   They do not run for a local-backend run that was not approved for local execution.
-- `dispatch check`, `status` and `explain` evaluate L0 and L1 only; an integration failure appears at accept.
+- `dispatch check`, `status` and `explain` evaluate L0 and L1 only; integration checks run at accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A native run compares the whole-tree fingerprint before starting a fresh attempt (the continuation after a clarification answer) and stops with source drift if the tree differs.

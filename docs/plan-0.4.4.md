@@ -252,3 +252,18 @@ Untouched throughout:
     - A unit test for the reopen rule.
   - README and product guide updated.
   - `cargo test`: 431 passed, 0 failed.
+- 2026-09-24 — Stage 2 (F3, F5). `coherence::shown_validity` is the verdict
+  that `check`, `status`, `explain`, the TUI and `refresh` show. It is the fresh
+  L0 and L1 evaluation, except that a stored non-CONTINUE verdict with an
+  integration reason, for the same world digest, is shown instead.
+  - An integration refusal is stored with its L1 analysis level, not
+    `integration`, so it is recognized by its reasons
+    (`integration::is_integration_reason`). Mid-run verdicts, which judged a
+    work-in-progress patch, are never resurrected.
+  - The accept gate still evaluates afresh (`evaluate_run`), so a retry runs the
+    checks again and a flaky check does not stick.
+  - Test: `coherence_integration.rs`. After the refusal, `check` (JSON and
+    human, "Next: dispatch refresh") and `status` report the integration REFRESH.
+    `refresh` hands the new agent "check `…` failed". After the world moves,
+    `check` shows the fresh CONTINUE. The test fails on stage 1 (`continue`).
+  - `cargo test`: 431 passed, 0 failed.

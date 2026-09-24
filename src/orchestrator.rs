@@ -1811,7 +1811,7 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     };
     ensure_unapplied_ready(&run, "check")?;
     let candidate = sole_candidate(&run)?;
-    let validity = crate::coherence::evaluate_run(&run, &candidate.label)?;
+    let validity = crate::coherence::shown_validity(&run, &candidate.label)?;
     if json {
         println!(
             "{}",
