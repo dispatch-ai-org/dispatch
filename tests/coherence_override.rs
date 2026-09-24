@@ -186,6 +186,13 @@ fn a_failing_check_on_the_merged_tree_refuses_the_override() {
         "{}",
         stderr(&output)
     );
+    assert!(
+        stderr(&output)
+            .contains("it needs the checks to pass on the merged tree, and they did not")
+            && !stderr(&output).contains("cannot be overridden"),
+        "{}",
+        stderr(&output)
+    );
     assert!(!f.source.join("admin.py").exists());
     assert_eq!(f.metadata()["outcome"]["review"], "pending");
     assert!(f.overridden_events().is_empty());

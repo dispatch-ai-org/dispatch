@@ -170,9 +170,10 @@ local backend, the run itself was approved for local execution (the run's
    becomes `Refresh`. A failure to build the scratch tree or apply the patch also
    yields `Refresh` with `analysis_uncertain`. All passing sets the analysis level to `integration`.
    The words are an excerpt of the check's output: the first two lines that read
-   like a failure (`FAIL`, `Error`, `error:`, `assert`, `panicked`), stderr first,
-   else the last non-empty line, for example `FAIL: test_whoami_admin (…) /
-   AssertionError: Tuples differ: (200, 'alice <admin>') != (200, 'alice (admin)')`.
+   like a failure (containing `FAIL`, `ERROR`, `Error`, `error:` or `panicked`, or
+   starting with `assert`), stderr first, else the last non-empty line, for example
+   `ERROR: test_admin_token (…) / TypeError: validate() missing 1 required positional
+   argument: 'token'`.
 
 There is no cooperative cancellation of these checks. They run while the per-run and
 per-source apply locks are held, so another accept of the same run or source waits.

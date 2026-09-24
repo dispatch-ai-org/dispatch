@@ -327,7 +327,7 @@ shortcut would silently skip evaluation and the integration checks. Attached run
 when it says `Continue`, through L2 as usual; only `coherence.accept: strict` still
 takes them straight to `Legacy`, exactly as it does for native runs.
 
-This was found and fixed during 0.4.0 dogfood (see "Evidence" in the [claims
+This was found and fixed during a 0.4.0 real-agent trial (see "Evidence" in the [claims
 table](coherence-validation.md)): the first real-agent attach applied without ever
 computing a verdict because of this shortcut, and `dispatch explain` showed no
 coherence section for an applied run — the regression test lives in
@@ -341,7 +341,7 @@ reason `empty_delta`, instead of applying it as "0 files changed." This matters
 specifically for attached work: a foreign or wrapped agent that made no edits, or an
 agent that only touched files the source's ignore rules exclude, still produces a
 Ready result with nothing to apply. The run stays reviewable; nothing is recorded as
-applied. This was also found during 0.4.0 dogfood, fixed alongside the gate rule
+applied. This was also found during a 0.4.0 real-agent trial, fixed alongside the gate rule
 above.
 
 ## Review of attached work

@@ -202,11 +202,23 @@ impl fmt::Display for CoherenceBlocked {
                 id = self.run_id
             )?;
         }
-        if self.despite_refresh && !overridable(&self.validity) {
-            write!(
-                f,
-                " --despite-refresh covers only a REFRESH whose every reason comes from the analysis (fact_broken, fact_missing, same_symbol_edited, analysis_uncertain); this one cannot be overridden."
-            )?;
+        if self.despite_refresh {
+            if self
+                .validity
+                .reasons
+                .iter()
+                .any(integration::is_integration_reason)
+            {
+                write!(
+                    f,
+                    " The override was refused: it needs the checks to pass on the merged tree, and they did not."
+                )?;
+            } else if !overridable(&self.validity) {
+                write!(
+                    f,
+                    " --despite-refresh covers only a REFRESH whose every reason comes from the analysis (fact_broken, fact_missing, same_symbol_edited, analysis_uncertain); this one cannot be overridden."
+                )?;
+            }
         }
         Ok(())
     }

@@ -344,3 +344,38 @@ Untouched throughout:
   - Tests: `work_line` unit tests; `coherence_accept.rs` with two identical runs
     (the second is STOP, landed by the first); the `product_ux` S0 wording.
   - `cargo test`: 440 passed, 0 failed.
+- 2026-09-24 — Stage 8. Release and regression trial.
+  - Regression trial with real agents on `release-0.4.4`: the same project shape,
+    S0 and tasks as the first trial (`/private/tmp/dispatch-dogfood/coherence-044`);
+    Claude through Dispatch, attached Claude Code, attached Cursor.
+  - W-API, M1, W, C1 and A: CONTINUE and landed, as before.
+  - B (a new caller of `validate(token)`): REFRESH `fact_broken`, with attached
+    advice ("run your agent again … and attach"); the review stays pending.
+  - An override of B was refused because the merged tree's tests failed. The
+    refusal quotes `TypeError: validate() missing 1 required positional argument`.
+  - C2: STOP "landed by run" C1.
+  - D: refused by the integration check, naming `test_whoami_alice_admin`.
+    `check`, `status` and `serve` then all showed REFRESH, and the review stayed
+    pending.
+  - E (`format_user(user)` after M2's optional parameter): CONTINUE, applied. It
+    was a false REFRESH in 0.4.3.
+  - D-refresh: given the integration failure, the agent asked whether it may also
+    update `tests/test_handlers.py`. In 0.4.3 it repeated the failure.
+  - The mid-run watcher was not exercised by a real agent: the refreshed agent
+    asked before editing, and the continuation below never started. F1 rests on
+    the deterministic test in `coherence_watch.rs`.
+  - Fixes from this trial, both covered by tests:
+    - The excerpt matched a test's source line (`self.assertEqual(...)`). `assert`
+      now counts only at the start of a line, and `ERROR` is a marker.
+    - A check-refused override said "cannot be overridden". It now says the checks
+      refused it.
+  - **New finding F10, not fixed.** Answering D-refresh's question stopped the
+    run at once with `source_drift` ("source drift before fresh attempt"). A native
+    run refuses any fresh attempt, including the continuation after an answer,
+    once the source has changed at all. In a moving project, answering a
+    clarification question therefore always ends the goal, although the accept
+    gate could judge the continuation's result. This drift stop predates the
+    coherence model (it guarded planned tasks and the removed retry). Decision
+    needed; see the release report.
+  - Official docs no longer say "dogfood". Release notes, install note, version
+    0.4.4.

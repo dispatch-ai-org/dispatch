@@ -181,8 +181,10 @@ fn failure_reasons(results: &[CheckResult]) -> Vec<Reason> {
 }
 
 /// What failed, in the check's own words: the first two lines that read like a
-/// failure (`FAIL`, `Error`, `error:`, `assert`, `panicked`), searching stderr
-/// then stdout, else the last non-empty line. `None` when the check printed
+/// failure (containing `FAIL`, `ERROR`, `Error`, `error:` or `panicked`, or
+/// starting with `assert`), searching stderr then stdout, else the last
+/// non-empty line. A test's own source line (`self.assertEqual(...)`) is not a
+/// failure message, so `assert` counts only at the start of a line. `None` when the check printed
 /// nothing. No language is special-cased.
 fn excerpt(result: &CheckResult) -> Option<String> {
     use std::io::Read;
@@ -207,9 +209,10 @@ fn excerpt(result: &CheckResult) -> Option<String> {
     };
     let marked = lines()
         .filter(|line| {
-            ["FAIL", "Error", "error:", "assert", "panicked"]
-                .iter()
-                .any(|marker| line.contains(marker))
+            line.starts_with("assert")
+                || ["FAIL", "ERROR", "Error", "error:", "panicked"]
+                    .iter()
+                    .any(|marker| line.contains(marker))
         })
         .take(2)
         .collect::<Vec<_>>();
@@ -260,6 +263,12 @@ mod tests {
         assert_eq!(
             excerpt(&failed_check(temp.path(), unittest, "")).unwrap(),
             "FAIL: test_whoami_admin (test_handlers.HandlerTests) / AssertionError: Tuples differ: (200, 'alice <admin>') != (200, 'alice (admin)')"
+        );
+        // The trial's real case: a test source line must not be the excerpt.
+        let unittest_error = "E\n======\nERROR: test_admin_token (test_admin.RequireAdminTests.test_admin_token)\n------\nTraceback (most recent call last):\n  File \"tests/test_admin.py\", line 9, in test_admin_token\n    self.assertEqual(require_admin(\"t-alice\")[\"name\"], \"alice\")\nTypeError: validate() missing 1 required positional argument: 'token'\n";
+        assert_eq!(
+            excerpt(&failed_check(temp.path(), unittest_error, "")).unwrap(),
+            "ERROR: test_admin_token (test_admin.RequireAdminTests.test_admin_token) / TypeError: validate() missing 1 required positional argument: 'token'"
         );
         let cargo = "running 1 test\ntest tests::adds ... FAILED\n\n---- tests::adds stdout ----\nthread 'tests::adds' panicked at src/lib.rs:5:9:\nassertion `left == right` failed\n";
         assert_eq!(
