@@ -134,6 +134,9 @@ coherence:
   facts: any change to a file the patch edits, or mentions by path, is a `REFRESH`.
 - A referenced symbol is bound by *unique name* in the baseline, not by full name
   resolution. Ambiguous or very common names are skipped, so some breakage is missed.
+- A Python function that only gains optional parameters (defaults, `*args`,
+  `**kwargs`) keeps code that calls it valid. Any other signature change to a
+  function the work calls is a `REFRESH`; Rust signatures compare exactly.
 - Integration checks run your configured `checks.verify` on the merged tree in a
   scratch copy of the non-ignored files, with no build cache. They hold the apply
   locks while running. On the local backend they are skipped for a run that was not

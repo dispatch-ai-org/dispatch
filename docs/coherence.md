@@ -141,7 +141,11 @@ checked, always from what is on disk now.
   For a `Modified` fact, no declaration with the same `full_fp` (or `sig_fp` for
   containers) is `same_symbol_edited`. For a `Referenced` fact, no declaration with the
   same `sig_fp` is `fact_broken`, with the detail `old signature => new signature`
-  (each truncated to 100 characters).
+  (each truncated to 100 characters). One exception keeps compatible calls valid: a
+  referenced Python function whose header only gained optional parameters (defaults,
+  `*args`, `**kwargs`, or keyword-only parameters with defaults after `*`), with every
+  original parameter, the name, `async` and the return annotation unchanged, still
+  holds (`symbols::python_call_compatible`). Rust signatures compare exactly.
 - The analysis level is `symbols` when any signature fact's file was among the changed files,
   otherwise `files_only`. If the baseline repository cannot be read, L1 returns no
   reasons and `files_only`.

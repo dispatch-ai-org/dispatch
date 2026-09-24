@@ -140,6 +140,65 @@ fn parse(lang: Lang, source: &[u8]) -> Result<tree_sitter::Tree> {
         .ok_or_else(|| anyhow!("tree-sitter produced no tree"))
 }
 
+/// Whether a Python function whose header changed from `old` to `new` still
+/// accepts every call the old header accepted. Both must be `def` headers with
+/// the same name, `async`-ness and return annotation; every old parameter is
+/// unchanged and in place; every added parameter is optional (it has a
+/// default, or is `*args`, `**kwargs` or the bare `*` before keyword-only
+/// parameters with defaults). Anything that cannot be parsed or proven,
+/// including a header cut short for display, is not compatible.
+pub fn python_call_compatible(old: &str, new: &str) -> bool {
+    struct Header {
+        is_async: bool,
+        name: String,
+        returns: Option<String>,
+        params: Vec<(String, String)>,
+    }
+    fn header(text: &str) -> Option<Header> {
+        if text.chars().count() >= DISPLAY_MAX_CHARS {
+            return None;
+        }
+        let source = format!("{text}\n    pass\n");
+        let tree = parse(Lang::Python, source.as_bytes()).ok()?;
+        let root = tree.root_node();
+        let def = root.named_child(0)?;
+        if root.has_error() || def.kind() != "function_definition" {
+            return None;
+        }
+        let text_of = |node: Node| node.utf8_text(source.as_bytes()).ok().map(str::to_owned);
+        let params = def.child_by_field_name("parameters")?;
+        let mut cursor = params.walk();
+        let params = params
+            .named_children(&mut cursor)
+            .map(|param| Some((param.kind().to_owned(), text_of(param)?)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Header {
+            is_async: def.child(0).is_some_and(|first| first.kind() == "async"),
+            name: text_of(def.child_by_field_name("name")?)?,
+            returns: def.child_by_field_name("return_type").and_then(text_of),
+            params,
+        })
+    }
+    let (Some(old), Some(new)) = (header(old), header(new)) else {
+        return false;
+    };
+    old.is_async == new.is_async
+        && old.name == new.name
+        && old.returns == new.returns
+        && new.params.len() >= old.params.len()
+        && new.params[..old.params.len()] == old.params[..]
+        && new.params[old.params.len()..].iter().all(|(kind, _)| {
+            matches!(
+                kind.as_str(),
+                "default_parameter"
+                    | "typed_default_parameter"
+                    | "list_splat_pattern"
+                    | "dictionary_splat_pattern"
+                    | "keyword_separator"
+            )
+        })
+}
+
 /// A declaration already emitted by a nested scope, so its trait or class can
 /// exclude it from `sig_fp` and fold in its `full_fp`.
 struct Member {
@@ -652,6 +711,41 @@ class Point(Base):
     fn py(edit: (&str, &str), name: &str) -> Change {
         assert!(PY.contains(edit.0), "edit target missing: {}", edit.0);
         compare(Lang::Python, PY, &PY.replace(edit.0, edit.1), name)
+    }
+
+    #[test]
+    fn python_calls_stay_valid_only_when_additions_are_optional() {
+        let holds = |old: &str, new: &str| python_call_compatible(old, new);
+        // The trial's case: an added defaulted parameter.
+        assert!(holds(
+            "def format_user(user):",
+            "def format_user(user, brackets=\"()\"):"
+        ));
+        assert!(holds("def f(a):", "def f(a, b: int = 1):"));
+        assert!(holds("def f(a):", "def f(a, *args, **kwargs):"));
+        assert!(holds("def f(a):", "def f(a, *, strict=False):"));
+        assert!(holds(
+            "async def f(a) -> int:",
+            "async def f(a, b=2) -> int:"
+        ));
+        // Anything a caller could notice breaks.
+        assert!(!holds("def validate(token):", "def validate(ctx, token):"));
+        assert!(!holds("def f(a):", "def f(a, b):"));
+        assert!(!holds("def f(a):", "def f(a, *, strict):"));
+        assert!(!holds("def f(a, b):", "def f(a):"));
+        assert!(!holds("def f(a, b):", "def f(b, a):"));
+        assert!(!holds("def f(a, b):", "def f(a, c):"));
+        assert!(!holds("def f(a=1):", "def f(a=2):"));
+        assert!(!holds("def f(a: int):", "def f(a: str):"));
+        assert!(!holds("def f(a) -> int:", "def f(a) -> str:"));
+        assert!(!holds("def f(a):", "async def f(a):"));
+        assert!(!holds("def f(a):", "def f(a, /):"));
+        assert!(!holds("def f(a):", "def g(a):"));
+        assert!(!holds("class A:", "class A(Base):"));
+        assert!(!holds(
+            "def f(a):",
+            &format!("def f(a, {}=1):", "x".repeat(300))
+        ));
     }
 
     #[test]

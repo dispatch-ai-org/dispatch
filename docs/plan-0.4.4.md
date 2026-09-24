@@ -292,3 +292,18 @@ Untouched throughout:
     recorded before it finishes. On 0.4.3 it is never recorded.
   - No test binary got measurably slower.
   - `cargo test`: 433 passed, 0 failed.
+- 2026-09-24 — Stage 5 (F7, the rule). `symbols::python_call_compatible` parses
+  both headers with the existing Python grammar. A referenced Python function
+  still holds when only optional parameters were added: defaults, `*args`,
+  `**kwargs`, or `*` followed by defaulted keyword-only parameters. Every
+  original parameter, the name, `async` and the return annotation must be
+  unchanged.
+  - Anything unparsable or cut short for display is not compatible. Modified
+    facts and Rust are untouched.
+  - Tests:
+    - 19 header pairs, covering every accepted and refused shape;
+    - the trial's `format_user(user)` → `format_user(user, brackets="()")` holds
+      at the facts level, while a required parameter still breaks. That test
+      fails without the rule.
+    - The 36-scenario matrix is unchanged.
+  - `cargo test`: 435 passed, 0 failed.

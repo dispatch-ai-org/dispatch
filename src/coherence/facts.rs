@@ -24,7 +24,10 @@ use crate::{
     AnalysisLevel, FactKind, FactOrigin, MustHold, Reason, ReasonCode,
     coherence::{
         WorkView,
-        symbols::{FileSymbols, SymbolDecl, SymbolKind, extract, identifiers_in, lang_for_path},
+        symbols::{
+            FileSymbols, Lang, SymbolDecl, SymbolKind, extract, identifiers_in, lang_for_path,
+            python_call_compatible,
+        },
         world::WorldObservation,
     },
     source::{git_command, run_git},
@@ -941,7 +944,11 @@ pub fn evaluate_facts(
                     format!("{} was also edited in {}", fact.subject, fact.path),
                 ));
             }
-        } else if !decls.iter().any(|decl| decl.sig_fp == fact.sig_fp) {
+        } else if !decls.iter().any(|decl| {
+            decl.sig_fp == fact.sig_fp
+                // An added optional parameter still accepts the work's calls.
+                || (lang == Lang::Python && python_call_compatible(&fact.display, &decl.display))
+        }) {
             reasons.push(reason(
                 ReasonCode::FactBroken,
                 format!(
@@ -1389,6 +1396,37 @@ diff --git a/y.rs b/y.rs\nindex 1..2 100644\n--- a/y.rs\n+++ b/y.rs\n\
             subjects(&derived.facts, FactOrigin::Referenced),
             ["models.py:Account", "models.py:Account.deposit"]
         );
+    }
+
+    /// The multi-agent trial's case: new code calls `format_user(user)` while
+    /// the world adds an optional parameter. The call still holds; a required
+    /// parameter would not.
+    #[test]
+    fn an_added_optional_python_parameter_keeps_callers_valid() {
+        let textutil = "def format_user(user):\n    return user['name']\n";
+        let repo = Repo::new(&[("textutil.py", textutil)]);
+        let labels = "from textutil import format_user\n\n\ndef user_label(user):\n    return format_user(user)\n";
+        let derived = repo.derive(&[("labels.py", Some(labels))]);
+        assert_eq!(
+            subjects(&derived.facts, FactOrigin::Referenced),
+            ["textutil.py:format_user"]
+        );
+        let optional = repo.world(&[(
+            "textutil.py",
+            Some("def format_user(user, brackets=\"()\"):\n    return user['name']\n"),
+        )]);
+        assert!(
+            evaluate_facts(&repo.work(), &optional, &derived.facts)
+                .unwrap()
+                .is_empty()
+        );
+        let required = repo.world(&[(
+            "textutil.py",
+            Some("def format_user(user, brackets):\n    return user['name']\n"),
+        )]);
+        let reasons = evaluate_facts(&repo.work(), &required, &derived.facts).unwrap();
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, ReasonCode::FactBroken);
     }
 
     #[test]
