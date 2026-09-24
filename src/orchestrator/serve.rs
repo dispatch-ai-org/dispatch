@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -89,6 +89,11 @@ async fn run(
             _ = &mut shutdown => return Ok(()),
         }
         let tick = owner.tick(state);
+        if tick.cost.idle() && !tick.moved {
+            tracing::debug!("tick: {}", tick.cost);
+        } else {
+            tracing::info!("tick: {}", tick.cost);
+        }
         if background {
             if tick.error.is_some() && tick.error != last_error {
                 eprintln!(
@@ -112,8 +117,49 @@ async fn run(
         // Render every tick: a run attached, finished or applied by another
         // process changes the view without any verdict or apply of our own.
         // `render` prints only what differs from what is already shown.
-        view.render(&tick.runs, json);
+        view.render(None, &tick.runs, json);
         let _ = io::stdout().flush();
+    }
+}
+
+/// `dispatch watch [--root <path>] [--json]`: the project view, live, read
+/// from canonical state. It takes no lock and records nothing, so leaving it
+/// never stops project watching. It redraws when an event is committed, when
+/// who watches changes, and every 30 s so finished Work ages out.
+pub async fn watch(state: &State, root: Option<PathBuf>, json: bool) -> Result<()> {
+    let root = source::resolve_source(root.as_deref())?;
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut view = View::default();
+    let mut shown: Option<(Option<i64>, String)> = None;
+    let mut rendered_at = Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = &mut shutdown => return Ok(()),
+        }
+        let header = format!(
+            "{} · {}",
+            root.display(),
+            super::background::describe(state, &root)
+        );
+        let journal = Database::open_read_only(state.db_path())
+            .and_then(|db| db.latest_event_id())
+            .ok()
+            .flatten();
+        let now = (journal, header);
+        if shown.as_ref() == Some(&now) && rendered_at.elapsed() < Duration::from_secs(30) {
+            continue;
+        }
+        match load_source_runs(state, &root) {
+            Ok(runs) => view.render(Some(&now.1), &runs, json),
+            Err(error) => eprintln!("watch: {error:#}"),
+        }
+        let _ = io::stdout().flush();
+        shown = Some(now);
+        rendered_at = Instant::now();
     }
 }
 
@@ -144,6 +190,50 @@ pub(crate) struct Tick {
     /// The first error of the tick. SQLite busy and other transient
     /// failures are retried on the next tick rather than ending the loop.
     pub error: Option<String>,
+    pub cost: Cost,
+}
+
+/// Where one tick's time went, for `-v` diagnostics: the world signal,
+/// loading the root's runs, following unowned attached work (snapshotting
+/// its patch), evaluating it, re-checking Ready results, and auto-apply.
+#[derive(Default)]
+pub(crate) struct Cost {
+    pub signal: Duration,
+    pub load: Duration,
+    pub follow: Duration,
+    pub evaluate: Duration,
+    pub recheck: Duration,
+    pub apply: Duration,
+    pub runs: usize,
+    pub followed: usize,
+    pub evaluated: usize,
+    pub rechecked: usize,
+}
+
+impl Cost {
+    fn idle(&self) -> bool {
+        self.evaluated == 0 && self.rechecked == 0
+    }
+}
+
+impl std::fmt::Display for Cost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |d: Duration| d.as_millis();
+        write!(
+            f,
+            "signal {} ms · {} runs loaded in {} ms · {} followed in {} ms · {} evaluated in {} ms · {} rechecked in {} ms · auto-apply {} ms",
+            ms(self.signal),
+            self.runs,
+            ms(self.load),
+            self.followed,
+            ms(self.follow),
+            self.evaluated,
+            ms(self.evaluate),
+            self.rechecked,
+            ms(self.recheck),
+            ms(self.apply)
+        )
+    }
 }
 
 impl Tick {
@@ -169,6 +259,7 @@ impl Owner {
 
     pub(crate) fn tick(&mut self, state: &State) -> Tick {
         let mut tick = Tick::default();
+        let started = Instant::now();
         let signal_now = match world::signal(&self.root, &self.kind) {
             Ok(signal) => Some(signal),
             Err(error) => {
@@ -184,12 +275,19 @@ impl Owner {
         if let Some(signal_now) = &signal_now {
             self.last_signal = Some(signal_now.clone());
         }
+        tick.cost.signal = started.elapsed();
 
+        let started = Instant::now();
         let runs = self.load(state, &mut tick);
+        tick.cost.load = started.elapsed();
+        tick.cost.runs = runs.len();
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
+        let started = Instant::now();
         self.recheck_ready(state, &runs, &mut tick);
+        tick.cost.recheck = started.elapsed();
+        let started = Instant::now();
         for run in ready_for_auto_apply(&runs) {
             match auto_apply(state, &run.id) {
                 Ok(ApplyOutcome::Applied { .. }) => {
@@ -202,6 +300,7 @@ impl Owner {
                 Err(error) => tick.report(&error),
             }
         }
+        tick.cost.apply = started.elapsed();
         if tick.digest.is_none() {
             tick.digest = signal_now.map(|signal| signal.0);
         }
@@ -354,9 +453,17 @@ impl Owner {
             // lock into a scratch file: `finish` takes that lock without
             // waiting, so the owner holds it only when something moved.
             let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
-            let work =
-                source::snapshot_delta(&candidate.baseline_path, &attachment.workspace, &scratch)
-                    .and_then(|()| Ok(hex::encode(Sha256::digest(fs::read(&scratch)?))));
+            let started = Instant::now();
+            let index = scratch.with_extension("index");
+            let work = source::snapshot_delta_indexed(
+                &candidate.baseline_path,
+                &attachment.workspace,
+                &scratch,
+                &index,
+            )
+            .and_then(|()| Ok(hex::encode(Sha256::digest(fs::read(&scratch)?))));
+            tick.cost.follow += started.elapsed();
+            tick.cost.followed += 1;
             let work = match work {
                 Ok(work) => work,
                 Err(error) => {
@@ -390,6 +497,7 @@ impl Owner {
             if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
                 continue;
             }
+            let started = Instant::now();
             let delta_path = state.run_dir(&run.id).join("delta-live.patch");
             if let Err(error) =
                 source::snapshot_delta(&run.baseline_path, &attachment.workspace, &delta_path)
@@ -420,6 +528,8 @@ impl Owner {
                     continue;
                 }
             };
+            tick.cost.evaluate += started.elapsed();
+            tick.cost.evaluated += 1;
             // Compared with the verdict stored on the run, not with anything
             // this process remembers: a restarted owner still records a change.
             let validity = coherence::watch::settle(validity);
@@ -471,6 +581,7 @@ impl Owner {
             }
             // An evaluation that fails is logged by `live_validity` and
             // tried again when the world next moves.
+            tick.cost.rechecked += 1;
             let Some(validity) = coherence::live_validity(candidate) else {
                 self.checked.insert(candidate.id.clone(), signal.clone());
                 continue;
@@ -565,14 +676,23 @@ fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
 pub(crate) struct View {
     shown: HashMap<String, String>,
     last_block: Vec<String>,
+    last_header: Option<String>,
 }
 
 impl View {
-    /// Print the project view. `--json` emits one `{"type":"work",...}`
-    /// object per run whose displayed fields changed since the last tick;
-    /// otherwise the whole block is printed, redrawn in place on a TTY and
-    /// appended as lines otherwise.
-    pub(crate) fn render(&mut self, runs: &[RunRecord], json: bool) {
+    /// Print the project view under an optional header line. `--json`
+    /// emits one `{"type":"work",...}` object per run whose displayed fields
+    /// changed since the last tick, and a `{"type":"watcher",...}` object
+    /// when the header changed; otherwise the whole block is printed,
+    /// redrawn in place on a TTY and appended as lines otherwise.
+    pub(crate) fn render(&mut self, header: Option<&str>, runs: &[RunRecord], json: bool) {
+        if json && header.is_some() && self.last_header.as_deref() != header {
+            println!(
+                "{}",
+                serde_json::json!({"type": "watcher", "watcher": header})
+            );
+        }
+        self.last_header = header.map(str::to_owned);
         let (shown, last_block) = (&mut self.shown, &mut self.last_block);
         let rows = view_rows(runs);
 
@@ -604,12 +724,15 @@ impl View {
             return;
         }
 
-        let lines: Vec<String> = rows
-            .iter()
-            .map(|run| {
+        let empty = header.is_some() && rows.is_empty();
+        let lines: Vec<String> = header
+            .map(str::to_owned)
+            .into_iter()
+            .chain(rows.iter().map(|run| {
                 let id8 = &run.id[..8.min(run.id.len())];
                 format!("{id8} · {}", describe(run).0)
-            })
+            }))
+            .chain(empty.then(|| "no Work in the last hour".to_owned()))
             .collect();
 
         // Rendered every tick, so redraw only when the block would differ.

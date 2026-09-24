@@ -154,6 +154,15 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Show this project's Work live, as the watcher keeps it. Leaving the
+    /// view (Ctrl+C) does not stop watching.
+    Watch {
+        /// Defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop watching this project in the background.
     Stop {
         /// Defaults to the current directory.
@@ -587,6 +596,7 @@ async fn run() -> Result<()> {
         } => orchestrator::serve::serve(&state, root, json, background).await,
         Command::Start { root } => orchestrator::background::start(&state, root, cli.verbose),
         Command::Stop { root } => orchestrator::background::stop(&state, root),
+        Command::Watch { root, json } => orchestrator::serve::watch(&state, root, json).await,
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
         Command::Diff {
             run_id,

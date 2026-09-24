@@ -945,6 +945,14 @@ impl Database {
         Ok(Self { connection })
     }
 
+    /// The newest event's id: whatever changes a run commits an event, so
+    /// this moving is the doorbell `dispatch watch` listens for.
+    pub fn latest_event_id(&self) -> Result<Option<i64>> {
+        Ok(self
+            .connection
+            .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))?)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path

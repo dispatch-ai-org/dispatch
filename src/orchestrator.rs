@@ -1516,20 +1516,23 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
     // Display only: the live verdict is never written back.
     let run = crate::coherence::with_live_validity(&run);
     if run.execution.is_some() {
-        return native::emit(&run, RunOutputMode::Human);
-    }
-    if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
+        native::emit(&run, RunOutputMode::Human)?;
+    } else if id.is_none() && run.allocation.is_some() && run.candidates.len() == 1 {
         let feedback = Database::open(state.db_path())?.latest_goal_feedback(&run.id)?;
         let human_outcome = feedback.as_ref().map(|feedback| &feedback.outcome);
         print_single_result_summary(&run, "Latest task", true, human_outcome);
-        return Ok(());
+    } else {
+        print_run_header(&run);
+        println!("\nTask\n  {}\n", one_line(&run.task, 120));
+        print_candidates(&run);
+        if let Some(line) = coherence_line(&run) {
+            println!("{line}");
+        }
     }
-    print_run_header(&run);
-    println!("\nTask\n  {}\n", one_line(&run.task, 120));
-    print_candidates(&run);
-    if let Some(line) = coherence_line(&run) {
-        println!("{line}");
-    }
+    println!(
+        "\nProject: {}",
+        background::describe(state, &run.source_path)
+    );
     Ok(())
 }
 

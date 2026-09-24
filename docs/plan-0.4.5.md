@@ -390,3 +390,77 @@ Use `caffeinate -i`.
 ## Progress log
 
 - 2026-09-24: Stage 0. Plan committed.
+- Stage 1. The Owner/View split. Runs are loaded once per tick, and only the
+  root's (the source path comes from the projected metadata). No behavior change.
+- Stage 2 (D1, D2). The in-memory `Policy` is replaced for the owner: each verdict
+  is compared with the verdict stored on the run, which is reloaded under the run
+  lock. This uses `watch::worth_recording`, the same rule the watcher's messages
+  use. Both defects are fixed by construction, and nothing is lost on restart.
+  - Tests: `a_verdict_that_changes_back_within_a_minute_is_still_recorded` and
+    `a_restarted_owner_records_a_change_the_old_one_never_saw`. Both fail on
+    the old code.
+  - A full-suite run once failed `profile_selection::quota_failure_mid_attempt…`
+    with empty output. It passed 5/5 on rerun, on a path stage 2 does not touch.
+- Stage 3 (D3). The owner follows active, unowned attached work by a hash of its
+  patch, taken without the run lock. `finish` and `accept` take that lock without
+  waiting, so the owner holds it only when the world or the work moved.
+  `serve_follows_foreign_work_that_edits_into_a_change_already_made` fails on
+  the old code.
+- Stage 4 (D4). The owner re-checks Ready, unapplied, review-pending results
+  (native and attached) with `coherence::live_validity`, which is what `check`
+  shows. It checks when a result becomes Ready and whenever the world signal
+  moves.
+  - The evaluation takes no lock. The lock is held only to record, and only if
+    `state_revision` is unchanged.
+  - The first check after the world moved is stored even when it is CONTINUE,
+    so the view shows CONTINUE, not "not checked".
+  - `transition` accepts `coherence.*` events on finished runs.
+  - Tests: `the_owner_keeps_a_refusal_by_the_checks_until_the_world_moves` and
+    `the_owner_marks_a_ready_native_result_stale_when_the_world_moves`.
+- Stages 5-6. `background.rs` holds the record (`watchers/<key>.json`), the
+  watched/not-watched check (a probe of the serve lock), `start` and `stop`.
+  `serve --background` renders nothing, and its log names each distinct error
+  once.
+  - `serve` waits up to 1 s for its lock, because the check probes it.
+  - It now creates its shutdown listener once, so a SIGTERM that arrives
+    mid-tick is not lost.
+  - `start` validates `dispatch.yml` before spawning. It starts the owner with
+    `setsid` and `/dev/null` stdin, and waits for a record that names the child
+    with an `ExactLive` identity.
+  - `stop` signals only an `ExactLive` identity while the lock is held.
+  - `tests/background.rs` has 7 lifecycle tests. By hand, `start` returned in
+    0.48 s.
+- Stage 7. `dispatch watch`:
+  - Its doorbell is `MAX(id) FROM events` through a read-only connection, plus
+    the watcher line, plus a 30 s redraw.
+  - The header names who watches. It exits 0 on Ctrl+C and holds no lock.
+  - `status` ends with `Project: …`. `watch_follows_the_project_and_leaving_it_keeps_watching`
+    sees REFRESH from the background owner.
+- Stage 8. `Tick.cost` records the signal, run loading, work following,
+  evaluations, rechecks and auto-apply. `-v` logs each non-idle tick and `-vv`
+  logs every tick. `an_idle_tick_evaluates_nothing` asserts 0 evaluated and 0
+  rechecked on idle ticks.
+- Stage 8 measurements (`serve_tick_cost`: this Mac, Git root of 2,000 files,
+  foreign attached items with one edit each; Defender and DLP scanning active):
+
+  | items | signal | load runs | follow (idle) | evaluate (world moved) |
+  |---|---|---|---|---|
+  | 1 | ~48 ms | 3-7 ms | 200 ms → **50 ms** | 350-480 ms |
+  | 5 | ~48 ms | 11-20 ms | 1.0 s → **250 ms** | 1.7-2.3 s |
+  | 20 | ~48 ms | 32-46 ms | 4-5 s → **1.0-1.4 s** | 6.9-11.2 s |
+
+  - The follow cost was a fresh temporary index for each snapshot, so `git add
+    -A` re-hashed the whole workspace every tick.
+  - `source::snapshot_delta_indexed` keeps one index per followed run, so Git's
+    stat cache re-hashes only changed files. A unit test compares it with a
+    fresh index across edits, a same-size rewrite, a revert and deletions.
+  - Evaluation after a world move is roughly linear, at about 0.4-0.5 s per
+    item. That is the measured case for later indexed invalidation; nothing is
+    built for it here.
+- Test-suite load. During stage 7, `native_runs` and `review_session` failed in
+  parallel with "Codex account could not be read (probe timeout before
+  initialize response)". The committed stage 6 code failed the same way at that
+  time; serially, all 40 pass.
+  - The cause is environmental: the first exec of a freshly written script took
+    about 200 ms each while Defender and a DLP scanner were busy, and those
+    tests write a new fake agent per test, with a 5 s probe budget.

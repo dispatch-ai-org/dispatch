@@ -647,3 +647,106 @@ fn serve_view_lists_native_and_attached_runs() {
     );
     assert!(attached["verification"].is_string(), "{attached}");
 }
+
+/// A `dispatch -vv serve --background` owner whose `tick:` diagnostics are
+/// streamed to a channel; killed on drop.
+struct Diagnosed {
+    child: Child,
+    ticks: mpsc::Receiver<String>,
+}
+
+impl Diagnosed {
+    fn spawn(fixture: &Fixture) -> Self {
+        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
+            .arg("--state-dir")
+            .arg(&fixture.state)
+            .args(["-vv", "serve", "--background", "--root"])
+            .arg(&fixture.root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(tick) = line.split_once("tick: ").map(|(_, tick)| tick.to_owned())
+                    && tx.send(tick).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { child, ticks: rx }
+    }
+
+    fn next(&self) -> String {
+        self.ticks
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a tick line")
+    }
+}
+
+impl Drop for Diagnosed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn an_idle_tick_evaluates_nothing() {
+    let fixture = Fixture::new();
+    let _id = stale_foreign_work(&fixture);
+    let owner = Diagnosed::spawn(&fixture);
+    let first = owner.next();
+    assert!(first.contains("1 evaluated"), "{first}");
+    for _ in 0..3 {
+        let idle = owner.next();
+        assert!(idle.contains("1 followed"), "{idle}");
+        assert!(idle.contains("0 evaluated"), "{idle}");
+        assert!(idle.contains("0 rechecked"), "{idle}");
+    }
+}
+
+/// Where the owner's time goes as a project grows: a Git root of 2,000 files
+/// with 1, 5 and 20 foreign attached Work items, idle and after the root
+/// moves. Prints its measurements; asserts nothing about time.
+/// `cargo test --test serve serve_tick_cost -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn serve_tick_cost() {
+    for items in [1, 5, 20] {
+        let fixture = Fixture::new();
+        for n in 0..2000 {
+            let dir = fixture.root.join(format!("pkg{}", n / 100));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("m{n}.rs")),
+                format!("pub fn f{n}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(&fixture.root, &["add", "-A"]);
+        git(&fixture.root, &["commit", "--quiet", "-m", "grow"]);
+        for item in 0..items {
+            let workspace = fixture.extra_worktree(&format!("w{item}"));
+            fixture.attach_workspace(&workspace, &[]);
+            fs::write(
+                workspace.join(format!("pkg0/m{item}.rs")),
+                "pub fn changed() {}\n",
+            )
+            .unwrap();
+        }
+        let owner = Diagnosed::spawn(&fixture);
+        let first = owner.next();
+        let idle: Vec<String> = (0..3).map(|_| owner.next()).collect();
+        fs::write(fixture.root.join("pkg1/m100.rs"), "pub fn moved() {}\n").unwrap();
+        let moved = owner.next();
+        println!("{items} items, first: {first}");
+        for line in idle {
+            println!("{items} items, idle:  {line}");
+        }
+        println!("{items} items, moved: {moved}");
+    }
+}

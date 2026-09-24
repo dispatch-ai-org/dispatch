@@ -258,26 +258,41 @@ fn start_with_a_broken_configuration_explains_and_spawns_nothing() {
     assert!(project.record().is_none());
 }
 
+impl Project {
+    /// A Ready native result from the built-in `fake-good` agent, which adds
+    /// `dispatch-fake-good.txt`.
+    fn ready_result(&self) -> String {
+        let run = self.dispatch(&[
+            "run",
+            self.root.to_str().unwrap(),
+            "--allow-unsafe-local",
+            "--agent",
+            "fake-good",
+            "--task",
+            "Create the fake artifact.",
+        ]);
+        assert!(run.status.success(), "{}", text(&run));
+        String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("RUN ").map(str::to_owned))
+            .unwrap()
+    }
+}
+
 /// End to end: a Ready native result goes stale while nothing but the
-/// background owner runs.
+/// background owner runs, and `status` says who watches.
 #[test]
 fn the_background_owner_keeps_a_ready_result_current() {
     let project = Project::new();
-    let run = project.dispatch(&[
-        "run",
-        project.root.to_str().unwrap(),
-        "--allow-unsafe-local",
-        "--agent",
-        "fake-good",
-        "--task",
-        "Create the fake artifact.",
-    ]);
-    assert!(run.status.success(), "{}", text(&run));
-    let run_id = String::from_utf8_lossy(&run.stdout)
-        .lines()
-        .find_map(|line| line.strip_prefix("RUN ").map(str::to_owned))
-        .unwrap();
+    let run_id = project.ready_result();
+    let status = text(&project.dispatch(&["status", &run_id]));
+    assert!(status.contains("Project: not watched"), "{status}");
     assert!(project.dispatch(&["start"]).status.success());
+    let status = text(&project.dispatch(&["status", &run_id]));
+    assert!(
+        status.contains("Project: watched in the background"),
+        "{status}"
+    );
     fs::write(
         project.root.join("dispatch-fake-good.txt"),
         "someone else's\n",
@@ -294,5 +309,47 @@ fn the_background_owner_keeps_a_ready_result_current() {
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .is_some_and(|m| m["coherence"]["validity"]["decision"] == "refresh")
     });
+    assert!(project.dispatch(&["stop"]).status.success());
+}
+
+#[test]
+fn watch_follows_the_project_and_leaving_it_keeps_watching() {
+    use std::io::{BufRead, BufReader};
+
+    let project = Project::new();
+    let run_id = project.ready_result();
+    let mut watch = Command::new(assert_cmd::cargo_bin!("dispatch"))
+        .arg("--state-dir")
+        .arg(&project.state)
+        .arg("watch")
+        .current_dir(&project.root)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(watch.stdout.take().unwrap()).lines();
+    let mut until = |needle: &str| {
+        for line in lines.by_ref() {
+            if line.unwrap().contains(needle) {
+                return;
+            }
+        }
+        panic!("watch ended before showing {needle:?}");
+    };
+    until("not watched");
+    until(&run_id[..8]);
+
+    // watch holds no lock: the owner starts while it runs, and it notices.
+    assert!(project.dispatch(&["start"]).status.success());
+    until("watched in the background");
+    fs::write(
+        project.root.join("dispatch-fake-good.txt"),
+        "someone else's\n",
+    )
+    .unwrap();
+    until("REFRESH");
+
+    unsafe { libc::kill(watch.id() as i32, libc::SIGINT) };
+    assert!(watch.wait().unwrap().success());
+    assert!(alive(project.owner_pid()));
     assert!(project.dispatch(&["stop"]).status.success());
 }
