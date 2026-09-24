@@ -402,13 +402,53 @@ pub fn check_choices(source: &Path) -> Vec<&'static str> {
     if source.join("Makefile").is_file() {
         choices.push("make test");
     }
+    if source.join("package.json").is_file() {
+        choices.push("npm test");
+    }
+    if source.join("go.mod").is_file() {
+        choices.push("go test ./...");
+    }
+    let pytest = source.join("pytest.ini").is_file()
+        || source.join("conftest.py").is_file()
+        || fs::read_to_string(source.join("pyproject.toml"))
+            .is_ok_and(|text| text.contains("[tool.pytest"));
+    if pytest {
+        choices.push("python3 -m pytest");
+    } else if [source.to_path_buf(), source.join("tests")]
+        .iter()
+        .any(|dir| {
+            fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("test_") && name.ends_with(".py")
+                })
+            })
+        })
+    {
+        choices.push("python3 -m unittest");
+    }
     choices
 }
+/// Save a detected check. It must still be detected, so a changed project
+/// cannot turn a stale menu choice into an approval.
 pub fn save_checks(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
     ensure!(
         check_choices(source).contains(&command),
         "check choice is no longer available"
     );
+    write_check(source, command, expected)
+}
+/// Save a check the person typed; typing it is the approval.
+pub fn save_typed_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
+    let command = command.trim();
+    ensure!(
+        !command.is_empty() && !command.contains(['\n', '\r']),
+        "a check is one non-empty command line"
+    );
+    write_check(source, command, expected)
+}
+fn write_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
     let (_, path) = crate::Config::discover(source, None)?;
     let path = path.unwrap_or_else(|| source.join("dispatch.yml"));
     let mut value: serde_yaml::Value = expected
@@ -569,6 +609,29 @@ mod tests {
         assert_eq!(config.checks.verify, vec!["sh ./verify.sh"]);
         assert!(save_checks(t.path(), "sh ./verify.sh", before).is_err());
         assert!(save_checks(t.path(), "curl attacker", project_config_bytes(t.path())?).is_err());
+        Ok(())
+    }
+    #[test]
+    fn checks_are_detected_from_the_project_and_typed_checks_are_one_line() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        assert!(check_choices(t.path()).is_empty());
+        fs::write(t.path().join("test_calc.py"), "")?;
+        assert_eq!(check_choices(t.path()), ["python3 -m unittest"]);
+        fs::write(t.path().join("conftest.py"), "")?;
+        fs::write(t.path().join("package.json"), "{}")?;
+        fs::write(t.path().join("go.mod"), "module x")?;
+        assert_eq!(
+            check_choices(t.path()),
+            ["npm test", "go test ./...", "python3 -m pytest"]
+        );
+        // A typed check is saved as typed, but never a detected-only choice.
+        assert!(save_checks(t.path(), "make lint", None).is_err());
+        save_typed_check(t.path(), "  make lint  ", None)?;
+        let (config, _) = crate::Config::discover(t.path(), None)?;
+        assert_eq!(config.checks.verify, vec!["make lint"]);
+        let current = project_config_bytes(t.path())?;
+        assert!(save_typed_check(t.path(), "", current.clone()).is_err());
+        assert!(save_typed_check(t.path(), "a\nb", current).is_err());
         Ok(())
     }
     #[test]

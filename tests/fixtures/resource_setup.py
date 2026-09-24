@@ -93,9 +93,16 @@ for line in sys.stdin:
     assert (state/'resources.yml').read_bytes()==refreshed
     (source/'verify.sh').write_text('exit 0\n')
     # Checks are chosen, never typed: arrows move, Enter chooses the focused row.
+    # Rows: 1 sh ./verify.sh, 2 Other command…, 3 Continue without checks, 4 Back.
     with session('checks-skip',['setup','--checks']) as ui:
-        ui.wait('Continue without checks');ui.mark('choices');ui.send('\x1b[B');ui.pump(.3);ui.send('\r');ui.finish()
+        ui.wait('Continue without checks');ui.mark('choices');ui.send('\x1b[B');ui.pump(.2);ui.send('\x1b[B');ui.pump(.3);ui.send('\r');ui.finish()
     assert not (source/'dispatch.yml').exists()
+    # A command the person types is saved as typed.
+    with session('checks-other',['setup','--checks']) as ui:
+        ui.wait('Other command');ui.send('2\r');ui.wait('runs in the project');ui.send('sh ./verify.sh --strict\r')
+        ui.wait('Approved check saved');ui.finish()
+    assert '- sh ./verify.sh --strict' in (source/'dispatch.yml').read_text()
+    (source/'dispatch.yml').unlink()
     # Plain mode numbers the same rows; an empty line chooses the focused row.
     with session('checks-plain',['--plain','setup','--checks']) as ui:
         ui.wait('1) sh ./verify.sh');ui.wait('[1] >');ui.send('\r');ui.wait('Approved check saved');ui.finish()

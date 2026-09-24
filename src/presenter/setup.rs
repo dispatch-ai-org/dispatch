@@ -318,6 +318,7 @@ pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> 
     let expected = setup::project_config_bytes(source)?;
     let commands = setup::check_choices(source);
     let mut choices = commands.iter().map(|c| Choice::new(*c)).collect::<Vec<_>>();
+    choices.push(Choice::new("Other command…"));
     choices.push(Choice::new("Continue without checks"));
     choices.push(Choice::new("Back"));
     let body = "Choose checks\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.";
@@ -326,7 +327,17 @@ pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> 
             setup::save_checks(source, commands[i], expected)?;
             ui.commit(&format!("Approved check saved: {}", commands[i]))
         }
-        Some(i) if i == commands.len() => Ok(()),
+        Some(i) if i == commands.len() => {
+            let Input::Submit(typed) = ui
+                .command_prompt("Check command (runs in the project with your permissions)")
+                .await?
+            else {
+                anyhow::bail!("check selection cancelled")
+            };
+            setup::save_typed_check(source, &typed, expected)?;
+            ui.commit(&format!("Approved check saved: {}", typed.trim()))
+        }
+        Some(i) if i == commands.len() + 1 => Ok(()),
         _ => anyhow::bail!("check selection cancelled"),
     }
 }

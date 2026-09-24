@@ -530,3 +530,16 @@ decided). New languages for symbol facts.
     Defender makes timing here uncontrolled. Re-measure on CI, or on a machine
     without real-time scanning of the build tree, before claiming it.
   - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 8 (P2, partly).
+  - Checks setup detects `npm test` (`package.json`), `go test ./...` (`go.mod`),
+    `python3 -m pytest` (pytest configured) and `python3 -m unittest`
+    (`test_*.py` at the root or in `tests/`). This covers the dogfood project's
+    check.
+  - *Other command…* saves one command line the person types; typing it is the
+    approval. A detected choice must still be detected when saved.
+  - Tests: detection and typed-check unit tests; a setup journey for a typed
+    check.
+  - Deferred to the daemon work: a display-only live verdict for native Work in
+    `serve`. It would re-evaluate every ready run on each world change, and
+    continuous watching belongs to the future authority.
+  - `cargo test`: 430 passed, 0 failed.

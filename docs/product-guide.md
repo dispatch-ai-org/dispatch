@@ -57,9 +57,12 @@ each menu is a numbered list; type a number, or press Enter for the focused row
 ## Checks and direct work
 
 After intent, approve local execution for that goal. It uses a separate workspace
-but is **not a security sandbox**. If no checks are configured, Dispatch offers
-known choices from existing `verify.sh`, `Cargo.toml`, or `Makefile`. Choosing one
-explicitly approves saving and later executing it. The command may execute project
+but is **not a security sandbox**. If no checks are configured, Dispatch offers the
+checks it can detect: `verify.sh`, `Cargo.toml`, `Makefile`, `package.json`
+(`npm test`), `go.mod` (`go test ./...`), and Python (`python3 -m pytest` when pytest
+is configured, otherwise `python3 -m unittest` when `test_*.py` files exist). *Other
+command…* takes one command line you type. Choosing or typing a command explicitly
+approves saving and later executing it. The command may execute project
 code and is not proof of task-specific correctness. No script or tool is installed.
 Use `/checks` or `dispatch setup --checks` to do this independently. Advanced
 `checks.verify` configuration remains supported.
