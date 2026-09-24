@@ -543,3 +543,22 @@ decided). New languages for symbol facts.
     `serve`. It would re-evaluate every ready run on each world change, and
     continuous watching belongs to the future authority.
   - `cargo test`: 430 passed, 0 failed.
+- 2026-09-23 — Stage 9. Release.
+  - Dogfood on the finished branch with the isolated state `state-041`:
+    `serve --json` on the Python scratch project; a real Claude Code run
+    (`claude-sonnet-5`, 32 s, checks passed); a wrapped attach of a small script
+    in a new worktree.
+  - Both rows carried origin, agent (`claude`, `script`), S0 (`snapshot
+    f605d96b`, `merge-base e2cbd28b (full)`), state, verification and review.
+    `history` showed both.
+  - Accepting the native run applied two files, the project's tests pass, and
+    the view followed to `applied` by a human with the review accepted. `status`
+    showed the profile line and the Work line.
+  - The scratch attach was rejected and its worktree removed.
+  - The profile schema is unchanged since 0.4.1, so a `resources.yml` written by
+    0.4.3 setup still loads in 0.4.1 and 0.4.2.
+  - Version 0.4.3; release notes and install note written.
+  - Definition of done: met, except the twenty-consecutive-runs bar, which could
+    not be established on this machine (see stage 7c). The live verdict for
+    native Work in `serve` is deferred.
+  - `cargo test`: 430 passed, 0 failed.
