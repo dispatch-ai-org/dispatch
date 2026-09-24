@@ -244,6 +244,36 @@ fn persist_application_failed(
     Ok(run)
 }
 
+/// The applied run on the same source whose patch is `run`'s patch, when a
+/// STOP finds the work already present: which Work landed it. Reads the other
+/// runs' stored projections only; `index` lines are ignored because they name
+/// blobs, not changes.
+pub(super) fn landed_by(state: &State, run: &RunRecord) -> Option<String> {
+    let patch = |run: &RunRecord| -> Option<String> {
+        let bytes = std::fs::read(&sole_candidate(run).ok()?.diff_path).ok()?;
+        Some(
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|line| !line.starts_with("index "))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    let mine = patch(run)?;
+    state
+        .list_metadata_paths()
+        .ok()?
+        .into_iter()
+        .filter_map(|path| serde_json::from_slice::<RunRecord>(&std::fs::read(path).ok()?).ok())
+        .find(|other| {
+            other.id != run.id
+                && other.source_path == run.source_path
+                && other.outcome.application == ApplicationState::Applied
+                && patch(other).as_ref() == Some(&mine)
+        })
+        .map(|other| other.id)
+}
+
 /// Apply the run's result onto the source under the per-source lock.
 /// The caller holds the run's operation lock. `authority` names who is
 /// applying: only a human decision marks the review as accepted; a policy
@@ -297,6 +327,9 @@ pub(super) fn apply_locked(
         )),
         AcceptGate::Blocked(validity) => Err(CoherenceBlocked {
             run_id: run.id.clone(),
+            landed_by: (validity.decision == Decision::Stop)
+                .then(|| landed_by(state, &run))
+                .flatten(),
             validity,
             attached: run.mode == crate::RunMode::Attached,
             despite_refresh,

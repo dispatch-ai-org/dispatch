@@ -289,15 +289,18 @@ Nothing is applied or launched on start or exit.
 
   ```text
   <first 8 of id> · <native|attached> <agent> · S0 <what it began against> · <verdict>[: <first reason>] · <state> · <verification>[ · review <review>]
-  01M37J7H · native claude · S0 snapshot 99240318 · unmoved · ready · checks passed · review pending
+  01M37J7H · native claude · S0 snapshot at eec41cc7 · unmoved · ready · checks passed · review pending
   01M37K2A · attached codex · S0 merge-base 1c9e0a47 (full) · REFRESH: fact_broken: pub fn validate… · blocked · checks passed · review pending
   ```
 
-  The agent is the one that did the work, for native runs too. S0 is `snapshot
-  <commit>` for native work, and `merge-base <commit> (full)` or `snapshot at
-  attach (partial)` for attached work. The verdict is `CONTINUE`, `REFRESH` or
-  `STOP` from the stored validity, `unmoved` when the source has not changed, or
-  `not checked` when nothing has been evaluated yet. State is `working`, `ready`,
+  The agent is the one that did the work, for native runs too. S0 is `snapshot at
+  <project commit>` for native work on a Git source (the working tree as it was at
+  that commit), `directory snapshot` for a plain directory, and `merge-base <commit>
+  (full)` or `snapshot at attach (partial)` for attached work. The verdict is
+  `CONTINUE`, `REFRESH` or `STOP` from the stored validity; `unmoved` when the source
+  has not changed (including a result applied to an unmoved source); `overridden`
+  when a human applied it over a REFRESH; or `not checked` when nothing has been
+  evaluated yet. State is `working`, `ready`,
   `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
   `finished`.
 

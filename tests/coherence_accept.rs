@@ -113,6 +113,32 @@ impl Fixture {
         );
     }
 
+    /// Another run of the same task from the current source.
+    fn another_run(&self) -> String {
+        let output = cargo_bin_cmd!("dispatch")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("run")
+            .arg(&self.source)
+            .arg("--allow-unsafe-local")
+            .args([
+                "--task",
+                "Create the fake artifact.",
+                "--agent",
+                "fake-good",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("RUN "))
+            .expect("run output includes an ID")
+            .to_owned()
+    }
+
     fn apply(&self) -> assert_cmd::assert::Assert {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
@@ -206,6 +232,35 @@ fn patch_already_present_in_source_stops() {
         "stop"
     );
     fixture.assert_review_still_pending();
+}
+
+#[test]
+fn stop_names_the_run_that_already_landed_the_change() {
+    let fixture = Fixture::new(false, "");
+    let second = fixture.another_run();
+    fixture.apply().success();
+
+    let check = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .args(["check", &second, "--json"])
+        .output()
+        .unwrap();
+    let shown: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(shown["validity"]["decision"], "stop", "{shown}");
+    assert_eq!(shown["landed_by"], fixture.run_id.as_str(), "{shown}");
+
+    let accept = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .args(["accept", &second])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&accept.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains(&format!("(landed by run {})", fixture.run_id)),
+        "unexpected error: {stderr}"
+    );
 }
 
 #[test]

@@ -1844,11 +1844,15 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     ensure_unapplied_ready(&run, "check")?;
     let candidate = sole_candidate(&run)?;
     let validity = crate::coherence::shown_validity(&run, &candidate.label)?;
+    let landed_by = (validity.decision == Decision::Stop)
+        .then(|| apply::landed_by(state, &run))
+        .flatten();
     if json {
-        println!(
-            "{}",
-            serde_json::json!({"run_id": run.id, "validity": validity})
-        );
+        let mut shown = serde_json::json!({"run_id": run.id, "validity": validity});
+        if let Some(id) = &landed_by {
+            shown["landed_by"] = serde_json::json!(id);
+        }
+        println!("{shown}");
         return Ok(());
     }
     println!("Run {}", run.id);
@@ -1860,6 +1864,9 @@ pub fn check(state: &State, run_id: Option<&str>, source_path: &Path, json: bool
     println!("World changed files: {}", validity.changed_files);
     for reason in &validity.reasons {
         println!("  {}", reason_line(reason));
+    }
+    if let Some(id) = &landed_by {
+        println!("  already landed by run {id}");
     }
     match validity.decision {
         Decision::Continue => println!("Next: dispatch accept {}", run.id),
@@ -2014,7 +2021,12 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             format!("merge-base {} (full)", short(commit))
         }
         Some(crate::BaselineProvenance::SnapshotAtAttach) => "snapshot at attach (partial)".into(),
-        None => format!("snapshot {}", short(&run.baseline_commit)),
+        // Native S0 is the project as it was, named by its commit when it has
+        // one; Dispatch's own baseline commit means nothing to the reader.
+        None => run.source_git_head.as_deref().map_or_else(
+            || "directory snapshot".to_owned(),
+            |head| format!("snapshot at {}", short(head)),
+        ),
     };
     let overridden = run
         .coherence
@@ -2028,6 +2040,8 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
                 .and_then(|v| v.reasons.first())
                 .map(|r| r.detail.chars().take(60).collect()),
         ),
+        // Applied with no stored verdict: accept found the source unmoved.
+        None if run.outcome.application == ApplicationState::Applied => ("unmoved", None),
         None => ("not checked", None),
         Some(v) if v.decision == Decision::Continue && !v.world_changed => ("unmoved", None),
         Some(v) => (
@@ -2807,10 +2821,13 @@ mod tests {
         });
         run.outcome.lifecycle = LifecycleState::Working;
         let working = work_line(&run, None);
+        // S0 names the project, never Dispatch's own baseline commit.
         assert_eq!(
             (working.origin, working.agent.as_str(), working.s0.as_str()),
-            ("native", "claude", "snapshot abcdef01")
+            ("native", "claude", "directory snapshot")
         );
+        run.source_git_head = Some("eec41cc70c0a40aa".into());
+        assert_eq!(work_line(&run, None).s0, "snapshot at eec41cc7");
         assert_eq!(
             (working.verdict, working.state, working.review),
             ("not checked", "working", None)
@@ -2828,7 +2845,7 @@ mod tests {
         );
         assert_eq!(
             ready.to_string(),
-            "native claude · S0 snapshot abcdef01 · unmoved · ready · checks passed · review pending"
+            "native claude · S0 snapshot at eec41cc7 · unmoved · ready · checks passed · review pending"
         );
 
         let stale = work_line(&run, Some(&validity_with(Decision::Refresh, 1)));
@@ -2842,6 +2859,8 @@ mod tests {
             (applied.state, applied.applied_by),
             ("applied", Some("auto_apply"))
         );
+        // Applied with no stored verdict means accept found the source unmoved.
+        assert_eq!(applied.verdict, "unmoved");
         assert!(applied.to_string().contains("applied by auto-apply"));
     }
 

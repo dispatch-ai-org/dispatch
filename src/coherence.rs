@@ -169,6 +169,8 @@ pub struct CoherenceBlocked {
     pub attached: bool,
     /// The human asked to override (`--despite-refresh`).
     pub despite_refresh: bool,
+    /// For a STOP, the applied run that already landed the same patch.
+    pub landed_by: Option<String>,
 }
 
 impl fmt::Display for CoherenceBlocked {
@@ -180,6 +182,9 @@ impl fmt::Display for CoherenceBlocked {
         write!(f, "source has changed; this work is stale ({verdict})")?;
         for reason in &self.validity.reasons {
             write!(f, ": {}", reason.detail)?;
+        }
+        if let Some(id) = &self.landed_by {
+            write!(f, " (landed by run {id})")?;
         }
         write!(f, ". The source was left unchanged. ")?;
         if self.validity.decision == Decision::Stop {
@@ -827,6 +832,7 @@ mod tests {
             validity: validity.clone(),
             attached: false,
             despite_refresh: false,
+            landed_by: None,
         }
         .to_string();
         assert!(text.contains("STOP") && text.contains("Run 'dispatch reject RUN1'"));
@@ -838,6 +844,7 @@ mod tests {
             },
             attached: false,
             despite_refresh: false,
+            landed_by: None,
         }
         .to_string();
         assert!(refresh.contains(
@@ -852,6 +859,7 @@ mod tests {
             },
             attached: true,
             despite_refresh: false,
+            landed_by: None,
         }
         .to_string();
         assert!(!attached.contains("dispatch refresh"), "{attached}");
@@ -862,6 +870,7 @@ mod tests {
             validity,
             attached: false,
             despite_refresh: true,
+            landed_by: None,
         }
         .to_string();
         assert!(stop.contains("cannot be overridden"), "{stop}");

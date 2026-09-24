@@ -332,3 +332,15 @@ Untouched throughout:
     it); the attached advice in `attach_cli.rs`; the refusal texts in unit
     tests.
   - `cargo test`: 439 passed, 0 failed.
+- 2026-09-24 — Stage 7 (F8).
+  - The Work line names native S0 by the project commit (`snapshot at
+    eec41cc7`), or `directory snapshot` for a plain directory, never Dispatch's
+    internal baseline commit.
+  - A result applied with no stored verdict shows `unmoved`.
+  - STOP names the applied run that already landed the same patch, in `check`
+    (human, and `landed_by` in JSON) and in `accept`'s refusal. `index` lines are
+    ignored; other runs' stored projections are read without loading or
+    repairing them.
+  - Tests: `work_line` unit tests; `coherence_accept.rs` with two identical runs
+    (the second is STOP, landed by the first); the `product_ux` S0 wording.
+  - `cargo test`: 440 passed, 0 failed.
