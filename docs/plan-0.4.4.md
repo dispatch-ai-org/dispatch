@@ -369,13 +369,17 @@ Untouched throughout:
       now counts only at the start of a line, and `ERROR` is a marker.
     - A check-refused override said "cannot be overridden". It now says the checks
       refused it.
-  - **New finding F10, not fixed.** Answering D-refresh's question stopped the
+  - **New finding F10.** Answering D-refresh's question stopped the
     run at once with `source_drift` ("source drift before fresh attempt"). A native
     run refuses any fresh attempt, including the continuation after an answer,
     once the source has changed at all. In a moving project, answering a
     clarification question therefore always ends the goal, although the accept
     gate could judge the continuation's result. This drift stop predates the
-    coherence model (it guarded planned tasks and the removed retry). Decision
-    needed; see the release report.
+    coherence model (it guarded planned tasks and the removed retry).
+- Stage 8b (F10): decided to fix in 0.4.4. The drift stop before a fresh attempt
+  is removed: every attempt still starts from S0, the watcher reports the move,
+  and the accept gate judges the result. Regression test
+  `answering_after_the_source_moved_continues_the_goal` fails on the old code with
+  `source_drift` and passes now. Full suite: 441 passed.
   - Official docs no longer say "dogfood". Release notes, install note, version
     0.4.4.

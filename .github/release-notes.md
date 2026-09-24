@@ -33,6 +33,10 @@ human overrule a verdict the analysis got wrong.
   - native S0 shows the project commit;
   - a result applied to an unmoved source shows `unmoved`;
   - STOP names the run that already landed the same change.
+- **Answering a question no longer ends the run when the source moved.** A native
+  run stopped with `source_drift` when it was answered after any change to the
+  project, even though the accept gate judges the result against the source as it
+  is then. The continuation now proceeds from the run's snapshot like any attempt.
 
 **New: recorded human override.** `dispatch accept <run> --despite-refresh
 --explanation "<why>"` applies a REFRESH that comes only from the file and symbol

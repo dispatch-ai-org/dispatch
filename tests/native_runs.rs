@@ -413,6 +413,24 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
     Ok(())
 }
 
+/// The source moves while the goal waits on a question. Answering continues
+/// the goal from its original snapshot; it does not end it with source drift.
+/// The result is then judged against the moved source at accept.
+#[test]
+fn answering_after_the_source_moved_continues_the_goal() -> Result<()> {
+    let f = Fixture::new("clarify")?;
+    let r = Fixture::result(&f.run(&[])?)?;
+    assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
+    fs::write(f.source.join("NOTES.md"), "a teammate's change\n")?;
+    let answered = f.answer(&r, "1")?;
+    let result = Fixture::result(&answered)?;
+    assert!(answered.status.success(), "{result}");
+    assert_eq!(f.count(), 2);
+    assert_ne!(result["execution"]["failure"], "source_drift", "{result}");
+    assert_eq!(result["outcome"]["work_result"], "ready", "{result}");
+    Ok(())
+}
+
 #[test]
 fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     let f = Fixture::new("timeout")?;
