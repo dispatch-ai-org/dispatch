@@ -267,3 +267,12 @@ Untouched throughout:
     `refresh` hands the new agent "check `…` failed". After the world moves,
     `check` shows the fresh CONTINUE. The test fails on stage 1 (`continue`).
   - `cargo test`: 431 passed, 0 failed.
+- 2026-09-24 — Stage 3 (F4). An integration failure's reason quotes what
+  failed: the first two lines that read like a failure (`FAIL`, `Error`,
+  `error:`, `assert`, `panicked`), stderr first, else the last non-empty line.
+  - This goes between the exit code and the log path. Integration reasons get
+    600 characters and the excerpt 240, so the log path is never cut off.
+  - A check that prints nothing keeps the 0.4.3 wording.
+  - Test: unit tests with the trial's real unittest failure and a real
+    `cargo test` failure.
+  - `cargo test`: 432 passed, 0 failed.
