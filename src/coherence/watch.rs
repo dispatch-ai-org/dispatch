@@ -7,11 +7,13 @@
 //! so there is exactly one writer of the run's state revision.
 
 use std::{
+    fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -81,7 +83,7 @@ impl Drop for Watcher {
 
 async fn watch(spec: WatchSpec, tx: mpsc::UnboundedSender<WatchMsg>, stop: CancellationToken) {
     let mut policy = Policy::default();
-    let mut last: Option<Signal> = None;
+    let mut last: Option<Signals> = None;
     let mut ticker = tokio::time::interval(spec.poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -115,10 +117,21 @@ async fn watch(spec: WatchSpec, tx: mpsc::UnboundedSender<WatchMsg>, stop: Cance
     }
 }
 
-/// The cheap signal first; only when it moved, observe the world, snapshot the
-/// work so far and evaluate it. Returns the signal to remember.
-fn check(spec: &WatchSpec, previous: Option<Signal>) -> Result<(Signal, Option<Validity>)> {
-    let now = signal(&spec.source, &spec.kind)?;
+/// The world's signal and the work's: a verdict depends on both, so either
+/// moving is a reason to evaluate again.
+type Signals = (Signal, Signal);
+
+/// Cheap signals first; only when the world or the work so far moved, observe
+/// the world and evaluate. The work's signal is a hash of the work-in-progress
+/// patch, taken with the trusted baseline repository, so it honors the ignore
+/// rules (build output never counts) and never runs the workspace's own Git
+/// configuration. Following the work too means a change that landed before
+/// the agent touched the same code is still seen once the agent touches it.
+fn check(spec: &WatchSpec, previous: Option<Signals>) -> Result<(Signals, Option<Validity>)> {
+    let world_signal = signal(&spec.source, &spec.kind)?;
+    snapshot_delta(&spec.baseline, &spec.workspace, &spec.delta_patch)?;
+    let work_signal = Signal(hex::encode(Sha256::digest(fs::read(&spec.delta_patch)?)));
+    let now = (world_signal, work_signal);
     if previous.as_ref() == Some(&now) {
         return Ok((now, None));
     }
@@ -128,7 +141,6 @@ fn check(spec: &WatchSpec, previous: Option<Signal>) -> Result<(Signal, Option<V
         &spec.baseline_commit,
         &spec.kind,
     )?;
-    snapshot_delta(&spec.baseline, &spec.workspace, &spec.delta_patch)?;
     let validity = evaluate(
         &world,
         &WorkView {

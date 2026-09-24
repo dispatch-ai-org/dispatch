@@ -335,7 +335,8 @@ disagreeing with a CONTINUE verdict that was acted on automatically.
 ## The mid-run watcher (`watch.rs`)
 
 For native runs, the native engine starts one `Watcher` per attempt. It stops when the
-attempt returns or the watcher is dropped.
+attempt returns or the watcher is dropped. It evaluates again whenever the source or
+the agent's work so far changed, so the order in which they change does not matter.
 
 Attached work uses this same `Watcher` type, not a different mechanism: the wrapped
 attach owner loop starts one for the agent it spawned, and `serve` re-observes every
@@ -509,7 +510,7 @@ How to read it:
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
 - A native run compares the whole-tree fingerprint before starting a fresh attempt (the continuation after a clarification answer) and stops with source drift if the tree differs.
-- The mid-run watcher covers native runs, observes by default, and while the agent works builds a work-in-progress patch with a temporary Git index each time the signal moves (at most every `poll_secs`).
+- The mid-run watcher covers native runs and wrapped attach, and observes by default. Every `poll_secs` it builds the work-in-progress patch with a temporary Git index (taken with the trusted baseline repository, so ignored build output never counts) and evaluates again when either the source's signal or that patch changed. A change that landed before the agent touched the same code is therefore reported once the agent touches it.
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
 - Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured. What is claimed today, what is recorded during real use, and what would falsify the thesis are in [coherence-validation.md](coherence-validation.md).

@@ -276,3 +276,19 @@ Untouched throughout:
   - Test: unit tests with the trial's real unittest failure and a real
     `cargo test` failure.
   - `cargo test`: 432 passed, 0 failed.
+- 2026-09-24 — Stage 4 (F1). The watcher remembers two signals, the world's and
+  the work's, and evaluates again when either changes.
+  - The work signal is a hash of the work-in-progress patch, which the watcher
+    already builds with the trusted baseline repository and a temporary index.
+    It honors the ignore rules and never runs the workspace's own Git
+    configuration.
+  - Rejected alternatives:
+    - A directory walk of the workspace: this repository's 485,000 files
+      (24 GB `target/`) took 10.6 s, one full poll interval.
+    - `git status` in the workspace: the agent controls `.git/config` there,
+      including `core.fsmonitor`.
+  - Test: `coherence_watch.rs`. The source moves while the agent has written
+    nothing; the agent then edits the same line; `coherence.invalidated` is
+    recorded before it finishes. On 0.4.3 it is never recorded.
+  - No test binary got measurably slower.
+  - `cargo test`: 433 passed, 0 failed.

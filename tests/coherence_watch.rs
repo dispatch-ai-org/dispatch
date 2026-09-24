@@ -61,6 +61,22 @@ fn alive(pid: i32) -> bool {
 impl Fixture {
     /// `coherence` is the YAML body of the `coherence:` block.
     fn new(coherence: &str) -> Result<Self> {
+        Self::build(coherence, false)
+    }
+
+    /// The agent announces itself and waits before writing anything, then
+    /// writes its change and waits again: the source can move while the work
+    /// is still empty.
+    fn new_late_write(coherence: &str) -> Result<Self> {
+        Self::build(coherence, true)
+    }
+
+    fn build(coherence: &str, late_write: bool) -> Result<Self> {
+        let work = if late_write {
+            ": > '{root}/started'\nread line < '{root}/gate'\nprintf '// delivered\\n' > src/lib.rs\n: > '{root}/written'\nread line < '{root}/gate'"
+        } else {
+            "printf '// delivered\\n' > src/lib.rs\n: > '{root}/started'\nread line < '{root}/gate'"
+        };
         let temp = tempfile::tempdir()?;
         let root = temp.path().to_owned();
         let source = root.join("source");
@@ -96,14 +112,13 @@ model=''; previous=''
 for arg in "$@"; do if [ "$previous" = '--model' ]; then model="$arg"; fi; previous="$arg"; done
 printf '%s\n' "$model" >> '{root}/invocations'
 printf '%s\n' "$$" > '{root}/agent.pid'
-printf '// delivered\n' > src/lib.rs
-: > '{root}/started'
-read line < '{root}/gate'
+{work}
 printf 'ok\n' > result.txt
 : > '{root}/finished'
 printf '{{"type":"result","model":"%s"}}\n' "$model"
 "#,
-                root = root.display()
+                root = root.display(),
+                work = work.replace("{root}", &root.display().to_string()),
             ),
         )?;
         let check = root.join("verify");
@@ -252,6 +267,34 @@ fn wait_until(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    Ok(())
+}
+
+/// The source moves while the agent has written nothing, then the agent edits
+/// the same line. The watcher follows the work as well as the world, so the
+/// conflict is recorded during the attempt, not only at accept.
+#[test]
+fn a_change_that_lands_before_the_agent_edits_the_same_code_is_seen_mid_run() -> Result<()> {
+    let f = Fixture::new_late_write("  poll_secs: 1\n")?;
+    let mut child = f.start()?;
+    f.wait_for_agent(&mut child)?;
+    f.edit_source("src/lib.rs", "// teammate\n")?;
+    // Watcher ticks see the moved world against still-empty work: CONTINUE,
+    // which is not recorded.
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(f.event_count("coherence.invalidated"), 0);
+    f.release()?;
+    wait_until(|| Ok(f.root.join("written").exists()))?;
+    wait_until(|| Ok(f.event_count("coherence.invalidated") > 0))?;
+    assert!(
+        !f.root.join("finished").exists(),
+        "recorded while the agent was still working"
+    );
+    f.release()?;
+    let result = Fixture::result(&child.output()?)?;
+    let id = result["run_id"].as_str().unwrap();
+    let validity = f.loaded(id)?.coherence.unwrap().validity.unwrap();
+    assert_eq!(validity.decision, dispatch::Decision::Refresh);
     Ok(())
 }
 
