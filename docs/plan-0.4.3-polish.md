@@ -511,3 +511,22 @@ decided). New languages for symbol facts.
       question is pending, and waits for the run's own `deadline_at` instead of
       sleeping a fixed 5 s.
   - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 7c. Re-measurement and wait limits.
+  - The re-measurement at `c617fd7` could not give a clean signal on this
+    machine. Microsoft Defender's real-time scanner (about 130-150% CPU) and
+    Spotlight were scanning the suite's temp files and processes, and suite time
+    swung from 340 s to 1008 s to 1959 s, with a 15-minute load average of 11.7
+    on 10 cores.
+  - Runs 1 and 2 were clean. Run 3 (six times slower than normal) failed five
+    tests. Every failure was a fixed wait outrun by the slowdown: PTY waits of
+    20 s, a clarification run's 20 s deadline, and a native run that hit the
+    fixture's 30 s deadline before launching. There was no logic failure.
+  - Fix: PTY fixtures take one limit, `DISPATCH_TEST_WAIT_SECS` (default 60),
+    for every expected screen, session exit and condition poll. Waits return as
+    soon as the condition holds, so a passing run is no slower. The native-run
+    fixture's goal deadline is 60 s (deadline tests pass their own `--timeout`);
+    the clarifying deadline test uses 30 s.
+  - Not met on this machine: the plan's twenty consecutive runs, ten under load.
+    Defender makes timing here uncontrolled. Re-measure on CI, or on a machine
+    without real-time scanning of the build tree, before claiming it.
+  - `cargo test`: 429 passed, 0 failed.

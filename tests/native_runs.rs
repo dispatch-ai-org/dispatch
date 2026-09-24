@@ -93,7 +93,7 @@ test "$(cat result.txt)" = 'ok'
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 30\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
                 check.display(),
                 agent.display()
             ),
@@ -426,7 +426,7 @@ fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     // Room for the first attempt to ask its question even on a loaded
     // machine; then wait out the run's own recorded deadline before answering.
     let g = Fixture::new("clarify")?;
-    let r = Fixture::result(&g.run(&["--timeout", "20"])?)?;
+    let r = Fixture::result(&g.run(&["--timeout", "30"])?)?;
     assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
     let deadline: chrono::DateTime<chrono::Utc> =
         r["execution"]["deadline_at"].as_str().unwrap().parse()?;

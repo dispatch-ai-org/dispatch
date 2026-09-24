@@ -20,6 +20,12 @@ import time
 from pathlib import Path
 
 
+
+# Longest wait for any expected screen or exit. Waits return as soon as the
+# condition holds, so a generous limit only matters on a slow machine; set
+# DISPATCH_TEST_WAIT_SECS to change it.
+WAIT = float(os.environ.get("DISPATCH_TEST_WAIT_SECS", "60"))
+
 def has_color(output):
     for parameters in re.findall(rb"\x1b\[([0-9;]*)m", output):
         codes = [int(value) for value in parameters.split(b";") if value]
@@ -99,7 +105,7 @@ raise SystemExit(code if code >= 0 else 128-code)
             self.cast.flush()
             self.clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", " ", self.output.decode("utf8", "replace"))
 
-    def wait(self, text, timeout=20):
+    def wait(self, text, timeout=WAIT):
         deadline = time.monotonic()+timeout
         pattern = re.compile(re.escape(text).replace(r"\ ", r"\s+"))
         while time.monotonic() < deadline:
@@ -128,7 +134,7 @@ raise SystemExit(code if code >= 0 else 128-code)
         Path(str(self.capture_path) + "." + label + ".ansi").write_bytes(self.output)
         self.capture_path.with_suffix(".markers.json").write_text(json.dumps(self.markers, indent=2))
 
-    def finish(self, timeout=10):
+    def finish(self, timeout=WAIT):
         deadline = time.monotonic()+timeout
         while self.process.poll() is None and time.monotonic() < deadline:
             self.pump()
