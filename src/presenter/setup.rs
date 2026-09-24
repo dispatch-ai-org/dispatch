@@ -26,50 +26,106 @@ pub(super) async fn accounts(
     state: &State,
     mut selected: Option<String>,
 ) -> Result<()> {
+    const PROVIDERS: [(&str, &str); 2] = [("claude", "Claude Code"), ("codex", "Codex")];
     loop {
-        let status = setup::status(state)?;
-        let choice = if let Some(provider) = selected.take() {
-            provider
-        } else {
-            match ui.command_prompt(&format!("{status}\n\n[c] Add Codex   [a] Add Claude\n[number] Revalidate profile   [l] Provider login   [b] Back")).await? {
-                Input::Submit(v)=>v.trim().to_lowercase(), _=>return Ok(()),
-            }
-        };
-        if matches!(choice.as_str(), "b" | "back" | "") {
-            return Ok(());
-        }
-        if choice == "l" {
-            let provider=match ui.command_prompt("Provider login changes the provider's saved account.\nChoose codex or claude, or cancel.").await? {
-                Input::Submit(v) if matches!(v.trim(),"codex"|"claude")=>v.trim().to_owned(), _=>continue,
-            };
-            if let Err(e) = login(ui, &provider).await {
-                ui.commit(&format!(
-                    "Login stopped: {e}. No Dispatch funding authorization changed."
-                ))?;
+        if let Some(provider) = selected.take() {
+            if let Err(e) = configure(ui, state, &provider, None).await {
+                report(ui, &e)?;
             }
             continue;
         }
         let resources = crate::config::ResourceConfig::load(&state.root)?;
-        let (provider, index) = match choice.as_str() {
-            "c" | "codex" => ("codex".to_owned(), None),
-            "a" | "claude" => ("claude".to_owned(), None),
-            value => match value
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| n.checked_sub(1))
-                .filter(|n| *n < resources.profiles.len())
-            {
-                Some(i) => (resources.profiles[i].harness.clone(), Some(i)),
-                None => {
-                    ui.commit("Choose a listed resource or provider.")?;
-                    continue;
+        let installed = |provider: &str| which::which(provider).is_ok();
+        let mut choices = PROVIDERS
+            .iter()
+            .map(|(provider, name)| {
+                if installed(provider) {
+                    Choice::new(format!("Add {name}"))
+                } else {
+                    Choice::disabled(format!("Add {name}"), "not found on PATH")
                 }
-            },
+            })
+            .collect::<Vec<_>>();
+        choices.extend(resources.profiles.iter().map(profile_choice));
+        let login_row = choices.len();
+        choices.push(Choice::new("Provider login…"));
+        choices.push(Choice::new("Back"));
+        let body = "Accounts / Resources\nLocal operation · no Dispatch login required\nA resource is needed only for Dispatch to launch an agent; attach, check, serve and review work without one.";
+        let Some(choice) = ui.select(body, &choices, 0).await? else {
+            return Ok(());
         };
-        if let Err(e) = configure(ui, state, &provider, index).await {
-            ui.commit(&format!("Resource unchanged: {}\nChoose Login for missing authentication, or revalidate after correcting provider settings.",clip(&format!("{e:#}"),500)))?;
+        let result = if choice < PROVIDERS.len() {
+            configure(ui, state, PROVIDERS[choice].0, None).await
+        } else if choice < login_row {
+            let index = choice - PROVIDERS.len();
+            let provider = resources.profiles[index].harness.clone();
+            configure(ui, state, &provider, Some(index)).await
+        } else if choice == login_row {
+            let providers = PROVIDERS
+                .iter()
+                .filter(|(provider, _)| installed(provider))
+                .collect::<Vec<_>>();
+            let mut rows = providers
+                .iter()
+                .map(|(_, name)| Choice::new(*name))
+                .collect::<Vec<_>>();
+            rows.push(Choice::new("Back"));
+            match ui
+                .select(
+                    "Provider login changes the provider's saved account.",
+                    &rows,
+                    0,
+                )
+                .await?
+            {
+                Some(i) if i < providers.len() => login(ui, providers[i].0).await,
+                _ => Ok(()),
+            }
+        } else {
+            return Ok(());
+        };
+        if let Err(e) = result {
+            report(ui, &e)?;
         }
     }
+}
+
+/// A profile as a menu row: selecting it revalidates. A disabled profile
+/// stays disabled until it is enabled in `resources.yml`.
+fn profile_choice(profile: &crate::config::ResourceProfile) -> Choice {
+    let name = format!(
+        "Revalidate {} · {} · {}",
+        profile.harness,
+        profile.model,
+        profile.effort.as_deref().unwrap_or("default effort")
+    );
+    if !profile.enabled {
+        return Choice::disabled(name, "disabled in resources.yml");
+    }
+    let status = match profile.eligibility() {
+        Ok(()) => match &profile.claude_subscription {
+            Some(evidence) => format!("ready, expires in {}", remaining(evidence.valid_until)),
+            None => "ready".to_owned(),
+        },
+        Err(e) => format!("needs revalidation: {e}"),
+    };
+    Choice::new(format!("{name} · {status}"))
+}
+
+fn remaining(until: chrono::DateTime<chrono::Utc>) -> String {
+    let left = until - chrono::Utc::now();
+    if left.num_hours() >= 1 {
+        format!("{} h", left.num_hours())
+    } else {
+        format!("{} min", left.num_minutes().max(1))
+    }
+}
+
+fn report(ui: &mut Ui, error: &anyhow::Error) -> Result<()> {
+    ui.commit(&format!(
+        "Resource unchanged: {}\nChoose Provider login for missing authentication, or revalidate after correcting provider settings.",
+        clip(&format!("{error:#}"), 500)
+    ))
 }
 
 async fn configure(ui: &mut Ui, state: &State, provider: &str, index: Option<usize>) -> Result<()> {
@@ -78,53 +134,117 @@ async fn configure(ui: &mut Ui, state: &State, provider: &str, index: Option<usi
     let Some(discovery) = discovery else {
         return Ok(());
     };
-    let (model, effort, tier) = if index.is_some() {
-        (String::new(), String::new(), ResourceTier::Standard)
+    ui.commit(&discovery.summary())?;
+    // Revalidation keeps the profile's model and effort; only a new resource
+    // chooses them.
+    let (model, effort) = if index.is_some() {
+        (String::new(), String::new())
     } else {
-        let default_model = if provider == "codex" {
-            "gpt-5.6-sol"
-        } else {
-            "claude-sonnet-5"
+        let resources = crate::config::ResourceConfig::load(&state.root)?;
+        let Some((model, efforts, default_effort)) =
+            choose_model(ui, provider, &resources, &discovery.models).await?
+        else {
+            return Ok(());
         };
-        let Input::Submit(model)=ui.command_prompt(&format!("{}\n\nExact included model ID [{default_model}]\nConfirm inclusion with your provider; a default is not evidence.",discovery.summary())).await? else{return Ok(())};
-        let model = if model.trim().is_empty() {
-            default_model.into()
-        } else {
-            model.trim().into()
-        };
-        let Input::Submit(effort) = ui
-            .command_prompt("Effort [medium] · low / medium / high / xhigh")
+        let rows = efforts.iter().map(Choice::new).collect::<Vec<_>>();
+        let initial = default_effort
+            .and_then(|d| efforts.iter().position(|e| *e == d))
+            .or_else(|| efforts.iter().position(|e| e == "medium"))
+            .unwrap_or(0);
+        let Some(effort) = ui
+            .select(&format!("Effort for {model}"), &rows, initial)
             .await?
         else {
             return Ok(());
         };
-        let effort = if effort.trim().is_empty() {
-            "medium".into()
-        } else {
-            effort.trim().into()
-        };
-        let Input::Submit(tier)=ui.command_prompt("Resource tier [standard] · light / standard / strong\nChoose the resource's capability tier. This does not change task suitability rules.").await? else{return Ok(())};
-        let tier = match tier.trim() {
-            "light" => ResourceTier::Light,
-            "strong" => ResourceTier::Strong,
-            "standard" | "" => ResourceTier::Standard,
-            _ => anyhow::bail!("unknown tier"),
-        };
-        (model, effort, tier)
+        (model, efforts[effort].clone())
     };
-    let proposal = Proposal::prepare(state, discovery, provider, index, model, effort, tier)?;
-    // Longer consent content uses scrollback plus a short explicit command prompt.
+    let proposal = Proposal::prepare(state, discovery, provider, index, model, effort)?;
+    // The full assertion goes to scrollback so a short terminal never clips
+    // the choice. Focus starts on Cancel: Enter alone never authorizes.
     ui.commit(&proposal.summary())?;
-    if matches!(ui.command_prompt("Authorize this resource? Type confirm, or cancel.").await?,Input::Submit(v) if v.trim()=="confirm")
-    {
+    let consent = [Choice::new("Authorize and save"), Choice::new("Cancel")];
+    if ui.select("Authorize this resource?", &consent, 1).await? == Some(0) {
         proposal.confirm(state)?;
         ui.commit(
             "Resource saved. The current account and funding are checked again before launch.",
         )?;
     } else {
-        ui.commit("Revalidation cancelled. Configuration unchanged.")?;
+        ui.commit("Not authorized. Configuration unchanged.")?;
     }
     Ok(())
+}
+
+/// Choose a model: models already configured for this provider first, then
+/// what the provider listed (or the adapter suggests), then typing another
+/// ID. Returns the model, the efforts to offer and the one to focus.
+async fn choose_model(
+    ui: &mut Ui,
+    provider: &str,
+    resources: &crate::config::ResourceConfig,
+    listed: &[crate::harness::ModelOption],
+) -> Result<Option<(String, Vec<String>, Option<String>)>> {
+    let fallback: Vec<String> = if provider == "claude" {
+        crate::harness::claude::EFFORTS
+            .iter()
+            .map(|e| (*e).to_owned())
+            .collect()
+    } else {
+        ["minimal", "low", "medium", "high", "xhigh"]
+            .map(str::to_owned)
+            .to_vec()
+    };
+    let mut options: Vec<crate::harness::ModelOption> = Vec::new();
+    for profile in resources.profiles.iter().filter(|p| p.harness == provider) {
+        if !options.iter().any(|o| o.id == profile.model) {
+            options.push(
+                listed
+                    .iter()
+                    .find(|o| o.id == profile.model)
+                    .cloned()
+                    .unwrap_or(crate::harness::ModelOption {
+                        id: profile.model.clone(),
+                        efforts: fallback.clone(),
+                        default_effort: profile.effort.clone(),
+                    }),
+            );
+        }
+    }
+    for option in listed {
+        if !options.iter().any(|o| o.id == option.id) {
+            options.push(option.clone());
+        }
+    }
+    let mut rows = options
+        .iter()
+        .map(|o| Choice::new(&o.id))
+        .collect::<Vec<_>>();
+    rows.push(Choice::new("Other model ID…"));
+    let body = "Model\nChoose a model included in your subscription; a listed model is not evidence of inclusion.";
+    let Some(choice) = ui.select(body, &rows, 0).await? else {
+        return Ok(None);
+    };
+    if let Some(option) = options.get(choice) {
+        let efforts = if option.efforts.is_empty() {
+            fallback
+        } else {
+            option.efforts.clone()
+        };
+        return Ok(Some((
+            option.id.clone(),
+            efforts,
+            option.default_effort.clone(),
+        )));
+    }
+    let Input::Submit(typed) = ui
+        .command_prompt("Model ID (exact, as your provider names it)")
+        .await?
+    else {
+        return Ok(None);
+    };
+    let model = typed.trim().to_owned();
+    crate::config::validate_model(Some(&model))?;
+    Ok(Some((model, fallback, None)))
 }
 
 impl Ui {
@@ -156,8 +276,14 @@ impl Ui {
 
 async fn login(ui: &mut Ui, provider: &str) -> Result<()> {
     let executable = setup::executable(provider)?;
-    let Input::Submit(answer)=ui.command_prompt(&format!("Open {provider}'s supported login? This may open a browser and change its saved account.\nNo funding is authorized by login. Type login to continue.")).await? else{return Ok(())};
-    if answer.trim() != "login" {
+    let body = format!(
+        "Open {provider}'s supported login? This may open a browser and change its saved account.\nNo funding is authorized by login."
+    );
+    let rows = [
+        Choice::new(format!("Open {provider} login")),
+        Choice::new("Cancel"),
+    ];
+    if ui.select(&body, &rows, 0).await? != Some(0) {
         return Ok(());
     }
     let temp = tempfile::tempdir()?;
@@ -190,24 +316,28 @@ async fn login(ui: &mut Ui, provider: &str) -> Result<()> {
 
 pub(super) async fn checks(ui: &mut Ui, source: &std::path::Path) -> Result<()> {
     let expected = setup::project_config_bytes(source)?;
-    let choices = setup::check_choices(source);
-    let list = choices
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("[{}] {c}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let Input::Submit(answer)=ui.command_prompt(&format!("Choose checks\n{list}\n[n] Continue unverified   [b] Back\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.")).await? else{anyhow::bail!("check selection cancelled")};
-    if answer.trim() == "n" {
-        return Ok(());
+    let commands = setup::check_choices(source);
+    let mut choices = commands.iter().map(|c| Choice::new(*c)).collect::<Vec<_>>();
+    choices.push(Choice::new("Other command…"));
+    choices.push(Choice::new("Continue without checks"));
+    choices.push(Choice::new("Back"));
+    let body = "Choose checks\nA check runs project code with your permissions. Choosing a command approves it for this project; it does not prove task-specific correctness.";
+    match ui.select(body, &choices, 0).await? {
+        Some(i) if i < commands.len() => {
+            setup::save_checks(source, commands[i], expected)?;
+            ui.commit(&format!("Approved check saved: {}", commands[i]))
+        }
+        Some(i) if i == commands.len() => {
+            let Input::Submit(typed) = ui
+                .command_prompt("Check command (runs in the project with your permissions)")
+                .await?
+            else {
+                anyhow::bail!("check selection cancelled")
+            };
+            setup::save_typed_check(source, &typed, expected)?;
+            ui.commit(&format!("Approved check saved: {}", typed.trim()))
+        }
+        Some(i) if i == commands.len() + 1 => Ok(()),
+        _ => anyhow::bail!("check selection cancelled"),
     }
-    let command = answer
-        .trim()
-        .parse::<usize>()
-        .ok()
-        .and_then(|n| n.checked_sub(1))
-        .and_then(|n| choices.get(n))
-        .context("check selection cancelled")?;
-    setup::save_checks(source, command, expected)?;
-    ui.commit(&format!("Approved check saved: {command}"))
 }

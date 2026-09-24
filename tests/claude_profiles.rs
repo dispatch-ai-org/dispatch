@@ -20,7 +20,7 @@ fn scenario(script: &str, name: &str) {
     );
 }
 macro_rules! portfolio {
-    ($($name:ident => $case:literal),* $(,)?) => {$(#[test] fn $name() { scenario("phase6_portfolio", $case); })*};
+    ($($name:ident => $case:literal),* $(,)?) => {$(#[test] fn $name() { scenario("claude_profiles", $case); })*};
 }
 portfolio! {
     claude_only_cli_identity_usage_review => "direct",

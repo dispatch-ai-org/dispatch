@@ -3,6 +3,7 @@
 use crate::{
     ResourceTier,
     config::{ExecutionConfig, ResourceConfig, ResourceProfile},
+    harness::ModelOption,
     state::State,
 };
 use anyhow::{Context, Result, ensure};
@@ -21,6 +22,9 @@ pub struct Discovery {
     pub account: String,
     pub claude: Option<crate::harness::claude::SubscriptionEvidence>,
     pub codex: Option<crate::harness::codex::AccountEvidence>,
+    /// Models setup offers for selection: listed by the installed CLI when it
+    /// can list them, otherwise the adapter's suggestions.
+    pub models: Vec<ModelOption>,
 }
 impl Discovery {
     pub fn summary(&self) -> String {
@@ -78,6 +82,7 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
             account,
             claude: Some(evidence),
             codex: None,
+            models: crate::harness::claude::models(),
         })
     } else {
         ensure!(provider == "codex", "unsupported provider");
@@ -104,6 +109,11 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
             codex::refusal(&observed, Some(&evidence), &funding).is_none(),
             "paid credits or unsupported service detected; no profile was authorized"
         );
+        // An unlisted model list is not a funding fact; setup still offers
+        // typing a model ID.
+        let models = codex::list_models(&executable, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_or_default();
         Ok(Discovery {
             executable,
             version,
@@ -111,6 +121,7 @@ pub async fn discover(provider: &str, executable: PathBuf) -> Result<Discovery> 
             codex: Some(evidence),
             account,
             claude: None,
+            models,
         })
     }
 }
@@ -122,7 +133,10 @@ pub fn status(state: &State) -> Result<String> {
         "Local operation · no Dispatch login required".into(),
     ];
     if !config.allocation_enabled {
-        lines.push("Included-resource allocation is not configured.".into());
+        lines.push(
+            "No resource is set up. One is needed only for Dispatch to launch an agent; attach, check, serve and review work without one."
+                .into(),
+        );
     }
     for provider in ["codex", "claude"] {
         lines.push(format!(
@@ -167,7 +181,6 @@ impl Proposal {
         existing: Option<usize>,
         model: String,
         effort: String,
-        tier: ResourceTier,
     ) -> Result<Self> {
         let path = state.root.join("resources.yml");
         let original = read_config(&path)?;
@@ -240,11 +253,6 @@ impl Proposal {
                             .as_ref()
                             .is_some_and(|e| e.account_sha256 == discovery.account))
             });
-            // Existing explicit bucket mappings require deliberate advanced setup.
-            ensure!(
-                shared.is_none_or(|p| p.provider_buckets.is_empty()),
-                "existing account uses explicit bucket mappings; revalidate its existing profile instead"
-            );
             ResourceProfile {
                 enabled: true,
                 provider: if provider == "codex" {
@@ -263,7 +271,9 @@ impl Proposal {
                     .map(|p| p.pool.clone())
                     .unwrap_or_else(|| format!("{provider}-included-{}", &discovery.account[..12])),
                 provider_buckets: vec![],
-                tier,
+                // Nothing selects on tier since 0.4.1; it is written so the
+                // file still loads in earlier versions.
+                tier: ResourceTier::Standard,
                 included: false,
                 no_overage_verified: false,
                 authorization_revision: revision,
@@ -288,22 +298,24 @@ impl Proposal {
             discovery,
         })
     }
+    /// What authorizing this proposal asserts, shown in full before the
+    /// Authorize / Cancel choice.
     pub fn summary(&self) -> String {
         let p = &self.config.profiles[self.index];
+        let claude = p.harness == "claude";
         format!(
-            "{}\n\n{} / {} / {} · {:?}\nLocal runtime · standard service · included only\n{}\n\nConfirm: this exact model and effort are included in my subscription.\nI verified that paid overage / usage credits are disabled.{}\n\nType confirm to authorize and save, or cancel to keep configuration.",
+            "{}\n\n{} / {} / {}\nLocal runtime · standard service · included only\n{}\n\nBy authorizing, you confirm:\n- this exact model and effort are included in your subscription;\n- paid overage and usage credits are disabled.{}",
             self.discovery.summary(),
             p.harness,
             p.model,
             p.effort.as_deref().unwrap_or("default"),
-            p.tier,
-            if p.harness == "claude" {
-                "Funding assertion expires in 24 hours."
+            if claude {
+                "The authorization expires in 24 hours."
             } else {
-                "Launch checks current account and retained funding evidence."
+                "Each launch checks the current account and funding again."
             },
-            if p.harness == "claude" {
-                "\nI verified controlled print mode is included and this account is unmanaged."
+            if claude {
+                "\n- controlled print mode is included;\n- this account is unmanaged."
             } else {
                 ""
             }
@@ -390,13 +402,53 @@ pub fn check_choices(source: &Path) -> Vec<&'static str> {
     if source.join("Makefile").is_file() {
         choices.push("make test");
     }
+    if source.join("package.json").is_file() {
+        choices.push("npm test");
+    }
+    if source.join("go.mod").is_file() {
+        choices.push("go test ./...");
+    }
+    let pytest = source.join("pytest.ini").is_file()
+        || source.join("conftest.py").is_file()
+        || fs::read_to_string(source.join("pyproject.toml"))
+            .is_ok_and(|text| text.contains("[tool.pytest"));
+    if pytest {
+        choices.push("python3 -m pytest");
+    } else if [source.to_path_buf(), source.join("tests")]
+        .iter()
+        .any(|dir| {
+            fs::read_dir(dir).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("test_") && name.ends_with(".py")
+                })
+            })
+        })
+    {
+        choices.push("python3 -m unittest");
+    }
     choices
 }
+/// Save a detected check. It must still be detected, so a changed project
+/// cannot turn a stale menu choice into an approval.
 pub fn save_checks(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
     ensure!(
         check_choices(source).contains(&command),
         "check choice is no longer available"
     );
+    write_check(source, command, expected)
+}
+/// Save a check the person typed; typing it is the approval.
+pub fn save_typed_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
+    let command = command.trim();
+    ensure!(
+        !command.is_empty() && !command.contains(['\n', '\r']),
+        "a check is one non-empty command line"
+    );
+    write_check(source, command, expected)
+}
+fn write_check(source: &Path, command: &str, expected: Option<Vec<u8>>) -> Result<()> {
     let (_, path) = crate::Config::discover(source, None)?;
     let path = path.unwrap_or_else(|| source.join("dispatch.yml"));
     let mut value: serde_yaml::Value = expected
@@ -431,6 +483,7 @@ mod tests {
                 account_sha256: "a".repeat(64),
                 checked_at: Utc::now(),
             }),
+            models: vec![],
         }
     }
     fn proposal(state: &State) -> Proposal {
@@ -441,7 +494,6 @@ mod tests {
             None,
             "fixed-model".into(),
             "medium".into(),
-            ResourceTier::Standard,
         )
         .unwrap()
     }
@@ -481,15 +533,8 @@ mod tests {
         let before = fs::read(state.root.join("resources.yml"))?;
         assert!(stale.confirm(&state).is_err());
         assert_eq!(fs::read(state.root.join("resources.yml"))?, before);
-        let current = Proposal::prepare(
-            &state,
-            discovery(),
-            "codex",
-            Some(0),
-            "".into(),
-            "".into(),
-            ResourceTier::Light,
-        )?;
+        let current =
+            Proposal::prepare(&state, discovery(), "codex", Some(0), "".into(), "".into())?;
         drop(current);
         assert_eq!(fs::read(state.root.join("resources.yml"))?, before);
         Ok(())
@@ -508,7 +553,6 @@ mod tests {
             Some(0),
             "other-model".into(),
             "low".into(),
-            ResourceTier::Light,
         )?;
         assert_eq!(update.config.profiles[0].model, "fixed-model");
         assert_eq!(update.config.profiles[0].tier, ResourceTier::Standard);
@@ -521,16 +565,8 @@ mod tests {
             serde_yaml::to_string(&config)?,
         )?;
         assert!(
-            Proposal::prepare(
-                &state,
-                discovery(),
-                "codex",
-                Some(0),
-                "".into(),
-                "".into(),
-                ResourceTier::Light
-            )
-            .is_err()
+            Proposal::prepare(&state, discovery(), "codex", Some(0), "".into(), "".into(),)
+                .is_err()
         );
         Ok(())
     }
@@ -553,15 +589,8 @@ mod tests {
         let proposal = proposal(&state);
         assert_eq!(proposal.config.profiles[0].authorization_revision, 5);
         proposal.confirm(&state)?;
-        let update = Proposal::prepare(
-            &state,
-            discovery(),
-            "codex",
-            Some(0),
-            "".into(),
-            "".into(),
-            ResourceTier::Standard,
-        )?;
+        let update =
+            Proposal::prepare(&state, discovery(), "codex", Some(0), "".into(), "".into())?;
         assert_eq!(update.config.profiles[0].authorization_revision, 6);
         Ok(())
     }
@@ -580,6 +609,29 @@ mod tests {
         assert_eq!(config.checks.verify, vec!["sh ./verify.sh"]);
         assert!(save_checks(t.path(), "sh ./verify.sh", before).is_err());
         assert!(save_checks(t.path(), "curl attacker", project_config_bytes(t.path())?).is_err());
+        Ok(())
+    }
+    #[test]
+    fn checks_are_detected_from_the_project_and_typed_checks_are_one_line() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        assert!(check_choices(t.path()).is_empty());
+        fs::write(t.path().join("test_calc.py"), "")?;
+        assert_eq!(check_choices(t.path()), ["python3 -m unittest"]);
+        fs::write(t.path().join("conftest.py"), "")?;
+        fs::write(t.path().join("package.json"), "{}")?;
+        fs::write(t.path().join("go.mod"), "module x")?;
+        assert_eq!(
+            check_choices(t.path()),
+            ["npm test", "go test ./...", "python3 -m pytest"]
+        );
+        // A typed check is saved as typed, but never a detected-only choice.
+        assert!(save_checks(t.path(), "make lint", None).is_err());
+        save_typed_check(t.path(), "  make lint  ", None)?;
+        let (config, _) = crate::Config::discover(t.path(), None)?;
+        assert_eq!(config.checks.verify, vec!["make lint"]);
+        let current = project_config_bytes(t.path())?;
+        assert!(save_typed_check(t.path(), "", current.clone()).is_err());
+        assert!(save_typed_check(t.path(), "a\nb", current).is_err());
         Ok(())
     }
     #[test]

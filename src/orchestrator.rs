@@ -25,7 +25,7 @@ use ulid::Ulid;
 use crate::{
     AllocationDecision, ApplicationState, AppliedBy, AttemptRecord, CandidateRecord,
     CandidateStatus, CheckPhase, CheckStatus, CoherenceRecord, Config, Decision, DiffStats,
-    EnvironmentRecord, EventRecord, LifecycleState, ReviewState, RoutingHumanOutcome, RunMode,
+    EnvironmentRecord, EventRecord, LifecycleState, ReviewOutcome, ReviewState, RunMode,
     RunOutcome, RunPhase, RunRecord, RunResult, RunStatus, VERSION, VerificationState, WaitingOn,
     WorkResult,
     db::Database,
@@ -301,11 +301,11 @@ pub async fn doctor(state: &State, source_path: &Path, config_path: Option<&Path
 }
 
 fn print_allocation_decision(decision: &AllocationDecision) {
-    println!("Resource");
+    println!("Profile");
     println!(
         "  {} · {} · {} effort",
+        decision.selected.harness,
         decision.selected.requested_model,
-        decision.selected.tier.as_str(),
         decision.selected.effort.as_deref().unwrap_or("default")
     );
     println!("Why:\n  {}\n", decision.reason);
@@ -476,7 +476,7 @@ pub async fn run_dispatch(state: &State, request: RunRequest) -> Result<RunRecor
         resources.allocation_enabled || request.model.is_some() || request.effort.is_some();
     anyhow::ensure!(
         allocation_requested || request.agent.is_some(),
-        "no coding agent is configured: run `dispatch setup` to configure one, or pass --agent claude|codex|cursor"
+        "no coding agent is set up for Dispatch to launch: run `dispatch setup`, or pass --agent claude|codex|cursor. To protect work you run yourself, use `dispatch attach` (no setup needed)."
     );
     let fixed_harness = request.agent.clone();
     let mut local_authorized = request.allow_unsafe_local;
@@ -818,7 +818,7 @@ fn print_single_result_summary(
     run: &RunRecord,
     heading: &str,
     show_status: bool,
-    human_outcome: Option<&RoutingHumanOutcome>,
+    human_outcome: Option<&ReviewOutcome>,
 ) {
     let candidate = run
         .candidates
@@ -832,15 +832,27 @@ fn print_single_result_summary(
         .and_then(|a| a.detail.decision.as_ref())
         .or(run.allocation.as_ref())
     {
-        println!("Agent\n  {}", harness_name(&decision.selected.harness));
+        let selected = &decision.selected;
+        println!("Agent\n  {}", harness_name(&selected.harness));
         println!(
-            "  Allocation trial · {} tier\n",
-            decision.selected.tier.as_str()
+            "  Profile: {} · {} · {}\n",
+            selected.harness,
+            selected.requested_model,
+            selected.effort.as_deref().unwrap_or("default effort")
         );
     } else if let Some(candidate) = run.candidates.first() {
         println!("Agent\n  {}", harness_name(&candidate.harness_id));
-        println!("  Chosen explicitly with --agent\n");
+        println!("  Chosen with --agent (no profile)\n");
     }
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    let line = work_line(run, validity);
+    println!(
+        "Work\n  {} {} · began against {} at {}\n",
+        line.origin,
+        line.agent,
+        line.s0,
+        run.created_at.format("%Y-%m-%d %H:%M UTC")
+    );
     if let Some(attempt) = run.attempts.last()
         && (attempt.requested_model.is_some() || attempt.observed_model.is_some())
     {
@@ -855,14 +867,14 @@ fn print_single_result_summary(
         println!("{line}\n");
     }
     if show_status {
-        println!("Status\n  {}\n", run.status.as_str());
+        println!("Status\n  {}\n", line.state);
     }
     if run.status == RunStatus::Applied {
         println!("Result\n  Applied to the source tree");
     } else if let Some(outcome) = human_outcome {
         match outcome {
-            RoutingHumanOutcome::Accepted => println!("Result\n  Accepted; not applied"),
-            RoutingHumanOutcome::Rejected => {
+            ReviewOutcome::Accepted => println!("Result\n  Accepted; not applied"),
+            ReviewOutcome::Rejected => {
                 println!("Result\n  Rejected; source tree unchanged")
             }
         }
@@ -1555,14 +1567,38 @@ pub fn history(state: &State, limit: usize) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<28} {:<22} {:<11} {:<10} TASK",
-        "RUN", "CREATED", "STATUS", "CANDIDATES"
+        "{:<28} {:<17} {:<20} {:<9} {:<11} TASK",
+        "RUN", "CREATED", "WORK", "STATE", "VERDICT"
     );
     for row in rows {
         let task = one_line(&row.task, 52);
+        let created = row
+            .created_at
+            .get(..16)
+            .unwrap_or(&row.created_at)
+            .replace('T', " ");
+        // The committed projection, read as stored: listing never repairs or
+        // rewrites a run.
+        let (work, state, verdict) = match db.committed_run_projection(&row.id)? {
+            Some(run) => {
+                let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+                let line = work_line(&run, validity);
+                (
+                    format!("{} {}", line.origin, line.agent),
+                    line.state.to_owned(),
+                    line.verdict.to_owned(),
+                )
+            }
+            None => ("—".into(), row.status.clone(), "—".into()),
+        };
         println!(
-            "{:<28} {:<22} {:<11} {:<10} {}",
-            row.id, row.created_at, row.status, row.candidate_count, task
+            "{:<28} {:<17} {:<20} {:<9} {:<11} {}",
+            row.id,
+            created,
+            one_line(&work, 20),
+            state,
+            verdict,
+            task
         );
     }
     Ok(())
@@ -1904,6 +1940,125 @@ pub fn refresh_request(
 }
 
 /// The Coherence line for a Ready run that carries a validity, else `None`.
+/// One Work item as every list shows it: where it came from and what it
+/// began against, the verdict and why, and where verification, review and
+/// integration stand. Built from the run and the validity given (stored or
+/// live); nothing is evaluated or written here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkLine {
+    pub origin: &'static str,
+    pub agent: String,
+    pub s0: String,
+    /// `CONTINUE`, `REFRESH`, `STOP`, `unmoved` or `not checked`.
+    pub verdict: &'static str,
+    pub reason: Option<String>,
+    /// `working`, `ready`, `blocked`, `applied` or `finished`.
+    pub state: &'static str,
+    /// Who applied it: `human` or `auto_apply`; `None` when not applied.
+    pub applied_by: Option<&'static str>,
+    pub verification: &'static str,
+    /// `pending`, `accepted` or `rejected`; `None` before a result exists.
+    pub review: Option<&'static str>,
+}
+
+pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> WorkLine {
+    let attached = run.mode == RunMode::Attached;
+    let agent = run
+        .candidates
+        .first()
+        .map(|candidate| candidate.harness_id.clone())
+        .or_else(|| run.attachment.as_ref().and_then(|a| a.agent.clone()))
+        .or_else(|| run.execution.as_ref().and_then(|e| e.fixed_harness.clone()))
+        .or_else(|| run.allocation.as_ref().map(|a| a.selected.harness.clone()))
+        .unwrap_or_else(|| if attached { "external" } else { "unknown" }.into());
+    let short = |commit: &str| commit.chars().take(8).collect::<String>();
+    let s0 = match run.attachment.as_ref().map(|a| &a.provenance) {
+        Some(crate::BaselineProvenance::GitMergeBase { commit }) => {
+            format!("merge-base {} (full)", short(commit))
+        }
+        Some(crate::BaselineProvenance::SnapshotAtAttach) => "snapshot at attach (partial)".into(),
+        None => format!("snapshot {}", short(&run.baseline_commit)),
+    };
+    let (verdict, reason) = match validity {
+        None => ("not checked", None),
+        Some(v) if v.decision == Decision::Continue && !v.world_changed => ("unmoved", None),
+        Some(v) => (
+            crate::coherence::verdict(v.decision),
+            v.reasons
+                .first()
+                .map(|r| r.detail.chars().take(60).collect()),
+        ),
+    };
+    let state = if run.outcome.lifecycle != LifecycleState::Finished {
+        "working"
+    } else {
+        match run.outcome.application {
+            ApplicationState::Applied => "applied",
+            ApplicationState::BlockedBySourceDrift | ApplicationState::Failed => "blocked",
+            ApplicationState::NotApplied if run.outcome.work_result != WorkResult::Ready => {
+                "finished"
+            }
+            ApplicationState::NotApplied
+                if validity.is_some_and(|v| v.decision != Decision::Continue) =>
+            {
+                "blocked"
+            }
+            ApplicationState::NotApplied => "ready",
+        }
+    };
+    let verification = match run.outcome.verification {
+        VerificationState::NotConfigured => "no checks",
+        VerificationState::NotRun => "checks not run",
+        VerificationState::Passed => "checks passed",
+        VerificationState::Failed => "checks failed",
+        VerificationState::Inconclusive => "checks inconclusive",
+    };
+    let review = match run.outcome.review {
+        ReviewState::Accepted => Some("accepted"),
+        ReviewState::Rejected => Some("rejected"),
+        _ if run.outcome.work_result == WorkResult::Ready => Some("pending"),
+        _ => None,
+    };
+    let applied_by = match run.outcome.applied_by {
+        _ if run.outcome.application != ApplicationState::Applied => None,
+        Some(AppliedBy::AutoApply) => Some("auto_apply"),
+        _ => Some("human"),
+    };
+    WorkLine {
+        origin: if attached { "attached" } else { "native" },
+        agent,
+        s0,
+        verdict,
+        reason,
+        state,
+        applied_by,
+        verification,
+        review,
+    }
+}
+
+impl std::fmt::Display for WorkLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} · S0 {} · {}",
+            self.origin, self.agent, self.s0, self.verdict
+        )?;
+        if let Some(reason) = &self.reason {
+            write!(f, ": {reason}")?;
+        }
+        match self.applied_by {
+            Some("auto_apply") => write!(f, " · applied by auto-apply")?,
+            _ => write!(f, " · {}", self.state)?,
+        }
+        write!(f, " · {}", self.verification)?;
+        if let Some(review) = self.review {
+            write!(f, " · review {review}")?;
+        }
+        Ok(())
+    }
+}
+
 fn coherence_line(run: &RunRecord) -> Option<String> {
     let validity = run.coherence.as_ref()?.validity.as_ref()?;
     (run.outcome.work_result == WorkResult::Ready)
@@ -2089,26 +2244,19 @@ fn print_allocation_details(decision: &AllocationDecision) {
         "  effort: {}",
         decision.selected.effort.as_deref().unwrap_or("default")
     );
-    println!("  tier: {}", decision.selected.tier.as_str());
     println!("  service mode: {}", decision.selected.service_mode);
     println!("  runtime: {}", decision.selected.runtime);
-    println!("  pool: {}", decision.selected.pool);
     println!(
         "  profile no-overage assertion: {}",
         decision.selected.no_overage_verified
     );
-    println!(
-        "  internal composition: {}",
-        decision.selected.internal_composition
-    );
     println!("\nSelection reason\n  {}", decision.reason);
-    println!("Policy\n  {}", decision.policy_version);
     println!("Capability provenance\n  {}", decision.capability.source);
-    println!("\nConfigured alternatives");
+    println!("\nConfigured profiles");
     for alternative in &decision.alternatives {
         println!(
             "  {} / {} / {}: {}",
-            alternative.choice.tier.as_str(),
+            alternative.choice.harness,
             alternative.choice.requested_model,
             alternative.choice.effort.as_deref().unwrap_or("default"),
             alternative
@@ -2139,9 +2287,9 @@ fn review_locked(
         && run.outcome.applied_by == Some(AppliedBy::AutoApply);
     let reasons = normalize_reasons(reasons)?;
     let outcome = if accept {
-        RoutingHumanOutcome::Accepted
+        ReviewOutcome::Accepted
     } else {
-        RoutingHumanOutcome::Rejected
+        ReviewOutcome::Rejected
     };
     let mut database = Database::open(state.db_path())?;
     let feedback = database.save_goal_feedback(&run.id, outcome, reasons, explanation)?;
@@ -2261,7 +2409,8 @@ fn load_latest_unresolved_single(state: &State, source_path: &Path) -> Result<Ru
 
 fn print_run_header(run: &RunRecord) {
     println!("RUN {}", run.id);
-    println!("Status           {}", run.status.as_str());
+    let validity = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+    println!("Status           {}", work_line(run, validity).state);
     println!("Source           {}", run.source_path.display());
     println!("Source type      {}", run.source_kind.as_str());
     println!("Baseline         {}", run.baseline_commit);
@@ -2446,6 +2595,43 @@ mod tests {
         }
     }
 
+    fn validity_with(decision: Decision, reasons: usize) -> Validity {
+        Validity {
+            decision,
+            evaluated_at: Utc::now(),
+            world_digest: String::new(),
+            world_changed: true,
+            changed_files: 1,
+            reasons: (0..reasons).map(|i| reason(&format!("fact {i}"))).collect(),
+            analysis: crate::AnalysisLevel::FilesOnly,
+        }
+    }
+
+    fn sample_candidate() -> CandidateRecord {
+        CandidateRecord {
+            id: "candidate".into(),
+            label: "A".into(),
+            harness_id: "fake-good".into(),
+            harness_version: None,
+            model: None,
+            status: CandidateStatus::Completed,
+            workspace_path: PathBuf::new(),
+            prompt_path: PathBuf::new(),
+            stdout_path: PathBuf::new(),
+            stderr_path: PathBuf::new(),
+            diff_path: PathBuf::new(),
+            duration_ms: 1_000,
+            exit_code: Some(0),
+            timed_out: false,
+            tokens: None,
+            token_semantics: None,
+            cost_usd: None,
+            error: None,
+            diff_stats: DiffStats::default(),
+            checks: vec![],
+        }
+    }
+
     #[test]
     fn run_result_summarizes_stored_validity_only_when_the_world_moved() {
         let mut run: RunRecord = serde_json::from_value(serde_json::json!({
@@ -2512,6 +2698,61 @@ mod tests {
         let again = refresh_task(&task, "RUN2", &[reason("new")]);
         assert_eq!(again.matches("Context: this task").count(), 1);
         assert!(again.starts_with("Fix the cache.\n\nContext:") && again.contains("(run RUN2)"));
+    }
+
+    #[test]
+    fn work_line_names_origin_agent_s0_verdict_and_review() {
+        let mut run: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"01WORK", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"b", "baseline_path":"/b", "baseline_commit":"abcdef0123456789",
+            "status":"running", "created_at":"2026-09-17T00:00:00Z", "completed_at":null,
+            "environment":{"dispatch_version":"t","os":"t","architecture":"t","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "applied_candidate":null
+        }))
+        .unwrap();
+        run.candidates.push(CandidateRecord {
+            harness_id: "claude".into(),
+            ..sample_candidate()
+        });
+        run.outcome.lifecycle = LifecycleState::Working;
+        let working = work_line(&run, None);
+        assert_eq!(
+            (working.origin, working.agent.as_str(), working.s0.as_str()),
+            ("native", "claude", "snapshot abcdef01")
+        );
+        assert_eq!(
+            (working.verdict, working.state, working.review),
+            ("not checked", "working", None)
+        );
+
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Ready;
+        run.outcome.verification = VerificationState::Passed;
+        let mut unmoved = validity_with(Decision::Continue, 0);
+        unmoved.world_changed = false;
+        let ready = work_line(&run, Some(&unmoved));
+        assert_eq!(
+            (ready.verdict, ready.state, ready.review),
+            ("unmoved", "ready", Some("pending"))
+        );
+        assert_eq!(
+            ready.to_string(),
+            "native claude · S0 snapshot abcdef01 · unmoved · ready · checks passed · review pending"
+        );
+
+        let stale = work_line(&run, Some(&validity_with(Decision::Refresh, 1)));
+        assert_eq!((stale.verdict, stale.state), ("REFRESH", "blocked"));
+        assert!(stale.reason.is_some());
+
+        run.outcome.application = ApplicationState::Applied;
+        run.outcome.applied_by = Some(AppliedBy::AutoApply);
+        let applied = work_line(&run, None);
+        assert_eq!(
+            (applied.state, applied.applied_by),
+            ("applied", Some("auto_apply"))
+        );
+        assert!(applied.to_string().contains("applied by auto-apply"));
     }
 
     #[test]
@@ -2594,13 +2835,13 @@ mod tests {
             fs::write(
                 project.join("dispatch.yml"),
                 format!(
-                    "execution:\n  timeout_secs: 3\nchecks:\n  baseline: ['true']\n  verify: ['true']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                    "execution:\n  timeout_secs: 60\nchecks:\n  baseline: ['true']\n  verify: ['true']\nharnesses:\n  codex:\n    executable: '{}'\n",
                     agent.display()
                 ),
             )?;
             fs::write(
                 state.root.join("resources.yml"),
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
+                "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: fixture\n    effort: medium\n    runtime: local\n    service_mode: standard\n    pool: pool\n    provider_buckets: [codex]\n    tier: standard\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
             )?;
             let db = Database::open(state.db_path())?;
             let result = CANCEL_AT_HANDOFF
@@ -2625,10 +2866,14 @@ mod tests {
                     ),
                 )
                 .await;
+            // The run is stopped and its result delivered, never launched.
+            let run = result?;
+            assert_eq!(run.outcome.lifecycle, LifecycleState::Finished);
             assert!(
-                result.is_err(),
-                "fault point {point} must interrupt the run"
+                run.execution.as_ref().unwrap().failure.is_some(),
+                "fault point {point} must stop the run"
             );
+            assert!(run.attempts.iter().all(|a| a.completed_at.is_some()));
             assert!(!marker.exists(), "fault point {point} spawned a model");
             let launches: i64 =
                 db.connection()

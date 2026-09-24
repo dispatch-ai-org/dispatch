@@ -74,9 +74,16 @@ impl State {
         self.run_dir(run_id).join("events.jsonl")
     }
 
+    /// Write the run's `metadata.json` projection. Unchanged content is not
+    /// rewritten, so reading a run (`status`, every `serve` tick) leaves its
+    /// files alone.
     pub fn save_run(&self, run: &RunRecord) -> Result<()> {
         let path = self.metadata_path(&run.id);
-        write_atomically(&path, &serde_json::to_vec_pretty(run)?)
+        let bytes = serde_json::to_vec_pretty(run)?;
+        if fs::read(&path).is_ok_and(|current| current == bytes) {
+            return Ok(());
+        }
+        write_atomically(&path, &bytes)
     }
 
     pub fn append_event(&self, event: &EventRecord) -> Result<()> {

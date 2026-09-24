@@ -93,6 +93,15 @@ pub struct HarnessTelemetry {
     pub failure: Option<crate::FailureKind>,
 }
 
+/// A model setup can offer for selection, with the efforts Dispatch accepts
+/// for it (the first-listed default is focused).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub id: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HarnessRunRequest {
     pub read_only: bool,

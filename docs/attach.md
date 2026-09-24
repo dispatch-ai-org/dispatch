@@ -288,15 +288,26 @@ Nothing is applied or launched on start or exit.
   what the tick above already evaluated:
 
   ```text
-  <first 8 of id> · <agent or "dispatch"> · CONTINUE|REFRESH|STOP|— · working|ready|applied|blocked|finished · <first reason, clipped to 60 chars>
+  <first 8 of id> · <native|attached> <agent> · S0 <what it began against> · <verdict>[: <first reason>] · <state> · <verification>[ · review <review>]
+  01M37J7H · native claude · S0 snapshot 99240318 · unmoved · ready · checks passed · review pending
+  01M37K2A · attached codex · S0 merge-base 1c9e0a47 (full) · REFRESH: fact_broken: pub fn validate… · blocked · checks passed · review pending
   ```
+
+  The agent is the one that did the work, for native runs too. S0 is `snapshot
+  <commit>` for native work, and `merge-base <commit> (full)` or `snapshot at
+  attach (partial)` for attached work. The verdict is `CONTINUE`, `REFRESH` or
+  `STOP` from the stored validity, `unmoved` when the source has not changed, or
+  `not checked` when nothing has been evaluated yet. State is `working`, `ready`,
+  `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
+  `finished`.
 
   A run is shown while it is still active, or for up to an hour after it finished.
   On a TTY the block is redrawn in place; otherwise lines are appended. It **renders
   every tick but prints only what changed** since the last redraw — the whole block is
   only ever redrawn if at least one line in it differs from what is already on screen.
   `--json` instead emits one `{"type":"work", "run_id", "agent", "verdict", "state",
-  "reason"}` object per run whose displayed fields changed, and one
+  "reason", "origin", "s0", "verification", "review", "applied_by"}` object per run
+  whose displayed fields changed (the last five since 0.4.3), and one
   `{"type":"world", "digest"}` object whenever the observed world moved.
 
 ## The gate rule for attached runs

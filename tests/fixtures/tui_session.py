@@ -40,7 +40,11 @@ def pump(seconds=.1):
             for _ in range(chunk.count(b'\x1b[6n')): os.write(master,b'\x1b[1;1R')
             clean=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', ' ',transcript.decode('utf8','replace'))
 
-def wait(word,timeout=20):
+# Longest wait for any expected screen or state. Waits return as soon as the
+# condition holds, so a generous limit only matters on a slow machine; set
+# DISPATCH_TEST_WAIT_SECS to change it.
+WAIT=float(os.environ.get('DISPATCH_TEST_WAIT_SECS','60'))
+def wait(word,timeout=WAIT):
     global position
     end=time.time()+timeout
     while time.time()<end:
@@ -90,11 +94,15 @@ try:
             resize(100,28);send(b'\r')
         wait('[y/N]');send(b'y\r')
         if scenario=='activity':
-            wait('elapsed');activity_start=len(transcript);pump(1.2)
-            assert sum(c.encode() in transcript[activity_start:] for c in '◐◓◑◒')>=2, 'activity indicator did not update'
+            wait('elapsed');activity_start=len(transcript)
+            # The indicator must move; a loaded machine may draw frames slowly.
+            frames=lambda: sum(c.encode() in transcript[activity_start:] for c in '◐◓◑◒')
+            end=time.time()+WAIT
+            while frames()<2 and time.time()<end: pump(.2)
+            assert frames()>=2, 'activity indicator did not update'
             resize(38,16);resize(100,28)
         if scenario in ('cancel','active-eof','hangup'):
-            end=time.time()+10
+            end=time.time()+WAIT
             while not os.path.exists(os.path.join(os.path.dirname(state),'invocations')) and time.time()<end:pump()
             if scenario=='active-eof':send(b'\x04')
             elif scenario=='hangup':os.kill(int(open(os.path.join(state,'pty-'+str(pid)+'-child')).read()),signal.SIGHUP)
@@ -112,7 +120,7 @@ try:
             if scenario=='drift': open(os.path.join(source,'src','lib.rs'),'w').write('// user edit\n')  # conflicts with the delivered change; unrelated edits no longer block
             send(b'A\n' if scenario=='plain' else b'r\r' if scenario in ('reject','recovery','concurrent','natural') else b'a\r')
             wait('accomplish?');send(b'\x04')
-    end=time.time()+8
+    end=time.time()+WAIT
     while time.time()<end:
         pump()
         done,status=os.waitpid(pid,os.WNOHANG)

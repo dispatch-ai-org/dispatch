@@ -465,7 +465,7 @@ fn details(run: &RunRecord) -> String {
         run.task, run.id, run.state_revision
     );
     if let Some(decision) = &run.allocation {
-        text.push_str(&format!("\nAllocation: {}", decision.reason));
+        text.push_str(&format!("\nProfile choice: {}", decision.reason));
     }
     for attempt in &run.attempts {
         text.push_str(&format!(
@@ -488,6 +488,36 @@ fn details(run: &RunRecord) -> String {
 }
 
 const INPUT_LIMIT: usize = 16 * 1024;
+
+/// How to use Dispatch on work it does not launch: no resource setup needed.
+const OBSERVE_HELP: &str = "Protect work you run yourself · no setup needed\n  dispatch attach -- <agent command>         run your agent in its own worktree under Dispatch\n  dispatch attach --workspace <dir>           observe an agent already working there\n  dispatch finish <run>                       freeze its result, verify it, make it reviewable\n  dispatch serve                              watch this project in the foreground\n  dispatch check / accept / reject            judge and apply a result against the source now";
+/// One row of a selection menu. A disabled row is shown with its reason and
+/// cannot be chosen.
+struct Choice {
+    label: String,
+    disabled: Option<String>,
+}
+impl Choice {
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            disabled: None,
+        }
+    }
+    fn disabled(label: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            disabled: Some(reason.into()),
+        }
+    }
+    fn row(&self) -> String {
+        match &self.disabled {
+            None => self.label.clone(),
+            Some(reason) => format!("{} — {reason}", self.label),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Input {
     Submit(String),
@@ -1173,6 +1203,113 @@ impl Ui {
     async fn command_prompt(&mut self, body: &str) -> Result<Input> {
         self.input_prompt(body, false).await
     }
+    /// Choose one of `choices`: ↑/↓ or j/k move, a digit moves to that row,
+    /// Enter chooses the focused row, Esc or Ctrl+C returns `None`. Focus
+    /// starts on `initial`, so Enter alone always chooses it. Plain mode
+    /// prints a numbered list and reads a number; an empty line chooses
+    /// `initial`. A disabled row shows its reason and cannot be chosen.
+    async fn select(
+        &mut self,
+        body: &str,
+        choices: &[Choice],
+        initial: usize,
+    ) -> Result<Option<usize>> {
+        if self.closed || choices.is_empty() {
+            return Ok(None);
+        }
+        let mut focus = initial.min(choices.len() - 1);
+        if self.screen.is_none() {
+            let rows = choices
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| format!("{}) {}", i + 1, choice.row()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.commit(&format!("{body}\n{rows}"))?;
+            loop {
+                print!("[{}] > ", focus + 1);
+                io::stdout().flush()?;
+                let line = loop {
+                    match self.next().await? {
+                        None => {
+                            self.closed = true;
+                            return Ok(None);
+                        }
+                        Some(Event::Paste(line)) => break line,
+                        Some(_) => {}
+                    }
+                };
+                let chosen = match line.trim() {
+                    "" => Some(focus),
+                    value => value
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|n| *n < choices.len()),
+                };
+                match chosen.map(|i| (i, &choices[i].disabled)) {
+                    Some((i, None)) => return Ok(Some(i)),
+                    Some((i, Some(reason))) => {
+                        focus = i;
+                        println!("Not available: {reason}");
+                    }
+                    None => println!("Choose a listed number."),
+                }
+            }
+        }
+        loop {
+            let marker = if self.options.ascii { ">" } else { "›" };
+            let rows = choices
+                .iter()
+                .enumerate()
+                .map(|(i, choice)| {
+                    let mark = if i == focus { marker } else { " " };
+                    format!("{mark} {}", choice.row())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.draw(
+                &format!("{body}\n{rows}"),
+                None,
+                "↑↓ move · Enter choose · Esc back",
+            )?;
+            let Some(event) = self.next().await? else {
+                self.closed = true;
+                return Ok(None);
+            };
+            let Event::Key(key) = event else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => focus = focus.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => focus = (focus + 1).min(choices.len() - 1),
+                KeyCode::Char(c)
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'c' | 'd') =>
+                {
+                    self.closed |= c == 'd';
+                    return Ok(None);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(i) = c
+                        .to_digit(10)
+                        .and_then(|n| (n as usize).checked_sub(1))
+                        .filter(|i| *i < choices.len())
+                    {
+                        focus = i;
+                    }
+                }
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Enter if choices[focus].disabled.is_none() => {
+                    self.render_key.clear();
+                    return Ok(Some(focus));
+                }
+                _ => {}
+            }
+        }
+    }
     async fn input_prompt(&mut self, body: &str, compose: bool) -> Result<Input> {
         if self.closed {
             return Ok(Input::Eof);
@@ -1544,10 +1681,26 @@ async fn run_goal(
     if !resources.allocation_enabled || !resources.profiles.iter().any(|p| p.eligibility().is_ok())
     {
         ui.commit(&format!(
-            "{}\nSetup needed · your goal is preserved.",
+            "{}\nNo agent is set up for Dispatch to launch · your goal is preserved.",
             goal_heading(&task, ui.width().saturating_sub(3))
         ))?;
-        setup::accounts(ui, state, None).await?;
+        let choices = [
+            Choice::new("Set up an agent for Dispatch to launch"),
+            Choice::new("Protect work I run myself"),
+            Choice::new("Back to my goal"),
+        ];
+        match ui
+            .select(
+                "Dispatch launches an agent only with a set-up resource.",
+                &choices,
+                0,
+            )
+            .await?
+        {
+            Some(0) => setup::accounts(ui, state, None).await?,
+            Some(1) => ui.commit(OBSERVE_HELP)?,
+            _ => {}
+        }
         ui.draft = task;
         ui.commit("Return to your goal. Submit explicitly when ready.")?;
         return Ok(());
@@ -2303,7 +2456,7 @@ mod tests {
             let output = std::process::Command::new("python3")
                 .arg(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/phase4_session.py"
+                    "/tests/fixtures/tui_session.py"
                 ))
                 .arg(std::env::current_exe().unwrap())
                 .arg(temp.path())

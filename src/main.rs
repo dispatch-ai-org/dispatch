@@ -134,9 +134,9 @@ enum Command {
         #[arg(long)]
         allow_unsafe_local: bool,
     },
-    /// One foreground process per integration root: observes attached work
-    /// with no live owner, auto-applies ready work with INTEGRATE, and
-    /// prints the project view.
+    /// Watch this project in the foreground: show each Work item's coherence
+    /// state, observe attached work whose owner has exited, and auto-apply
+    /// attached work allowed to integrate. Stops when you stop it.
     Serve {
         /// Defaults to the current directory.
         #[arg(long)]

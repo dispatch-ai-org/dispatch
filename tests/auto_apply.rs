@@ -8,7 +8,7 @@
 //! `tests/coherence_accept.rs` and covers the eligibility rows, the
 //! Legacy/Compatible/Blocked gate rows and the human accept path.
 //! `AllocationFixture`, an immediate-delivery profile-bound run modeled on
-//! `tests/phase1_allocation.rs`, covers the post-hoc review guard.
+//! `tests/profile_selection.rs`, covers the post-hoc review guard.
 #![cfg(unix)]
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, path::PathBuf, process::Command};
@@ -431,7 +431,7 @@ fn human_apply_still_records_human_authority_and_accepted_review() {
 
 /// An immediate-delivery allocation run: single profile, a shell fixture
 /// harness that delivers on its first invocation, modeled on
-/// `tests/phase1_allocation.rs`. Allocation mode is required here (unlike
+/// `tests/profile_selection.rs`. Allocation mode is required here (unlike
 /// `Fixture`) because `dispatch accept`/`dispatch reject` only work for an
 /// allocation or routed run.
 struct AllocationFixture {

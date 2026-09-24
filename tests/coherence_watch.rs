@@ -124,9 +124,7 @@ printf '{{"type":"result","model":"%s"}}\n' "$model"
         }).concat();
         fs::write(
             state.join("resources.yml"),
-            format!(
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n{profiles}"
-            ),
+            format!("version: 1\nallocation_enabled: true\nprofiles:\n{profiles}"),
         )?;
         Ok(Self {
             _temp: temp,

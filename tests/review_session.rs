@@ -82,7 +82,7 @@ print('{"type":"result","model":"light-model"}')
         )?;
         fs::write(
             state.join("resources.yml"),
-            "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light-model\n    effort: low\n    runtime: local\n    service_mode: standard\n    pool: fixture\n    tier: light\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
+            "version: 1\nallocation_enabled: true\nprofiles:\n  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: light-model\n    effort: low\n    runtime: local\n    service_mode: standard\n    pool: fixture\n    tier: light\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}\n",
         )?;
         Ok(Self {
             _temp: temp,
@@ -253,15 +253,15 @@ fn phase4_external_review_owns_terminal_preserves_evidence_and_apply_guards() ->
     Ok(())
 }
 
-/// Drives `tests/fixtures/phase4_session.py` directly (the same PTY fixture
-/// `tests/phase3_recovery.rs` uses), following the `exercise`/`reviewer`
+/// Drives `tests/fixtures/tui_session.py` directly (the same PTY fixture
+/// `tests/native_runs.rs` uses), following the `exercise`/`reviewer`
 /// pattern of sending keys and waiting for text. The fixture itself asserts
 /// the run's committed outcome and events for each `auto_apply_*` scenario.
 fn auto_apply_pty(fixture: &Fixture, scenario: &str) -> Result<()> {
     let output = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/phase4_session.py"
+            "/tests/fixtures/tui_session.py"
         ))
         .arg(assert_cmd::cargo_bin!("dispatch"))
         .arg(&fixture.source)

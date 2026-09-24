@@ -93,7 +93,7 @@ test "$(cat result.txt)" = 'ok'
         fs::write(
             source.join("dispatch.yml"),
             format!(
-                "execution:\n  timeout_secs: 30\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
+                "execution:\n  timeout_secs: 60\nchecks:\n  verify: ['{}']\nharnesses:\n  codex:\n    executable: '{}'\n",
                 check.display(),
                 agent.display()
             ),
@@ -101,9 +101,7 @@ test "$(cat result.txt)" = 'ok'
         let profiles=[("light-model","low","light"),("strong-model","high","strong")].map(|(m,e,t)|format!("  - provider: openai\n    funding_source: chatgpt-plus\n    harness: codex\n    model: {m}\n    effort: {e}\n    runtime: local\n    service_mode: standard\n    pool: shared\n    provider_buckets: [codex]\n    tier: {t}\n    included: true\n    no_overage_verified: true\n    authorization_revision: 1\n    codex_account: {{\"account_sha256\":\"cc6d96611cffa9f02c3626f0b9ee897dc171e2d540a5cae349d4ec316104997b\",\"checked_at\":\"2026-01-01T00:00:00Z\"}}\n")).concat();
         fs::write(
             state.join("resources.yml"),
-            format!(
-                "version: 1\nallocation_enabled: true\ncapacity:\n  codex_probe: false\nprofiles:\n{profiles}"
-            ),
+            format!("version: 1\nallocation_enabled: true\nprofiles:\n{profiles}"),
         )?;
         Ok(Self {
             _temp: temp,
@@ -425,9 +423,16 @@ fn one_deadline_bounds_invocations_and_waiting_answers() -> Result<()> {
     assert_eq!(r["execution"]["failure"], "deadline");
     assert_eq!(f.count(), 1);
     f.no_live_launches()?;
+    // Room for the first attempt to ask its question even on a loaded
+    // machine; then wait out the run's own recorded deadline before answering.
     let g = Fixture::new("clarify")?;
-    let r = Fixture::result(&g.run(&["--timeout", "5"])?)?;
-    thread::sleep(Duration::from_secs(5));
+    let r = Fixture::result(&g.run(&["--timeout", "30"])?)?;
+    assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
+    let deadline: chrono::DateTime<chrono::Utc> =
+        r["execution"]["deadline_at"].as_str().unwrap().parse()?;
+    while chrono::Utc::now() <= deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
     let answer = Fixture::result(&g.answer(&r, "1")?)?;
     assert_eq!(answer["execution"]["failure"], "deadline");
     assert_eq!(g.count(), 1);
@@ -1010,7 +1015,7 @@ fn phase4_natural_goal_reaches_review_with_light_and_standard_profiles_only() ->
     let output = Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/phase4_session.py"
+            "/tests/fixtures/tui_session.py"
         ))
         .arg(assert_cmd::cargo_bin!("dispatch"))
         .arg(&f.source)
@@ -1056,7 +1061,7 @@ fn phase4_pty_intent_answer_recovery_review_and_restoration() -> Result<()> {
         let output = Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/phase4_session.py"
+                "/tests/fixtures/tui_session.py"
             ))
             .arg(assert_cmd::cargo_bin!("dispatch"))
             .arg(&f.source)
@@ -1161,7 +1166,7 @@ fn phase4_two_foreground_sessions_keep_their_own_deliveries() -> Result<()> {
         Ok(Command::new("python3")
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/phase4_session.py"
+                "/tests/fixtures/tui_session.py"
             ))
             .arg(assert_cmd::cargo_bin!("dispatch"))
             .arg(source)

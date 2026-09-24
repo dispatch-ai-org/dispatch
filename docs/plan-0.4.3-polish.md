@@ -382,3 +382,183 @@ decided). New languages for symbol facts.
   `no such table: capacity_authorizations`. By hand: the real `dispatch setup`
   against the migrated schema-24 dogfood state reached the consent screen for the
   Claude profile; it was cancelled, and `resources.yml` was unchanged.
+- 2026-09-23 — Stage 1. `Ui::select` in `src/presenter.rs` implements the menu
+  rules from section 3: ↑/↓ or j/k move, a digit moves focus, Enter chooses the
+  focused row, Esc or Ctrl+C backs out, focus starts on the caller's initial row,
+  and disabled rows cannot be chosen. Plain mode prints numbered rows, and an
+  empty line chooses the focused row. The checks menu uses it: detected commands,
+  *Continue without checks*, *Back*. Tests: the setup journeys choose checks with
+  an arrow and Enter (nothing saved) and in plain mode with an empty line (the
+  focused command saved). A PTY capture repaints only changed cells, so tests
+  assert outcomes, not the drawn marker. `cargo test`: 428 passed, 0 failed.
+- 2026-09-23 — Stage 2. Every setup step is a menu.
+  - The main menu has *Add Claude Code* and *Add Codex* (unselectable, with a
+    reason, when not on PATH), one row per profile showing readiness and Claude's
+    expiry, *Provider login…* and *Back*.
+  - Login is chosen, then *Open login*.
+  - Models: Codex's own list from `model/list`. This was probed on codex-cli
+    0.155.1, which lists `gpt-6-*` models with supported and default efforts;
+    hidden models are dropped. Claude uses suggested fixed IDs. Configured models
+    come first; *Other model ID…* is validated and shown verbatim before consent.
+  - Efforts come from the chosen model: those Codex supports and Dispatch accepts
+    (`max` and `ultra` are not offered), or Claude's `EFFORTS`.
+  - Consent is the full assertion in scrollback, then *Authorize and save* /
+    *Cancel* with focus on Cancel.
+  - Tier is no longer asked (written as `standard` for rollback), and the
+    explicit-bucket refusal is gone.
+  - The Codex app-server handshake is shared by the account probe and
+    `list_models`; the funding preflight's checks are unchanged.
+  - Tests: `parse_models`, plus setup journeys for Enter-cancels-consent,
+    Authorize, revalidation with expiry, account change, login, Other model ID
+    (rejected, then verbatim), plain mode, and a state with a database. By hand,
+    with the real Claude Code CLI on a copy of the dogfood state: menu, model,
+    effort, and Enter cancelled; `resources.yml` unchanged.
+  - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 3. Observe versus launch.
+  - Submitting a goal with no agent set up now offers *Set up an agent for
+    Dispatch to launch*, *Protect work I run myself* (prints the attach, finish,
+    serve and check commands; changes nothing) or *Back to my goal*. The goal is
+    preserved each way.
+  - The setup header, `dispatch resources`, the `run` refusal and `serve` help
+    say a resource is needed only for Dispatch to launch an agent.
+  - The README gains "Two ways to use Dispatch" and "Watching a project today"
+    (foreground only; nothing watches in the background).
+  - Tests: a setup journey for the observe choice; the `run` refusal wording in
+    `product_ux.rs`.
+  - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 4. One Work line.
+  - `orchestrator::work_line(run, validity)` gives origin, the agent that did the
+    work (never `dispatch`), S0 (`snapshot <commit>`, `merge-base <commit>
+    (full)` or `snapshot at attach (partial)`), the verdict (`CONTINUE`,
+    `REFRESH`, `STOP`, `unmoved`, `not checked`) with its first reason, state,
+    who applied it, verification and review.
+  - `serve` uses it for rows and for `--json`. The new JSON fields are `origin`,
+    `s0`, `verification`, `review` and `applied_by`; existing keys keep their
+    meaning, except that `agent` names the harness for native runs.
+  - `history` shows WORK, STATE and VERDICT from each committed projection,
+    read as stored, instead of the raw status and a candidate count.
+  - The status summary shows the Work line with its start time. `Profile: …`
+    replaces "Allocation trial · tier", and the status line comes from `outcome`.
+  - Tests: `work_line` unit tests; `serve` JSON fields for native and attached
+    rows; `status` and `history` output in `product_ux.rs`; the allocation
+    status assertion uses the profile wording.
+  - Flake data point: `phase3_recovery::phase4_pty_intent_answer_recovery_review_and_restoration`
+    failed once in the full suite ("activity indicator did not update") and
+    passed alone.
+  - `cargo test`: 428 passed, 0 failed after those fixes.
+- 2026-09-23 — Stage 5. Allocation-era wording is out of human output:
+  - The run-start line reads `Profile · <harness> · <model> · <effort>`.
+  - `explain` lists the selected profile without tier, pool, composition or
+    policy version, and names "Configured profiles".
+  - The TUI details say "Profile choice".
+  - `show` derives its status from `outcome` through `work_line`.
+  - The README profile example has `tier: standard`, commented as unused.
+  - Kept: "Capability provenance" (still true: user-validated profile), and the
+    apply refusal's status word (`apply.rs` is on the untouched list; it names
+    only terminal states).
+  - Tests: `explain` has no "tier" and lists "Configured profiles".
+  - `cargo test`: 428 passed, 0 failed.
+- 2026-09-23 — Stage 6. `State::save_run` skips writing `metadata.json` when the
+  bytes are unchanged.
+  - Verified first: each `serve` tick loads every run in the state through
+    `load_run`, up to four times, and every load rewrote the projection.
+  - Tests: a unit test that the file keeps its inode on an identical save and is
+    replaced on a change; `product_ux.rs` checks that repeated `status` leaves
+    `metadata.json` untouched, and it fails without the fix.
+  - The failed-projection-write recovery test still passes: a directory in place
+    of the file fails the read, so the write is attempted and errors.
+  - Flake data point: `phase0_outcomes::committed_transition_recovers_after_projection_write_failure`
+    failed once in the full suite. Its fixture run hit its goal deadline under
+    load (exit 124) before any projection code ran; it passed 3 of 3 alone.
+  - `cargo test`: 428 passed plus that flake.
+- 2026-09-23 — Stage 7a. Names and fixtures.
+  - Test files are named by topic: `outcomes`, `profile_selection`,
+    `native_runs`, `cli_modes`, `review_session`, `claude_profiles`; fixtures
+    `tui_session.py` and `claude_profiles.py`.
+  - `RoutingHumanOutcome` is `ReviewOutcome` (serde unchanged).
+  - Test `resources.yml` strings drop the ignored `capacity:` block, except in
+    the funding and launch-record proof suites, which stay untouched and keep
+    proving old keys are ignored.
+  - `scripts/capture-product.py` is deleted: nothing references it, and it
+    imported the planning fixture removed in 0.4.1. `render-product.py` loses
+    its "planned" scenario and still renders setup-journey captures.
+  - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 7b. Flake measurement and fixes.
+  - Measured on `2a96f38`, 10 cores: ten full suites at default threads, 272-321 s
+    each. Nine were clean. Run 1 failed
+    `claude_deadline_bounds_preflight_and_attempt` and
+    `phase4_pty_intent_answer_recovery_review_and_restoration`.
+  - The load phase as planned (32 test threads plus a CPU hog on every core) was
+    stopped. Its first suite ran over 45 minutes, unit tests took over 60 s, and
+    23 tests failed across attach, serve and auto-apply because even 30 s goal
+    deadlines expired. That is saturation, not something per-test fixes should
+    target. Load is redefined as 32 test threads (3x oversubscription) without
+    hogs.
+  - Product fix found by the Claude deadline flake: a cancel or deadline noticed
+    at the native engine's handoff recorded the stop and then returned an
+    error, so `dispatch run --json` printed no result. The same condition one
+    check earlier delivered the result. The handoff now records the stop and
+    leaves the attempt loop too, so the result and the deadline's exit code
+    (124) always reach the caller. The unit test keeps its invariants (nothing
+    spawned, no launch recorded) and adds that the stop is recorded and
+    delivered.
+  - Test fixes:
+    - Goal deadlines of 2-5 s in tests that do not test deadlines are now 30-60 s
+      (`outcomes.rs`, `unsafe_local.rs`, `e2e.rs`, the handoff unit test).
+    - The PTY activity check polls up to 10 s for two spinner frames instead of
+      sampling 1.2 s.
+    - The native deadline test gives the clarifying run 20 s, checks that its
+      question is pending, and waits for the run's own `deadline_at` instead of
+      sleeping a fixed 5 s.
+  - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 7c. Re-measurement and wait limits.
+  - The re-measurement at `c617fd7` could not give a clean signal on this
+    machine. Microsoft Defender's real-time scanner (about 130-150% CPU) and
+    Spotlight were scanning the suite's temp files and processes, and suite time
+    swung from 340 s to 1008 s to 1959 s, with a 15-minute load average of 11.7
+    on 10 cores.
+  - Runs 1 and 2 were clean. Run 3 (six times slower than normal) failed five
+    tests. Every failure was a fixed wait outrun by the slowdown: PTY waits of
+    20 s, a clarification run's 20 s deadline, and a native run that hit the
+    fixture's 30 s deadline before launching. There was no logic failure.
+  - Fix: PTY fixtures take one limit, `DISPATCH_TEST_WAIT_SECS` (default 60),
+    for every expected screen, session exit and condition poll. Waits return as
+    soon as the condition holds, so a passing run is no slower. The native-run
+    fixture's goal deadline is 60 s (deadline tests pass their own `--timeout`);
+    the clarifying deadline test uses 30 s.
+  - Not met on this machine: the plan's twenty consecutive runs, ten under load.
+    Defender makes timing here uncontrolled. Re-measure on CI, or on a machine
+    without real-time scanning of the build tree, before claiming it.
+  - `cargo test`: 429 passed, 0 failed.
+- 2026-09-23 — Stage 8 (P2, partly).
+  - Checks setup detects `npm test` (`package.json`), `go test ./...` (`go.mod`),
+    `python3 -m pytest` (pytest configured) and `python3 -m unittest`
+    (`test_*.py` at the root or in `tests/`). This covers the dogfood project's
+    check.
+  - *Other command…* saves one command line the person types; typing it is the
+    approval. A detected choice must still be detected when saved.
+  - Tests: detection and typed-check unit tests; a setup journey for a typed
+    check.
+  - Deferred to the daemon work: a display-only live verdict for native Work in
+    `serve`. It would re-evaluate every ready run on each world change, and
+    continuous watching belongs to the future authority.
+  - `cargo test`: 430 passed, 0 failed.
+- 2026-09-23 — Stage 9. Release.
+  - Dogfood on the finished branch with the isolated state `state-041`:
+    `serve --json` on the Python scratch project; a real Claude Code run
+    (`claude-sonnet-5`, 32 s, checks passed); a wrapped attach of a small script
+    in a new worktree.
+  - Both rows carried origin, agent (`claude`, `script`), S0 (`snapshot
+    f605d96b`, `merge-base e2cbd28b (full)`), state, verification and review.
+    `history` showed both.
+  - Accepting the native run applied two files, the project's tests pass, and
+    the view followed to `applied` by a human with the review accepted. `status`
+    showed the profile line and the Work line.
+  - The scratch attach was rejected and its worktree removed.
+  - The profile schema is unchanged since 0.4.1, so a `resources.yml` written by
+    0.4.3 setup still loads in 0.4.1 and 0.4.2.
+  - Version 0.4.3; release notes and install note written.
+  - Definition of done: met, except the twenty-consecutive-runs bar, which could
+    not be established on this machine (see stage 7c). The live verdict for
+    native Work in `serve` is deferred.
+  - `cargo test`: 430 passed, 0 failed.

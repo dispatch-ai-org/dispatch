@@ -50,7 +50,10 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "run `dispatch setup` to configure one, or pass --agent",
+            "run `dispatch setup`, or pass --agent",
+        ))
+        .stderr(predicates::str::contains(
+            "To protect work you run yourself, use `dispatch attach` (no setup needed)",
         ));
     assert!(
         !marker.exists(),
@@ -72,7 +75,7 @@ fn no_configured_agent_is_refused_and_explicit_agent_runs() -> anyhow::Result<()
         .stdout
         .clone();
     let override_output = String::from_utf8(override_output)?;
-    assert!(override_output.contains("Chosen explicitly with --agent"));
+    assert!(override_output.contains("Chosen with --agent (no profile)"));
     assert!(fs::read_to_string(&marker)?.ends_with("cursor\n"));
     Ok(())
 }
@@ -110,7 +113,40 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("Fix the greeting typo"));
+        .stdout(predicates::str::contains("Fix the greeting typo"))
+        .stdout(predicates::str::contains(
+            "Chosen with --agent (no profile)",
+        ))
+        .stdout(predicates::str::contains(
+            "Work\n  native codex · began against snapshot",
+        ))
+        .stdout(predicates::str::contains("tier").not());
+    // Reading a run never rewrites its projection when nothing changed.
+    let metadata = fs::read_dir(state.join("runs"))?
+        .next()
+        .unwrap()?
+        .path()
+        .join("metadata.json");
+    let before = fs::metadata(&metadata)?.modified()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&metadata)?);
+    for _ in 0..2 {
+        base().arg("status").assert().success();
+    }
+    assert_eq!(fs::metadata(&metadata)?.modified()?, before);
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&metadata)?),
+        inode
+    );
+    base()
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("WORK"))
+        .stdout(predicates::str::contains("native codex"))
+        .stdout(predicates::str::contains("CANDIDATES").not())
+        .stdout(predicates::str::contains("ready_for_evaluation").not());
     base()
         .arg("explain")
         .assert()

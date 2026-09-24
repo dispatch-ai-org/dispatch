@@ -12,8 +12,8 @@ use rusqlite::{
 };
 
 use crate::models::{
-    AttemptRecord, CandidateRecord, CheckResult, EventRecord, GoalFeedbackRevision,
-    RoutingHumanOutcome, RunRecord,
+    AttemptRecord, CandidateRecord, CheckResult, EventRecord, GoalFeedbackRevision, ReviewOutcome,
+    RunRecord,
 };
 
 const MIGRATIONS: &[(i64, &str, &str)] = &[
@@ -920,8 +920,6 @@ pub struct RunSummary {
     pub source_path: PathBuf,
     pub status: String,
     pub created_at: String,
-    pub candidate_count: usize,
-    pub evaluated: bool,
 }
 
 /// Dispatch's durable structured store. Large artifacts remain on disk and are
@@ -1438,7 +1436,7 @@ impl Database {
     pub fn save_goal_feedback(
         &mut self,
         run_id: &str,
-        outcome: RoutingHumanOutcome,
+        outcome: ReviewOutcome,
         reasons: Vec<String>,
         explanation: Option<String>,
     ) -> Result<GoalFeedbackRevision> {
@@ -1482,8 +1480,8 @@ impl Database {
                 [run_id],
                 |row| {
                     let outcome = match row.get::<_, String>(2)?.as_str() {
-                        "accepted" => RoutingHumanOutcome::Accepted,
-                        "rejected" => RoutingHumanOutcome::Rejected,
+                        "accepted" => ReviewOutcome::Accepted,
+                        "rejected" => ReviewOutcome::Rejected,
                         value => return Err(rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, format!("invalid goal feedback outcome {value}").into())),
                     };
                     let reasons_json: String = row.get(3)?;
@@ -1700,26 +1698,19 @@ impl Database {
         }
         let limit = usize_integer(limit, "history limit")?;
         let mut statement = self.connection.prepare(
-            r#"SELECT r.id, r.task, s.path, r.status, r.created_at,
-                      COUNT(c.id), e.id IS NOT NULL
+            r#"SELECT r.id, r.task, s.path, r.status, r.created_at
                FROM runs r
                JOIN sources s ON s.id = r.source_id
-               LEFT JOIN candidates c ON c.run_id = r.id
-               LEFT JOIN evaluations e ON e.run_id = r.id
-               GROUP BY r.id
                ORDER BY r.created_at DESC, r.id DESC
                LIMIT ?1"#,
         )?;
         let rows = statement.query_map([limit], |row| {
-            let count: i64 = row.get(5)?;
             Ok(RunSummary {
                 id: row.get(0)?,
                 task: row.get(1)?,
                 source_path: PathBuf::from(row.get::<_, String>(2)?),
                 status: row.get(3)?,
                 created_at: row.get(4)?,
-                candidate_count: usize::try_from(count).unwrap_or(usize::MAX),
-                evaluated: row.get(6)?,
             })
         })?;
 
@@ -2161,6 +2152,31 @@ mod tests {
             },
             checks: vec![check("test", CheckPhase::Verify)],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_an_unchanged_projection_leaves_the_file_alone() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir()?;
+        let state = crate::state::State {
+            root: temp.path().into(),
+        };
+        let mut record = run("unchanged");
+        state.save_run(&record)?;
+        let path = state.metadata_path(&record.id);
+        let first = fs::metadata(&path)?.ino();
+        state.save_run(&record)?;
+        assert_eq!(
+            fs::metadata(&path)?.ino(),
+            first,
+            "identical bytes were rewritten"
+        );
+        record.task = "changed".into();
+        state.save_run(&record)?;
+        assert_ne!(fs::metadata(&path)?.ino(), first);
+        assert!(fs::read_to_string(&path)?.contains("\"changed\""));
+        Ok(())
     }
 
     #[test]
@@ -2918,8 +2934,6 @@ mod tests {
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].id, "run-1");
         assert_eq!(summary[0].source_path, PathBuf::from("/code/worker"));
-        assert_eq!(summary[0].candidate_count, 2);
-        assert!(!summary[0].evaluated);
 
         let mapping: Vec<(String, String)> = {
             let mut statement = database.connection.prepare(
@@ -2961,7 +2975,12 @@ mod tests {
 
         // Re-sync replaces, rather than duplicates, child rows.
         database.sync_run(&record)?;
-        assert_eq!(database.list_runs(10)?[0].candidate_count, 2);
+        let candidates: i64 = database.connection.query_row(
+            "SELECT COUNT(*) FROM candidates WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(candidates, 2);
         let checks: i64 = database.connection.query_row(
             "SELECT COUNT(*) FROM checks WHERE run_id = 'run-1'",
             [],

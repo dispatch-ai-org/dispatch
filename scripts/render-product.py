@@ -4,7 +4,7 @@ import sys,json,subprocess,hashlib
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 source,target=map(lambda p:Path(p).resolve(),sys.argv[1:3]);target.mkdir(parents=True,exist_ok=True)
-chosen={'direct':['startup','working','review'],'planned':['working','review'],'attention':['question'],'unverified':['review'],'failed':['failed'],'large':['file-index','file'],'narrow':['review'],'light':['review'],'mono':['review'],'missing':['setup'], 'fresh':['missing','funding','preserved'],'cli-claude':['confirm'],'revalidate':['expired','refresh'],'account-change':['blocked'],'login':['return'],'checks':['choices']}
+chosen={'direct':['startup','working','review'],'attention':['question'],'unverified':['review'],'failed':['failed'],'large':['file-index','file'],'narrow':['review'],'light':['review'],'mono':['review'],'missing':['setup'], 'fresh':['missing','funding','preserved'],'cli-claude':['confirm'],'revalidate':['expired','refresh'],'account-change':['blocked'],'login':['return'],'checks':['choices']}
 index=[]
 for name,labels in chosen.items():
     path=source/(name+'.markers.json')

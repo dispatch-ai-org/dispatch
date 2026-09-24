@@ -197,8 +197,8 @@ pub(super) fn emit(run: &RunRecord, output: RunOutputMode) -> Result<()> {
                 );
             } else if !run.candidates.is_empty() {
                 let human = match run.outcome.review {
-                    ReviewState::Accepted => Some(crate::RoutingHumanOutcome::Accepted),
-                    ReviewState::Rejected => Some(crate::RoutingHumanOutcome::Rejected),
+                    ReviewState::Accepted => Some(crate::ReviewOutcome::Accepted),
+                    ReviewState::Rejected => Some(crate::ReviewOutcome::Rejected),
                     _ => None,
                 };
                 let heading = match (run.outcome.work_result, run.outcome.verification) {
@@ -699,10 +699,12 @@ async fn drive_inner(
         if CANCEL_AT_HANDOFF.try_with(|p| *p == 2).unwrap_or(false) {
             cancellation.cancel();
         }
+        // Like the check before the attempt: record the stop and deliver the
+        // result, so `--json` always gets the run and the deadline's exit code.
         if cancellation.is_cancelled() {
             let failure = interrupted(&run);
             stop(state, db, &mut run, failure, "cancelled before handoff")?;
-            bail!("cancelled before handoff");
+            break 'attempt;
         }
         let attempt_id = update_attempt_started(&mut run, &candidate.id);
         db.sync_run(&run)?;
