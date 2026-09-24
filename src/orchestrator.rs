@@ -1,5 +1,6 @@
 mod apply;
 pub mod attach;
+pub mod background;
 pub(crate) mod native;
 pub mod serve;
 pub use apply::{ApplyAuthority, ApplyOutcome, auto_apply};

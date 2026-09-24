@@ -34,28 +34,72 @@ use crate::{
 
 /// `dispatch serve [--root <path>] [--json]`. Loops until Ctrl+C, SIGTERM or
 /// SIGHUP; a second `serve` on the same root refuses to start. The owner
-/// decides and records; this loop only renders what it did.
-pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<()> {
+/// decides and records; this loop only renders what it did. `background`
+/// is `dispatch start`'s owner: it renders nothing, and its stderr is a log
+/// that names each distinct error once.
+pub async fn serve(
+    state: &State,
+    root: Option<PathBuf>,
+    json: bool,
+    background: bool,
+) -> Result<()> {
     state.initialize()?;
     let root = source::resolve_source(root.as_deref())?;
-    let _serve_lock =
-        OperationLock::acquire(&serve_lock_path(state, &root), "already serving this root")?;
+    let _serve_lock = super::background::acquire(state, &root)?;
     let (kind, _head) = source::inspect_source(&root)?;
     let (config, _config_path) = Config::discover(&root, None)?;
     let poll = Duration::from_secs(config.coherence.poll_secs.max(1));
+    let mut owner = Owner::new(root.clone(), kind)?;
+    super::background::write_record(state, &root, background)?;
+    if background {
+        eprintln!(
+            "{} watching {} (pid {})",
+            Utc::now().to_rfc3339(),
+            root.display(),
+            std::process::id()
+        );
+    }
+    let result = run(state, &mut owner, poll, json, background).await;
+    super::background::remove_record(state, &root);
+    if background {
+        eprintln!("{} stopped", Utc::now().to_rfc3339());
+    }
+    result
+}
 
+async fn run(
+    state: &State,
+    owner: &mut Owner,
+    poll: Duration,
+    json: bool,
+    background: bool,
+) -> Result<()> {
     let mut ticker = tokio::time::interval(poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let mut owner = Owner::new(root, kind)?;
+    // Listening for the whole loop, so a signal that arrives mid-tick is
+    // still seen at the next select.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     let mut view = View::default();
+    let mut last_error: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
-            _ = shutdown_signal() => return Ok(()),
+            _ = &mut shutdown => return Ok(()),
         }
         let tick = owner.tick(state);
+        if background {
+            if tick.error.is_some() && tick.error != last_error {
+                eprintln!(
+                    "{} {}",
+                    Utc::now().to_rfc3339(),
+                    tick.error.as_deref().unwrap_or_default()
+                );
+            }
+            last_error = tick.error;
+            continue;
+        }
         if let Some(error) = &tick.error {
             eprintln!("serve: {error}");
         }
@@ -175,11 +219,6 @@ impl Owner {
             Vec::new()
         })
     }
-}
-
-fn serve_lock_path(state: &State, root: &Path) -> PathBuf {
-    let key = hex::encode(Sha256::digest(root.to_string_lossy().as_bytes()));
-    state.root.join("locks").join(format!("serve-{key}.lock"))
 }
 
 fn run_lock_path(state: &State, run_id: &str) -> PathBuf {
