@@ -407,6 +407,72 @@ fn serve_reevaluates_foreign_work_when_the_root_moves() {
     });
 }
 
+fn stored_decision(fixture: &Fixture, id: &str) -> Value {
+    fixture.metadata(id)["coherence"]["validity"]["decision"].clone()
+}
+
+/// Foreign work edits line 2 of `src/lib.rs`; the root edits the same line
+/// to another value, so the work goes stale.
+fn conflict_in_root(fixture: &Fixture) {
+    fs::write(
+        fixture.root.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    3\n}\n",
+    )
+    .unwrap();
+}
+
+fn restore_root(fixture: &Fixture) {
+    git(&fixture.root, &["checkout", "--", "src/lib.rs"]);
+}
+
+fn stale_foreign_work(fixture: &Fixture) -> String {
+    let id = fixture.attach(&[]);
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    id
+}
+
+#[test]
+fn a_verdict_that_changes_back_within_a_minute_is_still_recorded() {
+    let fixture = Fixture::new();
+    let id = stale_foreign_work(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    conflict_in_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+    // The root moves back at once and then stays put: the owner must record
+    // CONTINUE without waiting for yet another move.
+    restore_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "continue"
+    });
+}
+
+#[test]
+fn a_restarted_owner_records_a_change_the_old_one_never_saw() {
+    let fixture = Fixture::new();
+    let id = stale_foreign_work(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    conflict_in_root(&fixture);
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+    drop(serve);
+
+    restore_root(&fixture);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "continue"
+    });
+}
+
 #[test]
 fn serve_auto_applies_ready_foreign_work_with_integrate() {
     let fixture = Fixture::new();

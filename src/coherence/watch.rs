@@ -166,16 +166,22 @@ pub(crate) fn settle(mut validity: Validity) -> Validity {
     validity
 }
 
-/// Decides which verdicts become messages. A run is taken to be valid until a
-/// message says otherwise. A verdict is worth a message when its decision
-/// differs from the last one sent, or when it is not `Continue` and the world
-/// it describes is not the world the last message described. At most one
-/// message goes out per `MIN_MESSAGE_GAP`; a verdict held back by that limit
-/// is sent later unless a newer evaluation supersedes it.
-///
-/// `pub(crate)` so `orchestrator::serve` can reuse this exact "worth
-/// sending" rule for foreign attached Work (part 14 of
-/// `docs/plan-0.3-auto-apply-and-attach.md`), instead of forking it.
+/// Whether `validity` says something `last` did not: a run is taken to be
+/// valid until a verdict says otherwise, so a verdict is worth recording when
+/// its decision differs from the last one, or when it is not `Continue` and
+/// the world it describes is not the world the last one described. Shared by
+/// the watcher's messages and the project owner's stored verdicts.
+pub(crate) fn worth_recording(last: Option<&Validity>, validity: &Validity) -> bool {
+    let last_decision = last.map_or(Decision::Continue, |v| v.decision);
+    validity.decision != last_decision
+        || (validity.decision != Decision::Continue
+            && last.is_none_or(|last| last.world_digest != validity.world_digest))
+}
+
+/// Decides which verdicts become messages to a running agent: those
+/// `worth_recording` against the last message sent. At most one message goes
+/// out per `MIN_MESSAGE_GAP`; a verdict held back by that limit is sent later
+/// unless a newer evaluation supersedes it.
 #[derive(Default)]
 pub(crate) struct Policy {
     sent: Option<Validity>,
@@ -204,16 +210,7 @@ impl Policy {
     }
 
     fn worth_sending(&self, validity: &Validity) -> bool {
-        let last = self
-            .sent
-            .as_ref()
-            .map_or(Decision::Continue, |v| v.decision);
-        validity.decision != last
-            || (validity.decision != Decision::Continue
-                && self
-                    .sent
-                    .as_ref()
-                    .is_none_or(|sent| sent.world_digest != validity.world_digest))
+        worth_recording(self.sent.as_ref(), validity)
     }
 }
 

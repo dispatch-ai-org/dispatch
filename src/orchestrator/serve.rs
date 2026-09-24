@@ -13,7 +13,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -24,7 +24,7 @@ use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line}
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
     RunMode, RunRecord, SourceKind, WorkResult,
-    coherence::{self, WorkView, watch::Policy, world},
+    coherence::{self, WorkView, world},
     db::Database,
     lock::{OperationLock, shutdown_signal},
     process::{IdentityState, ProcessIdentity, identity_state},
@@ -81,7 +81,6 @@ pub(crate) struct Owner {
     root: PathBuf,
     kind: SourceKind,
     last_signal: Option<world::Signal>,
-    policies: HashMap<String, Policy>,
 }
 
 /// What one tick did, and the root's runs as they stand after it.
@@ -110,7 +109,6 @@ impl Owner {
             root,
             kind,
             last_signal: None,
-            policies: HashMap::new(),
         }
     }
 
@@ -281,7 +279,7 @@ impl Owner {
     /// rule, and persist through `apply::persist_verdict`. The first world
     /// digest observed is the tick's: `observe` hashes the current tree
     /// whichever baseline it is given.
-    fn reevaluate(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+    fn reevaluate(&self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
         let (root, kind) = (self.root.as_path(), &self.kind);
         for candidate in runs {
             if candidate.mode != RunMode::Attached
@@ -347,11 +345,13 @@ impl Owner {
                     continue;
                 }
             };
+            // Compared with the verdict stored on the run, not with anything
+            // this process remembers: a restarted owner still records a change.
             let validity = coherence::watch::settle(validity);
-            let policy = self.policies.entry(run.id.clone()).or_default();
-            let Some(worth_sending) = policy.step(Instant::now(), Some(validity)) else {
+            let stored = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
+            if !coherence::watch::worth_recording(stored, &validity) {
                 continue;
-            };
+            }
             let database = match Database::open(state.db_path()) {
                 Ok(database) => database,
                 Err(error) => {
@@ -359,7 +359,7 @@ impl Owner {
                     continue;
                 }
             };
-            if let Err(error) = apply::persist_verdict(state, &database, &mut run, &worth_sending) {
+            if let Err(error) = apply::persist_verdict(state, &database, &mut run, &validity) {
                 tick.report(&error);
                 continue;
             }
