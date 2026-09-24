@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use super::{ApplyOutcome, WorkLine, apply, auto_apply, persist_event, work_line};
 use crate::{
     ApplicationState, Config, Decision, EventRecord, LifecycleState, OwnerState, ReviewState,
-    RunMode, RunRecord, SourceKind, WorkResult,
+    RunMode, RunRecord, SourceKind, Validity, WorkResult,
     coherence::{self, WorkView, world},
     db::Database,
     lock::{OperationLock, shutdown_signal},
@@ -83,6 +83,8 @@ pub(crate) struct Owner {
     last_signal: Option<world::Signal>,
     /// Each followed run's work signal when it was last evaluated.
     work: HashMap<String, String>,
+    /// Each Ready result's world signal when it was last checked.
+    checked: HashMap<String, world::Signal>,
     scratch: tempfile::TempDir,
 }
 
@@ -113,6 +115,7 @@ impl Owner {
             kind,
             last_signal: None,
             work: HashMap::new(),
+            checked: HashMap::new(),
             scratch: tempfile::Builder::new()
                 .prefix("dispatch-owner-")
                 .tempdir()
@@ -142,6 +145,7 @@ impl Owner {
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
         let moved = tick.moved || tick.adopted;
         self.reevaluate(state, &runs, &mut tick, moved);
+        self.recheck_ready(state, &runs, &mut tick);
         for run in ready_for_auto_apply(&runs) {
             match auto_apply(state, &run.id) {
                 Ok(ApplyOutcome::Applied { .. }) => {
@@ -381,7 +385,7 @@ impl Owner {
             // this process remembers: a restarted owner still records a change.
             let validity = coherence::watch::settle(validity);
             let stored = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
-            if !coherence::watch::worth_recording(stored, &validity) {
+            if !worth_storing(stored, &validity) {
                 self.work.insert(run.id.clone(), work);
                 continue;
             }
@@ -401,6 +405,78 @@ impl Owner {
         }
         self.work.retain(|id, _| followed.contains(id));
     }
+}
+
+impl Owner {
+    /// Keep the stored verdict of every Ready result awaiting review, native
+    /// or attached, what `check` would show: `coherence::live_validity`, which
+    /// keeps a refusal by the merged-tree checks for as long as the world has
+    /// not moved. A result is checked when it becomes Ready and again whenever
+    /// the world signal moves. The evaluation takes no lock; the run's lock is
+    /// held only to record a verdict that is worth storing, and only if the
+    /// run has not changed since it was read.
+    fn recheck_ready(&mut self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+        let Some(signal) = self.last_signal.clone() else {
+            return;
+        };
+        let mut waiting = HashSet::new();
+        for candidate in runs {
+            if candidate.outcome.review != ReviewState::Pending
+                || !coherence::is_ready_unapplied(candidate)
+            {
+                continue;
+            }
+            waiting.insert(candidate.id.clone());
+            if self.checked.get(&candidate.id) == Some(&signal) {
+                continue;
+            }
+            // An evaluation that fails is logged by `live_validity` and
+            // tried again when the world next moves.
+            let Some(validity) = coherence::live_validity(candidate) else {
+                self.checked.insert(candidate.id.clone(), signal.clone());
+                continue;
+            };
+            let stored = candidate
+                .coherence
+                .as_ref()
+                .and_then(|c| c.validity.as_ref());
+            if !worth_storing(stored, &validity) {
+                self.checked.insert(candidate.id.clone(), signal.clone());
+                continue;
+            }
+            let Ok(_lock) = OperationLock::acquire(
+                &run_lock_path(state, &candidate.id),
+                "run has a foreground owner",
+            ) else {
+                continue; // busy: a review or apply is under way; try next tick
+            };
+            let recorded = state.load_run(&candidate.id).and_then(|mut run| {
+                if run.state_revision != candidate.state_revision {
+                    return Ok(false); // changed since it was read; next tick
+                }
+                let database = Database::open(state.db_path())?;
+                apply::persist_verdict(state, &database, &mut run, &validity)?;
+                Ok(true)
+            });
+            match recorded {
+                Ok(true) => {
+                    self.checked.insert(candidate.id.clone(), signal.clone());
+                    tick.persisted = true;
+                }
+                Ok(false) => {}
+                Err(error) => tick.report(&error),
+            }
+        }
+        self.checked.retain(|id, _| waiting.contains(id));
+    }
+}
+
+/// Whether the owner stores `validity` over `stored`: when it says something
+/// new (`worth_recording`), and also the first time a moved world was checked
+/// at all, so the view shows CONTINUE rather than "not checked".
+fn worth_storing(stored: Option<&Validity>, validity: &Validity) -> bool {
+    coherence::watch::worth_recording(stored, validity)
+        || (stored.is_none() && validity.world_changed)
 }
 
 /// Every attached run ready to auto-apply: finished, `Ready`, unreviewed,
