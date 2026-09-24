@@ -383,3 +383,18 @@ Untouched throughout:
   `source_drift` and passes now. Full suite: 441 passed.
   - Official docs no longer say "dogfood". Release notes, install note, version
     0.4.4.
+- Stage 8b real-agent re-run (trial project `coherence-044`, native Claude,
+  claude-sonnet-5):
+  - Re-refreshing D, the agent did not ask this time. Its patch also removed M2's
+    `brackets` parameter; the verdict was CONTINUE, because M2 was already in its
+    S0. Human review has to catch that kind of loss. The result is left pending.
+  - An ask-first task was refused at launch once, correctly: the Mac slept
+    14:12:47-14:23:42 UTC, and the Claude approval expired at 14:23:10.
+  - After revalidation, run `01M3A25PWQ81BX62XS8DE3VJRC` asked whether `shout`
+    appends "!". A teammate then landed `textutil.initials` in the same file
+    (`a1f510c`), and the answer was given. The continuation ran (2 attempts), the
+    checks passed, and `check` said CONTINUE (symbols, 1 world file). Accept
+    applied the patch beside `initials`, and the project tests passed. F10 is
+    fixed with a real agent.
+  - Found while it waited: `history` showed the run as `working`. It now shows
+    `question`, asserted in the F10 regression test.

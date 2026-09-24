@@ -57,7 +57,8 @@ No migration; the schema stays at 24. An accept that coherence refuses now leave
 the result pending instead of recording an acceptance. `check` and `status` show a
 refusal by the merged-tree checks until the source moves. Answering a native run's
 question after the project changed now continues the run instead of stopping it with
-`source_drift`. `CoherenceRecord` gains an
+`source_drift`, and `history`, `status` and `serve` show such a waiting run as
+`question` (it was `working`). `CoherenceRecord` gains an
 optional `overridden` field, `serve --json` gains `overridden`, and `check --json`
 gains `landed_by`.
 

@@ -32,7 +32,8 @@ human overrule a verdict the analysis got wrong.
   - attached work is told to run its agent again, not to `dispatch refresh`;
   - native S0 shows the project commit;
   - a result applied to an unmoved source shows `unmoved`;
-  - STOP names the run that already landed the same change.
+  - STOP names the run that already landed the same change;
+  - a run waiting for your answer shows `question`, not `working`.
 - **Answering a question no longer ends the run when the source moved.** A native
   run stopped with `source_drift` when it was answered after any change to the
   project, even though the accept gate judges the result against the source as it

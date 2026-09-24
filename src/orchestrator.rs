@@ -2051,7 +2051,9 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
                 .map(|r| r.detail.chars().take(60).collect()),
         ),
     };
-    let state = if run.outcome.lifecycle != LifecycleState::Finished {
+    let state = if run.outcome.waiting_on == WaitingOn::Human {
+        "question"
+    } else if run.outcome.lifecycle != LifecycleState::Finished {
         "working"
     } else {
         match run.outcome.application {

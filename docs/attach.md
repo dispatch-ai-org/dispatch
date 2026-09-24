@@ -300,8 +300,8 @@ Nothing is applied or launched on start or exit.
   `CONTINUE`, `REFRESH` or `STOP` from the stored validity; `unmoved` when the source
   has not changed (including a result applied to an unmoved source); `overridden`
   when a human applied it over a REFRESH; or `not checked` when nothing has been
-  evaluated yet. State is `working`, `ready`,
-  `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
+  evaluated yet. State is `working`, `question` (the run waits for your
+  `dispatch answer`), `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
   `finished`.
 
   A run is shown while it is still active, or for up to an hour after it finished.

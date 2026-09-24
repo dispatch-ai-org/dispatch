@@ -421,6 +421,10 @@ fn answering_after_the_source_moved_continues_the_goal() -> Result<()> {
     let f = Fixture::new("clarify")?;
     let r = Fixture::result(&f.run(&[])?)?;
     assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
+    // A run waiting for your answer says so, not "working".
+    let history = f.command().args(["--plain", "history"]).output()?;
+    let history = String::from_utf8_lossy(&history.stdout);
+    assert!(history.contains(" question "), "{history}");
     fs::write(f.source.join("NOTES.md"), "a teammate's change\n")?;
     let answered = f.answer(&r, "1")?;
     let result = Fixture::result(&answered)?;

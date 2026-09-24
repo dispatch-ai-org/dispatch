@@ -314,7 +314,7 @@ is invisible to the patch Dispatch judges.
 watches every attached run with no live owner (a foreign attachment, or a wrapped
 attach whose wrapper process died) and applies the ones you marked `--auto-apply` once
 they are ready and coherent. It also prints a one-line-per-run project view —
-`<id> · agent · CONTINUE/REFRESH/STOP · working/ready/applied/blocked · reason` — that
+`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason` — that
 redraws in place as things change, and includes your ordinary Dispatch runs on the
 same source alongside attached ones. Run it alongside a foreign attachment so it gets
 observed and, if eligible, applied; wrapped attach and the TUI need no `serve` at all.
