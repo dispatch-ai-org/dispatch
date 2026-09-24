@@ -413,7 +413,8 @@ Use `caffeinate -i`.
   - The evaluation takes no lock. The lock is held only to record, and only if
     `state_revision` is unchanged.
   - The first check after the world moved is stored even when it is CONTINUE,
-    so the view shows CONTINUE, not "not checked".
+    so the view shows CONTINUE, not "not checked". In stage 9 this became every
+    first check, so an unmoved result shows `unmoved`.
   - `transition` accepts `coherence.*` events on finished runs.
   - Tests: `the_owner_keeps_a_refusal_by_the_checks_until_the_world_moves` and
     `the_owner_marks_a_ready_native_result_stale_when_the_world_moves`.
@@ -464,3 +465,32 @@ Use `caffeinate -i`.
   - The cause is environmental: the first exec of a freshly written script took
     about 200 ms each while Defender and a DLP scanner were busy, and those
     tests write a new fake agent per test, with a 5 s probe budget.
+- Stage 9. Release.
+  - Docs: README "Watching a project", the attach.md "The project owner"
+    section, the coherence.md watcher section, the product guide, the 0.4.5
+    upgrade note and the release notes. The version is 0.4.5.
+  - The real-agent trial (`coherence-044`, `state-041`, log in `logs045/`) found
+    three presentation defects, all fixed with tests:
+    - results waiting for review dropped out of the view after an hour;
+    - reasons quoting Git's errors broke the one-line rows;
+    - the owner's log carried terminal colour codes.
+
+    It also changed the owner to store its first check of any Work, so an unmoved
+    result shows `unmoved`, not "not checked".
+  - Trial results:
+    - `start` returned in 0.10 s.
+    - The first tick re-checked the 4 results waiting for review and recorded
+      correct verdicts: two REFRESH `patch_conflict` (D, D-refresh2), REFRESH
+      `fact_broken` (B) and STOP `already_applied` (C2).
+    - A native Claude item and a foreign Cursor item then ran in parallel.
+      Cursor reported edits but left the workspace unchanged, because the
+      requested behavior already existed.
+    - Teammate commit `51a18a2` touched `truncate` and added `reverse_words`.
+      Within 2 s the owner recorded the Claude result as REFRESH (patch no
+      longer applies) and the Cursor work as CONTINUE, and `watch` showed both.
+    - After SIGKILL, `status` and `watch` said "not watched" and `stop` signalled
+      nothing. `start` recovered, and `stop` ended the owner.
+  - Full suite at 4 threads: 457 passed, 1 failed. The failure was
+    `funding_safety::claude_refusal_is_sticky_until_reauthorized` (a fake
+    Claude probe under load, on a path 0.4.5 does not touch). It passed 5/5 on
+    rerun.

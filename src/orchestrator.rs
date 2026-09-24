@@ -1986,6 +1986,17 @@ pub fn refresh_request(
     })
 }
 
+/// A reason on one line: Git's multi-line complaints included.
+fn line_reason(detail: &str) -> String {
+    detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(60)
+        .collect()
+}
+
 /// The Coherence line for a Ready run that carries a validity, else `None`.
 /// One Work item as every list shows it: where it came from and what it
 /// began against, the verdict and why, and where verification, review and
@@ -2042,7 +2053,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             "overridden",
             overridden
                 .and_then(|v| v.reasons.first())
-                .map(|r| r.detail.chars().take(60).collect()),
+                .map(|r| line_reason(&r.detail)),
         ),
         // Applied with no stored verdict: accept found the source unmoved.
         None if run.outcome.application == ApplicationState::Applied => ("unmoved", None),
@@ -2050,9 +2061,7 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(v) if v.decision == Decision::Continue && !v.world_changed => ("unmoved", None),
         Some(v) => (
             crate::coherence::verdict(v.decision),
-            v.reasons
-                .first()
-                .map(|r| r.detail.chars().take(60).collect()),
+            v.reasons.first().map(|r| line_reason(&r.detail)),
         ),
     };
     let state = if run.outcome.waiting_on == WaitingOn::Human {
@@ -2694,6 +2703,14 @@ fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::Validity;
+
+    #[test]
+    fn a_work_line_reason_is_one_line() {
+        assert_eq!(
+            line_reason("error: patch failed: a.py:3\nerror: a.py: patch does not apply"),
+            "error: patch failed: a.py:3 error: a.py: patch does not appl"
+        );
+    }
 
     fn reason(detail: &str) -> crate::Reason {
         crate::Reason {

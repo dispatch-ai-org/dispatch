@@ -1,12 +1,12 @@
-//! `dispatch serve`: the repo-scoped foreground owner loop for foreign and
-//! orphaned attached Work (part 6.7, 6.9, 14.4, 14.11 of
-//! `docs/plan-0.3-auto-apply-and-attach.md`). One process per integration
-//! root: every tick it observes the root's world, re-evaluates active
-//! attached Work whose live owner is not `Live`, auto-applies Ready attached
-//! Work whose `capabilities.integrate` is true, adopts Work whose stored
-//! owner has gone, and prints the project view. It never finishes, launches,
-//! kills or refreshes anything; wrapped attach (S4) and human review remain
-//! the only things that do.
+//! The project owner and its view (`docs/attach.md`, "The project owner").
+//! One owner per integration root, `dispatch start` in the background or
+//! `dispatch serve` in the foreground: every tick it observes the root's
+//! world, adopts attached Work whose owner has gone, follows unowned attached
+//! Work, keeps Ready results' verdicts what `check` would show, and
+//! auto-applies attached Work whose `capabilities.integrate` is true. It never
+//! finishes, launches, kills or refreshes anything; wrapped attach and human
+//! review remain the only things that do. `dispatch watch` renders the same
+//! view from canonical state and owns nothing.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -570,9 +570,7 @@ impl Owner {
         };
         let mut waiting = HashSet::new();
         for candidate in runs {
-            if candidate.outcome.review != ReviewState::Pending
-                || !coherence::is_ready_unapplied(candidate)
-            {
+            if !awaits_review(candidate) {
                 continue;
             }
             waiting.insert(candidate.id.clone());
@@ -621,12 +619,16 @@ impl Owner {
     }
 }
 
+/// A Ready result nobody has accepted, rejected or applied yet.
+fn awaits_review(run: &RunRecord) -> bool {
+    run.outcome.review == ReviewState::Pending && coherence::is_ready_unapplied(run)
+}
+
 /// Whether the owner stores `validity` over `stored`: when it says something
-/// new (`worth_recording`), and also the first time a moved world was checked
-/// at all, so the view shows CONTINUE rather than "not checked".
+/// new (`worth_recording`), and also the first time the Work is checked at
+/// all, so the view says "unmoved" or CONTINUE rather than "not checked".
 fn worth_storing(stored: Option<&Validity>, validity: &Validity) -> bool {
-    coherence::watch::worth_recording(stored, validity)
-        || (stored.is_none() && validity.world_changed)
+    stored.is_none() || coherence::watch::worth_recording(stored, validity)
 }
 
 /// Every attached run ready to auto-apply: finished, `Ready`, unreviewed,
@@ -652,15 +654,16 @@ fn describe(run: &RunRecord) -> (WorkLine, Option<Decision>) {
     (work_line(run, validity), validity.map(|v| v.decision))
 }
 
-/// Runs whose `source_path` is `root` and that are still active or finished
-/// within the last hour (part 4/14.11 of the view), sorted for a stable
-/// redraw.
+/// Runs whose `source_path` is `root` and that are still active, still wait
+/// for your review, or finished within the last hour (part 4/14.11 of the
+/// view), sorted for a stable redraw.
 fn view_rows(runs: &[RunRecord]) -> Vec<&RunRecord> {
     let now = Utc::now();
     let mut rows: Vec<&RunRecord> = runs
         .iter()
         .filter(|run| {
             run.outcome.lifecycle != LifecycleState::Finished
+                || awaits_review(run)
                 || run
                     .completed_at
                     .is_some_and(|at| now - at < chrono::Duration::hours(1))
@@ -757,5 +760,28 @@ mod tests {
     #[test]
     fn live_owner_state_maps_identity_outcomes() {
         assert_eq!(live_owner_state(None), OwnerState::Unknown);
+    }
+
+    #[test]
+    fn a_result_awaiting_review_stays_in_the_view() {
+        let mut waiting: RunRecord = serde_json::from_value(serde_json::json!({
+            "id":"waiting", "task":"t", "exact_prompt":"t",
+            "source_path":"/source", "source_kind":"directory", "source_git_head":null,
+            "source_fingerprint":"f", "baseline_path":"/baseline", "baseline_commit":"abc",
+            "status":"ready_for_evaluation", "created_at":"2026-09-17T00:00:00Z",
+            "completed_at":"2026-09-17T00:10:00Z",
+            "environment":{"dispatch_version":"test","os":"test","architecture":"test","execution_backend":"local","timeout_secs":30,"cpus":1.0,"memory":"1g","max_parallel":1},
+            "evaluation":null,"applied_candidate":null
+        }))
+        .unwrap();
+        waiting.outcome.lifecycle = LifecycleState::Finished;
+        waiting.outcome.work_result = WorkResult::Ready;
+        waiting.outcome.review = ReviewState::Pending;
+        let mut reviewed = waiting.clone();
+        reviewed.id = "reviewed".into();
+        reviewed.outcome.review = ReviewState::Rejected;
+        let runs = [waiting, reviewed];
+        let rows: Vec<&str> = view_rows(&runs).iter().map(|run| run.id.as_str()).collect();
+        assert_eq!(rows, ["waiting"]);
     }
 }

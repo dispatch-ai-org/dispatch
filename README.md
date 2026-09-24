@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.4 — experimental developer preview**
+**Dispatch 0.4.5 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -50,10 +50,27 @@ service; Dispatch itself needs no account, no network service and no upload.
 Either way, the result is judged the same way: `dispatch check`, `accept` and
 `reject` work on it against the source as it is now.
 
-**Watching a project today.** `dispatch serve` watches one project in the
-foreground and shows each Work item's coherence state. `check` and `status`
-answer on demand. Nothing watches in the background: when `serve` stops,
-watching stops.
+**Watching a project.** `dispatch start` watches the project in the
+background and gives you your shell back. While it runs, Dispatch keeps the
+verdict of every Work item it knows about current as the code moves:
+- results waiting for your review, native or attached;
+- attached work still in progress;
+- attached work it may apply.
+
+`dispatch watch` shows that state live; leaving it does not stop watching.
+`dispatch stop` ends watching for this project. No agent needs to be set up
+for any of this.
+
+```text
+$ dispatch start
+✓ Watching ~/src/project
+  Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop
+```
+
+Watching covers Work Dispatch launched or that you attached. It does not look
+for agents running elsewhere on your machine. After a reboot, run `dispatch
+start` again. `dispatch serve` does the same watching in the foreground, and
+`check` and `status` answer on demand.
 
 ## Work coherence: keeping results valid while the code moves
 
@@ -175,7 +192,7 @@ full eligibility and authorization rules.
 dispatch attach --auto-apply -- claude -p "add input validation"   # wrap it
 dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
 dispatch finish <run-id>                                           # you say when it's done
-dispatch serve                                                     # keeps a foreign attachment observed and applies it
+dispatch start                                                     # keeps a foreign attachment observed and applies it
 ```
 
 Dispatch is honest about what it saw: full confidence when S0 is a real Git merge-base commit, partial confidence when it had to snapshot a plain directory at attach time, since earlier edits are then invisible to the patch. See [attach.md](docs/attach.md).
@@ -315,7 +332,10 @@ dispatch answer <run-id> <question-id> --revision n --answer text [--json]
 dispatch cancel <run-id> <question-id> --revision n [--json]
 dispatch attach [--workspace path] [--auto-apply] [-- command...]
 dispatch finish <run-id>
-dispatch serve [--root path]
+dispatch start [--root path]
+dispatch watch [--root path] [--json]
+dispatch stop [--root path]
+dispatch serve [--root path] [--json]
 dispatch history [--limit count]
 dispatch version
 ```
@@ -468,7 +488,7 @@ No network service is required to create, execute, inspect, accept, or reject a 
 - Experimental developer preview, not a stable 1.0 service.
 - Real-agent testing centers on Codex CLI and Claude Code (see [provider support](docs/provider-support.md)); Cursor Agent remains available as an explicit `--agent cursor` choice without a funding contract. Agent installation, authentication, quotas, and provider availability remain external prerequisites.
 - Coherence evidence comes from the fixture matrix and a small number of runs. False-refresh and false-continue rates on real repositories are not measured, no real run has been stopped by the mid-run watcher, and no token, time or cost saving is claimed.
-- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh, daemon or network service.
+- One agent per run, no automatic retry, no task decomposition, no agent racing, ML, embeddings, LLM judging, background refresh or network service. The background watcher (`dispatch start`) is one local process per project: it keeps verdicts current and applies only attached work you allowed to integrate; it never launches, refreshes or discovers agents.
 
 ## Development
 

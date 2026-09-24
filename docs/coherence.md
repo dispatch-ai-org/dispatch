@@ -344,13 +344,17 @@ attempt returns or the watcher is dropped. It evaluates again whenever the sourc
 the agent's work so far changed, so the order in which they change does not matter.
 
 Attached work uses this same `Watcher` type, not a different mechanism: the wrapped
-attach owner loop starts one for the agent it spawned, and `serve` re-observes every
-foreign or orphaned attached run on its own tick. Both persist through the same
+attach owner loop starts one for the agent it spawned, and the project owner
+(`dispatch start`, or `serve` in the foreground) follows every foreign or orphaned
+attached run on its own tick, evaluating when the source or that work moved. The
+project owner also keeps the stored verdict of every Ready result awaiting review,
+native or attached, equal to what `check` shows, recording it when the source
+moves. All of them persist through the same
 `apply::persist_verdict` step described above (`remember_validity` plus
 `coherence.checked`/`coherence.invalidated`) — only `native::apply_watch` still
 implements `mid_run: stop`, and it never applies to attached work. See
 [attach.md](attach.md#shared-verdict-persistence) for the wrapped owner loop and
-`serve`'s reevaluation loop.
+[the project owner](attach.md#the-project-owner-start-stop-serve-and-watch).
 
 - Every `coherence.poll_secs` it takes `world::signal`: for Git, `HEAD`, the hash of
   `git status --porcelain=v2 -z --untracked-files=all`, and size and modification time of

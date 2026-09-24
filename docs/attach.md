@@ -22,14 +22,16 @@ mechanism:
   world while the agent runs, and on exit freezes the patch, verifies it, and applies
   it if authorized. Claude, Codex, Cursor or anything else stays exactly itself;
   Dispatch prints nothing to that terminal while it runs.
-- **`dispatch serve`** is the owner loop for Work that has no live owner: an already
+- **The project owner** (`dispatch start` in the background, or `dispatch serve` in
+  the foreground) is the owner loop for Work that has no live owner: an already
   running agent attached with `--workspace` and no command, or wrapped Work whose
-  wrapper process died. It also renders the project view. One foreground process per
-  integration root.
+  wrapper process died. It also keeps the verdict of every Ready result awaiting
+  review current, native or attached. One owner per integration root. `dispatch
+  watch` renders the project view from what the owner recorded, and owns nothing.
 
-No daemon is required for a standalone run, wrapped attach, or the TUI. `serve` is
-needed only to keep an already-running foreign agent observed and to apply its work
-once it is ready. Native runs and attached Work coexist by sharing state (SQLite, run
+No owner is required for a standalone run, wrapped attach, or the TUI. The owner is
+needed to keep an already-running foreign agent observed, to apply its work once it
+is ready, and to keep verdicts current while you are not asking. Native runs and attached Work coexist by sharing state (SQLite, run
 directories) and locks (the per-source apply lock), not by routing native runs through
 `serve`: both paths call the same `evaluate`, `gate` and `auto_apply`.
 
@@ -183,6 +185,9 @@ dispatch attach [--root <path>] [--workspace <path>] [--task <text>] [--agent <n
 dispatch attach --workspace <path> [--root <path>] [--pid <n>] [--task <text>]
                 [--agent <name>] [--allow-unsafe-local] [--auto-apply]
 dispatch finish <run-id> [--allow-unsafe-local]
+dispatch start  [--root <path>]
+dispatch watch  [--root <path>] [--json]
+dispatch stop   [--root <path>]
 dispatch serve  [--root <path>] [--json]
 ```
 
@@ -197,7 +202,10 @@ dispatch serve  [--root <path>] [--json]
 | `--auto-apply` | sets `capabilities.integrate`: apply automatically once the work is ready and coherent |
 | `-- <command> [args...]` | selects the **wrapped** form: everything after `--` is the agent command Dispatch spawns and owns for the session |
 | `dispatch finish <run-id> [--allow-unsafe-local]` | foreign work only: freeze Δ, run `checks.verify` in the workspace, become an ordinary Ready result |
-| `dispatch serve [--root <path>] [--json]` | one foreground process per integration root |
+| `dispatch start [--root <path>]` | run the project owner in the background (`serve --background` in its own session) and return |
+| `dispatch watch [--root <path>] [--json]` | the project view, live; holds no lock, records nothing |
+| `dispatch stop [--root <path>]` | stop exactly this root's owner |
+| `dispatch serve [--root <path>] [--json]` | the project owner in the foreground, with the view |
 
 Whether `attach` is wrapped or foreign is decided by whether a command follows `--`:
 with one, it is `run_wrapped`; without one, it is the plain `create` (foreign) form.
@@ -250,32 +258,82 @@ Dispatch does not own this agent's execution, only its observation.
   code, when the wrapper's own bookkeeping (creation, then finishing) succeeded; a
   bookkeeping failure exits 1 instead (creation failures never start the agent at all).
 
-## `serve`
+## The project owner: `start`, `stop`, `serve` and `watch`
 
-`dispatch serve [--root <path>] [--json]` loops until Ctrl+C, SIGTERM or SIGHUP.
-Nothing is applied or launched on start or exit.
+The owner loops until Ctrl+C, SIGTERM or SIGHUP. Nothing is applied or launched on
+start or exit. `dispatch serve` runs it in the foreground with the view;
+`dispatch start` runs it in the background and returns.
 
-- **Identity and lock.** `locks/serve-<sha256(root)>.lock` (`flock`). A second `serve`
-  on the same root refuses to start: *"already serving this root."* A dead `serve`
-  releases the lock by itself — no stale socket, no PID file.
+- **Identity and lock.** `locks/serve-<sha256(root)>.lock` (`flock`). A second owner
+  on the same root refuses to start: *"already serving this root."* The lock is what
+  "watched" means: the kernel releases it when the owner exits, crashes or the
+  machine reboots, so nothing can claim a project is watched when it is not.
+- **The record.** Once it holds the lock, the owner writes
+  `watchers/<sha256(root)>.json`: root, `ProcessIdentity` (pid, start time, boot),
+  start time, Dispatch version, background or foreground. It removes the record
+  when it stops. The record only says whom `stop` may signal.
+- **`dispatch start`** checks `dispatch.yml` and returns "Already watching" if the
+  lock is held. Otherwise it starts `dispatch serve --background --root <root>`:
+  - in its own session (`setsid`), so closing the terminal does not stop it;
+  - with stdin from `/dev/null`;
+  - with stdout and stderr in `watchers/<key>.log`, which names each distinct error
+    once and is truncated on each start.
+
+  It returns once the record names that child with an `ExactLive` identity (within
+  10 s), or prints the log's last lines. Of two concurrent starts, one wins the lock;
+  the other reports "Already watching". No agent profile is read.
+- **`dispatch stop`** says "Not watching" when the lock is free, deleting any
+  leftover record. Otherwise it sends SIGTERM only when the record names the exact
+  live process (same pid, start time and boot), then waits for the lock. A record
+  from before a crash or a reboot never names a live process, so it is never
+  signalled; a lock held by an unidentified process is refused, naming the lock.
 - **Every tick** (`coherence.poll_secs`, minimum 1 second):
-  1. Read `world::signal(root)` and compare it with the previous tick's; adopt any
-     orphaned Work (next bullet).
-  2. If the world moved, or something was adopted this tick: re-evaluate every active
-     attached run whose live owner state is not `Live` (a live wrapper is that
-     wrapper's own business, not `serve`'s) — observe the world against *that run's*
-     own baseline, evaluate, drop `analysis_uncertain`-only reasons the same way the
-     mid-run watcher does (a person may be mid-edit), and persist through
-     `apply::persist_verdict`.
-  3. For every attached run that is now `Finished`, `Ready`, unreviewed, unapplied and
+  1. Read `world::signal(root)` and compare it with the previous tick's. Load the
+     root's runs once (other projects' runs are not read). Adopt any orphaned Work
+     (next bullet).
+  2. Follow every active attached run whose live owner state is not `Live` (a live
+     wrapper is that wrapper's own business). Its signal is a hash of its patch so
+     far, taken with the trusted baseline repository into the owner's scratch
+     directory, with an index kept per run so only changed files are re-hashed. No
+     lock is held for this. When the world or that work moved:
+     - take the run's lock;
+     - observe the world against that run's own baseline and evaluate;
+     - drop `analysis_uncertain`-only reasons, the same way the mid-run watcher does
+       (a person may be mid-edit).
+  3. Re-check every Ready, unapplied, review-pending result, native or attached. It
+     is checked when it becomes Ready and whenever the world signal moves, with
+     `coherence::live_validity`, which is exactly what `check` shows: a refusal by
+     the merged-tree checks stands while the world has not moved. The evaluation
+     takes no lock. The run's lock is taken only to record, and only if the run is
+     unchanged since it was read.
+  4. A verdict is recorded (`apply::persist_verdict`) when it differs from the
+     verdict stored on the run in its decision, or is not `CONTINUE` and describes
+     another world. The owner's first check of a Work item is always recorded, so
+     the view says `unmoved` or `CONTINUE` rather than "not checked". The comparison is with
+     the stored verdict, never with the owner's memory, so a restarted owner
+     records what changed while it was away.
+  5. For every attached run that is now `Finished`, `Ready`, unreviewed, unapplied and
      has `capabilities.integrate`, call `auto_apply` (serialized by the same
-     per-source lock every applier uses). After its own successful apply, `serve`
+     per-source lock every applier uses). After its own successful apply, the owner
      re-observes immediately instead of waiting for the next tick — the apply is its
      own doorbell.
-  4. Render the project view (below). This step runs on every tick, independent of
-     whether `serve` itself changed anything this tick, because a run attached,
-     finished or applied by *another* process changes the view without any verdict or
-     apply of `serve`'s own.
+  6. In the foreground, render the project view (below) every tick, because a run
+     attached, finished or applied by *another* process changes the view without any
+     verdict or apply of the owner's own.
+
+  With `-v` the owner logs where each non-idle tick's time went (`-vv`: every tick):
+  signal, loading runs, following work, evaluations, re-checks and auto-apply.
+- **`dispatch watch`** renders the same view from canonical state under a header
+  naming who watches (`watched in the background since 10:02 (pid 812)`, or `not
+  watched · dispatch start`, plus a note when the owner runs another Dispatch
+  version).
+  - It checks every second for a new event id or a change of watcher, and redraws
+    at least every 30 s so finished Work ages out.
+  - It holds no lock and records nothing, so leaving it (Ctrl+C) never stops
+    watching.
+  - `--json` adds a `{"type":"watcher", "watcher"}` object whenever the header
+    changes.
+  - `dispatch status` ends with the same line (`Project: …`).
 - **Adoption.** An active attached run whose stored `owner_state` is `Live` but whose
   owner process (`attachment.owner`, the wrapper) is now gone (`identity_state`:
   `Gone`/`Reused`) is adopted: `serve` takes over its observation, commits

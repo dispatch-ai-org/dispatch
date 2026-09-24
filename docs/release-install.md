@@ -51,6 +51,20 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.5
+
+No migration; the schema stays at 24.
+- New commands: `dispatch start`, `watch` and `stop`.
+- The project owner (`start`, or `serve` in the foreground) now also records
+  verdicts on Ready results awaiting review, native or attached, when the source
+  moves. So `serve`, `watch` and `history` agree with `check`.
+- The state directory gains `watchers/` (one record and one log per watched
+  project).
+- `status` ends with a `Project:` line. `serve --json` is unchanged; `watch --json`
+  adds a `watcher` object.
+- After upgrading, `dispatch stop && dispatch start` replaces an owner started by
+  the old binary; `watch` names the version the owner runs.
+
 ### Upgrading to 0.4.4
 
 No migration; the schema stays at 24. An accept that coherence refuses now leaves
