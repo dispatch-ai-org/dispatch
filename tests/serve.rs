@@ -474,6 +474,26 @@ fn a_restarted_owner_records_a_change_the_old_one_never_saw() {
 }
 
 #[test]
+fn serve_follows_foreign_work_that_edits_into_a_change_already_made() {
+    let fixture = Fixture::new();
+    let id = fixture.attach(&[]);
+    let serve = ServeProcess::spawn(&fixture, &["--json"]);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    // The root moves first, while the work has not touched the code yet.
+    conflict_in_root(&fixture);
+    serve.wait_for(Duration::from_secs(10), |value| value["type"] == "world");
+    // Then the work edits the same line, and the root stays put.
+    fs::write(
+        fixture.workspace.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    wait_until(Duration::from_secs(30), || {
+        stored_decision(&fixture, &id) == "refresh"
+    });
+}
+
+#[test]
 fn serve_auto_applies_ready_foreign_work_with_integrate() {
     let fixture = Fixture::new();
 

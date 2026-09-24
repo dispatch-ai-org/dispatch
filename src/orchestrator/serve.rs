@@ -9,7 +9,7 @@
 //! the only things that do.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -47,7 +47,7 @@ pub async fn serve(state: &State, root: Option<PathBuf>, json: bool) -> Result<(
     let mut ticker = tokio::time::interval(poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut owner = Owner::new(root, kind);
+    let mut owner = Owner::new(root, kind)?;
     let mut view = View::default();
 
     loop {
@@ -81,6 +81,9 @@ pub(crate) struct Owner {
     root: PathBuf,
     kind: SourceKind,
     last_signal: Option<world::Signal>,
+    /// Each followed run's work signal when it was last evaluated.
+    work: HashMap<String, String>,
+    scratch: tempfile::TempDir,
 }
 
 /// What one tick did, and the root's runs as they stand after it.
@@ -104,12 +107,17 @@ impl Tick {
 }
 
 impl Owner {
-    pub(crate) fn new(root: PathBuf, kind: SourceKind) -> Self {
-        Self {
+    pub(crate) fn new(root: PathBuf, kind: SourceKind) -> Result<Self> {
+        Ok(Self {
             root,
             kind,
             last_signal: None,
-        }
+            work: HashMap::new(),
+            scratch: tempfile::Builder::new()
+                .prefix("dispatch-owner-")
+                .tempdir()
+                .context("failed to create the owner's scratch directory")?,
+        })
     }
 
     pub(crate) fn tick(&mut self, state: &State) -> Tick {
@@ -132,16 +140,15 @@ impl Owner {
 
         let runs = self.load(state, &mut tick);
         tick.adopted = adopt_orphans(state, &runs, &mut tick);
-        if tick.moved || tick.adopted {
-            self.reevaluate(state, &runs, &mut tick);
-        }
+        let moved = tick.moved || tick.adopted;
+        self.reevaluate(state, &runs, &mut tick, moved);
         for run in ready_for_auto_apply(&runs) {
             match auto_apply(state, &run.id) {
                 Ok(ApplyOutcome::Applied { .. }) => {
                     tick.applied = true;
                     // The apply is the doorbell: re-observe immediately
                     // rather than waiting for the next tick's signal.
-                    self.reevaluate(state, &runs, &mut tick);
+                    self.reevaluate(state, &runs, &mut tick, true);
                 }
                 Ok(_) => {}
                 Err(error) => tick.report(&error),
@@ -273,14 +280,21 @@ fn adopt_orphans(state: &State, runs: &[RunRecord], errors: &mut Tick) -> bool {
 
 impl Owner {
     /// Re-evaluate every active attached run whose live owner state is not
-    /// `Live` (a live wrapper owns those; part 14.4 step (b)/(c)): observe the
-    /// world against that run's own baseline, evaluate, drop
-    /// `analysis_uncertain`-only reasons, apply the watcher's "worth sending"
-    /// rule, and persist through `apply::persist_verdict`. The first world
-    /// digest observed is the tick's: `observe` hashes the current tree
+    /// `Live` (a live wrapper owns those; part 14.4 step (b)/(c)) when the
+    /// world moved or the work did: observe the world against that run's own
+    /// baseline, evaluate, drop `analysis_uncertain`-only reasons, and persist
+    /// through `apply::persist_verdict` what is worth recording. The first
+    /// world digest observed is the tick's: `observe` hashes the current tree
     /// whichever baseline it is given.
-    fn reevaluate(&self, state: &State, runs: &[RunRecord], tick: &mut Tick) {
+    fn reevaluate(
+        &mut self,
+        state: &State,
+        runs: &[RunRecord],
+        tick: &mut Tick,
+        world_moved: bool,
+    ) {
         let (root, kind) = (self.root.as_path(), &self.kind);
+        let mut followed = HashSet::new();
         for candidate in runs {
             if candidate.mode != RunMode::Attached
                 || candidate.outcome.lifecycle == LifecycleState::Finished
@@ -292,6 +306,24 @@ impl Owner {
             };
             if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
                 continue; // the wrapper's own business
+            }
+            // The work's signal is its patch so far, taken without the run's
+            // lock into a scratch file: `finish` takes that lock without
+            // waiting, so the owner holds it only when something moved.
+            let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
+            let work =
+                source::snapshot_delta(&candidate.baseline_path, &attachment.workspace, &scratch)
+                    .and_then(|()| Ok(hex::encode(Sha256::digest(fs::read(&scratch)?))));
+            let work = match work {
+                Ok(work) => work,
+                Err(error) => {
+                    tick.report(&error);
+                    continue;
+                }
+            };
+            followed.insert(candidate.id.clone());
+            if !world_moved && self.work.get(&candidate.id) == Some(&work) {
+                continue;
             }
             let Ok(_lock) = OperationLock::acquire(
                 &run_lock_path(state, &candidate.id),
@@ -350,6 +382,7 @@ impl Owner {
             let validity = coherence::watch::settle(validity);
             let stored = run.coherence.as_ref().and_then(|c| c.validity.as_ref());
             if !coherence::watch::worth_recording(stored, &validity) {
+                self.work.insert(run.id.clone(), work);
                 continue;
             }
             let database = match Database::open(state.db_path()) {
@@ -363,8 +396,10 @@ impl Owner {
                 tick.report(&error);
                 continue;
             }
+            self.work.insert(run.id.clone(), work);
             tick.persisted = true;
         }
+        self.work.retain(|id, _| followed.contains(id));
     }
 }
 
