@@ -141,7 +141,11 @@ checked, always from what is on disk now.
   For a `Modified` fact, no declaration with the same `full_fp` (or `sig_fp` for
   containers) is `same_symbol_edited`. For a `Referenced` fact, no declaration with the
   same `sig_fp` is `fact_broken`, with the detail `old signature => new signature`
-  (each truncated to 100 characters).
+  (each truncated to 100 characters). One exception keeps compatible calls valid: a
+  referenced Python function whose header only gained optional parameters (defaults,
+  `*args`, `**kwargs`, or keyword-only parameters with defaults after `*`), with every
+  original parameter, the name, `async` and the return annotation unchanged, still
+  holds (`symbols::python_call_compatible`). Rust signatures compare exactly.
 - The analysis level is `symbols` when any signature fact's file was among the changed files,
   otherwise `files_only`. If the baseline repository cannot be read, L1 returns no
   reasons and `files_only`.
@@ -161,9 +165,15 @@ local backend, the run itself was approved for local execution (the run's
    timeout. Logs stay under `<run dir>/coherence-checks/<id>/`; the scratch copy is
    removed on every exit path.
 4. Any check that did not pass adds a reason (`integration_check_failed` with the
-   command and log path, or `analysis_uncertain` if it could not run) and the verdict
+   command, what failed in the check's own words and the log path, or
+   `analysis_uncertain` if it could not run) and the verdict
    becomes `Refresh`. A failure to build the scratch tree or apply the patch also
    yields `Refresh` with `analysis_uncertain`. All passing sets the analysis level to `integration`.
+   The words are an excerpt of the check's output: the first two lines that read
+   like a failure (containing `FAIL`, `ERROR`, `Error`, `error:` or `panicked`, or
+   starting with `assert`), stderr first, else the last non-empty line, for example
+   `ERROR: test_admin_token (…) / TypeError: validate() missing 1 required positional
+   argument: 'token'`.
 
 There is no cooperative cancellation of these checks. They run while the per-run and
 per-source apply locks are held, so another accept of the same run or source waits.
@@ -330,7 +340,8 @@ disagreeing with a CONTINUE verdict that was acted on automatically.
 ## The mid-run watcher (`watch.rs`)
 
 For native runs, the native engine starts one `Watcher` per attempt. It stops when the
-attempt returns or the watcher is dropped.
+attempt returns or the watcher is dropped. It evaluates again whenever the source or
+the agent's work so far changed, so the order in which they change does not matter.
 
 Attached work uses this same `Watcher` type, not a different mechanism: the wrapped
 attach owner loop starts one for the agent it spawned, and `serve` re-observes every
@@ -366,6 +377,28 @@ implements `mid_run: stop`, and it never applies to attached work. See
   If the goal deadline had already passed, the failure is `Deadline` instead. The partial
   patch is kept; no review is recorded (asserted by `tests/coherence_watch.rs`). A verdict that arrives after the attempt has
   ended is recorded but can no longer stop anything.
+
+## Human override (`dispatch accept --despite-refresh`)
+
+The file and symbol analysis can be more cautious than the work requires. A human who
+has checked that the work still holds may apply it anyway:
+
+- only a `Refresh` whose every reason is `fact_broken`, `fact_missing`,
+  `same_symbol_edited` or `analysis_uncertain` (`coherence::overridable`). `Stop`,
+  `patch_conflict` and a failed or unrunnable integration check are never
+  overridable, and the refusal says so;
+- an explanation is required (`--explanation` or `--explanation-file`);
+- `coherence::gate` then runs `checks.verify` on the merged tree regardless of the
+  analysis level (`AcceptGate::Overridden`); a failing check refuses, and so does a
+  configuration where no check can run;
+- the apply goes through `apply_validated` against the verified world digest, under
+  the same locks and fences as any accept;
+- `CoherenceRecord.overridden` keeps the overridden verdict, `coherence.validity`
+  the verification, and a `coherence.overridden {coherence, explanation}` event is
+  committed before the human review. The Work line shows the verdict `overridden`.
+
+Auto-apply and `serve` never override. The review menu does not offer it; it is a
+typed, explained command.
 
 ## Refresh (`orchestrator::refresh_request`)
 
@@ -500,11 +533,11 @@ How to read it:
 - Integration checks use your `checks.verify` on a scratch copy of the non-ignored files with no build cache
   (a `cargo test` builds from scratch unless the command points `CARGO_TARGET_DIR` elsewhere), hold the apply locks while running, and cannot be cancelled.
   They do not run for a local-backend run that was not approved for local execution.
-- `dispatch check`, `status` and `explain` evaluate L0 and L1 only; an integration failure appears at accept.
+- `dispatch check`, `status` and `explain` evaluate L0 and L1 only; integration checks run at accept. When accept refused a result on the merged tree, they show that refusal for as long as the source is unchanged, and `refresh` passes its reason to the new agent. Once the source moves, they show the fresh L0 and L1 verdict until the next accept runs the checks again.
 - Plain-directory sources cannot honor `.gitignore`; ignored build output counts as world change (the patch usually still applies).
 - Nested repositories and submodules are not analysed.
-- A native run compares the whole-tree fingerprint before starting a fresh attempt (the continuation after a clarification answer) and stops with source drift if the tree differs.
-- The mid-run watcher covers native runs, observes by default, and while the agent works builds a work-in-progress patch with a temporary Git index each time the signal moves (at most every `poll_secs`).
+- A source that moved since S0 does not stop a native run, including the continuation after a clarification answer: every attempt starts from the run's original snapshot, the mid-run watcher reports what the move means for the work, and the accept gate judges the result against the source as it is then. (Before 0.4.4 a continuation stopped with `source_drift` whenever the tree differed.)
+- The mid-run watcher covers native runs and wrapped attach, and observes by default. Every `poll_secs` it builds the work-in-progress patch with a temporary Git index (taken with the trusted baseline repository, so ignored build output never counts) and evaluates again when either the source's signal or that patch changed. A change that landed before the agent touched the same code is therefore reported once the agent touches it.
 - Agent time after invalid is wall-clock time from attempt timestamps; it is not cost, and it is only meaningful for a run whose watcher stored an invalid verdict during the attempt.
 - Apply is not crash-atomic: a crash between `git apply` and the database update leaves patched source and an unapplied run (pre-existing).
 - Evidence is from fixtures and a small number of runs. False-refresh and false-continue rates on real repositories are not measured. What is claimed today, what is recorded during real use, and what would falsify the thesis are in [coherence-validation.md](coherence-validation.md).

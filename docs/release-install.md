@@ -51,6 +51,17 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.4
+
+No migration; the schema stays at 24. An accept that coherence refuses now leaves
+the result pending instead of recording an acceptance. `check` and `status` show a
+refusal by the merged-tree checks until the source moves. Answering a native run's
+question after the project changed now continues the run instead of stopping it with
+`source_drift`, and `history`, `status` and `serve` show such a waiting run as
+`question` (it was `working`). `CoherenceRecord` gains an
+optional `overridden` field, `serve --json` gains `overridden`, and `check --json`
+gains `landed_by`.
+
 ### Upgrading to 0.4.3
 
 No migration; the schema stays at 24. Setup is now menus; the `resources.yml` it

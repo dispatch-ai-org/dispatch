@@ -2204,6 +2204,7 @@ mod tests {
                 analysis: AnalysisLevel::Symbols,
             }),
             first_invalid_at: None,
+            overridden: None,
         });
         r
     }

@@ -157,7 +157,7 @@ enum Command {
         name_only: bool,
     },
     /// Accept and safely apply the latest single result.
-    Accept(ReviewArgs),
+    Accept(AcceptArgs),
     /// Reject the latest single result without changing the source tree.
     Reject(ReviewArgs),
     /// Print the Dispatch version.
@@ -319,6 +319,19 @@ struct ReviewArgs {
 
     #[command(flatten)]
     feedback: FeedbackArgs,
+}
+
+#[derive(Args, Debug)]
+struct AcceptArgs {
+    #[command(flatten)]
+    review: ReviewArgs,
+
+    /// Apply a REFRESH caused only by the file and symbol analysis, because you
+    /// checked the work still holds. Requires an explanation; the project's
+    /// checks must still pass on the merged tree. Never overrides STOP, a patch
+    /// that no longer applies, or a failing check.
+    #[arg(long)]
+    despite_refresh: bool,
 }
 
 #[tokio::main]
@@ -567,13 +580,15 @@ async fn run() -> Result<()> {
             name_only,
         ),
         Command::Accept(args) => {
-            let explanation = args.feedback.read_explanation()?;
+            let explanation = args.review.feedback.read_explanation()?;
             orchestrator::accept_or_reject_latest(
                 &state,
-                args.run_id.as_deref(),
+                args.review.run_id.as_deref(),
                 &std::env::current_dir()?,
-                true,
-                args.feedback.reasons,
+                orchestrator::ReviewDecision::Accept {
+                    despite_refresh: args.despite_refresh,
+                },
+                args.review.feedback.reasons,
                 explanation,
             )
         }
@@ -583,7 +598,7 @@ async fn run() -> Result<()> {
                 &state,
                 args.run_id.as_deref(),
                 &std::env::current_dir()?,
-                false,
+                orchestrator::ReviewDecision::Reject,
                 args.feedback.reasons,
                 explanation,
             )

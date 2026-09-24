@@ -61,15 +61,17 @@ snapshot and the verdict.
 - **Refresh outcomes.** Whether a refreshed run was accepted, rejected or went
   stale again.
 - **Bypasses.** Every use of `coherence.accept: strict`, every accept over a
-  disagreed verdict, and every run on a path with no watcher (runs made before 0.4.1 by the legacy,
+  disagreed verdict (since 0.4.4 each is a `coherence.overridden` event carrying the
+  overridden verdict and the human's explanation, which also measures false
+  REFRESH), and every run on a path with no watcher (runs made before 0.4.1 by the legacy,
   routed, comparison or planned paths).
 - **Auto-apply outcomes and post-hoc disagreement.** Every `auto_apply.skipped` and
   `auto_apply.blocked` reason, every `result.applied`/`application.failed` with
   `applied_by: auto_apply`, and every later `review.rejected` on a run that was
   already `applied_by: auto_apply` (a human disagreeing with a CONTINUE that was
-  acted on automatically). The only dogfooding so far used a scripted agent behind
-  the Codex adapter, not a real agent; treat any auto-apply numbers as fixture
-  evidence until a real-agent run is logged.
+  acted on automatically). Real-agent trials have exercised auto-apply only a few
+  times (a Claude Code attach in 0.4.0); treat any auto-apply numbers as anecdotal
+  until real use is logged.
 - **Attached versus native Work.** The run's `mode` field (`attached` versus the
   native modes) separates work Dispatch launched from work it only observed, so every
   metric above can be split by the two. Record `attach.created`/`attach.finished`/

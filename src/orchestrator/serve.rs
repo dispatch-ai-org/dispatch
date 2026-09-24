@@ -453,6 +453,7 @@ fn render_view(
                         "verification": line.verification,
                         "review": line.review,
                         "applied_by": line.applied_by,
+                        "overridden": line.verdict == "overridden",
                     })
                 );
                 shown.insert(run.id.clone(), key);

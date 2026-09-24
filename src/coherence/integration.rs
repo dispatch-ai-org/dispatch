@@ -28,6 +28,12 @@ use crate::{
 /// Longest slice of a configured command quoted in a reason, so the log path
 /// after it survives the overall detail cap.
 const MAX_COMMAND_CHARS: usize = 80;
+/// Integration reasons carry a command, what failed, an excerpt and a log
+/// path, so they get more room than a fact reason.
+const MAX_INTEGRATION_DETAIL_CHARS: usize = 600;
+const MAX_EXCERPT_CHARS: usize = 240;
+/// How much of each output log is searched for the excerpt.
+const EXCERPT_SCAN_BYTES: u64 = 256 * 1024;
 
 /// Removes the scratch tree when dropped, whatever path leaves the function.
 struct Scratch(PathBuf);
@@ -84,7 +90,7 @@ pub async fn verify_integration(
             fact_id: None,
             path: None,
             detail: cap(format!(
-                "integration checks could not run: {error:#}; set coherence.integration_checks: false to skip"
+                "{COULD_NOT_RUN}: {error:#}; set coherence.integration_checks: false to skip"
             )),
         }],
     };
@@ -154,16 +160,134 @@ fn failure_reasons(results: &[CheckResult]) -> Vec<Reason> {
                 }
                 _ => (ReasonCode::AnalysisUncertain, "could not run".to_owned()),
             };
+            let excerpt = if result.status == CheckStatus::Failed {
+                excerpt(result)
+                    .map(|line| format!(": {line}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             Reason {
                 code,
                 fact_id: None,
                 path: None,
-                detail: cap(format!("check `{command}` {what}; logs: {logs}")),
+                detail: format!("check `{command}` {what}{excerpt}; logs: {logs}")
+                    .chars()
+                    .take(MAX_INTEGRATION_DETAIL_CHARS)
+                    .collect(),
             }
         })
         .collect()
 }
 
+/// What failed, in the check's own words: the first two lines that read like a
+/// failure (containing `FAIL`, `ERROR`, `Error`, `error:` or `panicked`, or
+/// starting with `assert`), searching stderr then stdout, else the last
+/// non-empty line. A test's own source line (`self.assertEqual(...)`) is not a
+/// failure message, so `assert` counts only at the start of a line. `None` when the check printed
+/// nothing. No language is special-cased.
+fn excerpt(result: &CheckResult) -> Option<String> {
+    use std::io::Read;
+    let read = |path: &Path| -> Option<String> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(EXCERPT_SCAN_BYTES)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let outputs = [&result.stderr_path, &result.stdout_path]
+        .into_iter()
+        .filter_map(|path| read(path))
+        .collect::<Vec<_>>();
+    let lines = || {
+        outputs
+            .iter()
+            .flat_map(|output| output.lines())
+            .map(str::trim)
+    };
+    let marked = lines()
+        .filter(|line| {
+            line.starts_with("assert")
+                || ["FAIL", "ERROR", "Error", "error:", "panicked"]
+                    .iter()
+                    .any(|marker| line.contains(marker))
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    let text = if marked.is_empty() {
+        lines().rfind(|line| !line.is_empty())?.to_owned()
+    } else {
+        marked.join(" / ")
+    };
+    Some(text.chars().take(MAX_EXCERPT_CHARS).collect())
+}
+
+const COULD_NOT_RUN: &str = "integration checks could not run";
+
+/// Whether `reason` came from running the checks on the merged tree, which only
+/// accept does; a file and symbol evaluation can never reproduce it.
+pub fn is_integration_reason(reason: &Reason) -> bool {
+    reason.code == ReasonCode::IntegrationCheckFailed || reason.detail.starts_with(COULD_NOT_RUN)
+}
+
 fn cap(detail: String) -> String {
     detail.chars().take(MAX_DETAIL_CHARS).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_check(dir: &Path, stderr: &str, stdout: &str) -> CheckResult {
+        let (err, out) = (dir.join("err.log"), dir.join("out.log"));
+        fs::write(&err, stderr).unwrap();
+        fs::write(&out, stdout).unwrap();
+        CheckResult {
+            name: "verify 1".into(),
+            phase: crate::CheckPhase::Verify,
+            command: "run tests".into(),
+            status: CheckStatus::Failed,
+            exit_code: Some(1),
+            duration_ms: 1,
+            stdout_path: out,
+            stderr_path: err,
+        }
+    }
+
+    #[test]
+    fn a_failed_check_names_what_failed_in_its_own_words() {
+        let temp = tempfile::tempdir().unwrap();
+        let unittest = "..F\n======\nFAIL: test_whoami_admin (test_handlers.HandlerTests)\n------\nTraceback (most recent call last):\n  File \"t.py\", line 9\nAssertionError: Tuples differ: (200, 'alice <admin>') != (200, 'alice (admin)')\n\nFAILED (failures=1)\n";
+        assert_eq!(
+            excerpt(&failed_check(temp.path(), unittest, "")).unwrap(),
+            "FAIL: test_whoami_admin (test_handlers.HandlerTests) / AssertionError: Tuples differ: (200, 'alice <admin>') != (200, 'alice (admin)')"
+        );
+        // The trial's real case: a test source line must not be the excerpt.
+        let unittest_error = "E\n======\nERROR: test_admin_token (test_admin.RequireAdminTests.test_admin_token)\n------\nTraceback (most recent call last):\n  File \"tests/test_admin.py\", line 9, in test_admin_token\n    self.assertEqual(require_admin(\"t-alice\")[\"name\"], \"alice\")\nTypeError: validate() missing 1 required positional argument: 'token'\n";
+        assert_eq!(
+            excerpt(&failed_check(temp.path(), unittest_error, "")).unwrap(),
+            "ERROR: test_admin_token (test_admin.RequireAdminTests.test_admin_token) / TypeError: validate() missing 1 required positional argument: 'token'"
+        );
+        let cargo = "running 1 test\ntest tests::adds ... FAILED\n\n---- tests::adds stdout ----\nthread 'tests::adds' panicked at src/lib.rs:5:9:\nassertion `left == right` failed\n";
+        assert_eq!(
+            excerpt(&failed_check(temp.path(), "", cargo)).unwrap(),
+            "test tests::adds ... FAILED / thread 'tests::adds' panicked at src/lib.rs:5:9:"
+        );
+        assert!(excerpt(&failed_check(temp.path(), "", "")).is_none());
+        assert_eq!(
+            excerpt(&failed_check(
+                temp.path(),
+                "",
+                "3 files differ\nsee report\n"
+            ))
+            .unwrap(),
+            "see report"
+        );
+        let reasons = failure_reasons(&[failed_check(temp.path(), unittest, "")]);
+        let detail = &reasons[0].detail;
+        assert!(detail.starts_with("check `run tests` failed (exit 1): FAIL: test_whoami_admin"));
+        assert!(detail.ends_with("err.log"), "{detail}");
+    }
 }

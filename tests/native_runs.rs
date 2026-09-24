@@ -388,11 +388,8 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
         f.loaded(id)?.outcome.application,
         dispatch::ApplicationState::BlockedBySourceDrift
     );
-    // The human's review is still recorded; only the application is blocked.
-    assert_eq!(
-        f.loaded(id)?.outcome.review,
-        dispatch::ReviewState::Accepted
-    );
+    // A refused accept records no human review; the result stays pending.
+    assert_eq!(f.loaded(id)?.outcome.review, dispatch::ReviewState::Pending);
     let g = Fixture::new("success")?;
     let success = Fixture::result(&g.run(&[])?)?;
     let id = success["run_id"].as_str().unwrap();
@@ -413,6 +410,28 @@ fn source_drift_blocks_apply_and_human_rejection_cannot_continue() -> Result<()>
             .success()
     );
     assert_eq!(g.count(), 1);
+    Ok(())
+}
+
+/// The source moves while the goal waits on a question. Answering continues
+/// the goal from its original snapshot; it does not end it with source drift.
+/// The result is then judged against the moved source at accept.
+#[test]
+fn answering_after_the_source_moved_continues_the_goal() -> Result<()> {
+    let f = Fixture::new("clarify")?;
+    let r = Fixture::result(&f.run(&[])?)?;
+    assert_eq!(r["execution"]["questions"][0]["state"], "pending", "{r}");
+    // A run waiting for your answer says so, not "working".
+    let history = f.command().args(["--plain", "history"]).output()?;
+    let history = String::from_utf8_lossy(&history.stdout);
+    assert!(history.contains(" question "), "{history}");
+    fs::write(f.source.join("NOTES.md"), "a teammate's change\n")?;
+    let answered = f.answer(&r, "1")?;
+    let result = Fixture::result(&answered)?;
+    assert!(answered.status.success(), "{result}");
+    assert_eq!(f.count(), 2);
+    assert_ne!(result["execution"]["failure"], "source_drift", "{result}");
+    assert_eq!(result["outcome"]["work_result"], "ready", "{result}");
     Ok(())
 }
 

@@ -344,6 +344,11 @@ pub struct CoherenceRecord {
     pub validity: Option<Validity>,
     #[serde(default)]
     pub first_invalid_at: Option<DateTime<Utc>>,
+    /// The REFRESH a human overrode to apply this result (`dispatch accept
+    /// --despite-refresh`), kept as evidence; `validity` then holds the
+    /// merged-tree verification the override required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overridden: Option<Validity>,
 }
 
 fn coherence_version() -> u32 {

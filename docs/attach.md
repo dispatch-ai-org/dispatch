@@ -289,16 +289,19 @@ Nothing is applied or launched on start or exit.
 
   ```text
   <first 8 of id> · <native|attached> <agent> · S0 <what it began against> · <verdict>[: <first reason>] · <state> · <verification>[ · review <review>]
-  01M37J7H · native claude · S0 snapshot 99240318 · unmoved · ready · checks passed · review pending
+  01M37J7H · native claude · S0 snapshot at eec41cc7 · unmoved · ready · checks passed · review pending
   01M37K2A · attached codex · S0 merge-base 1c9e0a47 (full) · REFRESH: fact_broken: pub fn validate… · blocked · checks passed · review pending
   ```
 
-  The agent is the one that did the work, for native runs too. S0 is `snapshot
-  <commit>` for native work, and `merge-base <commit> (full)` or `snapshot at
-  attach (partial)` for attached work. The verdict is `CONTINUE`, `REFRESH` or
-  `STOP` from the stored validity, `unmoved` when the source has not changed, or
-  `not checked` when nothing has been evaluated yet. State is `working`, `ready`,
-  `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
+  The agent is the one that did the work, for native runs too. S0 is `snapshot at
+  <project commit>` for native work on a Git source (the working tree as it was at
+  that commit), `directory snapshot` for a plain directory, and `merge-base <commit>
+  (full)` or `snapshot at attach (partial)` for attached work. The verdict is
+  `CONTINUE`, `REFRESH` or `STOP` from the stored validity; `unmoved` when the source
+  has not changed (including a result applied to an unmoved source); `overridden`
+  when a human applied it over a REFRESH; or `not checked` when nothing has been
+  evaluated yet. State is `working`, `question` (the run waits for your
+  `dispatch answer`), `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
   `finished`.
 
   A run is shown while it is still active, or for up to an hour after it finished.
@@ -324,7 +327,7 @@ shortcut would silently skip evaluation and the integration checks. Attached run
 when it says `Continue`, through L2 as usual; only `coherence.accept: strict` still
 takes them straight to `Legacy`, exactly as it does for native runs.
 
-This was found and fixed during 0.4.0 dogfood (see "Evidence" in the [claims
+This was found and fixed during a 0.4.0 real-agent trial (see "Evidence" in the [claims
 table](coherence-validation.md)): the first real-agent attach applied without ever
 computing a verdict because of this shortcut, and `dispatch explain` showed no
 coherence section for an applied run — the regression test lives in
@@ -338,7 +341,7 @@ reason `empty_delta`, instead of applying it as "0 files changed." This matters
 specifically for attached work: a foreign or wrapped agent that made no edits, or an
 agent that only touched files the source's ignore rules exclude, still produces a
 Ready result with nothing to apply. The run stays reviewable; nothing is recorded as
-applied. This was also found during 0.4.0 dogfood, fixed alongside the gate rule
+applied. This was also found during a 0.4.0 real-agent trial, fixed alongside the gate rule
 above.
 
 ## Review of attached work

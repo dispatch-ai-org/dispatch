@@ -633,16 +633,11 @@ async fn drive_inner(
             )?;
             break 'attempt;
         }
-        if source::fingerprint_tree(&run.source_path)? != run.source_fingerprint {
-            stop(
-                state,
-                db,
-                &mut run,
-                FailureKind::SourceDrift,
-                "source drift before fresh attempt",
-            )?;
-            break 'attempt;
-        }
+        // A source that moved since S0 does not stop an attempt, including the
+        // continuation after an answer: every attempt starts from the run's
+        // original snapshot, the mid-run watcher reports what the move means
+        // for the work, and the accept gate judges the result against the
+        // source as it is then.
         let profile = match &decision {
             None => None,
             Some(decision) => {

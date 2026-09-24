@@ -118,7 +118,7 @@ fn latest_project_diff_accept_reject_and_explain_need_no_run_id() -> anyhow::Res
             "Chosen with --agent (no profile)",
         ))
         .stdout(predicates::str::contains(
-            "Work\n  native codex · began against snapshot",
+            "Work\n  native codex · began against directory snapshot",
         ))
         .stdout(predicates::str::contains("tier").not());
     // Reading a run never rewrites its projection when nothing changed.

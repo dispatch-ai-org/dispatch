@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.3 — experimental developer preview**
+**Dispatch 0.4.4 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -82,10 +82,16 @@ it is now. Nothing about it is trusted from an earlier moment.
   analysis level, number of changed files, reasons and the next command. It is
   read-only, stores nothing, and exits 0 for any verdict (1 if it cannot evaluate).
   It runs the file, patch and symbol layers only; integration checks run at accept.
-- `dispatch accept [run]` records your decision and then applies. If the tree is
-  byte-identical to the snapshot, behavior is unchanged. If it moved, the verdict
-  gates the apply. A `REFRESH` or `STOP` leaves the source untouched and the run
-  shows its application as blocked by source drift.
+- `dispatch accept [run]` applies the result and then records your acceptance. If
+  the tree is byte-identical to the snapshot, behavior is unchanged. If it moved,
+  the verdict gates the apply. A `REFRESH` or `STOP` leaves the source untouched,
+  shows the application as blocked by source drift, and records no acceptance: the
+  result stays pending until you refresh or reject it.
+- `dispatch accept [run] --despite-refresh --explanation "<why>"` applies a `REFRESH`
+  that comes only from the file and symbol analysis, when you have checked that the
+  work still holds. Your checks must still run and pass on the merged tree, and the
+  overridden verdict is recorded with your explanation. It never overrides `STOP`, a
+  patch that no longer applies, or a failing check, and auto-apply never uses it.
 - `dispatch refresh [run]` starts a **new** run of the same task against the current
   source. The task gets a fixed note naming the earlier run and up to ten reasons it
   went stale. The old run is not modified. It needs the same explicit flags as `run`
@@ -133,6 +139,9 @@ coherence:
   facts: any change to a file the patch edits, or mentions by path, is a `REFRESH`.
 - A referenced symbol is bound by *unique name* in the baseline, not by full name
   resolution. Ambiguous or very common names are skipped, so some breakage is missed.
+- A Python function that only gains optional parameters (defaults, `*args`,
+  `**kwargs`) keeps code that calls it valid. Any other signature change to a
+  function the work calls is a `REFRESH`; Rust signatures compare exactly.
 - Integration checks run your configured `checks.verify` on the merged tree in a
   scratch copy of the non-ignored files, with no build cache. They hold the apply
   locks while running. On the local backend they are skipped for a run that was not

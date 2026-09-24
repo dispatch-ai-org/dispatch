@@ -94,6 +94,51 @@ impl Fixture {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
+    /// A refused accept records no human review: the review stays pending,
+    /// with no review revision and no `review.accepted` event.
+    fn assert_review_still_pending(&self) {
+        assert_eq!(self.metadata()["outcome"]["review"], "pending");
+        let db = rusqlite::Connection::open(self.state.join("dispatch.db")).unwrap();
+        let count =
+            |sql: &str| -> i64 { db.query_row(sql, [&self.run_id], |row| row.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM goal_feedback_revisions WHERE run_id = ?1"),
+            0
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'review.accepted'"
+            ),
+            0
+        );
+    }
+
+    /// Another run of the same task from the current source.
+    fn another_run(&self) -> String {
+        let output = cargo_bin_cmd!("dispatch")
+            .arg("--state-dir")
+            .arg(&self.state)
+            .arg("run")
+            .arg(&self.source)
+            .arg("--allow-unsafe-local")
+            .args([
+                "--task",
+                "Create the fake artifact.",
+                "--agent",
+                "fake-good",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("RUN "))
+            .expect("run output includes an ID")
+            .to_owned()
+    }
+
     fn apply(&self) -> assert_cmd::assert::Assert {
         cargo_bin_cmd!("dispatch")
             .arg("--state-dir")
@@ -160,6 +205,17 @@ fn conflicting_source_change_blocks_apply_and_leaves_source_unchanged() {
         metadata["coherence"]["validity"]["reasons"][0]["code"],
         "patch_conflict"
     );
+    fixture.assert_review_still_pending();
+    // Still the latest pending result: a bare accept finds it again.
+    let bare = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .arg("accept")
+        .current_dir(&fixture.source)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&bare.get_output().stderr).into_owned();
+    assert!(stderr.contains("stale"), "unexpected error: {stderr}");
 }
 
 #[test]
@@ -174,6 +230,36 @@ fn patch_already_present_in_source_stops() {
     assert_eq!(
         fixture.metadata()["coherence"]["validity"]["decision"],
         "stop"
+    );
+    fixture.assert_review_still_pending();
+}
+
+#[test]
+fn stop_names_the_run_that_already_landed_the_change() {
+    let fixture = Fixture::new(false, "");
+    let second = fixture.another_run();
+    fixture.apply().success();
+
+    let check = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .args(["check", &second, "--json"])
+        .output()
+        .unwrap();
+    let shown: Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(shown["validity"]["decision"], "stop", "{shown}");
+    assert_eq!(shown["landed_by"], fixture.run_id.as_str(), "{shown}");
+
+    let accept = cargo_bin_cmd!("dispatch")
+        .arg("--state-dir")
+        .arg(&fixture.state)
+        .args(["accept", &second])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&accept.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains(&format!("(landed by run {})", fixture.run_id)),
+        "unexpected error: {stderr}"
     );
 }
 

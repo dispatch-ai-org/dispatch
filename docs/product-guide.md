@@ -91,7 +91,8 @@ Review separates configured verification, human acceptance, and application:
 `Unverified — no checks configured` is attention, not success. Enter/d opens native
 changes; it never accepts. Choose `a` then Enter to accept and safely apply, `r`
 then Enter to reject, `n` to leave pending, or `i` for evidence and full paths.
-Source drift can preserve acceptance while blocking application.
+If the source moved and the result no longer holds, accepting it applies nothing,
+records no review and leaves the result pending, so you can refresh or reject it.
 
 While a result waits for review the source may keep changing. A Ready run's
 status shows one `Coherence:` line (`CONTINUE`, `REFRESH` or `STOP`), computed
@@ -313,7 +314,7 @@ is invisible to the patch Dispatch judges.
 watches every attached run with no live owner (a foreign attachment, or a wrapped
 attach whose wrapper process died) and applies the ones you marked `--auto-apply` once
 they are ready and coherent. It also prints a one-line-per-run project view —
-`<id> · agent · CONTINUE/REFRESH/STOP · working/ready/applied/blocked · reason` — that
+`<id> · agent · CONTINUE/REFRESH/STOP · working/question/ready/applied/blocked · reason` — that
 redraws in place as things change, and includes your ordinary Dispatch runs on the
 same source alongside attached ones. Run it alongside a foreign attachment so it gets
 observed and, if eligible, applied; wrapped attach and the TUI need no `serve` at all.
