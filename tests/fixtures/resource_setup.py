@@ -140,12 +140,13 @@ for line in sys.stdin:
     # 5 Runtime integrations…, 6 Back. Enter on the consent screen cancels.
     claude_settings=home/'.claude'/'settings.json'
     hooks_env=dict(env,CLAUDE_CONFIG_DIR=str(home/'.claude'))
-    with Session([binary,'--state-dir',str(used),'setup'],source,captures,'integrations',env=hooks_env,width=100,height=36) as ui:
-        ui.wait('Runtime integrations');ui.send('5\r');ui.wait('Install Claude Code hooks');ui.send('1\r')
-        ui.wait('hook claude');ui.mark('hooks-consent');ui.send('\r')
-        ui.wait('Revalidate codex');assert not claude_settings.exists(), 'Enter alone installed hooks'
-        ui.send('5\r');ui.wait('Install Claude Code hooks');ui.send('1\r');ui.wait('hook claude');ui.send('1\r')
-        ui.wait('hooks installed');ui.wait('Revalidate codex');ui.send('6\r');ui.finish()
+    # Plain mode, so each menu arrives as whole numbered lines.
+    with Session([binary,'--state-dir',str(used),'--plain','setup'],source,captures,'integrations',env=hooks_env,width=100,height=36) as ui:
+        ui.wait('5) Runtime integrations');ui.send('5\r');ui.wait('1) Install Claude Code hooks');ui.send('1\r')
+        ui.wait('hook claude');ui.wait('2) Cancel');ui.mark('hooks-consent');ui.send('\r')
+        ui.wait('6) Back');assert not claude_settings.exists(), 'Enter alone installed hooks'
+        ui.send('5\r');ui.wait('1) Install Claude Code hooks');ui.send('1\r');ui.wait('2) Cancel');ui.send('1\r')
+        ui.wait('hooks installed');ui.wait('6) Back');ui.send('6\r');ui.finish()
     installed=claude_settings.read_text()
     assert 'hook claude' in installed and str(used) in installed and 'SessionStart' in installed, installed
     print('CLI/TUI setup journeys passed; zero model calls; no database or grants created')
