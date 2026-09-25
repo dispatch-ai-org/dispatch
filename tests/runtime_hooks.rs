@@ -254,6 +254,9 @@ fn repeated_and_later_sessions_land_on_one_work() {
         "cwd": p.worktree,
     }));
 
+    // The project view reads it as discovered work with no open session.
+    let history = text(&p.dispatch(&["history"]));
+    assert!(history.contains("discovered claude"), "{history}");
     let run = p.only_run();
     let sessions = run["attachment"]["sessions"].as_array().unwrap();
     let ids: Vec<&str> = sessions
@@ -333,6 +336,9 @@ fn removing_the_worktree_keeps_its_exact_changes_before_the_hook_returns() {
         run["outcome"]["lifecycle"], "working",
         "removal does not end the work"
     );
+    let status = text(&p.dispatch(&["status", &id]));
+    assert!(status.contains("made by: the agent's runtime"), "{status}");
+    assert!(status.contains("exact changes are kept"), "{status}");
 
     // Claude deletes it; the work is still finished and applied from what
     // was kept, its checks run in a workspace rebuilt from S0 and Δ.

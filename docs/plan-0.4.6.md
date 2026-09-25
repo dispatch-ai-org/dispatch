@@ -464,3 +464,37 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
     - a failed keep stops the removal with exit 2, and the worktree is intact;
     - an unannounced vanishing is noted and cannot be finished.
   - Full suite (stages 4-5): 477 passed.
+- Stage 6. Setup: Runtime integrations.
+  - A new setup row, **Runtime integrations…**, installs or removes Claude Code's
+    hooks in `$CLAUDE_CONFIG_DIR/settings.json` (by default
+    `~/.claude/settings.json`).
+  - The events are `SessionStart` (60 s), `SessionEnd` (5 s) and `WorktreeRemove`
+    (300 s, above the 240 s removal deadline). The command names this binary and
+    state directory.
+  - The consent screen shows the exact JSON, with focus on Cancel. A backup is
+    kept beside the file, the write is durable and atomic, and invalid JSON is
+    left untouched.
+  - Our entries are identified by a command ending in ` hook claude`, so a
+    reinstall replaces them and uninstall removes exactly them.
+  - Honest cost: the JSON library orders keys, so a rewrite may reorder
+    `settings.json`. The preview says so.
+  - Tests:
+    - 3 unit tests: install keeps other hooks and settings, a reinstall doesn't
+      duplicate, uninstall restores the original, invalid JSON is untouched, no
+      file is created from scratch;
+    - a PTY journey: Enter on consent writes nothing, a deliberate Install
+      writes hooks naming the binary and state (`CLAUDE_CONFIG_DIR` is pinned,
+      so the real settings are never touched).
+  - The setup journeys' "Back" row numbers shift by one.
+- Stage 7. View and status.
+  - The Work line's origin is `native`, `attached`, `discovered` (registered by
+    a runtime) or `isolated` (a workspace Dispatch made).
+  - New states: `idle` (discovered, no open session), `removed` (workspace gone,
+    exact changes kept, waiting for a person) and `lost` (vanished unannounced).
+  - `status` gains a Workspace block, shared with `explain`: path, who made it,
+    branch or copy and whether it was released, sessions, and the removal. The
+    recovery facts stay on the run.
+  - Tests: assertions in `runtime_hooks` (history `discovered claude`, status
+    after removal) and `attach_wrapped` (status `made by: Dispatch` and its
+    branch, history `isolated`).
+  - Full suite (stages 6-7): 480 passed.

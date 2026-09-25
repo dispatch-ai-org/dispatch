@@ -539,6 +539,12 @@ fn wrapped_attach_from_the_checkout_works_in_a_workspace_dispatch_makes() {
     );
     assert_eq!(metadata["outcome"]["work_result"], "ready");
 
+    let status = String::from_utf8_lossy(&f.dispatch(&["status", &id]).stdout).into_owned();
+    assert!(status.contains("made by: Dispatch"), "{status}");
+    assert!(status.contains(&format!("branch: {branch}")), "{status}");
+    let history = String::from_utf8_lossy(&f.dispatch(&["history"]).stdout).into_owned();
+    assert!(history.contains("isolated"), "{history}");
+
     // Accepting applies Δ to the checkout; the workspace is then released.
     let accept = f.dispatch(&["accept", &id]);
     assert!(
