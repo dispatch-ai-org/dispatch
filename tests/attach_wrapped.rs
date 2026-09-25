@@ -475,3 +475,150 @@ fn wrapped_attach_of_a_plain_directory_snapshots_the_workspace() {
     assert_eq!(metadata["attachment"]["confidence"], "partial");
     assert_eq!(metadata["attachment"]["repo_key"], Value::Null);
 }
+
+impl Fixture {
+    /// Wrapped attach started in the checkout itself: Dispatch makes the
+    /// workspace. Returns the run and the wrapper's output.
+    fn attach_from_the_checkout(&self, workspace: &Path) -> (String, Output) {
+        let mut command = self.attach_command(workspace, &[]);
+        command
+            .env("STDIN_CAPTURE", self._temp.path().join("stdin-capture"))
+            .env("READY", self._temp.path().join("ready"))
+            .env_remove("GATE")
+            .env("EXIT_CODE", "0");
+        let mut child = OwnedChild(command.spawn().unwrap());
+        child.write_stdin_line("hello");
+        let output = child.finish();
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (self.only_run_id(), output)
+    }
+}
+
+#[test]
+fn wrapped_attach_from_the_checkout_works_in_a_workspace_dispatch_makes() {
+    let f = Fixture::new();
+    // Uncommitted work in the checkout is part of S0.
+    fs::write(f.root.join("notes.txt"), "mine, not committed\n").unwrap();
+    let (id, output) = f.attach_from_the_checkout(&f.root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("your checkout is not touched"), "{stderr}");
+
+    let metadata = f.metadata(&id);
+    let attachment = &metadata["attachment"];
+    assert_eq!(attachment["workspace_owner"], "dispatch");
+    let branch = format!("dispatch/{}", id.to_lowercase());
+    assert_eq!(attachment["managed"]["branch"], branch.as_str());
+    let workspace = PathBuf::from(attachment["workspace"].as_str().unwrap());
+    assert_eq!(
+        workspace,
+        fs::canonicalize(f.state.join("workspaces"))
+            .unwrap()
+            .join(&id)
+    );
+    assert!(!workspace.starts_with(&f.root));
+    assert_eq!(attachment["confidence"], "full");
+    assert!(attachment["provenance"]["workspace_at_start"]["commit"].is_string());
+
+    // The agent worked in the workspace, which began as the checkout's world.
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+        "mine, not committed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    1\n}\n"
+    );
+    let patch = f.delta_patch(&id);
+    assert!(
+        patch.contains("+    2") && !patch.contains("notes.txt"),
+        "{patch}"
+    );
+    assert_eq!(metadata["outcome"]["work_result"], "ready");
+
+    let status = String::from_utf8_lossy(&f.dispatch(&["status", &id]).stdout).into_owned();
+    assert!(status.contains("made by: Dispatch"), "{status}");
+    assert!(status.contains(&format!("branch: {branch}")), "{status}");
+    let history = String::from_utf8_lossy(&f.dispatch(&["history"]).stdout).into_owned();
+    assert!(history.contains("isolated"), "{history}");
+
+    // Accepting applies Δ to the checkout; the workspace is then released.
+    let accept = f.dispatch(&["accept", &id]);
+    assert!(
+        accept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    2\n}\n"
+    );
+    assert!(!workspace.exists());
+    assert!(!git(&f.root, &["branch", "--list", &branch]).contains("dispatch/"));
+    assert_eq!(f.metadata(&id)["attachment"]["managed"]["removed"], true);
+    assert_eq!(f.event_count("workspace.released"), 1);
+}
+
+#[test]
+fn a_rejected_workspace_dispatch_made_is_kept() {
+    let f = Fixture::new();
+    let (id, _) = f.attach_from_the_checkout(&f.root);
+    let workspace = PathBuf::from(f.metadata(&id)["attachment"]["workspace"].as_str().unwrap());
+    let reject = f.dispatch(&["reject", &id]);
+    assert!(
+        reject.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reject.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&reject.stdout);
+    assert!(
+        stdout.contains(&format!("kept at {}", workspace.display())),
+        "{stdout}"
+    );
+    assert!(workspace.join("src/lib.rs").is_file());
+    assert_eq!(f.event_count("workspace.released"), 0);
+    let history = String::from_utf8_lossy(&f.dispatch(&["history"]).stdout).into_owned();
+    assert!(history.contains("rejected"), "{history}");
+}
+
+#[test]
+fn wrapped_attach_from_a_plain_directory_works_in_a_private_copy() {
+    let f = Fixture::new();
+    let plain = f.plain_workspace();
+    let mut command = Command::new(assert_cmd::cargo_bin!("dispatch"));
+    command
+        .arg("--state-dir")
+        .arg(&f.state)
+        .args(["attach", "--workspace"])
+        .arg(&plain)
+        .arg("--root")
+        .arg(&plain)
+        .args(["--", "sh"])
+        .arg(&f.agent_script)
+        .env("STDIN_CAPTURE", f._temp.path().join("stdin-capture"))
+        .env("READY", f._temp.path().join("ready"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = OwnedChild(command.spawn().unwrap());
+    child.write_stdin_line("hello");
+    let output = child.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let id = f.only_run_id();
+    let attachment = &f.metadata(&id)["attachment"];
+    assert_eq!(attachment["workspace_owner"], "dispatch");
+    assert!(attachment["managed"]["branch"].is_null());
+    assert_eq!(
+        fs::read_to_string(plain.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    1\n}\n"
+    );
+    assert!(f.delta_patch(&id).contains("+    2"));
+}

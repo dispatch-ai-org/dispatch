@@ -443,6 +443,32 @@ fn finish_collects_delta_runs_checks_and_becomes_ready() {
     );
 }
 
+/// A build leaves ignored output behind (large files, links out of the
+/// tree); it can never enter Δ, so it must not stop the work from finishing.
+#[test]
+fn finish_succeeds_after_a_build_left_ignored_output() {
+    let f = Fixture::new(true);
+    let id = f.attach(&[]);
+    edit_workspace(&f.workspace);
+    let build = f.workspace.join("build");
+    fs::create_dir_all(&build).unwrap();
+    fs::File::create(build.join("huge.bin"))
+        .unwrap()
+        .set_len(600 * 1024 * 1024)
+        .unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", build.join("env")).unwrap();
+
+    f.dispatch(&["finish", &id]).success();
+    let metadata = f.metadata(&id);
+    assert_eq!(metadata["status"], "ready_for_evaluation", "{metadata}");
+    assert!(
+        !metadata["candidates"][0]["diff_stats"]["changed_files"]
+            .to_string()
+            .contains("build/"),
+        "{metadata}"
+    );
+}
+
 #[test]
 fn finish_then_root_moves_then_check_refreshes() {
     let f = Fixture::new(true);

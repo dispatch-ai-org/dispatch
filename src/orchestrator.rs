@@ -1529,6 +1529,12 @@ pub fn status(state: &State, id: Option<&str>, source_path: &Path) -> Result<()>
             println!("{line}");
         }
     }
+    if let Some(attachment) = &run.attachment {
+        println!("\nWorkspace");
+        for line in workspace_details(attachment) {
+            println!("{line}");
+        }
+    }
     println!(
         "\nProject: {}",
         background::describe(state, &run.source_path)
@@ -1803,6 +1809,25 @@ pub fn accept_or_reject_latest(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
     };
+    // Work whose workspace vanished before its final changes were kept has no
+    // result to review, and rejecting it is how a person closes it.
+    let lost = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| !removal.exact);
+    if !accept && lost && run.outcome.lifecycle == LifecycleState::Working {
+        attach::close_lost(state, &run.id)?;
+        println!(
+            "Closed {}: its workspace is gone, and the changes last seen stay at {}.",
+            run.id,
+            state
+                .run_dir(&run.id)
+                .join("delta-last-seen.patch")
+                .display()
+        );
+        return Ok(());
+    }
     let command = ReviewCommand {
         run_id: run.id.clone(),
         candidate_id: sole_candidate(&run)?.id.clone(),
@@ -2011,7 +2036,9 @@ pub(crate) struct WorkLine {
     /// `overridden` when a human applied it over a REFRESH.
     pub verdict: &'static str,
     pub reason: Option<String>,
-    /// `working`, `ready`, `blocked`, `applied` or `finished`.
+    /// `working`, `question`, `idle` (discovered, no live session), `removed`
+    /// or `lost` (its workspace is gone, with its exact or only its last-seen
+    /// changes kept), `ready`, `blocked`, `applied` or `finished`.
     pub state: &'static str,
     /// Who applied it: `human` or `auto_apply`; `None` when not applied.
     pub applied_by: Option<&'static str>,
@@ -2036,6 +2063,9 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             format!("merge-base {} (full)", short(commit))
         }
         Some(crate::BaselineProvenance::SnapshotAtAttach) => "snapshot at attach (partial)".into(),
+        Some(crate::BaselineProvenance::WorkspaceAtStart { commit }) => {
+            format!("workspace at start {}", short(commit))
+        }
         // Native S0 is the project as it was, named by its commit when it has
         // one; Dispatch's own baseline commit means nothing to the reader.
         None => run.source_git_head.as_deref().map_or_else(
@@ -2064,16 +2094,33 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             v.reasons.first().map(|r| line_reason(&r.detail)),
         ),
     };
+    let attachment = run.attachment.as_ref();
+    let removal = attachment.and_then(|attachment| attachment.workspace_removed.as_ref());
     let state = if run.outcome.waiting_on == WaitingOn::Human {
         "question"
     } else if run.outcome.lifecycle != LifecycleState::Finished {
-        "working"
+        match removal {
+            // Waiting for a person to finish or reject it.
+            Some(removal) if removal.exact => "removed",
+            Some(_) => "lost",
+            // Discovered work with no session open right now.
+            None if attachment
+                .and_then(|attachment| attachment.sessions.last())
+                .is_some_and(|session| session.ended_at.is_some()) =>
+            {
+                "idle"
+            }
+            None => "working",
+        }
     } else {
         match run.outcome.application {
             ApplicationState::Applied => "applied",
             ApplicationState::BlockedBySourceDrift | ApplicationState::Failed => "blocked",
             ApplicationState::NotApplied if run.outcome.work_result != WorkResult::Ready => {
                 "finished"
+            }
+            ApplicationState::NotApplied if run.outcome.review == ReviewState::Rejected => {
+                "rejected"
             }
             ApplicationState::NotApplied
                 if validity.is_some_and(|v| v.decision != Decision::Continue) =>
@@ -2101,8 +2148,16 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
         Some(AppliedBy::AutoApply) => Some("auto_apply"),
         _ => Some("human"),
     };
+    let origin = match attachment {
+        None => "native",
+        Some(attachment) if attachment.workspace_owner == crate::WorkspaceOwner::Dispatch => {
+            "isolated"
+        }
+        Some(attachment) if !attachment.sessions.is_empty() => "discovered",
+        Some(_) => "attached",
+    };
     WorkLine {
-        origin: if attached { "attached" } else { "native" },
+        origin,
         agent,
         s0,
         verdict,
@@ -2260,12 +2315,60 @@ pub fn explain(state: &State, run_id: Option<&str>, source_path: &Path) -> Resul
 /// The attachment record as `explain` shows it: provenance and confidence of
 /// S0 (the honesty rule for work Dispatch did not launch), who owns it, and
 /// what it is allowed to do.
+/// Where attached Work happens and what became of the place, for `status`
+/// and `explain`: the recovery facts live on the run, not in a list.
+fn workspace_details(attachment: &crate::AttachmentRecord) -> Vec<String> {
+    let mut lines = vec![format!("  workspace: {}", attachment.workspace.display())];
+    lines.push(format!(
+        "  made by: {}",
+        match attachment.workspace_owner {
+            crate::WorkspaceOwner::User => "you",
+            crate::WorkspaceOwner::Runtime => "the agent's runtime",
+            crate::WorkspaceOwner::Dispatch => "Dispatch",
+        }
+    ));
+    if let Some(made) = &attachment.managed {
+        lines.push(match (made.removed, &made.branch) {
+            (true, _) => "  released: the work was applied".to_owned(),
+            (false, Some(branch)) => format!("  branch: {branch}; kept until the work is applied"),
+            (false, None) => "  a private copy; kept until the work is applied".to_owned(),
+        });
+    }
+    if let Some(last) = attachment.sessions.last() {
+        lines.push(format!(
+            "  sessions: {} ({} {}, {})",
+            attachment.sessions.len(),
+            last.provider,
+            last.session_id,
+            if last.ended_at.is_some() {
+                "ended"
+            } else {
+                "open"
+            }
+        ));
+    }
+    if let Some(removal) = &attachment.workspace_removed {
+        lines.push(format!(
+            "  removed {}: {}",
+            removal.at.format("%Y-%m-%d %H:%M UTC"),
+            if removal.exact {
+                "its exact changes are kept; finish or reject it"
+            } else {
+                "only the changes last seen were kept; it cannot be finished"
+            }
+        ));
+    }
+    lines
+}
+
 fn print_attachment_details(run: &RunRecord) {
     let Some(attachment) = &run.attachment else {
         return;
     };
     println!("Attached work");
-    println!("  workspace: {}", attachment.workspace.display());
+    for line in workspace_details(attachment) {
+        println!("{line}");
+    }
     println!("  root: {}", attachment.integration_root.display());
     match &attachment.provenance {
         crate::BaselineProvenance::GitMergeBase { commit } => {
@@ -2273,6 +2376,9 @@ fn print_attachment_details(run: &RunRecord) {
         }
         crate::BaselineProvenance::SnapshotAtAttach => {
             println!("  S0: snapshot of the workspace at attach; earlier edits are not attributed");
+        }
+        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
+            println!("  S0: the workspace as it was when the work began ({commit})");
         }
     }
     println!("  confidence: {}", snake_case(&attachment.confidence));
@@ -2442,6 +2548,18 @@ fn review_locked(
     )?;
     if !quiet {
         println!("Review recorded (revision {}).", feedback.revision);
+        if let Some(attachment) = run.attachment.as_ref().filter(|attachment| {
+            attachment
+                .managed
+                .as_ref()
+                .is_some_and(|made| !made.removed)
+        }) && run.outcome.review == ReviewState::Rejected
+        {
+            println!(
+                "The workspace Dispatch made for it is kept at {}.",
+                attachment.workspace.display()
+            );
+        }
     }
     Ok(())
 }

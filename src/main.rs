@@ -172,6 +172,10 @@ enum Command {
     /// Show a run and its persisted signals.
     #[command(hide = true)]
     Show { run_id: String },
+    /// An agent runtime's lifecycle hook (installed by `dispatch setup`):
+    /// reads the runtime's event on stdin and never fails the runtime.
+    #[command(hide = true)]
+    Hook { provider: String },
     /// Print a candidate's patch.
     Diff {
         run_id: Option<String>,
@@ -571,6 +575,7 @@ async fn run() -> Result<()> {
                 command: wrapped.then_some(args.command),
                 allow_unsafe_local: args.allow_unsafe_local,
                 auto_apply: args.auto_apply,
+                runtime: None,
             };
             if wrapped {
                 let code = orchestrator::attach::run_wrapped(&state, request).await?;
@@ -599,6 +604,25 @@ async fn run() -> Result<()> {
         Command::Stop { root } => orchestrator::background::stop(&state, root),
         Command::Watch { root, json } => orchestrator::serve::watch(&state, root, json).await,
         Command::Show { run_id } => orchestrator::show(&state, &run_id),
+        Command::Hook { provider } => {
+            use std::io::Read;
+            anyhow::ensure!(provider == "claude", "unknown agent runtime: {provider}");
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take(dispatch::runtime::MAX_INPUT_BYTES as u64 + 1)
+                .read_to_end(&mut input)?;
+            let output = dispatch::runtime::claude::handle(&state, &input);
+            if !output.stdout.is_empty() {
+                println!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprintln!("{}", output.stderr);
+            }
+            if output.code != 0 {
+                std::process::exit(output.code);
+            }
+            Ok(())
+        }
         Command::Diff {
             run_id,
             candidate,

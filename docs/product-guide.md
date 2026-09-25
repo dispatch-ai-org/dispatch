@@ -324,9 +324,27 @@ under a line saying who watches. It redraws in place as things change, and leavi
 it does not stop watching. **`dispatch stop`** ends watching. `dispatch serve` is
 the same owner in the foreground, with the view.
 
-Watching needs no agent profile. It covers the Work Dispatch launched or that you
-attached, and nothing else on your machine. Wrapped attach and the TUI need no
-owner at all.
+Watching needs no agent profile. It covers:
+- the Work Dispatch launched;
+- the Work you attached;
+- sessions a runtime reports.
+
+It never scans for agent processes. Wrapped attach and the TUI need no owner at
+all.
+
+**Work that appears by itself.** `dispatch setup` → **Runtime integrations…** installs
+Claude Code's hooks into `~/.claude/settings.json`: `SessionStart`, `SessionEnd`,
+`WorktreeRemove`, and `PreToolUse` for the `ExitWorktree` tool only.
+- **Consent:** the screen shows exactly what is added, and focus starts on Cancel.
+  A backup of the previous settings is kept, and **Remove** takes out exactly what
+  was added. These hooks observe; they involve no account, model or funding.
+- **What they do:** in a project you watch, a Claude Code session in its own
+  worktree (`claude --worktree`) becomes Work by itself, with S0 taken before its
+  first edit. When Claude Code removes the worktree, its exact changes are kept
+  first, and the Work waits for you to `finish` or `reject` it.
+- **Sessions in your checkout:** a fresh one is told that Dispatch cannot follow it.
+- **Other agents:** `dispatch attach -- <agent>` from your checkout gives any agent
+  CLI a workspace of its own.
 
 What shows in the CLI: `dispatch status` and `dispatch check` treat an attached run
 exactly like any other single-result run once it is finished — same `Coherence`

@@ -48,10 +48,13 @@ directories) and locks (the per-source apply lock), not by routing native runs t
   *"workspace belongs to a different repository than the integration root."* Two main
   worktrees of the same repository are, by design, two separate worlds; the attachment
   names the one it targets.
-- **Same-checkout attach** (workspace equals the integration root) is refused:
-  *"attach needs a separate worktree; run git worktree add."* Δ attribution and
-  self-application are undefined when the workspace and the root are the same tree, so
-  this is refused rather than left ambiguous.
+- **Same-checkout attach** (workspace equals the integration root): the checkout is
+  never the workspace. Δ attribution and self-application are undefined when the
+  workspace and the root are the same tree.
+  - **Wrapped form:** Dispatch makes a workspace instead (see *Workspaces Dispatch
+    makes* below).
+  - **Foreign form:** refused with *"attach needs a separate worktree; run git worktree
+    add, or wrap the agent (dispatch attach -- <agent>) and Dispatch makes one"*.
 - **Plain directories**: only the wrapped form can attach a plain (non-Git) directory;
   S0 is a snapshot taken at attach time (below). Foreign attach of a plain directory
   always requires Git and is refused otherwise.
@@ -213,7 +216,9 @@ with one, it is `run_wrapped`; without one, it is the plain `create` (foreign) f
 **Refusals, in the order they are checked**, with the exact messages `attach` prints
 on `stderr` and exits non-zero:
 
-1. workspace equals root — *"attach needs a separate worktree; run git worktree add"*
+1. workspace equals root, foreign form only — *"attach needs a separate worktree; run
+   git worktree add, or wrap the agent (dispatch attach -- <agent>) and Dispatch makes
+   one"*
 2. different repository — *"workspace belongs to a different repository than the
    integration root"*
 3. Git workspace with no merge base — *"no common history between the workspace and
@@ -346,7 +351,7 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   what the tick above already evaluated:
 
   ```text
-  <first 8 of id> · <native|attached> <agent> · S0 <what it began against> · <verdict>[: <first reason>] · <state> · <verification>[ · review <review>]
+  <first 8 of id> · <origin> <agent> · S0 <what it began against> · <verdict>[: <first reason>] · <state> · <verification>[ · review <review>]
   01M37J7H · native claude · S0 snapshot at eec41cc7 · unmoved · ready · checks passed · review pending
   01M37K2A · attached codex · S0 merge-base 1c9e0a47 (full) · REFRESH: fact_broken: pub fn validate… · blocked · checks passed · review pending
   ```
@@ -354,13 +359,29 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   The agent is the one that did the work, for native runs too. S0 is `snapshot at
   <project commit>` for native work on a Git source (the working tree as it was at
   that commit), `directory snapshot` for a plain directory, and `merge-base <commit>
-  (full)` or `snapshot at attach (partial)` for attached work. The verdict is
+  (full)`, `snapshot at attach (partial)` or `workspace at start <commit>` for
+  attached work.
+
+  The origin is:
+  - `native` for work Dispatch ran;
+  - `isolated` for work in a workspace Dispatch made;
+  - `discovered` for work a runtime's session registered;
+  - `attached` for any other attached work.
+
+  The verdict is
   `CONTINUE`, `REFRESH` or `STOP` from the stored validity; `unmoved` when the source
   has not changed (including a result applied to an unmoved source); `overridden`
   when a human applied it over a REFRESH; or `not checked` when nothing has been
-  evaluated yet. State is `working`, `question` (the run waits for your
-  `dispatch answer`), `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
-  `finished`.
+  evaluated yet.
+
+  The state is one of:
+  - `working`;
+  - `question` (the run waits for your `dispatch answer`);
+  - `idle` (discovered work with no open session);
+  - `removed` (its workspace is gone and its exact changes are kept, waiting for you);
+  - `lost` (its workspace vanished unannounced; it cannot be finished);
+  - `ready`, `blocked`, `applied` (`applied by auto-apply` when policy applied it) or
+    `finished`.
 
   A run is shown while it is still active, or for up to an hour after it finished.
   On a TTY the block is redrawn in place; otherwise lines are appended. It **renders
@@ -370,6 +391,59 @@ start or exit. `dispatch serve` runs it in the foreground with the view;
   "reason", "origin", "s0", "verification", "review", "applied_by"}` object per run
   whose displayed fields changed (the last five since 0.4.3), and one
   `{"type":"world", "digest"}` object whenever the observed world moved.
+
+## Workspaces Dispatch makes
+
+`dispatch attach -- <agent>` run from the checkout itself makes the workspace for
+the agent under `<state>/workspaces/<run-id>`, never inside the checkout.
+- **Git checkout:** S0 is the checkout's exact world at that moment, including
+  uncommitted and untracked files but not ignored ones. It is recorded as a commit
+  without copying anything (`source::world_commit`, like `git stash create`) and
+  checked out as a linked worktree on its own `dispatch/<run-id>` branch.
+- **Plain directory:** a snapshot and a private copy of it.
+- The provenance is `workspace_at_start`, with full confidence. The agent needs no
+  worktree support of its own.
+- Ignored files, such as installed dependencies or build output, are not carried
+  over, just as with `claude --worktree`.
+- **Release:** the workspace is removed only once its work is applied, because its Δ
+  is then in the checkout. It is kept after a reject (whose message prints its
+  path), after a crash, or when removal fails. `dispatch status <id>` shows where it
+  is and what became of it.
+
+## Work a runtime registers
+
+With Claude Code's hooks installed (`dispatch setup` → Runtime integrations), the
+runtime tells Dispatch about its sessions (`dispatch hook claude`, which reads the
+runtime's event on stdin):
+- **Only in a watched project.** Only a project watched with `dispatch start` is
+  followed. The integration root is always derived from the workspace's own Git
+  repository, never taken from the event. Hook input is validated and bounded, and
+  anything malformed is refused whole.
+- **A session starting in a separate worktree** registers Work the first time:
+  - S0 is the worktree's exact world then, before the session's first turn;
+  - later sessions in that worktree (resume, clear, compact, a fork into it, a
+    replayed event) are recorded on the same Work;
+  - an ended session never ends the Work;
+  - a resume into a worktree Dispatch has not seen is partial, since earlier edits
+    may predate S0.
+- **A fresh session in the checkout itself** is told that Dispatch cannot tell its
+  edits from yours. Nothing is tracked. A resumed session gets no notice, because
+  Claude Code reports the checkout before re-entering the session's worktree.
+- **Verification:** runtime-registered Work carries no authority to run checks.
+  `dispatch finish <id> --allow-unsafe-local` is a person's decision.
+- **Workspace removal.** Claude Code deletes a worktree in two ways: at session exit,
+  which runs `WorktreeRemove`, and through its `ExitWorktree` tool with `action:
+  remove`, which does not. For that second path Dispatch hooks `PreToolUse`. Before
+  either deletion, Dispatch keeps the Work's exact final Δ: the patch is written and
+  synced into the run, and the removal committed, before the hook returns.
+  - If that fails, or takes longer than 240 s, the hook fails and Claude Code keeps
+    the worktree (for `ExitWorktree`, the tool call is refused).
+  - Removal is an observation, not an ending: the Work waits for `finish`, which
+    verifies it in a workspace rebuilt from S0 and the kept Δ, or for `reject`.
+  - Only an empty Δ closes the Work.
+  - If a followed workspace vanishes without the hook, the owner keeps the last Δ it
+    followed (`delta-last-seen.patch`). That Work cannot be finished; rejecting it
+    closes it.
 
 ## The gate rule for attached runs
 

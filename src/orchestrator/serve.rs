@@ -449,10 +449,23 @@ impl Owner {
             if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
                 continue; // the wrapper's own business
             }
+            if attachment.workspace_removed.is_some() {
+                continue; // nothing left to follow
+            }
             // The work's signal is its patch so far, taken without the run's
             // lock into a scratch file: `finish` takes that lock without
             // waiting, so the owner holds it only when something moved.
             let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
+            if !attachment.workspace.exists() {
+                // Gone without a word: keep the last Δ this owner followed.
+                if let Err(error) =
+                    super::attach::note_workspace_gone(state, &candidate.id, Some(&scratch))
+                {
+                    tick.report(&error);
+                }
+                tick.persisted = true;
+                continue;
+            }
             let started = Instant::now();
             let index = scratch.with_extension("index");
             let work = source::snapshot_delta_indexed(
@@ -625,10 +638,12 @@ fn awaits_review(run: &RunRecord) -> bool {
 }
 
 /// Whether the owner stores `validity` over `stored`: when it says something
-/// new (`worth_recording`), and also the first time the Work is checked at
-/// all, so the view says "unmoved" or CONTINUE rather than "not checked".
+/// new (`worth_recording`), the first time the Work is checked at all, and
+/// when the world first moves under it, so the view never says "not checked"
+/// or "unmoved" about something it has seen move.
 fn worth_storing(stored: Option<&Validity>, validity: &Validity) -> bool {
-    stored.is_none() || coherence::watch::worth_recording(stored, validity)
+    stored.is_none_or(|stored| stored.world_changed != validity.world_changed)
+        || coherence::watch::worth_recording(stored, validity)
 }
 
 /// Every attached run ready to auto-apply: finished, `Ready`, unreviewed,
@@ -760,6 +775,23 @@ mod tests {
     #[test]
     fn live_owner_state_maps_identity_outcomes() {
         assert_eq!(live_owner_state(None), OwnerState::Unknown);
+    }
+
+    #[test]
+    fn the_first_move_of_the_world_is_stored_even_when_the_verdict_holds() {
+        let validity = |world_changed| Validity {
+            decision: Decision::Continue,
+            evaluated_at: Utc::now(),
+            world_digest: format!("{world_changed}"),
+            world_changed,
+            changed_files: u32::from(world_changed),
+            reasons: Vec::new(),
+            analysis: crate::AnalysisLevel::FilesOnly,
+        };
+        assert!(worth_storing(None, &validity(false)));
+        assert!(worth_storing(Some(&validity(false)), &validity(true)));
+        assert!(!worth_storing(Some(&validity(true)), &validity(true)));
+        assert!(!worth_storing(Some(&validity(false)), &validity(false)));
     }
 
     #[test]

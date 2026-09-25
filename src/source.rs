@@ -177,6 +177,22 @@ pub fn repo_identity(path: &Path) -> Result<Option<RepoIdentity>> {
     }))
 }
 
+/// The top of the Git checkout `path` lies in (a subdirectory's worktree
+/// root), or `None` outside any Git checkout.
+pub fn checkout_top(path: &Path) -> Result<Option<PathBuf>> {
+    let path = resolve_source(Some(path))?;
+    if repo_identity(&path)?.is_none() {
+        return Ok(None);
+    }
+    let mut top = git_command(&path);
+    top.args(["rev-parse", "--show-toplevel"]);
+    let output = checked_output(top, "failed to find the checkout's top")?;
+    let top = bytes_to_path(trim_ascii(&output.stdout));
+    Ok(Some(fs::canonicalize(&top).with_context(|| {
+        format!("failed to resolve {}", top.display())
+    })?))
+}
+
 /// The merge base of `root`'s `HEAD` and `workspace`'s `HEAD`, or `None` when
 /// they share no history. `root` and `workspace` must name the same
 /// repository (equal `repo_identity` keys); a workspace from an unrelated
@@ -337,6 +353,137 @@ pub fn materialize_baseline_from_commit(
     })
 }
 
+/// The exact world of a Git checkout as a commit, without copying files: its
+/// tracked files as they are now, dirty or deleted, and its untracked files
+/// its ignore rules do not exclude (what `world::observe` calls the world),
+/// with `HEAD` as parent. Built like `git stash create`: staged into a copy of
+/// the checkout's own index (so Git's stat cache spares unchanged files),
+/// never its real index. Untracked nested repositories are left out, as the
+/// world leaves them out. The commit's objects live in the checkout's own
+/// repository; `materialize_baseline_from_commit` turns it into a baseline.
+pub fn world_commit(checkout: &Path) -> Result<String> {
+    let checkout = resolve_source(Some(checkout))?;
+    let scratch = Builder::new()
+        .prefix("dispatch-world-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index = scratch.path().join("index");
+
+    let mut index_path = git_command(&checkout);
+    index_path.args(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let real_index = PathBuf::from(
+        String::from_utf8_lossy(
+            &checked_output(index_path, "failed to locate the Git index")?.stdout,
+        )
+        .trim(),
+    );
+    if real_index.is_file() {
+        fs::copy(&real_index, &index)
+            .with_context(|| format!("failed to copy {}", real_index.display()))?;
+    }
+    let head = git_head_at(&checkout)?;
+    if !real_index.is_file() && head.is_some() {
+        let mut read_tree = git_command(&checkout);
+        read_tree
+            .env("GIT_INDEX_FILE", &index)
+            .args(["read-tree", "HEAD"]);
+        checked_output(read_tree, "failed to initialize a temporary Git index")?;
+    }
+
+    // Untracked nested repositories are listed as `dir/`; the world skips them.
+    let mut list = git_command(&checkout);
+    list.env("GIT_INDEX_FILE", &index)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let listed = checked_output(list, "failed to list the checkout's untracked files")?;
+    let nested: Vec<String> = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|raw| raw.strip_suffix(b"/"))
+        .map(|directory| format!(":(exclude,literal){}", String::from_utf8_lossy(directory)))
+        .collect();
+
+    let mut add = git_command(&checkout);
+    add.env("GIT_INDEX_FILE", &index)
+        .args(["add", "-A", "--", "."])
+        .args(dispatch_exclusion_pathspecs())
+        .args(&nested);
+    checked_output(add, "failed to stage the checkout's world")?;
+
+    let mut write_tree = git_command(&checkout);
+    write_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let tree = checked_output(write_tree, "failed to write the checkout's world")?.stdout;
+    let tree = String::from_utf8_lossy(&tree).trim().to_owned();
+
+    let mut commit = git_command(&checkout);
+    commit
+        .env("GIT_AUTHOR_NAME", "Dispatch")
+        .env("GIT_AUTHOR_EMAIL", "dispatch@localhost")
+        .env("GIT_COMMITTER_NAME", "Dispatch")
+        .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
+        .args(["commit-tree", &tree, "-m", "Dispatch S0"]);
+    if let Some(head) = &head {
+        commit.args(["-p", head]);
+    }
+    let commit = checked_output(commit, "failed to record the checkout's world")?.stdout;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
+}
+
+/// A private workspace at `dir` that is the baseline plus `patch`: the Work
+/// as it was when its own workspace was removed, for verifying it.
+pub fn rebuild_workspace(baseline_path: &Path, patch: &Path, dir: &Path) -> Result<PathBuf> {
+    let workspace = create_candidate_workspace(baseline_path, dir)?;
+    if fs::metadata(patch)?.len() > 0 {
+        let mut apply = git_command(&workspace);
+        apply
+            .args(["apply", "--binary", "--whitespace=nowarn", "--"])
+            .arg(patch);
+        checked_output(apply, "failed to rebuild the work from its kept changes")?;
+    }
+    Ok(workspace)
+}
+
+/// A linked worktree of `checkout`'s repository at `path`, on a new `branch`
+/// at `commit`: a workspace whose files are exactly that commit. `path` must
+/// lie outside the checkout.
+pub fn create_linked_workspace(
+    checkout: &Path,
+    commit: &str,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let checkout = resolve_source(Some(checkout))?;
+    let projected = canonicalize_allow_missing(path)?;
+    ensure!(
+        !projected.starts_with(&checkout),
+        "a workspace must be outside the checkout: {}",
+        path.display()
+    );
+    ensure!(
+        fs::symlink_metadata(path).is_err(),
+        "workspace already exists: {}",
+        path.display()
+    );
+    let mut add = git_command(&checkout);
+    add.args(["worktree", "add", "--quiet", "-b", branch, "--"])
+        .arg(path)
+        .arg(commit);
+    checked_output(add, "failed to create the workspace")?;
+    Ok(())
+}
+
+/// Remove a linked worktree `create_linked_workspace` made, and its branch.
+pub fn remove_linked_workspace(checkout: &Path, path: &Path, branch: &str) -> Result<()> {
+    let mut remove = git_command(checkout);
+    remove
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(path);
+    checked_output(remove, "failed to remove the workspace")?;
+    let mut delete = git_command(checkout);
+    delete.args(["branch", "-D", "--", branch]);
+    checked_output(delete, "failed to delete the workspace's branch")?;
+    Ok(())
+}
+
 /// Create a complete, independent workspace at the frozen baseline commit.
 pub fn create_candidate_workspace(baseline_path: &Path, candidate_dir: &Path) -> Result<PathBuf> {
     let baseline_path = resolve_source(Some(baseline_path))?;
@@ -405,7 +552,7 @@ pub fn collect_diff(baseline_path: &Path, workspace: &Path, diff_path: &Path) ->
         !projected_diff_path.starts_with(&workspace),
         "diff artifact must be stored outside the candidate workspace"
     );
-    validate_candidate_tree(&workspace)?;
+    validate_candidate_tree(&baseline_path, &workspace)?;
 
     let untracked_files = list_untracked_files(&baseline_path, &workspace)?;
     let index_directory = Builder::new()
@@ -808,6 +955,25 @@ pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path)
     Ok(())
 }
 
+/// The first parent of `relative` under `root` that is a symlink, if any.
+fn symlinked_parent(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let mut current = root.to_path_buf();
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    for component in parent.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Some(current)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// True when every parent directory of `relative` under `root` is a real
 /// directory (not a symlink); verified parents are remembered in `known`.
 pub(crate) fn parents_are_directories(
@@ -953,25 +1119,59 @@ fn ensure_symlink_stays_within(root: &Path, link: &Path, target: &Path) -> Resul
     Ok(())
 }
 
-fn validate_candidate_tree(root: &Path) -> Result<()> {
+/// Refuse a candidate whose Δ would be unsafe or too large: at most
+/// `MAX_CANDIDATE_FILES` files of at most `MAX_CANDIDATE_FILE_BYTES` each and
+/// `MAX_CANDIDATE_TREE_BYTES` in all, no special files, no symlink that leaves
+/// the tree. Only paths that can enter Δ count: the baseline's tracked paths
+/// and the workspace's untracked paths its ignore rules do not exclude, as the
+/// trusted baseline repository lists them for `git add -A`. Ignored build
+/// output (`target/`, `node_modules/`) can never enter Δ, so it is neither
+/// counted nor refused.
+fn validate_candidate_tree(baseline_path: &Path, root: &Path) -> Result<()> {
+    let mut list = comparison_git_command(baseline_path, root);
+    list.args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+    ])
+    .args(dispatch_exclusion_pathspecs());
+    let listing = checked_output(list, "failed to enumerate the candidate's changes")?;
     let mut files = 0_u64;
     let mut logical_bytes = 0_u64;
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(include_entry)
-    {
-        let entry =
-            entry.with_context(|| format!("failed to walk candidate {}", root.display()))?;
-        if entry.depth() == 0 {
+    let mut real_directories = HashSet::new();
+    let mut checked_links = HashSet::new();
+    for raw in listing.stdout.split(|byte| *byte == 0) {
+        // An untracked nested repository is listed as `dir/`, not as files.
+        if raw.is_empty() || raw.ends_with(b"/") {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
-            format!(
-                "failed to inspect candidate path {}",
-                entry.path().display()
-            )
-        })?;
+        let relative = bytes_to_path(raw);
+        // Under a parent that became a symlink, the link is what Git records.
+        if !parents_are_directories(root, &relative, &mut real_directories) {
+            if let Some(link) = symlinked_parent(root, &relative)?
+                && checked_links.insert(link.clone())
+            {
+                let target = fs::read_link(&link)
+                    .with_context(|| format!("failed to read symlink {}", link.display()))?;
+                ensure_symlink_stays_within(root, &link, &target)?;
+            }
+            continue;
+        }
+        let path = root.join(&relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // Deleted since the baseline: part of Δ, but nothing to inspect.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect candidate path {}", path.display())
+                });
+            }
+        };
         if metadata.is_dir() {
             continue;
         }
@@ -981,14 +1181,14 @@ fn validate_candidate_tree(root: &Path) -> Result<()> {
             "candidate contains more than {MAX_CANDIDATE_FILES} files; diff collection was refused"
         );
         if metadata.file_type().is_symlink() {
-            let target = fs::read_link(entry.path())
-                .with_context(|| format!("failed to read symlink {}", entry.path().display()))?;
-            ensure_symlink_stays_within(root, entry.path(), &target)?;
+            let target = fs::read_link(&path)
+                .with_context(|| format!("failed to read symlink {}", path.display()))?;
+            ensure_symlink_stays_within(root, &path, &target)?;
         } else if metadata.is_file() {
             ensure!(
                 metadata.len() <= MAX_CANDIDATE_FILE_BYTES,
                 "candidate file {} is larger than the {} MiB safety limit",
-                entry.path().display(),
+                path.display(),
                 MAX_CANDIDATE_FILE_BYTES / (1024 * 1024)
             );
             logical_bytes = logical_bytes.saturating_add(metadata.len());
@@ -1000,7 +1200,7 @@ fn validate_candidate_tree(root: &Path) -> Result<()> {
         } else {
             bail!(
                 "candidate contains unsupported special file: {}",
-                entry.path().display()
+                path.display()
             );
         }
     }
@@ -2157,6 +2357,114 @@ mod tests {
         assert!(error.contains("absolute symlink"));
     }
 
+    #[test]
+    fn world_commit_records_exactly_the_world_and_leaves_the_checkout_alone() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join(".gitignore"), "target/\n");
+        write(&source.join("a.txt"), "committed\n");
+        write(&source.join("b.txt"), "to be deleted\n");
+        write(&source.join("src/keep.rs"), "pub fn keep() {}\n");
+        initialize_user_repository(&source);
+        let head = run_git(&source, &["rev-parse", "HEAD"]);
+
+        write(&source.join("a.txt"), "dirty\n");
+        fs::remove_file(source.join("b.txt")).unwrap();
+        write(&source.join("new.txt"), "untracked\n");
+        write(&source.join("target/out.bin"), "build output\n");
+        let nested = source.join("vendor/dep");
+        write(&nested.join("lib.rs"), "nested\n");
+        run_git(&nested, &["init", "--quiet"]);
+        let status_before = run_git(&source, &["status", "--porcelain"]);
+        let index_before = fs::read(source.join(".git/index")).unwrap();
+
+        let commit = world_commit(&source).unwrap();
+
+        assert_eq!(run_git(&source, &["status", "--porcelain"]), status_before);
+        assert_eq!(fs::read(source.join(".git/index")).unwrap(), index_before);
+        assert_eq!(
+            run_git(&source, &["rev-parse", &format!("{commit}^")]),
+            head
+        );
+        let mut files: Vec<String> = run_git(&source, &["ls-tree", "-r", "--name-only", &commit])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        files.sort();
+        assert_eq!(files, [".gitignore", "a.txt", "new.txt", "src/keep.rs"]);
+
+        let baseline = materialize_baseline_from_commit(&source, &commit, &temp.path().join("run"))
+            .unwrap()
+            .baseline_path;
+        assert_eq!(
+            fs::read_to_string(baseline.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(!baseline.join("b.txt").exists() && !baseline.join("target").exists());
+
+        // A repository with no commit yet has a world too.
+        let fresh = temp.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        run_git(&fresh, &["init", "--quiet"]);
+        write(&fresh.join("first.txt"), "first\n");
+        let commit = world_commit(&fresh).unwrap();
+        assert_eq!(
+            run_git(&fresh, &["ls-tree", "-r", "--name-only", &commit]),
+            "first.txt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_build_output_never_limits_or_refuses_the_delta() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join(".gitignore"), "target/\nnode_modules/\n");
+        write(&source.join("src/lib.rs"), "pub fn f() {}\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        let diff = temp.path().join("delta.patch");
+        let collect = || collect_diff(&snapshot.baseline_path, &workspace, &diff);
+
+        // What a build and an install leave behind: a file over the per-file
+        // limit (sparse, so it costs nothing) and links out of the tree.
+        fs::create_dir_all(workspace.join("target")).unwrap();
+        fs::File::create(workspace.join("target/huge.bin"))
+            .unwrap()
+            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+            .unwrap();
+        fs::create_dir_all(workspace.join("node_modules/.bin")).unwrap();
+        symlink("/usr/bin/env", workspace.join("node_modules/.bin/env")).unwrap();
+        write(&workspace.join("src/lib.rs"), "pub fn f() { 1 }\n");
+        assert_eq!(collect().unwrap().changed_files, vec!["src/lib.rs"]);
+
+        // Whatever can enter the delta is still held to the same limits.
+        symlink("/usr/bin/env", workspace.join("src/escape")).unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("absolute symlink"), "{error}");
+        fs::remove_file(workspace.join("src/escape")).unwrap();
+
+        fs::File::create(workspace.join("src/huge.bin"))
+            .unwrap()
+            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+            .unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("safety limit"), "{error}");
+        fs::remove_file(workspace.join("src/huge.bin")).unwrap();
+
+        // A tracked directory replaced by a link out of the tree.
+        fs::remove_dir_all(workspace.join("src")).unwrap();
+        symlink("/tmp", workspace.join("src")).unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("absolute symlink"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn scratch_tree_copies_listed_files_only_and_never_follows_symlinks() {
@@ -2607,33 +2915,5 @@ mod tests {
         let finish_text = fs::read_to_string(&diff_path).unwrap();
         assert!(!finish_text.contains("out.bin"));
         assert!(!finish_text.contains(".git"));
-    }
-
-    // Performance report (run with `cargo test --lib source:: -- --ignored --nocapture`).
-    #[test]
-    #[ignore = "perf report; prints timing only"]
-    fn validate_candidate_tree_timing_report() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = 0_u64;
-        for entry in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(include_entry)
-        {
-            let entry = entry.unwrap();
-            if entry.depth() > 0 && !entry.path().is_dir() {
-                files += 1;
-            }
-        }
-
-        let started = Instant::now();
-        validate_candidate_tree(root).unwrap();
-        let elapsed = started.elapsed();
-
-        println!(
-            "validate_candidate_tree on {}: {:.1} ms wall time, {files} files walked",
-            root.display(),
-            elapsed.as_secs_f64() * 1000.0
-        );
     }
 }

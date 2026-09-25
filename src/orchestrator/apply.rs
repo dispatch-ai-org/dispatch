@@ -211,6 +211,11 @@ fn persist_applied(
         },
         &mut run,
     )?;
+    // Applied, so a workspace Dispatch made for this Work holds nothing the
+    // checkout lacks. Keeping it when removal fails loses nothing.
+    if let Err(error) = super::attach::release_workspace(state, &mut run) {
+        eprintln!("Kept the workspace Dispatch made for this work: {error:#}");
+    }
     Ok(run)
 }
 

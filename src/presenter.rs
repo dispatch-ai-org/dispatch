@@ -2047,6 +2047,10 @@ mod tests {
             attached_at: chrono::Utc::now(),
             finished_at: None,
             finish_reason: None,
+            workspace_owner: Default::default(),
+            managed: None,
+            sessions: Vec::new(),
+            workspace_removed: None,
         }
     }
 

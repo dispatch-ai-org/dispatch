@@ -546,13 +546,83 @@ pub struct AttachmentRecord {
     pub attached_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub finish_reason: Option<FinishReason>,
+    /// Who made the workspace. Records before 0.4.6 are the user's.
+    #[serde(default)]
+    pub workspace_owner: WorkspaceOwner,
+    /// A workspace Dispatch made for this Work, and whether it is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedWorkspace>,
+    /// Agent-runtime sessions that worked here, oldest first
+    /// (`runtime::ingest`); the Work is the workspace, not any one session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<RuntimeSession>,
+    /// The workspace is gone. An observation, not an ending: the Work waits
+    /// for a person, except an empty Δ, which leaves nothing to review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_removed: Option<WorkspaceRemoval>,
+}
+
+/// When the workspace went, and whether Dispatch kept its exact final Δ (a
+/// runtime told it first) or only the last Δ it had seen (it found the
+/// workspace gone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRemoval {
+    pub at: DateTime<Utc>,
+    pub exact: bool,
+}
+
+/// One agent-runtime session in a Work's workspace, as its runtime reported
+/// it. `provider` is the runtime (`claude`); the rest is its own words.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSession {
+    pub provider: String,
+    pub session_id: String,
+    /// How it started: `startup`, `resume`, `fork`, `clear`, `compact`.
+    pub source: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub end_reason: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Who made the workspace the Work happens in.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOwner {
+    /// You made it (`git worktree add`, or any directory you attached).
+    #[default]
+    User,
+    /// An agent runtime made it (a Claude Code `--worktree` session).
+    Runtime,
+    /// Dispatch made it (`dispatch attach -- <agent>` from the checkout).
+    Dispatch,
+}
+
+/// A workspace Dispatch made under `<state>/workspaces/<run-id>`: a linked
+/// worktree on `branch` for a Git checkout, a private copy otherwise. It is
+/// removed only once its Work is applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedWorkspace {
+    pub branch: Option<String>,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BaselineProvenance {
-    GitMergeBase { commit: String },
+    GitMergeBase {
+        commit: String,
+    },
     SnapshotAtAttach,
+    /// The workspace's exact world when its Work began, before any agent edit
+    /// (`source::world_commit`): at a runtime's session start, or when
+    /// Dispatch made the workspace.
+    WorkspaceAtStart {
+        commit: String,
+    },
 }
 
 /// `Partial`: edits made before attach are invisible to Δ and the record
@@ -873,6 +943,10 @@ mod tests {
                 .with_timezone(&Utc),
             finished_at: None,
             finish_reason: None,
+            workspace_owner: Default::default(),
+            managed: None,
+            sessions: Vec::new(),
+            workspace_removed: None,
         }
     }
 

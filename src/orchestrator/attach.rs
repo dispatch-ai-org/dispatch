@@ -29,9 +29,9 @@ use super::{
 use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
-    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, OwnerState,
-    ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, VerificationState, WaitingOn,
-    WorkResult,
+    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
+    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, RuntimeSession,
+    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
     coherence::watch::{WatchSpec, Watcher},
     db::Database,
     lock::OperationLock,
@@ -54,6 +54,17 @@ pub struct AttachRequest {
     pub command: Option<Vec<String>>,
     pub allow_unsafe_local: bool,
     pub auto_apply: bool,
+    /// `Some` when a runtime's session start registers the Work
+    /// (`runtime::ingest`) rather than a person typing `attach`.
+    pub runtime: Option<RuntimeStart>,
+}
+
+/// Work a runtime's session start registers: S0 is the workspace's exact
+/// world now, before the session's first turn. A resume into a workspace
+/// Dispatch has not seen may follow edits made before it, so it is partial.
+pub struct RuntimeStart {
+    pub session: RuntimeSession,
+    pub resumed: bool,
 }
 
 /// `dispatch attach --workspace <path> ...` (foreign form): create a
@@ -72,16 +83,23 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         },
     };
 
+    // Wrapped work started in the checkout itself gets a workspace Dispatch
+    // makes (`make_workspace`); the checkout is never the workspace.
+    let managed = is_wrapped && workspace == root;
+    let runtime = request.runtime.as_ref();
+
     // 14.8, in order: same-checkout, different repository, no merge base,
     // plain-directory foreign attach, checks without acknowledgement,
     // already attached.
     anyhow::ensure!(
-        workspace != root,
-        "attach needs a separate worktree; run git worktree add"
+        managed || workspace != root,
+        "attach needs a separate worktree; run git worktree add, or wrap the agent \
+         (dispatch attach -- <agent>) and Dispatch makes one"
     );
 
     let workspace_identity = source::repo_identity(&workspace)?;
     let commit = match &workspace_identity {
+        _ if managed || runtime.is_some() => None,
         Some(workspace_repo) => {
             let root_identity = source::repo_identity(&root)?;
             anyhow::ensure!(
@@ -107,13 +125,15 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
 
     let (config, config_path) = Config::discover(&root, None)?;
     config.validate()?;
+    // Runtime-registered Work carries no authority to run checks: a person
+    // gives it at `dispatch finish`.
     anyhow::ensure!(
-        config.checks.verify.is_empty() || request.allow_unsafe_local,
+        config.checks.verify.is_empty() || request.allow_unsafe_local || runtime.is_some(),
         "finish runs your checks.verify on the host; pass --allow-unsafe-local"
     );
     let unsafe_local = request.allow_unsafe_local;
 
-    if let Some(existing_id) = find_active_attachment(state, &workspace)? {
+    if !managed && let Some(existing_id) = find_active_attachment(state, &workspace)? {
         bail!("workspace already attached as {existing_id}");
     }
 
@@ -142,32 +162,70 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
-    let (snapshot, provenance, confidence) = match &commit {
-        Some(commit) => {
-            let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
-                .map_err(|error| {
+    let (snapshot, provenance, confidence, workspace, managed_workspace) = if managed {
+        let (snapshot, provenance, workspace, made) =
+            make_workspace(state, &root, &run_id, &run_dir).map_err(|error| {
+                let _ = fs::remove_dir_all(&run_dir);
+                error.context("could not make a workspace; incomplete run state was removed")
+            })?;
+        (
+            snapshot,
+            provenance,
+            AttachConfidence::Full,
+            workspace,
+            Some(made),
+        )
+    } else if let Some(runtime) = runtime {
+        let (snapshot, commit) = source::world_commit(&workspace)
+            .and_then(|commit| {
+                source::materialize_baseline_from_commit(&workspace, &commit, &run_dir)
+                    .map(|snapshot| (snapshot, commit))
+            })
+            .map_err(|error| {
+                let _ = fs::remove_dir_all(&run_dir);
+                error.context("could not record S0; incomplete run state was removed")
+            })?;
+        let confidence = if runtime.resumed {
+            AttachConfidence::Partial
+        } else {
+            AttachConfidence::Full
+        };
+        (
+            snapshot,
+            BaselineProvenance::WorkspaceAtStart { commit },
+            confidence,
+            workspace.clone(),
+            None,
+        )
+    } else {
+        let (snapshot, provenance, confidence) = match &commit {
+            Some(commit) => {
+                let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
+                    .map_err(|error| {
+                        let _ = fs::remove_dir_all(&run_dir);
+                        error.context("baseline creation failed; incomplete run state was removed")
+                    })?;
+                (
+                    snapshot,
+                    BaselineProvenance::GitMergeBase {
+                        commit: commit.clone(),
+                    },
+                    AttachConfidence::Full,
+                )
+            }
+            None => {
+                let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
                     let _ = fs::remove_dir_all(&run_dir);
                     error.context("baseline creation failed; incomplete run state was removed")
                 })?;
-            (
-                snapshot,
-                BaselineProvenance::GitMergeBase {
-                    commit: commit.clone(),
-                },
-                AttachConfidence::Full,
-            )
-        }
-        None => {
-            let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
-                let _ = fs::remove_dir_all(&run_dir);
-                error.context("baseline creation failed; incomplete run state was removed")
-            })?;
-            (
-                snapshot,
-                BaselineProvenance::SnapshotAtAttach,
-                AttachConfidence::Partial,
-            )
-        }
+                (
+                    snapshot,
+                    BaselineProvenance::SnapshotAtAttach,
+                    AttachConfidence::Partial,
+                )
+            }
+        };
+        (snapshot, provenance, confidence, workspace, None)
     };
 
     let (source_kind, source_git_head) = source::inspect_source(&root)?;
@@ -255,6 +313,20 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         attached_at: now,
         finished_at: None,
         finish_reason: None,
+        workspace_owner: if managed_workspace.is_some() {
+            WorkspaceOwner::Dispatch
+        } else if runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees"))
+        {
+            // Where Claude Code documents it makes `--worktree` workspaces.
+            WorkspaceOwner::Runtime
+        } else {
+            WorkspaceOwner::User
+        },
+        managed: managed_workspace,
+        sessions: runtime
+            .map(|runtime| vec![runtime.session.clone()])
+            .unwrap_or_default(),
+        workspace_removed: None,
     };
 
     let mut run = RunRecord {
@@ -342,10 +414,13 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     // (part 6.7): its owner loop prints its own single line only after the
     // child exits. The foreign form prints this banner immediately, as
     // before.
-    if !is_wrapped {
+    if !is_wrapped && runtime.is_none() {
         let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
             BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
             BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
+            BaselineProvenance::WorkspaceAtStart { commit } => {
+                format!("commit {commit} (the workspace at start)")
+            }
         };
         let confidence_text = match run.attachment.as_ref().unwrap().confidence {
             AttachConfidence::Full => "full",
@@ -359,6 +434,112 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     }
 
     Ok(run)
+}
+
+/// The workspace Dispatch makes for wrapped work started in the checkout
+/// itself, under `<state>/workspaces/<run-id>`, never inside the checkout.
+/// S0 is the checkout's exact world now: for Git, `source::world_commit`
+/// checked out as a linked worktree on its own `dispatch/<run-id>` branch;
+/// for a plain directory, a snapshot and a private copy of it.
+fn make_workspace(
+    state: &State,
+    root: &Path,
+    run_id: &str,
+    run_dir: &Path,
+) -> Result<(
+    source::SourceSnapshot,
+    BaselineProvenance,
+    PathBuf,
+    ManagedWorkspace,
+)> {
+    let parent = state.root.join("workspaces");
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = parent.join(run_id);
+    if source::repo_identity(root)?.is_none() {
+        let snapshot = source::create_snapshot(root, run_dir)?;
+        let workspace = source::create_candidate_workspace(&snapshot.baseline_path, &path)?;
+        let provenance = BaselineProvenance::WorkspaceAtStart {
+            commit: snapshot.baseline_commit.clone(),
+        };
+        let made = ManagedWorkspace {
+            branch: None,
+            removed: false,
+        };
+        return Ok((snapshot, provenance, workspace, made));
+    }
+    let commit = source::world_commit(root)?;
+    let branch = format!("dispatch/{}", run_id.to_lowercase());
+    source::create_linked_workspace(root, &commit, &path, &branch)?;
+    let snapshot = match source::materialize_baseline_from_commit(root, &commit, run_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // Nothing has run in it yet, so there is no work to lose.
+            let _ = source::remove_linked_workspace(root, &path, &branch);
+            return Err(error);
+        }
+    };
+    let workspace = source::resolve_source(Some(&path))?;
+    let made = ManagedWorkspace {
+        branch: Some(branch),
+        removed: false,
+    };
+    Ok((
+        snapshot,
+        BaselineProvenance::WorkspaceAtStart { commit },
+        workspace,
+        made,
+    ))
+}
+
+/// Remove the workspace Dispatch made for `run` once its Work is applied: its
+/// Δ is in the checkout now, so nothing is lost. Only a workspace under
+/// `<state>/workspaces/` recorded at creation is ever removed; a failure is
+/// reported and the workspace kept.
+pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()> {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return Ok(());
+    };
+    let Some(made) = attachment.managed.as_ref().filter(|made| !made.removed) else {
+        return Ok(());
+    };
+    let workspace = attachment.workspace.clone();
+    let parent = fs::canonicalize(state.root.join("workspaces"))?;
+    anyhow::ensure!(
+        workspace.parent() == Some(parent.as_path()),
+        "refusing to remove {}: not a workspace Dispatch made",
+        workspace.display()
+    );
+    match &made.branch {
+        Some(branch) => {
+            source::remove_linked_workspace(&attachment.integration_root, &workspace, branch)?
+        }
+        None => fs::remove_dir_all(&workspace)
+            .with_context(|| format!("failed to remove {}", workspace.display()))?,
+    }
+    if let Some(made) = run.attachment.as_mut().and_then(|a| a.managed.as_mut()) {
+        made.removed = true;
+    }
+    let db = Database::open(state.db_path())?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.released".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"workspace": workspace}),
+            ..EventRecord::default()
+        },
+        run,
+    )?;
+    Ok(())
 }
 
 /// `dispatch attach -- <command...>`: the wrapped form's owner loop (parts
@@ -385,6 +566,22 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
     let mut run = create(state, request)?;
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
+    // The one line before the agent starts: where it works, when Dispatch
+    // chose the place.
+    if let Some(branch) = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.managed.as_ref())
+        .map(|made| made.branch.clone())
+    {
+        let on = branch
+            .map(|branch| format!(" on branch {branch}"))
+            .unwrap_or_default();
+        eprintln!(
+            "Working in {}{on}; your checkout is not touched.",
+            workspace.display()
+        );
+    }
 
     // Held for the whole wrapped session: this is how `finish` and `serve`
     // know the Work is owned (rule 1).
@@ -610,7 +807,101 @@ fn print_auto_apply_outcome(run: &RunRecord, outcome: &ApplyOutcome) {
 /// A `RunMode::Attached` run whose lifecycle is still `Working` for this
 /// workspace, if one exists (part 14.8's "already attached" refusal and part
 /// 6.9's reattach rule).
-fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
+/// Record another runtime session on active Work: a resume, a clear, a
+/// compaction or a fork into the same workspace. The same session reported
+/// twice is recorded once.
+pub(crate) fn record_session_start(
+    state: &State,
+    run_id: &str,
+    session: RuntimeSession,
+) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(());
+    };
+    if attachment.sessions.iter().any(|known| {
+        known.provider == session.provider
+            && known.session_id == session.session_id
+            && known.ended_at.is_none()
+    }) {
+        return Ok(());
+    }
+    attachment.sessions.push(session.clone());
+    // A long-lived workspace sees many sessions; the Work keeps the latest.
+    let excess = attachment.sessions.len().saturating_sub(MAX_SESSIONS);
+    attachment.sessions.drain(..excess);
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.session_started".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"session": session}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+/// Record that a runtime session ended. Nothing else changes: an ended
+/// session does not end the Work.
+pub(crate) fn record_session_end(
+    state: &State,
+    run_id: &str,
+    provider: &str,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        // Within the 5 s `SessionEnd` timeout setup installs; the project owner
+        // may hold the lock while it checks this Work.
+        Duration::from_secs(3),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(session) = run.attachment.as_mut().and_then(|attachment| {
+        attachment.sessions.iter_mut().rev().find(|known| {
+            known.provider == provider && known.session_id == session_id && known.ended_at.is_none()
+        })
+    }) else {
+        return Ok(());
+    };
+    session.ended_at = Some(Utc::now());
+    session.end_reason = Some(reason.to_owned());
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.session_ended".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({
+                "provider": provider,
+                "session_id": session_id,
+                "reason": reason,
+            }),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+const MAX_SESSIONS: usize = 100;
+
+pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;
@@ -682,8 +973,39 @@ pub(super) async fn finish_locked(
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
     let diff_path = run.candidates[0].diff_path.clone();
+    let removal = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.clone());
+    if let Some(removal) = &removal {
+        anyhow::ensure!(
+            removal.exact,
+            "the workspace of {} was removed before Dispatch could keep its final changes; \
+             only the changes last seen are kept, at {}, and they cannot be finished. \
+             Reject this work: dispatch reject {}",
+            run.id,
+            run_dir.join("delta-last-seen.patch").display(),
+            run.id
+        );
+    }
+    // A removed workspace is rebuilt from S0 and its kept Δ, so the checks
+    // still run on exactly the work.
+    let rebuilt = tempfile::Builder::new()
+        .prefix("dispatch-rebuilt-")
+        .tempdir()
+        .context("failed to prepare a workspace for the checks")?;
+    let (workspace, diff_stats) = match &removal {
+        Some(_) => (
+            source::rebuild_workspace(&run.baseline_path, &diff_path, &rebuilt.path().join("w"))?,
+            Ok(run.candidates[0].diff_stats.clone()),
+        ),
+        None => (
+            workspace.clone(),
+            source::collect_diff(&run.baseline_path, &workspace, &diff_path),
+        ),
+    };
 
-    let diff_stats = match source::collect_diff(&run.baseline_path, &workspace, &diff_path) {
+    let diff_stats = match diff_stats {
         Ok(stats) => stats,
         Err(error) => {
             run.candidates[0].status = CandidateStatus::Failed;
@@ -764,6 +1086,185 @@ pub(super) async fn finish_locked(
     persist_event(state, db, run_finished_event(&run), &mut run)?;
 
     Ok(run)
+}
+
+/// A runtime is about to delete the workspace of active Work, which destroys
+/// the only authoritative copy of its Δ. The exact final Δ is written and
+/// synced into the run and the removal committed before this returns; any
+/// error means the deletion must not go ahead. The Work does not end: a
+/// removed workspace is an observation, and a person still finishes or
+/// rejects it. Only an empty Δ closes it, as there is nothing to review.
+/// Returns how many files the kept Δ changes.
+pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u64> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(60),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    anyhow::ensure!(
+        run.mode == RunMode::Attached
+            && run.outcome.lifecycle == LifecycleState::Working
+            && run.candidates.len() == 1,
+        "work {run_id} is not active attached work"
+    );
+    let already_kept = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| removal.exact);
+    if already_kept {
+        // A replayed event: the exact Δ is already durable.
+        return Ok(run.candidates[0].diff_stats.files_changed);
+    }
+    let run_dir = state.run_dir(run_id);
+    let staging = run_dir.join(".delta-at-removal.patch");
+    let stats = source::collect_diff(
+        &run.baseline_path,
+        &run.candidates[0].workspace_path,
+        &staging,
+    )?;
+    crate::state::write_durably(&run.candidates[0].diff_path, &fs::read(&staging)?)?;
+    let _ = fs::remove_file(&staging);
+
+    let files_changed = stats.files_changed;
+    run.candidates[0].diff_stats = stats;
+    let now = Utc::now();
+    if let Some(attachment) = run.attachment.as_mut() {
+        attachment.workspace_removed = Some(WorkspaceRemoval {
+            at: now,
+            exact: true,
+        });
+    }
+    if files_changed == 0 {
+        run.candidates[0].status = CandidateStatus::Cancelled;
+        run.status = RunStatus::Interrupted;
+        run.completed_at = Some(now);
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Cancelled;
+        run.outcome.phase = RunPhase::Finished;
+        run.outcome.review = ReviewState::NotRequested;
+        if let Some(attempt) = run.attempts.first_mut() {
+            attempt.completed_at = Some(now);
+            attempt.outcome = "no_changes".into();
+        }
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.removed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"exact": true, "files_changed": files_changed}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(files_changed)
+}
+
+/// The project owner found the workspace of active Work gone without being
+/// told first: only the Δ it last followed survives, kept beside the run as
+/// `delta-last-seen.patch`. It can be read, never finished.
+pub(crate) fn note_workspace_gone(
+    state: &State,
+    run_id: &str,
+    last_seen: Option<&Path>,
+) -> Result<()> {
+    let _lock = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(());
+    };
+    if attachment.workspace_removed.is_some()
+        || attachment.workspace.exists()
+        || run.outcome.lifecycle != LifecycleState::Working
+    {
+        return Ok(());
+    }
+    let now = Utc::now();
+    attachment.workspace_removed = Some(WorkspaceRemoval {
+        at: now,
+        exact: false,
+    });
+    if let Some(last_seen) = last_seen.filter(|path| path.is_file()) {
+        crate::state::write_durably(
+            &state.run_dir(run_id).join("delta-last-seen.patch"),
+            &fs::read(last_seen)?,
+        )?;
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.removed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"exact": false}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+/// Close Work whose workspace vanished before its final changes were kept: a
+/// person's decision (`dispatch reject`), as it can never be finished. The
+/// changes last seen stay beside the run.
+pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    anyhow::ensure!(
+        run.outcome.lifecycle == LifecycleState::Working
+            && run
+                .attachment
+                .as_ref()
+                .and_then(|attachment| attachment.workspace_removed.as_ref())
+                .is_some_and(|removal| !removal.exact),
+        "work {run_id} is not work whose workspace was lost"
+    );
+    let now = Utc::now();
+    if let Some(candidate) = run.candidates.first_mut() {
+        candidate.status = CandidateStatus::Cancelled;
+    }
+    run.status = RunStatus::Interrupted;
+    run.completed_at = Some(now);
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = WorkResult::Cancelled;
+    run.outcome.phase = RunPhase::Finished;
+    run.outcome.review = ReviewState::NotRequested;
+    if let Some(attempt) = run.attempts.first_mut() {
+        attempt.completed_at = Some(now);
+        attempt.outcome = "workspace_lost".into();
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "work.closed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"reason": "workspace_lost", "by": "human"}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
 }
 
 fn finish_attachment(run: &mut RunRecord, reason: FinishReason) {
