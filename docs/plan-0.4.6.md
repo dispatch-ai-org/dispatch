@@ -378,3 +378,14 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
 
     Both fail on the old code.
   - Full suite: 463 passed.
+- Stage 2. `source::world_commit(checkout)` records a checkout's exact world as
+  a commit, the same way `git stash create` does.
+  - It uses a copy of the checkout's own index (for the stat cache) and `add -A`,
+    which honors ignore rules and skips untracked nested repositories. HEAD is
+    the parent.
+  - The user's real index and status are untouched.
+  - It is materialized by the existing `materialize_baseline_from_commit`.
+  - `BaselineProvenance::WorkspaceAtStart { commit }` is added, with display arms.
+  - Test: `world_commit_records_exactly_the_world_and_leaves_the_checkout_alone`,
+    covering dirty, deleted, untracked, ignored and nested files, and a repository
+    with no commit yet.

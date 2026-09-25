@@ -337,6 +337,81 @@ pub fn materialize_baseline_from_commit(
     })
 }
 
+/// The exact world of a Git checkout as a commit, without copying files: its
+/// tracked files as they are now, dirty or deleted, and its untracked files
+/// its ignore rules do not exclude (what `world::observe` calls the world),
+/// with `HEAD` as parent. Built like `git stash create`: staged into a copy of
+/// the checkout's own index (so Git's stat cache spares unchanged files),
+/// never its real index. Untracked nested repositories are left out, as the
+/// world leaves them out. The commit's objects live in the checkout's own
+/// repository; `materialize_baseline_from_commit` turns it into a baseline.
+pub fn world_commit(checkout: &Path) -> Result<String> {
+    let checkout = resolve_source(Some(checkout))?;
+    let scratch = Builder::new()
+        .prefix("dispatch-world-")
+        .tempdir()
+        .context("failed to create a temporary Git index")?;
+    let index = scratch.path().join("index");
+
+    let mut index_path = git_command(&checkout);
+    index_path.args(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let real_index = PathBuf::from(
+        String::from_utf8_lossy(
+            &checked_output(index_path, "failed to locate the Git index")?.stdout,
+        )
+        .trim(),
+    );
+    if real_index.is_file() {
+        fs::copy(&real_index, &index)
+            .with_context(|| format!("failed to copy {}", real_index.display()))?;
+    }
+    let head = git_head_at(&checkout)?;
+    if !real_index.is_file() && head.is_some() {
+        let mut read_tree = git_command(&checkout);
+        read_tree
+            .env("GIT_INDEX_FILE", &index)
+            .args(["read-tree", "HEAD"]);
+        checked_output(read_tree, "failed to initialize a temporary Git index")?;
+    }
+
+    // Untracked nested repositories are listed as `dir/`; the world skips them.
+    let mut list = git_command(&checkout);
+    list.env("GIT_INDEX_FILE", &index)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"]);
+    let listed = checked_output(list, "failed to list the checkout's untracked files")?;
+    let nested: Vec<String> = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|raw| raw.strip_suffix(b"/"))
+        .map(|directory| format!(":(exclude,literal){}", String::from_utf8_lossy(directory)))
+        .collect();
+
+    let mut add = git_command(&checkout);
+    add.env("GIT_INDEX_FILE", &index)
+        .args(["add", "-A", "--", "."])
+        .args(dispatch_exclusion_pathspecs())
+        .args(&nested);
+    checked_output(add, "failed to stage the checkout's world")?;
+
+    let mut write_tree = git_command(&checkout);
+    write_tree.env("GIT_INDEX_FILE", &index).arg("write-tree");
+    let tree = checked_output(write_tree, "failed to write the checkout's world")?.stdout;
+    let tree = String::from_utf8_lossy(&tree).trim().to_owned();
+
+    let mut commit = git_command(&checkout);
+    commit
+        .env("GIT_AUTHOR_NAME", "Dispatch")
+        .env("GIT_AUTHOR_EMAIL", "dispatch@localhost")
+        .env("GIT_COMMITTER_NAME", "Dispatch")
+        .env("GIT_COMMITTER_EMAIL", "dispatch@localhost")
+        .args(["commit-tree", &tree, "-m", "Dispatch S0"]);
+    if let Some(head) = &head {
+        commit.args(["-p", head]);
+    }
+    let commit = checked_output(commit, "failed to record the checkout's world")?.stdout;
+    Ok(String::from_utf8_lossy(&commit).trim().to_owned())
+}
+
 /// Create a complete, independent workspace at the frozen baseline commit.
 pub fn create_candidate_workspace(baseline_path: &Path, candidate_dir: &Path) -> Result<PathBuf> {
     let baseline_path = resolve_source(Some(baseline_path))?;
@@ -2208,6 +2283,64 @@ mod tests {
         symlink("/tmp/outside", source.join("absolute")).unwrap();
         let error = fingerprint_tree(&source).unwrap_err().to_string();
         assert!(error.contains("absolute symlink"));
+    }
+
+    #[test]
+    fn world_commit_records_exactly_the_world_and_leaves_the_checkout_alone() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join(".gitignore"), "target/\n");
+        write(&source.join("a.txt"), "committed\n");
+        write(&source.join("b.txt"), "to be deleted\n");
+        write(&source.join("src/keep.rs"), "pub fn keep() {}\n");
+        initialize_user_repository(&source);
+        let head = run_git(&source, &["rev-parse", "HEAD"]);
+
+        write(&source.join("a.txt"), "dirty\n");
+        fs::remove_file(source.join("b.txt")).unwrap();
+        write(&source.join("new.txt"), "untracked\n");
+        write(&source.join("target/out.bin"), "build output\n");
+        let nested = source.join("vendor/dep");
+        write(&nested.join("lib.rs"), "nested\n");
+        run_git(&nested, &["init", "--quiet"]);
+        let status_before = run_git(&source, &["status", "--porcelain"]);
+        let index_before = fs::read(source.join(".git/index")).unwrap();
+
+        let commit = world_commit(&source).unwrap();
+
+        assert_eq!(run_git(&source, &["status", "--porcelain"]), status_before);
+        assert_eq!(fs::read(source.join(".git/index")).unwrap(), index_before);
+        assert_eq!(
+            run_git(&source, &["rev-parse", &format!("{commit}^")]),
+            head
+        );
+        let mut files: Vec<String> = run_git(&source, &["ls-tree", "-r", "--name-only", &commit])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        files.sort();
+        assert_eq!(files, [".gitignore", "a.txt", "new.txt", "src/keep.rs"]);
+
+        let baseline = materialize_baseline_from_commit(&source, &commit, &temp.path().join("run"))
+            .unwrap()
+            .baseline_path;
+        assert_eq!(
+            fs::read_to_string(baseline.join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert!(!baseline.join("b.txt").exists() && !baseline.join("target").exists());
+
+        // A repository with no commit yet has a world too.
+        let fresh = temp.path().join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        run_git(&fresh, &["init", "--quiet"]);
+        write(&fresh.join("first.txt"), "first\n");
+        let commit = world_commit(&fresh).unwrap();
+        assert_eq!(
+            run_git(&fresh, &["ls-tree", "-r", "--name-only", &commit]),
+            "first.txt"
+        );
     }
 
     #[cfg(unix)]

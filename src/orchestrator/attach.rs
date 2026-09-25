@@ -346,6 +346,9 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
             BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
             BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
+            BaselineProvenance::WorkspaceAtStart { commit } => {
+                format!("commit {commit} (the workspace at start)")
+            }
         };
         let confidence_text = match run.attachment.as_ref().unwrap().confidence {
             AttachConfidence::Full => "full",

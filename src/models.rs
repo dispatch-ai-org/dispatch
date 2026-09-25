@@ -551,8 +551,16 @@ pub struct AttachmentRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BaselineProvenance {
-    GitMergeBase { commit: String },
+    GitMergeBase {
+        commit: String,
+    },
     SnapshotAtAttach,
+    /// The workspace's exact world when its Work began, before any agent edit
+    /// (`source::world_commit`): at a runtime's session start, or when
+    /// Dispatch made the workspace.
+    WorkspaceAtStart {
+        commit: String,
+    },
 }
 
 /// `Partial`: edits made before attach are invisible to Δ and the record

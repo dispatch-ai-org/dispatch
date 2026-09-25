@@ -2036,6 +2036,9 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             format!("merge-base {} (full)", short(commit))
         }
         Some(crate::BaselineProvenance::SnapshotAtAttach) => "snapshot at attach (partial)".into(),
+        Some(crate::BaselineProvenance::WorkspaceAtStart { commit }) => {
+            format!("workspace at start {}", short(commit))
+        }
         // Native S0 is the project as it was, named by its commit when it has
         // one; Dispatch's own baseline commit means nothing to the reader.
         None => run.source_git_head.as_deref().map_or_else(
@@ -2273,6 +2276,9 @@ fn print_attachment_details(run: &RunRecord) {
         }
         crate::BaselineProvenance::SnapshotAtAttach => {
             println!("  S0: snapshot of the workspace at attach; earlier edits are not attributed");
+        }
+        crate::BaselineProvenance::WorkspaceAtStart { commit } => {
+            println!("  S0: the workspace as it was when the work began ({commit})");
         }
     }
     println!("  confidence: {}", snake_case(&attachment.confidence));
