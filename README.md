@@ -292,7 +292,7 @@ There is no ranking, benchmark data or automatic fallback to another agent.
 ## Install
 
 Download the archive for your platform and `SHA256SUMS` from the
-[latest GitHub release](https://github.com/dispatch-ai-org/dispatch/releases), verify
+[latest GitHub release](https://github.com/rundispatch/dispatch/releases), verify
 the checksum, and run the executable by its explicit path; see
 [install / upgrade / uninstall](docs/release-install.md).
 

@@ -4,7 +4,7 @@ version = "0.4.5"
 edition = "2024"
 description = "Keep coding-agent work valid while the code moves: isolated runs and coherence-checked apply"
 license = "MIT"
-repository = "https://github.com/dispatch-ai-org/dispatch"
+repository = "https://github.com/rundispatch/dispatch"
 
 [dependencies]
 anyhow = "1.0"
