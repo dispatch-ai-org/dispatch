@@ -51,6 +51,8 @@ pub enum EventKind {
     End {
         reason: String,
     },
+    /// The runtime is about to delete the workspace at `cwd`.
+    WorkspaceRemoved,
 }
 
 /// What the runtime should be told.
@@ -81,8 +83,9 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
         "the working directory must be an absolute path"
     );
     let word = match &event.kind {
-        EventKind::Start { source, .. } => source,
-        EventKind::End { reason } => reason,
+        EventKind::Start { source, .. } => source.as_str(),
+        EventKind::End { reason } => reason.as_str(),
+        EventKind::WorkspaceRemoved => "removed",
     };
     anyhow::ensure!(
         word.len() <= 32
@@ -101,7 +104,8 @@ pub fn validate(event: &RuntimeEvent) -> Result<()> {
     Ok(())
 }
 
-/// Apply one event. Only a watched project is ever touched.
+/// Apply one event. Sessions are followed only in a watched project; a
+/// workspace about to be deleted keeps its Work's Δ either way.
 pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
     validate(&event)?;
     let cwd = source::resolve_source(Some(&event.cwd)).context("the working directory")?;
@@ -109,6 +113,9 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         // A plain directory has no separate workspace to follow.
         return Ok(Reply::Silent);
     };
+    if let EventKind::WorkspaceRemoved = event.kind {
+        return removed(state, &workspace);
+    }
     let root = source::repo_identity(&workspace)?
         .context("the checkout lost its repository")?
         .main_worktree;
@@ -116,10 +123,7 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
         return Ok(Reply::Silent);
     }
     match event.kind {
-        EventKind::Start { source, resumed } => {
-            if workspace == root {
-                return Ok(Reply::Notice(SHARED_CHECKOUT.into()));
-            }
+        EventKind::Start { source, resumed } if workspace != root => {
             let session = RuntimeSession {
                 provider: event.provider.into(),
                 session_id: event.session_id,
@@ -131,6 +135,7 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
             };
             start(state, &root, &workspace, session, resumed)
         }
+        EventKind::Start { .. } => Ok(Reply::Notice(SHARED_CHECKOUT.into())),
         EventKind::End { reason } => {
             if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
                 attach::record_session_end(
@@ -143,7 +148,27 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
             }
             Ok(Reply::Silent)
         }
+        EventKind::WorkspaceRemoved => Ok(Reply::Silent),
     }
+}
+
+/// The runtime is about to delete `workspace`: the last chance to keep its
+/// Work's Δ, whether or not the project is still watched. An error here must
+/// stop the deletion (the adapter's job).
+fn removed(state: &State, workspace: &Path) -> Result<Reply> {
+    let Some(run_id) = attach::find_active_attachment(state, workspace)? else {
+        return Ok(Reply::Silent);
+    };
+    let files_changed = attach::freeze_removed_workspace(state, &run_id)?;
+    let id = &run_id[..8.min(run_id.len())];
+    Ok(Reply::Notice(if files_changed == 0 {
+        format!("Dispatch closed Work {id}: the worktree held no changes.")
+    } else {
+        format!(
+            "Dispatch kept this worktree's changes as Work {id}; \
+             finish or reject it: dispatch finish {id} or dispatch reject {id}."
+        )
+    }))
 }
 
 /// A session starting in a separate workspace: new Work the first time, with

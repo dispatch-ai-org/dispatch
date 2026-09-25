@@ -31,7 +31,7 @@ use crate::{
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
     DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
     OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, RuntimeSession,
-    VerificationState, WaitingOn, WorkResult, WorkspaceOwner,
+    VerificationState, WaitingOn, WorkResult, WorkspaceOwner, WorkspaceRemoval,
     coherence::watch::{WatchSpec, Watcher},
     db::Database,
     lock::OperationLock,
@@ -326,6 +326,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         sessions: runtime
             .map(|runtime| vec![runtime.session.clone()])
             .unwrap_or_default(),
+        workspace_removed: None,
     };
 
     let mut run = RunRecord {
@@ -970,8 +971,39 @@ pub(super) async fn finish_locked(
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
     let diff_path = run.candidates[0].diff_path.clone();
+    let removal = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.clone());
+    if let Some(removal) = &removal {
+        anyhow::ensure!(
+            removal.exact,
+            "the workspace of {} was removed before Dispatch could keep its final changes; \
+             only the changes last seen are kept, at {}, and they cannot be finished. \
+             Reject this work: dispatch reject {}",
+            run.id,
+            run_dir.join("delta-last-seen.patch").display(),
+            run.id
+        );
+    }
+    // A removed workspace is rebuilt from S0 and its kept Δ, so the checks
+    // still run on exactly the work.
+    let rebuilt = tempfile::Builder::new()
+        .prefix("dispatch-rebuilt-")
+        .tempdir()
+        .context("failed to prepare a workspace for the checks")?;
+    let (workspace, diff_stats) = match &removal {
+        Some(_) => (
+            source::rebuild_workspace(&run.baseline_path, &diff_path, &rebuilt.path().join("w"))?,
+            Ok(run.candidates[0].diff_stats.clone()),
+        ),
+        None => (
+            workspace.clone(),
+            source::collect_diff(&run.baseline_path, &workspace, &diff_path),
+        ),
+    };
 
-    let diff_stats = match source::collect_diff(&run.baseline_path, &workspace, &diff_path) {
+    let diff_stats = match diff_stats {
         Ok(stats) => stats,
         Err(error) => {
             run.candidates[0].status = CandidateStatus::Failed;
@@ -1052,6 +1084,135 @@ pub(super) async fn finish_locked(
     persist_event(state, db, run_finished_event(&run), &mut run)?;
 
     Ok(run)
+}
+
+/// A runtime is about to delete the workspace of active Work, which destroys
+/// the only authoritative copy of its Δ. The exact final Δ is written and
+/// synced into the run and the removal committed before this returns; any
+/// error means the deletion must not go ahead. The Work does not end: a
+/// removed workspace is an observation, and a person still finishes or
+/// rejects it. Only an empty Δ closes it, as there is nothing to review.
+/// Returns how many files the kept Δ changes.
+pub(crate) fn freeze_removed_workspace(state: &State, run_id: &str) -> Result<u64> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(60),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    anyhow::ensure!(
+        run.mode == RunMode::Attached
+            && run.outcome.lifecycle == LifecycleState::Working
+            && run.candidates.len() == 1,
+        "work {run_id} is not active attached work"
+    );
+    let already_kept = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| removal.exact);
+    if already_kept {
+        // A replayed event: the exact Δ is already durable.
+        return Ok(run.candidates[0].diff_stats.files_changed);
+    }
+    let run_dir = state.run_dir(run_id);
+    let staging = run_dir.join(".delta-at-removal.patch");
+    let stats = source::collect_diff(
+        &run.baseline_path,
+        &run.candidates[0].workspace_path,
+        &staging,
+    )?;
+    crate::state::write_durably(&run.candidates[0].diff_path, &fs::read(&staging)?)?;
+    let _ = fs::remove_file(&staging);
+
+    let files_changed = stats.files_changed;
+    run.candidates[0].diff_stats = stats;
+    let now = Utc::now();
+    if let Some(attachment) = run.attachment.as_mut() {
+        attachment.workspace_removed = Some(WorkspaceRemoval {
+            at: now,
+            exact: true,
+        });
+    }
+    if files_changed == 0 {
+        run.candidates[0].status = CandidateStatus::Cancelled;
+        run.status = RunStatus::Interrupted;
+        run.completed_at = Some(now);
+        run.outcome.lifecycle = LifecycleState::Finished;
+        run.outcome.work_result = WorkResult::Cancelled;
+        run.outcome.phase = RunPhase::Finished;
+        run.outcome.review = ReviewState::NotRequested;
+        if let Some(attempt) = run.attempts.first_mut() {
+            attempt.completed_at = Some(now);
+            attempt.outcome = "no_changes".into();
+        }
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.removed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"exact": true, "files_changed": files_changed}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )?;
+    Ok(files_changed)
+}
+
+/// The project owner found the workspace of active Work gone without being
+/// told first: only the Δ it last followed survives, kept beside the run as
+/// `delta-last-seen.patch`. It can be read, never finished.
+pub(crate) fn note_workspace_gone(
+    state: &State,
+    run_id: &str,
+    last_seen: Option<&Path>,
+) -> Result<()> {
+    let _lock = OperationLock::acquire(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(());
+    };
+    if attachment.workspace_removed.is_some()
+        || attachment.workspace.exists()
+        || run.outcome.lifecycle != LifecycleState::Working
+    {
+        return Ok(());
+    }
+    let now = Utc::now();
+    attachment.workspace_removed = Some(WorkspaceRemoval {
+        at: now,
+        exact: false,
+    });
+    if let Some(last_seen) = last_seen.filter(|path| path.is_file()) {
+        crate::state::write_durably(
+            &state.run_dir(run_id).join("delta-last-seen.patch"),
+            &fs::read(last_seen)?,
+        )?;
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.removed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"exact": false}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
 }
 
 fn finish_attachment(run: &mut RunRecord, reason: FinishReason) {

@@ -1,6 +1,8 @@
-//! Claude Code's hooks (`SessionStart`, `SessionEnd`) as `RuntimeEvent`s,
-//! and the reply Claude Code shows the person. Everything Claude-specific
-//! ends here.
+//! Claude Code's hooks (`SessionStart`, `SessionEnd`, `WorktreeRemove`) as
+//! `RuntimeEvent`s, and the reply Claude Code shows the person. Everything
+//! Claude-specific ends here.
+
+use std::{sync::mpsc, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -19,6 +21,9 @@ struct Input {
     reason: Option<String>,
     #[serde(default)]
     model: Option<serde_json::Value>,
+    /// `WorktreeRemove`: the worktree about to be deleted.
+    #[serde(default)]
+    worktree_path: Option<std::path::PathBuf>,
 }
 
 /// The event in a hook's input, or `None` for an event Dispatch does not use.
@@ -40,7 +45,14 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
         "SessionEnd" => EventKind::End {
             reason: input.reason.unwrap_or_else(|| "other".into()),
         },
+        "WorktreeRemove" => EventKind::WorkspaceRemoved,
         _ => return Ok(None),
+    };
+    let cwd = match kind {
+        EventKind::WorkspaceRemoved => input
+            .worktree_path
+            .context("WorktreeRemove names no worktree")?,
+        _ => input.cwd,
     };
     // Claude Code reports the model as a name or as an object with an id.
     let model = input.model.and_then(|model| match model {
@@ -50,25 +62,72 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
     Ok(Some(RuntimeEvent {
         provider: "claude",
         session_id: input.session_id,
-        cwd: input.cwd,
+        cwd,
         model,
         kind,
     }))
 }
 
-/// `dispatch hook claude`: what to print for Claude Code. It never fails the
-/// hook: a session is never held up by Dispatch, and a problem is shown.
-pub fn handle(state: &State, input: &[u8]) -> String {
-    let reply = parse(input).and_then(|event| match event {
-        Some(event) => super::ingest(state, event),
-        None => Ok(Reply::Silent),
+/// What `dispatch hook claude` prints, and its exit status.
+pub struct Output {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+}
+
+/// How long Dispatch may take to keep a removed worktree's Δ: below the
+/// `WorktreeRemove` timeout setup installs, so Dispatch decides, not Claude.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(240);
+
+/// `dispatch hook claude`. A session is never held up or failed by Dispatch:
+/// a problem is shown to the person. The one exception is a worktree about to
+/// be deleted whose Δ Dispatch could not keep: the hook fails, so Claude Code
+/// keeps the worktree and the work in it.
+pub fn handle(state: &State, input: &[u8]) -> Output {
+    let event = match parse(input) {
+        Ok(Some(event)) => event,
+        Ok(None) => return notice(Ok(Reply::Silent)),
+        Err(error) => return notice(Err(error)),
+    };
+    if !matches!(event.kind, EventKind::WorkspaceRemoved) {
+        return notice(super::ingest(state, event));
+    }
+    // Run it where a deadline can be kept; if the deadline passes, this
+    // process exits and the attempt with it, leaving nothing half-written
+    // (the Δ is renamed into place and the removal committed atomically).
+    let (sender, receiver) = mpsc::channel();
+    let state = state.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(super::ingest(&state, event));
     });
-    match reply {
+    let outcome = receiver
+        .recv_timeout(REMOVAL_DEADLINE)
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("keeping its changes took too long")));
+    match outcome {
+        Ok(reply) => notice(Ok(reply)),
+        Err(error) => Output {
+            stdout: String::new(),
+            stderr: format!(
+                "Dispatch could not keep this worktree's changes, so it stopped the removal; \
+                 the worktree is intact: {error:#}"
+            ),
+            code: 2,
+        },
+    }
+}
+
+fn notice(reply: Result<Reply>) -> Output {
+    let stdout = match reply {
         Ok(Reply::Silent) => String::new(),
         Ok(Reply::Notice(text)) => serde_json::json!({"systemMessage": text}).to_string(),
         Err(error) => serde_json::json!({
             "systemMessage": format!("Dispatch could not track this session: {error:#}")
         })
         .to_string(),
+    };
+    Output {
+        stdout,
+        stderr: String::new(),
+        code: 0,
     }
 }

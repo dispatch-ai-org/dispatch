@@ -237,6 +237,26 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// `write_atomically`, and durable before it returns: the bytes are synced
+/// before the rename and the directory after, so a crash cannot lose them.
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("durable path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".durable.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to stage {}", path.display()))?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 pub fn write_text(path: &Path, value: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;

@@ -428,6 +428,20 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&commit).trim().to_owned())
 }
 
+/// A private workspace at `dir` that is the baseline plus `patch`: the Work
+/// as it was when its own workspace was removed, for verifying it.
+pub fn rebuild_workspace(baseline_path: &Path, patch: &Path, dir: &Path) -> Result<PathBuf> {
+    let workspace = create_candidate_workspace(baseline_path, dir)?;
+    if fs::metadata(patch)?.len() > 0 {
+        let mut apply = git_command(&workspace);
+        apply
+            .args(["apply", "--binary", "--whitespace=nowarn", "--"])
+            .arg(patch);
+        checked_output(apply, "failed to rebuild the work from its kept changes")?;
+    }
+    Ok(workspace)
+}
+
 /// A linked worktree of `checkout`'s repository at `path`, on a new `branch`
 /// at `commit`: a workspace whose files are exactly that commit. `path` must
 /// lie outside the checkout.

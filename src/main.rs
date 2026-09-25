@@ -611,9 +611,15 @@ async fn run() -> Result<()> {
             std::io::stdin()
                 .take(dispatch::runtime::MAX_INPUT_BYTES as u64 + 1)
                 .read_to_end(&mut input)?;
-            let reply = dispatch::runtime::claude::handle(&state, &input);
-            if !reply.is_empty() {
-                println!("{reply}");
+            let output = dispatch::runtime::claude::handle(&state, &input);
+            if !output.stdout.is_empty() {
+                println!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprintln!("{}", output.stderr);
+            }
+            if output.code != 0 {
+                std::process::exit(output.code);
             }
             Ok(())
         }

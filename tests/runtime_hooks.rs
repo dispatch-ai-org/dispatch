@@ -91,6 +91,36 @@ impl Project {
         );
     }
 
+    /// Run the hook with raw input and return everything it did.
+    fn hook_output(&self, input: &[u8]) -> Output {
+        let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
+            .arg("--state-dir")
+            .arg(&self.state)
+            .args(["hook", "claude"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn remove(&self) -> Output {
+        self.hook_output(
+            serde_json::json!({
+                "hook_event_name": "WorktreeRemove", "session_id": "s1", "cwd": self.root,
+                "worktree_path": self.worktree, "name": "x",
+            })
+            .to_string()
+            .as_bytes(),
+        )
+    }
+
+    fn run_dir(&self, id: &str) -> PathBuf {
+        self.state.join("runs").join(id)
+    }
+
     /// Run the hook with raw input; the hook itself must always succeed.
     fn hook_raw(&self, input: &[u8]) -> String {
         let mut child = Command::new(assert_cmd::cargo_bin!("dispatch"))
@@ -265,4 +295,146 @@ fn malformed_hook_input_is_refused_whole_and_never_fails_the_session() {
         "hook_event_name": "Stop", "session_id": "s1", "cwd": p.worktree,
     }));
     assert_eq!(other, "");
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn removing_the_worktree_keeps_its_exact_changes_before_the_hook_returns() {
+    let p = Project::new("checks:\n  verify: ['test -f src/lib.rs']\n");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+
+    let output = p.remove();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("kept this worktree's changes"),
+        "{}",
+        text(&output)
+    );
+    // Once the hook has returned, the exact Δ and the removal are durable.
+    let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
+    assert!(patch.contains("+    2"), "{patch}");
+    let run = p.only_run();
+    assert_eq!(run["attachment"]["workspace_removed"]["exact"], true);
+    assert_eq!(
+        run["outcome"]["lifecycle"], "working",
+        "removal does not end the work"
+    );
+
+    // Claude deletes it; the work is still finished and applied from what
+    // was kept, its checks run in a workspace rebuilt from S0 and Δ.
+    git(
+        &p.root,
+        &["worktree", "remove", "--force", ".claude/worktrees/x"],
+    );
+    let finish = p.dispatch(&["finish", &id, "--allow-unsafe-local"]);
+    assert!(finish.status.success(), "{}", text(&finish));
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["work_result"], "ready");
+    assert_eq!(run["outcome"]["verification"], "passed");
+    let accept = p.dispatch(&["accept", &id]);
+    assert!(accept.status.success(), "{}", text(&accept));
+    assert_eq!(
+        fs::read_to_string(p.root.join("src/lib.rs")).unwrap(),
+        "pub fn f() -> i32 {\n    2\n}\n"
+    );
+}
+
+#[test]
+fn a_removed_worktree_with_no_changes_closes() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let output = p.remove();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("held no changes"),
+        "{}",
+        text(&output)
+    );
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "finished");
+    assert_eq!(run["outcome"]["work_result"], "cancelled");
+}
+
+#[test]
+fn when_the_changes_cannot_be_kept_the_removal_is_stopped() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let run_dir = p.run_dir(&id);
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let output = p.remove();
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("stopped the removal"),
+        "{}",
+        text(&output)
+    );
+    assert!(p.worktree.join("src/lib.rs").is_file());
+    assert!(p.only_run()["attachment"]["workspace_removed"].is_null());
+}
+
+#[test]
+fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    // Let the owner follow the edit, then delete the worktree behind its back.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    git(
+        &p.root,
+        &["worktree", "remove", "--force", ".claude/worktrees/x"],
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while p.only_run()["attachment"]["workspace_removed"].is_null() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never noticed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        p.only_run()["attachment"]["workspace_removed"]["exact"],
+        false
+    );
+    let last = fs::read_to_string(p.run_dir(&id).join("delta-last-seen.patch")).unwrap();
+    assert!(last.contains("+    2"), "{last}");
+    let finish = p.dispatch(&["finish", &id]);
+    assert!(!finish.status.success());
+    assert!(
+        text(&finish).contains("cannot be finished"),
+        "{}",
+        text(&finish)
+    );
 }

@@ -556,6 +556,19 @@ pub struct AttachmentRecord {
     /// (`runtime::ingest`); the Work is the workspace, not any one session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<RuntimeSession>,
+    /// The workspace is gone. An observation, not an ending: the Work waits
+    /// for a person, except an empty Δ, which leaves nothing to review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_removed: Option<WorkspaceRemoval>,
+}
+
+/// When the workspace went, and whether Dispatch kept its exact final Δ (a
+/// runtime told it first) or only the last Δ it had seen (it found the
+/// workspace gone).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceRemoval {
+    pub at: DateTime<Utc>,
+    pub exact: bool,
 }
 
 /// One agent-runtime session in a Work's workspace, as its runtime reported
@@ -933,6 +946,7 @@ mod tests {
             workspace_owner: Default::default(),
             managed: None,
             sessions: Vec::new(),
+            workspace_removed: None,
         }
     }
 

@@ -449,10 +449,23 @@ impl Owner {
             if live_owner_state(attachment.owner.as_ref()) == OwnerState::Live {
                 continue; // the wrapper's own business
             }
+            if attachment.workspace_removed.is_some() {
+                continue; // nothing left to follow
+            }
             // The work's signal is its patch so far, taken without the run's
             // lock into a scratch file: `finish` takes that lock without
             // waiting, so the owner holds it only when something moved.
             let scratch = self.scratch.path().join(format!("{}.patch", candidate.id));
+            if !attachment.workspace.exists() {
+                // Gone without a word: keep the last Δ this owner followed.
+                if let Err(error) =
+                    super::attach::note_workspace_gone(state, &candidate.id, Some(&scratch))
+                {
+                    tick.report(&error);
+                }
+                tick.persisted = true;
+                continue;
+            }
             let started = Instant::now();
             let index = scratch.with_extension("index");
             let work = source::snapshot_delta_indexed(

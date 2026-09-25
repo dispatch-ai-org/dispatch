@@ -441,3 +441,26 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
       not end it;
     - a first-seen resume is partial;
     - malformed input is refused whole.
+- Stage 5. `WorktreeRemove`: invariant 7.
+  - The Claude adapter parses `WorktreeRemove` (`worktree_path`).
+  - `attach::freeze_removed_workspace` takes the run lock, collects the exact Δ
+    into staging, writes it with the new `state::write_durably` (fsync the file,
+    rename, fsync the directory), and commits `workspace.removed { exact: true }`
+    through SQLite's FULL sync, all before the hook exits 0.
+  - Any failure, or the 240 s watchdog (below the 300 s timeout setup installs),
+    makes the hook exit 2, so Claude keeps the worktree. The watchdog abandons
+    the attempt by exiting; nothing is half-written.
+  - The Work does not end. `finish` verifies it in a workspace rebuilt from the
+    baseline plus the kept Δ (`source::rebuild_workspace`).
+  - An empty Δ closes the Work as `cancelled`, following the native precedent
+    `RunStatus::Interrupted`.
+  - The Owner records a workspace that vanished unannounced as `workspace.removed
+    { exact: false }`, keeping its last followed Δ as `delta-last-seen.patch`.
+    That Work cannot be finished; the message says to reject it.
+  - Tests (4):
+    - the Δ is durable when the hook returns, then finish in a rebuilt workspace
+      and accept;
+    - an empty worktree closes;
+    - a failed keep stops the removal with exit 2, and the worktree is intact;
+    - an unannounced vanishing is noted and cannot be finished.
+  - Full suite (stages 4-5): 477 passed.
