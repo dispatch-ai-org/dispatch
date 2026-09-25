@@ -411,3 +411,33 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
     - `a_rejected_workspace_dispatch_made_is_kept`;
     - `wrapped_attach_from_a_plain_directory_works_in_a_private_copy`.
   - Full suite (stages 2-3): 467 passed.
+- Stage 4. The runtime seam and the Claude adapter.
+  - `src/runtime.rs` is provider-neutral:
+    - `RuntimeEvent`, validation, and `ingest`;
+    - the per-workspace lock `locks/workspace-<sha>.lock`;
+    - Work registration through `attach::create` with `RuntimeStart`: S0 from
+      `world_commit`, confidence Full or Partial (on a first-seen resume), no
+      verification authority;
+    - `attach::record_session_start` and `record_session_end`, with at most 100
+      sessions per Work.
+  - `src/runtime/claude.rs` parses Claude's `SessionStart` and `SessionEnd`
+    input and replies with `systemMessage`.
+  - `dispatch hook claude` is hidden. It reads at most 64 KiB and always exits
+    0; a problem is shown as a notice.
+  - The root is derived from the workspace's own repository, never from the
+    payload, and only a watched project is touched.
+  - `workspace_owner` is `runtime` for workspaces under `.claude/worktrees/`
+    (where Claude documents it puts them), otherwise `user`.
+  - Deviation from the plan: no separate 10 s cap on `world_commit`. Setup
+    (stage 6) installs `SessionStart` with a bounded timeout instead; state from
+    a hook cut off mid-registration is never committed.
+  - Tests (`tests/runtime_hooks.rs`, 6):
+    - an unwatched project is untouched;
+    - a session in the checkout gets a notice and no Work;
+    - a session in its own worktree (reported from a subdirectory) gets Work
+      with S0 before its edits: an uncommitted file present at start is not in
+      Δ, and finishing needs `--allow-unsafe-local` from a person;
+    - duplicate and later sessions land on one Work, and an ended session does
+      not end it;
+    - a first-seen resume is partial;
+    - malformed input is refused whole.

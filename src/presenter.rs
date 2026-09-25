@@ -2049,6 +2049,7 @@ mod tests {
             finish_reason: None,
             workspace_owner: Default::default(),
             managed: None,
+            sessions: Vec::new(),
         }
     }
 

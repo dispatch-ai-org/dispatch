@@ -177,6 +177,22 @@ pub fn repo_identity(path: &Path) -> Result<Option<RepoIdentity>> {
     }))
 }
 
+/// The top of the Git checkout `path` lies in (a subdirectory's worktree
+/// root), or `None` outside any Git checkout.
+pub fn checkout_top(path: &Path) -> Result<Option<PathBuf>> {
+    let path = resolve_source(Some(path))?;
+    if repo_identity(&path)?.is_none() {
+        return Ok(None);
+    }
+    let mut top = git_command(&path);
+    top.args(["rev-parse", "--show-toplevel"]);
+    let output = checked_output(top, "failed to find the checkout's top")?;
+    let top = bytes_to_path(trim_ascii(&output.stdout));
+    Ok(Some(fs::canonicalize(&top).with_context(|| {
+        format!("failed to resolve {}", top.display())
+    })?))
+}
+
 /// The merge base of `root`'s `HEAD` and `workspace`'s `HEAD`, or `None` when
 /// they share no history. `root` and `workspace` must name the same
 /// repository (equal `repo_identity` keys); a workspace from an unrelated

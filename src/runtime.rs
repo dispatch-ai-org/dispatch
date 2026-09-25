@@ -1,0 +1,195 @@
+//! Agent runtimes that report their sessions to Dispatch (`dispatch hook
+//! <provider>`), so Work appears without anyone typing `attach`. A provider
+//! adapter turns its runtime's own hook input into a `RuntimeEvent`; `ingest`
+//! is the same for every provider and knows nothing of Claude sessions or
+//! Codex threads. The Work is the workspace, never a session: sessions come
+//! and go in it and are recorded as its actors. Nothing here decides a
+//! verdict, verifies, applies or deletes; the project owner follows the Work
+//! like any other.
+//!
+//! Hook input is untrusted. It never chooses the integration root (Dispatch
+//! derives it from the workspace's own repository), and acts only in a
+//! project someone chose to watch with `dispatch start`.
+
+pub mod claude;
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    RuntimeSession,
+    lock::OperationLock,
+    orchestrator::{
+        attach::{self, AttachRequest, RuntimeStart},
+        background::{self, Watcher},
+    },
+    source,
+    state::State,
+};
+
+/// The most hook input Dispatch reads.
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+/// One runtime lifecycle event, in Dispatch's words.
+pub struct RuntimeEvent {
+    pub provider: &'static str,
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub model: Option<String>,
+    pub kind: EventKind,
+}
+
+pub enum EventKind {
+    /// `source` is the runtime's own word for how the session began.
+    Start {
+        source: String,
+        resumed: bool,
+    },
+    End {
+        reason: String,
+    },
+}
+
+/// What the runtime should be told.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply {
+    Silent,
+    /// Shown to the person in the agent's session.
+    Notice(String),
+}
+
+const SHARED_CHECKOUT: &str = "Dispatch: this session works directly in your checkout, so \
+     Dispatch cannot tell its edits from yours and does not track them. For tracked work, \
+     start the agent in its own worktree (claude --worktree) or with dispatch attach -- claude.";
+
+/// Validate an event's fields; anything malformed is refused whole.
+pub fn validate(event: &RuntimeEvent) -> Result<()> {
+    anyhow::ensure!(
+        !event.session_id.is_empty()
+            && event.session_id.len() <= 128
+            && event
+                .session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+        "invalid session id"
+    );
+    anyhow::ensure!(
+        event.cwd.is_absolute() && event.cwd.as_os_str().len() <= 4096,
+        "the working directory must be an absolute path"
+    );
+    let word = match &event.kind {
+        EventKind::Start { source, .. } => source,
+        EventKind::End { reason } => reason,
+    };
+    anyhow::ensure!(
+        word.len() <= 32
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "invalid event detail"
+    );
+    anyhow::ensure!(
+        event
+            .model
+            .as_ref()
+            .is_none_or(|model| model.len() <= 128 && model.bytes().all(|b| b.is_ascii_graphic())),
+        "invalid model"
+    );
+    Ok(())
+}
+
+/// Apply one event. Only a watched project is ever touched.
+pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
+    validate(&event)?;
+    let cwd = source::resolve_source(Some(&event.cwd)).context("the working directory")?;
+    let Some(workspace) = source::checkout_top(&cwd)? else {
+        // A plain directory has no separate workspace to follow.
+        return Ok(Reply::Silent);
+    };
+    let root = source::repo_identity(&workspace)?
+        .context("the checkout lost its repository")?
+        .main_worktree;
+    if !matches!(background::watcher(state, &root)?, Watcher::Watched(_)) {
+        return Ok(Reply::Silent);
+    }
+    match event.kind {
+        EventKind::Start { source, resumed } => {
+            if workspace == root {
+                return Ok(Reply::Notice(SHARED_CHECKOUT.into()));
+            }
+            let session = RuntimeSession {
+                provider: event.provider.into(),
+                session_id: event.session_id,
+                source,
+                started_at: Utc::now(),
+                ended_at: None,
+                end_reason: None,
+                model: event.model,
+            };
+            start(state, &root, &workspace, session, resumed)
+        }
+        EventKind::End { reason } => {
+            if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
+                attach::record_session_end(
+                    state,
+                    &run_id,
+                    event.provider,
+                    &event.session_id,
+                    &reason,
+                )?;
+            }
+            Ok(Reply::Silent)
+        }
+    }
+}
+
+/// A session starting in a separate workspace: new Work the first time, with
+/// S0 taken now, before the session's first turn; another session on the same
+/// Work afterwards. One lock per workspace makes duplicate or concurrent starts
+/// land on one Work.
+fn start(
+    state: &State,
+    root: &Path,
+    workspace: &Path,
+    session: RuntimeSession,
+    resumed: bool,
+) -> Result<Reply> {
+    let key = hex::encode(Sha256::digest(workspace.to_string_lossy().as_bytes()));
+    let _lock = OperationLock::acquire_wait(
+        &state
+            .root
+            .join("locks")
+            .join(format!("workspace-{key}.lock")),
+        "another session is registering this workspace",
+        std::time::Duration::from_secs(10),
+    )?;
+    if let Some(run_id) = attach::find_active_attachment(state, workspace)? {
+        attach::record_session_start(state, &run_id, session)?;
+        return Ok(Reply::Silent);
+    }
+    let provider = session.provider.clone();
+    let name = workspace
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    let run = attach::create(
+        state,
+        AttachRequest {
+            workspace: workspace.to_owned(),
+            root: Some(root.to_owned()),
+            task: Some(format!("{provider} session in {name}")),
+            agent: Some(provider),
+            pid: None,
+            command: None,
+            allow_unsafe_local: false,
+            auto_apply: false,
+            runtime: Some(RuntimeStart { session, resumed }),
+        },
+    )?;
+    Ok(Reply::Notice(format!(
+        "Dispatch is tracking this worktree as Work {}; see it with dispatch watch.",
+        &run.id[..8.min(run.id.len())]
+    )))
+}

@@ -30,7 +30,7 @@ use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
     DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
-    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
+    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, RuntimeSession,
     VerificationState, WaitingOn, WorkResult, WorkspaceOwner,
     coherence::watch::{WatchSpec, Watcher},
     db::Database,
@@ -54,6 +54,17 @@ pub struct AttachRequest {
     pub command: Option<Vec<String>>,
     pub allow_unsafe_local: bool,
     pub auto_apply: bool,
+    /// `Some` when a runtime's session start registers the Work
+    /// (`runtime::ingest`) rather than a person typing `attach`.
+    pub runtime: Option<RuntimeStart>,
+}
+
+/// Work a runtime's session start registers: S0 is the workspace's exact
+/// world now, before the session's first turn. A resume into a workspace
+/// Dispatch has not seen may follow edits made before it, so it is partial.
+pub struct RuntimeStart {
+    pub session: RuntimeSession,
+    pub resumed: bool,
 }
 
 /// `dispatch attach --workspace <path> ...` (foreign form): create a
@@ -75,6 +86,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     // Wrapped work started in the checkout itself gets a workspace Dispatch
     // makes (`make_workspace`); the checkout is never the workspace.
     let managed = is_wrapped && workspace == root;
+    let runtime = request.runtime.as_ref();
 
     // 14.8, in order: same-checkout, different repository, no merge base,
     // plain-directory foreign attach, checks without acknowledgement,
@@ -87,7 +99,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
 
     let workspace_identity = source::repo_identity(&workspace)?;
     let commit = match &workspace_identity {
-        _ if managed => None,
+        _ if managed || runtime.is_some() => None,
         Some(workspace_repo) => {
             let root_identity = source::repo_identity(&root)?;
             anyhow::ensure!(
@@ -113,8 +125,10 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
 
     let (config, config_path) = Config::discover(&root, None)?;
     config.validate()?;
+    // Runtime-registered Work carries no authority to run checks: a person
+    // gives it at `dispatch finish`.
     anyhow::ensure!(
-        config.checks.verify.is_empty() || request.allow_unsafe_local,
+        config.checks.verify.is_empty() || request.allow_unsafe_local || runtime.is_some(),
         "finish runs your checks.verify on the host; pass --allow-unsafe-local"
     );
     let unsafe_local = request.allow_unsafe_local;
@@ -160,6 +174,28 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
             AttachConfidence::Full,
             workspace,
             Some(made),
+        )
+    } else if let Some(runtime) = runtime {
+        let (snapshot, commit) = source::world_commit(&workspace)
+            .and_then(|commit| {
+                source::materialize_baseline_from_commit(&workspace, &commit, &run_dir)
+                    .map(|snapshot| (snapshot, commit))
+            })
+            .map_err(|error| {
+                let _ = fs::remove_dir_all(&run_dir);
+                error.context("could not record S0; incomplete run state was removed")
+            })?;
+        let confidence = if runtime.resumed {
+            AttachConfidence::Partial
+        } else {
+            AttachConfidence::Full
+        };
+        (
+            snapshot,
+            BaselineProvenance::WorkspaceAtStart { commit },
+            confidence,
+            workspace.clone(),
+            None,
         )
     } else {
         let (snapshot, provenance, confidence) = match &commit {
@@ -279,10 +315,17 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         finish_reason: None,
         workspace_owner: if managed_workspace.is_some() {
             WorkspaceOwner::Dispatch
+        } else if runtime.is_some() && workspace.starts_with(root.join(".claude").join("worktrees"))
+        {
+            // Where Claude Code documents it makes `--worktree` workspaces.
+            WorkspaceOwner::Runtime
         } else {
             WorkspaceOwner::User
         },
         managed: managed_workspace,
+        sessions: runtime
+            .map(|runtime| vec![runtime.session.clone()])
+            .unwrap_or_default(),
     };
 
     let mut run = RunRecord {
@@ -370,7 +413,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     // (part 6.7): its owner loop prints its own single line only after the
     // child exits. The foreign form prints this banner immediately, as
     // before.
-    if !is_wrapped {
+    if !is_wrapped && runtime.is_none() {
         let provenance_text = match &run.attachment.as_ref().unwrap().provenance {
             BaselineProvenance::GitMergeBase { commit } => format!("commit {commit} (merge base)"),
             BaselineProvenance::SnapshotAtAttach => "snapshot at attach".to_owned(),
@@ -763,7 +806,99 @@ fn print_auto_apply_outcome(run: &RunRecord, outcome: &ApplyOutcome) {
 /// A `RunMode::Attached` run whose lifecycle is still `Working` for this
 /// workspace, if one exists (part 14.8's "already attached" refusal and part
 /// 6.9's reattach rule).
-fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
+/// Record another runtime session on active Work: a resume, a clear, a
+/// compaction or a fork into the same workspace. The same session reported
+/// twice is recorded once.
+pub(crate) fn record_session_start(
+    state: &State,
+    run_id: &str,
+    session: RuntimeSession,
+) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(attachment) = run.attachment.as_mut() else {
+        return Ok(());
+    };
+    if attachment.sessions.iter().any(|known| {
+        known.provider == session.provider
+            && known.session_id == session.session_id
+            && known.ended_at.is_none()
+    }) {
+        return Ok(());
+    }
+    attachment.sessions.push(session.clone());
+    // A long-lived workspace sees many sessions; the Work keeps the latest.
+    let excess = attachment.sessions.len().saturating_sub(MAX_SESSIONS);
+    attachment.sessions.drain(..excess);
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.session_started".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"session": session}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+/// Record that a runtime session ended. Nothing else changes: an ended
+/// session does not end the Work.
+pub(crate) fn record_session_end(
+    state: &State,
+    run_id: &str,
+    provider: &str,
+    session_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_millis(800),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    let Some(session) = run.attachment.as_mut().and_then(|attachment| {
+        attachment.sessions.iter_mut().rev().find(|known| {
+            known.provider == provider && known.session_id == session_id && known.ended_at.is_none()
+        })
+    }) else {
+        return Ok(());
+    };
+    session.ended_at = Some(Utc::now());
+    session.end_reason = Some(reason.to_owned());
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "runtime.session_ended".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({
+                "provider": provider,
+                "session_id": session_id,
+                "reason": reason,
+            }),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+const MAX_SESSIONS: usize = 100;
+
+pub(crate) fn find_active_attachment(state: &State, workspace: &Path) -> Result<Option<String>> {
     for path in state.list_metadata_paths()? {
         let projected: RunRecord = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("invalid metadata at {}", path.display()))?;

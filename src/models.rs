@@ -552,6 +552,27 @@ pub struct AttachmentRecord {
     /// A workspace Dispatch made for this Work, and whether it is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedWorkspace>,
+    /// Agent-runtime sessions that worked here, oldest first
+    /// (`runtime::ingest`); the Work is the workspace, not any one session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<RuntimeSession>,
+}
+
+/// One agent-runtime session in a Work's workspace, as its runtime reported
+/// it. `provider` is the runtime (`claude`); the rest is its own words.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSession {
+    pub provider: String,
+    pub session_id: String,
+    /// How it started: `startup`, `resume`, `fork`, `clear`, `compact`.
+    pub source: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub end_reason: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Who made the workspace the Work happens in.
@@ -911,6 +932,7 @@ mod tests {
             finish_reason: None,
             workspace_owner: Default::default(),
             managed: None,
+            sessions: Vec::new(),
         }
     }
 
