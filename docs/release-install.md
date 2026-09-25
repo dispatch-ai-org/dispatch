@@ -51,6 +51,19 @@ To roll back, stop every session and restore a complete matching backup into a
 separate directory; point the matching old binary at it with `--state-dir`. Never
 point an old binary at current state or restore only a DB over newer artifacts.
 
+### Upgrading to 0.4.6
+
+No migration; the schema stays at 24. State is forward-only: runs written by 0.4.6
+use new attachment values (`workspace_at_start`, `workspace_owner`, `sessions`,
+`workspace_removed`, `managed`) that 0.4.5 cannot read.
+- `dispatch attach -- <agent>` run from the checkout itself now makes the agent a
+  workspace under `<state>/workspaces/` instead of refusing.
+- `dispatch finish` counts only paths that can enter Δ. Ignored build output no
+  longer fails it.
+- **Claude Code hooks** are installed only through `dispatch setup` → Runtime
+  integrations. The hook command names the Dispatch binary and state directory it
+  was installed with; if you move either, install the hooks again.
+
 ### Upgrading to 0.4.5
 
 No migration; the schema stays at 24.

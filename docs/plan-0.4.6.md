@@ -498,3 +498,69 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
     after removal) and `attach_wrapped` (status `made by: Dispatch` and its
     branch, history `isolated`).
   - Full suite (stages 6-7): 480 passed.
+- Stage 8. Real-agent trials (trial project `coherence-044`, isolated state
+  `state-041`, log `logs046/`, Claude Code 2.1.280, Cursor Agent; hooks
+  installed in that project's own `.claude/settings.local.json`, so the user's
+  real settings were never touched).
+  - **A, runtime-native** (`claude -p --worktree`), with no Dispatch command:
+    - Claude's own stream showed "Dispatch is tracking this worktree as Work
+      01M3BPDQ".
+    - S0 predates the first edit: Work created at 07:10:38Z, first edit at
+      07:10:44Z, and the baseline has no `title_case` while the worktree does.
+    - A teammate commit in the same file moved the verdict to CONTINUE (symbols,
+      world changed), and history read `discovered claude · idle · CONTINUE`.
+    - Removing the worktree needed a resumed session and Claude's `ExitWorktree`
+      with `remove`. **Finding 1:** that tool deletes the worktree without
+      running `WorktreeRemove`.
+    - Dispatch's Owner noticed the vanished workspace within a tick and kept its
+      last-seen Δ (`exact: false`, not finishable).
+    - Fixed by also hooking `PreToolUse` of `ExitWorktree` with `action: remove`
+      (same durable freeze, fail closed). Re-run as A2: Claude's stream showed
+      "Dispatch kept this worktree's changes as Work 01M3BPWB", and
+      `workspace.removed { exact: true, files_changed: 2 }` was committed before
+      the worktree went.
+    - `finish --allow-unsafe-local` verified A2 in a workspace rebuilt from S0
+      and Δ. `accept` applied it, and the project's tests pass.
+  - **Findings along the way, all fixed with tests:**
+    - **2.** A resumed session launched from the checkout reports the checkout at
+      `SessionStart` before re-entering its worktree, and got the shared-checkout
+      notice wrongly. The notice is now for `startup` only.
+    - **3.** A's `SessionEnd` was not recorded at the real session end. It was
+      recorded when replayed (0.24 s), so most likely lock contention with the
+      Owner: the end recorder now waits up to 3 s, within the 5 s timeout.
+    - **4.** After the world first moved under a stored unmoved CONTINUE, the view
+      kept saying "unmoved". The Owner now stores the verdict when the world
+      first moves.
+    - **5 (pre-existing, safety).** `dispatch stop` refused to signal the trial's
+      own owner. macOS `kern.boottime` drifts while the machine runs (its seconds
+      changed within a day), so every stored process identity became "reused"
+      over time. That would also make `serve` adopt live wrapped work.
+      - The boot identity is now `kern.bootsessionuuid`.
+      - Records in the old format match by pid and exact start time, which
+        `stop` then proved live on the old owner.
+    - **6.** Lost Work could be neither finished nor rejected ("no delivered
+      result"). Rejecting it now closes it (`work.closed`).
+    - **7.** Rejected results showed state `ready`; they show `rejected` now.
+  - **B, Dispatch-managed** (`dispatch attach -- cursor-agent ...` from the
+    checkout):
+    - It ran in `<state>/workspaces/<id>` on `dispatch/<id>`.
+    - S0 included the checkout's uncommitted `notes-b.txt`, and Δ holds only the
+      agent's two files. The checkout was untouched.
+    - A teammate commit landed while the agent worked, and `check` read CONTINUE
+      (1 world file).
+    - `accept` applied the change, the workspace and its branch were released,
+      and the tests pass.
+  - **C, shared checkout:** `claude -p` in the checkout. Claude's stream showed
+    the notice, and no Work was created (29 runs before and after).
+  - **D, recovery:**
+    - Duplicate `SessionStart` replays and a real `claude -p --resume` from inside
+      the worktree landed on the same Work (32 runs before and after).
+    - Owner SIGKILL: `status` said not watched, `stop` signalled nothing, `start`
+      recovered.
+    - A managed wrapper SIGKILLed mid-run: the Owner adopted the Work, and the
+      workspace survived with the agent's edit while the checkout was untouched.
+      It was finished after adoption and rejected; the workspace was kept and its
+      path printed.
+    - A normally finished managed run was rejected: its workspace was kept and
+      its path printed. (The first attempt to kill that wrapper matched no
+      process and is logged as such.)

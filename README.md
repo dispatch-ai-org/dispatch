@@ -4,7 +4,7 @@
 
 **Keep autonomous software work valid while the code moves.**
 
-**Dispatch 0.4.5 — experimental developer preview**
+**Dispatch 0.4.6 — experimental developer preview**
 
 A coding agent works from a snapshot of your source while the real source keeps
 changing: you edit files, another run is accepted, a teammate merges. Dispatch
@@ -42,10 +42,12 @@ service; Dispatch itself needs no account, no network service and no upload.
 - **Let Dispatch launch the agent.** `dispatch run "<task>"` runs your coding
   agent from a frozen snapshot in an isolated workspace. This needs a resource
   set up with `dispatch setup`, or an explicit `--agent`.
-- **Protect work you run yourself.** `dispatch attach -- <agent command>` runs
-  your agent in its own worktree under Dispatch; `dispatch attach --workspace
-  <dir>` observes one that is already working. `dispatch finish` freezes the
-  result. No resource setup is needed.
+- **Protect work you run yourself.** Run `dispatch attach -- <agent command>`
+  from your checkout and Dispatch makes the agent its own workspace, so any
+  agent CLI works isolated, with or without worktree support of its own.
+  `dispatch attach --workspace <dir>` observes an agent already working in a
+  worktree, and `dispatch finish` freezes the result. No resource setup is
+  needed.
 
 Either way, the result is judged the same way: `dispatch check`, `accept` and
 `reject` work on it against the source as it is now.
@@ -67,10 +69,21 @@ $ dispatch start
   Dispatch is running in the background. See it: dispatch watch · Stop: dispatch stop
 ```
 
-Watching covers Work Dispatch launched or that you attached. It does not look
-for agents running elsewhere on your machine. After a reboot, run `dispatch
-start` again. `dispatch serve` does the same watching in the foreground, and
-`check` and `status` answer on demand.
+**Work that appears by itself.** With Claude Code's hooks installed (`dispatch
+setup` → Runtime integrations, shown and approved first), a Claude Code session
+in its own worktree of a watched project (`claude --worktree`) becomes Work by
+itself.
+- S0 is the worktree as the session found it, before its first edit.
+- Later sessions in the same worktree join the same Work.
+- When Claude Code removes the worktree, Dispatch first keeps its exact
+  changes, then waits for you to `finish` or `reject` them.
+- A session running directly in your checkout is told that Dispatch cannot
+  tell its edits from yours, and nothing is tracked.
+
+Watching covers Work Dispatch launched, that you attached, and sessions whose
+runtime reports them. It does not scan for agent processes. After a reboot, run
+`dispatch start` again. `dispatch serve` does the same watching in the
+foreground, and `check` and `status` answer on demand.
 
 ## Work coherence: keeping results valid while the code moves
 
@@ -189,13 +202,13 @@ full eligibility and authorization rules.
 `dispatch attach` puts work from an agent Dispatch did not launch — Claude Code, Codex, Cursor, a script — under the same coherence checking, in its own worktree:
 
 ```sh
-dispatch attach --auto-apply -- claude -p "add input validation"   # wrap it
+dispatch attach --auto-apply -- claude -p "add input validation"   # from your checkout: Dispatch makes the workspace
 dispatch attach --workspace ../scratch --agent codex --auto-apply  # or observe one already running
 dispatch finish <run-id>                                           # you say when it's done
 dispatch start                                                     # keeps a foreign attachment observed and applies it
 ```
 
-Dispatch is honest about what it saw: full confidence when S0 is a real Git merge-base commit, partial confidence when it had to snapshot a plain directory at attach time, since earlier edits are then invisible to the patch. See [attach.md](docs/attach.md).
+Dispatch is honest about what it saw: full confidence when S0 is the workspace as the work began (a workspace Dispatch made, or a session's start) or a real Git merge-base commit; partial confidence when it had to snapshot a directory at attach time, or when a session resumed in a worktree it had not seen, since earlier edits are then invisible to the patch. A workspace Dispatch made is removed once its work is applied, and kept otherwise. See [attach.md](docs/attach.md).
 
 See the [coherence reference](docs/coherence.md) for the model, rules, events and
 the fixture matrix, and [coherence validation](docs/coherence-validation.md) for
