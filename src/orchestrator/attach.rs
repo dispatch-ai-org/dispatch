@@ -864,7 +864,9 @@ pub(crate) fn record_session_end(
     let _lock = OperationLock::acquire_wait(
         &state.run_dir(run_id).join(".operation.lock"),
         "attached work has a foreground owner",
-        Duration::from_millis(800),
+        // Within the 5 s `SessionEnd` timeout setup installs; the project owner
+        // may hold the lock while it checks this Work.
+        Duration::from_secs(3),
     )?;
     let mut run = state.load_run(run_id)?;
     let Some(session) = run.attachment.as_mut().and_then(|attachment| {
@@ -1209,6 +1211,56 @@ pub(crate) fn note_workspace_gone(
             event_type: "workspace.removed".into(),
             timestamp: now,
             payload: serde_json::json!({"exact": false}),
+            ..EventRecord::default()
+        },
+        &mut run,
+    )
+}
+
+/// Close Work whose workspace vanished before its final changes were kept: a
+/// person's decision (`dispatch reject`), as it can never be finished. The
+/// changes last seen stay beside the run.
+pub(crate) fn close_lost(state: &State, run_id: &str) -> Result<()> {
+    let _lock = OperationLock::acquire_wait(
+        &state.run_dir(run_id).join(".operation.lock"),
+        "attached work has a foreground owner",
+        Duration::from_secs(5),
+    )?;
+    let mut run = state.load_run(run_id)?;
+    anyhow::ensure!(
+        run.outcome.lifecycle == LifecycleState::Working
+            && run
+                .attachment
+                .as_ref()
+                .and_then(|attachment| attachment.workspace_removed.as_ref())
+                .is_some_and(|removal| !removal.exact),
+        "work {run_id} is not work whose workspace was lost"
+    );
+    let now = Utc::now();
+    if let Some(candidate) = run.candidates.first_mut() {
+        candidate.status = CandidateStatus::Cancelled;
+    }
+    run.status = RunStatus::Interrupted;
+    run.completed_at = Some(now);
+    run.outcome.lifecycle = LifecycleState::Finished;
+    run.outcome.work_result = WorkResult::Cancelled;
+    run.outcome.phase = RunPhase::Finished;
+    run.outcome.review = ReviewState::NotRequested;
+    if let Some(attempt) = run.attempts.first_mut() {
+        attempt.completed_at = Some(now);
+        attempt.outcome = "workspace_lost".into();
+    }
+    let mut db = Database::open(state.db_path())?;
+    db.sync_run(&run)?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "work.closed".into(),
+            timestamp: now,
+            payload: serde_json::json!({"reason": "workspace_lost", "by": "human"}),
             ..EventRecord::default()
         },
         &mut run,

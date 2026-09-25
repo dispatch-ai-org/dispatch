@@ -1,6 +1,8 @@
-//! Claude Code's hooks (`SessionStart`, `SessionEnd`, `WorktreeRemove`) as
-//! `RuntimeEvent`s, and the reply Claude Code shows the person. Everything
-//! Claude-specific ends here.
+//! Claude Code's hooks (`SessionStart`, `SessionEnd`, and the two ways a
+//! worktree is deleted: `WorktreeRemove` at session exit, and `PreToolUse` of
+//! the `ExitWorktree` tool with `action: remove`, which does not run
+//! `WorktreeRemove`) as `RuntimeEvent`s, and the reply Claude Code shows the
+//! person. Everything Claude-specific ends here.
 
 use std::{sync::mpsc, time::Duration};
 
@@ -24,6 +26,11 @@ struct Input {
     /// `WorktreeRemove`: the worktree about to be deleted.
     #[serde(default)]
     worktree_path: Option<std::path::PathBuf>,
+    /// `PreToolUse`: which tool is about to run, with what.
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    tool_input: serde_json::Value,
 }
 
 /// The event in a hook's input, or `None` for an event Dispatch does not use.
@@ -46,12 +53,17 @@ pub fn parse(input: &[u8]) -> Result<Option<RuntimeEvent>> {
             reason: input.reason.unwrap_or_else(|| "other".into()),
         },
         "WorktreeRemove" => EventKind::WorkspaceRemoved,
+        // Leaving a worktree by removing it deletes it without WorktreeRemove.
+        "PreToolUse"
+            if input.tool_name.as_deref() == Some("ExitWorktree")
+                && input.tool_input["action"] == "remove" =>
+        {
+            EventKind::WorkspaceRemoved
+        }
         _ => return Ok(None),
     };
-    let cwd = match kind {
-        EventKind::WorkspaceRemoved => input
-            .worktree_path
-            .context("WorktreeRemove names no worktree")?,
+    let cwd = match (&kind, input.worktree_path) {
+        (EventKind::WorkspaceRemoved, Some(worktree)) => worktree,
         _ => input.cwd,
     };
     // Claude Code reports the model as a name or as an object with an id.
@@ -135,10 +147,11 @@ fn notice(reply: Result<Reply>) -> Output {
 /// The hook events Dispatch installs, with the timeout each gets. A
 /// `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch always
 /// decides before Claude Code gives up on it.
-const INSTALLED: [(&str, u64); 3] = [
-    ("SessionStart", 60),
-    ("SessionEnd", 5),
-    ("WorktreeRemove", 300),
+const INSTALLED: [(&str, Option<&str>, u64); 4] = [
+    ("SessionStart", None, 60),
+    ("SessionEnd", None, 5),
+    ("WorktreeRemove", None, 300),
+    ("PreToolUse", Some("ExitWorktree"), 300),
 ];
 
 /// Where Claude Code keeps the user's settings: `$CLAUDE_CONFIG_DIR`, or
@@ -176,7 +189,7 @@ fn ours(entry: &serde_json::Value) -> bool {
 /// `settings` without Dispatch's hooks: every other setting and hook as it was.
 pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
     if let Some(hooks) = settings["hooks"].as_object_mut() {
-        for (event, _) in INSTALLED {
+        for (event, _, _) in INSTALLED {
             if let Some(entries) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
                 entries.retain(|entry| !ours(entry));
                 if entries.is_empty() {
@@ -201,10 +214,13 @@ pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_js
     if !settings["hooks"].is_object() {
         settings["hooks"] = serde_json::json!({});
     }
-    for (event, timeout) in INSTALLED {
-        let entry = serde_json::json!({
+    for (event, matcher, timeout) in INSTALLED {
+        let mut entry = serde_json::json!({
             "hooks": [{"type": "command", "command": command, "timeout": timeout}]
         });
+        if let Some(matcher) = matcher {
+            entry["matcher"] = serde_json::json!(matcher);
+        }
         match settings["hooks"][event].as_array_mut() {
             Some(entries) => entries.push(entry),
             None => settings["hooks"][event] = serde_json::json!([entry]),
@@ -220,7 +236,7 @@ pub fn hooks_installed(path: &std::path::Path) -> Result<bool> {
     };
     let settings: serde_json::Value =
         serde_json::from_slice(&bytes).context("Claude Code settings are not valid JSON")?;
-    Ok(INSTALLED.iter().any(|(event, _)| {
+    Ok(INSTALLED.iter().any(|(event, _, _)| {
         settings["hooks"][event]
             .as_array()
             .is_some_and(|entries| entries.iter().any(ours))
@@ -313,10 +329,10 @@ mod tests {
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(settings["model"], "claude-sonnet-5");
-        assert_eq!(
-            settings["hooks"]["PreToolUse"],
-            theirs["hooks"]["PreToolUse"]
-        );
+        let tools = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "theirs plus exactly one of ours: {tools:?}");
+        assert_eq!(tools[0], theirs["hooks"]["PreToolUse"][0]);
+        assert_eq!(tools[1]["matcher"], "ExitWorktree");
         let starts = settings["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(
             starts.len(),

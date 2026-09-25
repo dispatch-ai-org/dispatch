@@ -135,7 +135,12 @@ pub fn ingest(state: &State, event: RuntimeEvent) -> Result<Reply> {
             };
             start(state, &root, &workspace, session, resumed)
         }
-        EventKind::Start { .. } => Ok(Reply::Notice(SHARED_CHECKOUT.into())),
+        // Only a fresh start is known to stay in the checkout: a resumed
+        // session reports it before re-entering its worktree.
+        EventKind::Start { source, .. } if source == "startup" => {
+            Ok(Reply::Notice(SHARED_CHECKOUT.into()))
+        }
+        EventKind::Start { .. } => Ok(Reply::Silent),
         EventKind::End { reason } => {
             if let Some(run_id) = attach::find_active_attachment(state, &workspace)? {
                 attach::record_session_end(

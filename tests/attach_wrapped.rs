@@ -580,6 +580,8 @@ fn a_rejected_workspace_dispatch_made_is_kept() {
     );
     assert!(workspace.join("src/lib.rs").is_file());
     assert_eq!(f.event_count("workspace.released"), 0);
+    let history = String::from_utf8_lossy(&f.dispatch(&["history"]).stdout).into_owned();
+    assert!(history.contains("rejected"), "{history}");
 }
 
 #[test]

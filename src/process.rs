@@ -45,10 +45,19 @@ pub fn identity_state(expected: &ProcessIdentity) -> IdentityState {
         &current.start,
         &current.boot,
     ) {
-        (Some(a), Some(b), Some(c), Some(d)) if a == c && b == d => IdentityState::ExactLive,
+        (Some(a), Some(b), Some(c), Some(d)) if a == c && (b == d || drifting_boot(b)) => {
+            IdentityState::ExactLive
+        }
         (Some(_), Some(_), Some(_), Some(_)) => IdentityState::Reused,
         _ => IdentityState::Unknown,
     }
+}
+
+/// Before 0.4.6, macOS identities recorded `kern.boottime`, which drifts while
+/// the machine runs, so it can no longer be compared. Such a record is matched
+/// by its pid and exact start time alone; a recycled pid does not share both.
+fn drifting_boot(boot: &str) -> bool {
+    boot.starts_with("{ sec = ")
 }
 
 pub fn process_group_exists(group: Option<i32>) -> Option<bool> {
@@ -108,9 +117,12 @@ fn process_start(pid: u32) -> Option<String> {
     tail.split_whitespace().nth(19).map(str::to_owned)
 }
 
+/// The boot session's UUID: fixed for the life of a boot, as Linux's
+/// `boot_id` is. (`kern.boottime` is not: the clock adjusts it by fractions of
+/// a second while the machine runs.)
 #[cfg(target_os = "macos")]
 fn boot_identity() -> Option<String> {
-    command_output("/usr/sbin/sysctl", &["-n", "kern.boottime"])
+    command_output("/usr/sbin/sysctl", &["-n", "kern.bootsessionuuid"])
 }
 
 #[cfg(target_os = "macos")]
@@ -144,6 +156,20 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_with_the_old_drifting_boot_time_still_names_its_process() {
+        let mut identity = ProcessIdentity::current();
+        if identity.start.is_none() || identity.boot.is_none() {
+            return;
+        }
+        identity.boot = Some("{ sec = 1788733769, usec = 196719 } Sun Sep  6 18:29:29 2026".into());
+        assert_eq!(identity_state(&identity), IdentityState::ExactLive);
+        identity.start = Some("Thu Jan  1 00:00:00 1970".into());
+        assert_eq!(identity_state(&identity), IdentityState::Reused);
+        identity.boot = Some("another boot".into());
+        assert_eq!(identity_state(&identity), IdentityState::Reused);
+    }
 
     #[test]
     fn current_process_identity_is_exact_when_supported() {

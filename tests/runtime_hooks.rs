@@ -443,4 +443,66 @@ fn a_worktree_that_vanishes_unannounced_is_noted_and_cannot_be_finished() {
         "{}",
         text(&finish)
     );
+    // Rejecting it is how a person closes it.
+    let reject = p.dispatch(&["reject", &id]);
+    assert!(reject.status.success(), "{}", text(&reject));
+    assert!(text(&reject).contains("Closed"), "{}", text(&reject));
+    let run = p.only_run();
+    assert_eq!(run["outcome"]["lifecycle"], "finished");
+    assert_eq!(run["outcome"]["work_result"], "cancelled");
+}
+
+/// Claude Code's `ExitWorktree` tool with `action: remove` deletes the worktree
+/// without running `WorktreeRemove`; its `PreToolUse` is the last chance.
+#[test]
+fn leaving_a_worktree_by_removing_it_keeps_its_exact_changes() {
+    let p = Project::new("");
+    p.watch();
+    p.start("s1", "startup", &p.worktree);
+    let id = p.only_run()["id"].as_str().unwrap().to_owned();
+    fs::write(
+        p.worktree.join("src/lib.rs"),
+        "pub fn f() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+    let tool = |name: &str, action: &str| {
+        p.hook_output(
+            serde_json::json!({
+                "hook_event_name": "PreToolUse", "session_id": "s1", "cwd": p.worktree,
+                "tool_name": name, "tool_input": {"action": action, "discard_changes": true},
+            })
+            .to_string()
+            .as_bytes(),
+        )
+    };
+    // Other tools, and leaving while keeping the worktree, change nothing.
+    for output in [tool("Bash", "remove"), tool("ExitWorktree", "keep")] {
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty(), "{}", text(&output));
+    }
+    assert!(p.only_run()["attachment"]["workspace_removed"].is_null());
+
+    let output = tool("ExitWorktree", "remove");
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("kept this worktree's changes"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        p.only_run()["attachment"]["workspace_removed"]["exact"],
+        true
+    );
+    let patch = fs::read_to_string(p.run_dir(&id).join("delta.patch")).unwrap();
+    assert!(patch.contains("+    2"), "{patch}");
+}
+
+/// A resumed session reports the checkout before it re-enters its worktree,
+/// so only a fresh start is told it works in the checkout.
+#[test]
+fn a_resumed_session_in_the_checkout_is_not_told_it_is_shared() {
+    let p = Project::new("");
+    p.watch();
+    assert_eq!(p.start("s1", "resume", &p.root), "");
+    assert!(p.runs().is_empty());
 }

@@ -1809,6 +1809,25 @@ pub fn accept_or_reject_latest(
         Some(run_id) => state.load_run(run_id)?,
         None => load_latest_unresolved_single(state, source_path)?,
     };
+    // Work whose workspace vanished before its final changes were kept has no
+    // result to review, and rejecting it is how a person closes it.
+    let lost = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_removed.as_ref())
+        .is_some_and(|removal| !removal.exact);
+    if !accept && lost && run.outcome.lifecycle == LifecycleState::Working {
+        attach::close_lost(state, &run.id)?;
+        println!(
+            "Closed {}: its workspace is gone, and the changes last seen stay at {}.",
+            run.id,
+            state
+                .run_dir(&run.id)
+                .join("delta-last-seen.patch")
+                .display()
+        );
+        return Ok(());
+    }
     let command = ReviewCommand {
         run_id: run.id.clone(),
         candidate_id: sole_candidate(&run)?.id.clone(),
@@ -2099,6 +2118,9 @@ pub(crate) fn work_line(run: &RunRecord, validity: Option<&crate::Validity>) -> 
             ApplicationState::BlockedBySourceDrift | ApplicationState::Failed => "blocked",
             ApplicationState::NotApplied if run.outcome.work_result != WorkResult::Ready => {
                 "finished"
+            }
+            ApplicationState::NotApplied if run.outcome.review == ReviewState::Rejected => {
+                "rejected"
             }
             ApplicationState::NotApplied
                 if validity.is_some_and(|v| v.decision != Decision::Continue) =>
