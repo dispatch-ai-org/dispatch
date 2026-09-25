@@ -49,6 +49,7 @@ pub(super) async fn accounts(
         choices.extend(resources.profiles.iter().map(profile_choice));
         let login_row = choices.len();
         choices.push(Choice::new("Provider login…"));
+        choices.push(Choice::new("Runtime integrations…"));
         choices.push(Choice::new("Back"));
         let body = "Accounts / Resources\nLocal operation · no Dispatch login required\nA resource is needed only for Dispatch to launch an agent; attach, check, serve and review work without one.";
         let Some(choice) = ui.select(body, &choices, 0).await? else {
@@ -81,6 +82,8 @@ pub(super) async fn accounts(
                 Some(i) if i < providers.len() => login(ui, providers[i].0).await,
                 _ => Ok(()),
             }
+        } else if choice == login_row + 1 {
+            integrations(ui, state).await
         } else {
             return Ok(());
         };
@@ -88,6 +91,65 @@ pub(super) async fn accounts(
             report(ui, &e)?;
         }
     }
+}
+
+/// Claude Code's session hooks, which let Work appear by itself in watched
+/// projects. They are observation hooks, not a resource: no account, model
+/// or funding is involved. Installing shows exactly what is added and where,
+/// and needs a deliberate choice; focus starts on Cancel.
+async fn integrations(ui: &mut Ui, state: &State) -> Result<()> {
+    use crate::runtime::claude;
+    let path = claude::settings_path()?;
+    let installed = claude::hooks_installed(&path)?;
+    let action = if installed {
+        "Remove Claude Code hooks"
+    } else {
+        "Install Claude Code hooks"
+    };
+    let body = format!(
+        "Runtime integrations\nClaude Code hooks: {} ({})\nWith them, a Claude Code session in its own worktree of a project you watch \
+         (dispatch start) appears as Work by itself; a session in the checkout itself is told Dispatch cannot follow it.",
+        if installed {
+            "installed"
+        } else {
+            "not installed"
+        },
+        path.display()
+    );
+    let rows = [Choice::new(action), Choice::new("Back")];
+    if ui.select(&body, &rows, 0).await? != Some(0) {
+        return Ok(());
+    }
+    let command = claude::hook_command(state)?;
+    let consent = if installed {
+        format!(
+            "Remove Dispatch's hooks from {}?\nOnly the entries running `... hook claude` are removed; a backup is kept beside the file.",
+            path.display()
+        )
+    } else {
+        format!(
+            "Add these hooks to {}?\n{}\nOther settings and hooks are kept (key order may change); a backup is kept beside the file.",
+            path.display(),
+            claude::hooks_preview(&command)
+        )
+    };
+    let confirm = if installed { "Remove" } else { "Install" };
+    let rows = [Choice::new(confirm), Choice::new("Cancel")];
+    if ui.select(&consent, &rows, 1).await? != Some(0) {
+        return Ok(());
+    }
+    let backup = if installed {
+        claude::uninstall_hooks(&path)?
+    } else {
+        claude::install_hooks(&path, &command)?
+    };
+    let kept = backup.map_or_else(String::new, |backup| {
+        format!(" Previous settings: {}.", backup.display())
+    });
+    ui.commit(&format!(
+        "Claude Code hooks {}.{kept}",
+        if installed { "removed" } else { "installed" }
+    ))
 }
 
 /// A profile as a menu row: selecting it revalidates. A disabled profile

@@ -34,7 +34,8 @@ for line in sys.stdin:
     captures=os.environ.get('DISPATCH_SETUP_CAPTURES',str(root/'captures'))
     def session(name,args=None):return Session([binary,'--state-dir',str(state)]+(args or []),source,captures,name,env=env,width=100,height=36)
     # Setup is chosen, not typed. Rows with no profiles: 1 Add Claude Code,
-    # 2 Add Codex, 3 Provider login…, 4 Back. A digit moves focus; Enter chooses.
+    # 2 Add Codex, 3 Provider login…, 4 Runtime integrations…, 5 Back. A digit
+    # moves focus; Enter chooses.
     with session('fresh') as ui:
         ui.wait('accomplish?');ui.send('Update main.c safely\r');ui.wait('Protect work I run myself');ui.mark('first-goal')
         ui.send('\r');ui.wait('Add Codex');ui.mark('missing')
@@ -44,7 +45,7 @@ for line in sys.stdin:
         ui.wait('Authorize this resource?');ui.mark('funding');ui.send('\r');ui.wait('Not authorized');assert not state.exists()
         for absent in ('hidden-fixture-model','ultra','Resource tier','Type confirm'):
             assert absent not in ui.clean, absent
-        ui.wait('Add Codex');ui.send('4\r');ui.wait('accomplish?');ui.mark('preserved');ui.pump(.1)
+        ui.wait('Add Codex');ui.send('5\r');ui.wait('accomplish?');ui.mark('preserved');ui.pump(.1)
         assert 'Update main.c safely' in ui.clean
         ui.send(b'\x03');ui.finish()
     # Observing needs no setup: the second choice explains attach and serve,
@@ -58,18 +59,18 @@ for line in sys.stdin:
     with session('cli-codex',['setup','codex']) as ui:
         ui.wait('Other model ID');ui.send('\r');ui.wait('Effort for');ui.send('\r')
         ui.wait('Authorize this resource?');ui.mark('confirm');ui.send('1\r');ui.wait('Resource saved')
-        ui.wait('Revalidate codex');ui.send('5\r');ui.finish()
+        ui.wait('Revalidate codex');ui.send('6\r');ui.finish()
     with session('cli-claude',['setup','claude']) as ui:
         ui.wait('claude-sonnet-5');ui.send('\r');ui.wait('Effort for claude-sonnet-5');ui.send('\r')
         ui.wait('Authorize this resource?');ui.send('1\r');ui.wait('Resource saved')
-        ui.wait('Revalidate claude');ui.send('6\r');ui.finish()
+        ui.wait('Revalidate claude');ui.send('7\r');ui.finish()
     original=(state/'resources.yml').read_bytes();config=original.decode()
     assert config.count('provider: ')==2
     assert 'model: fixture-codex-model' in config and 'model: claude-sonnet-5' in config
     assert config.count('effort: medium')==2 and config.count('tier: standard')==2
     assert 'print_mode_included: true' in config and re.search(r'account_sha256: [a-f0-9]{64}',config)
     # Rows now: 1 Add Claude Code, 2 Add Codex, 3 codex profile, 4 claude profile,
-    # 5 Provider login…, 6 Back. Expired evidence is shown and can be refreshed;
+    # 5 Provider login…, 6 Runtime integrations…, 7 Back. Expired evidence is shown and can be refreshed;
     # cancellation never renews it.
     config=re.sub(r'valid_until: [^\n]+','valid_until: 2020-01-01T00:00:00Z',config)
     (state/'resources.yml').write_text(config);expired=(state/'resources.yml').read_bytes()
@@ -77,19 +78,19 @@ for line in sys.stdin:
         ui.wait('needs revalidation');ui.mark('expired');ui.send('4\r');ui.wait('Authorize this resource?');ui.send('\r');ui.wait('Not authorized')
         assert (state/'resources.yml').read_bytes()==expired
         ui.wait('Add Codex');ui.send('4\r');ui.wait('Authorize this resource?');ui.mark('refresh');ui.send('1\r');ui.wait('Resource saved')
-        ui.wait('expires in');ui.send('6\r');ui.finish()
+        ui.wait('expires in');ui.send('7\r');ui.finish()
     refreshed=(state/'resources.yml').read_bytes();assert max(map(int,re.findall(rb'authorization_revision: (\d+)',refreshed)))>2
     auth=json.loads((root/'auth.json').read_text());auth['email']='different@example.invalid';(root/'auth.json').write_text(json.dumps(auth))
     with session('account-change',['setup']) as ui:
-        ui.wait('Add Codex');ui.send('4\r');ui.wait('account changed');ui.mark('blocked');ui.wait('Add Codex');ui.send('6\r');ui.finish()
+        ui.wait('Add Codex');ui.send('4\r');ui.wait('account changed');ui.mark('blocked');ui.wait('Add Codex');ui.send('7\r');ui.finish()
     assert (state/'resources.yml').read_bytes()==refreshed
     auth['authMethod']='api';(root/'auth.json').write_text(json.dumps(auth))
     with session('unsupported',['setup','claude']) as ui:
-        ui.wait('Resource unchanged');ui.wait('Add Codex');ui.send('6\r');ui.finish()
+        ui.wait('Resource unchanged');ui.wait('Add Codex');ui.send('7\r');ui.finish()
     # Login: choose the provider, then Open (focused) or Cancel; never typed.
     with session('login',['setup']) as ui:
         ui.wait('Add Codex');ui.send('5\r');ui.wait('Provider login changes');ui.send('2\r')
-        ui.wait('Open codex login');ui.send('\r');ui.wait('Fixture device login');ui.send('\r');ui.wait('Add Codex');ui.mark('return');ui.send('6\r');ui.finish()
+        ui.wait('Open codex login');ui.send('\r');ui.wait('Fixture device login');ui.send('\r');ui.wait('Add Codex');ui.mark('return');ui.send('7\r');ui.finish()
     assert (state/'resources.yml').read_bytes()==refreshed
     (source/'verify.sh').write_text('exit 0\n')
     # Checks are chosen, never typed: arrows move, Enter chooses the focused row.
@@ -117,7 +118,7 @@ for line in sys.stdin:
     def used_session(name,args):return Session([binary,'--state-dir',str(used)]+args,source,captures,name,env=env,width=100,height=36)
     with used_session('with-database',['setup','codex']) as ui:
         ui.wait('Other model ID');ui.send('\r');ui.wait('Effort for');ui.send('\r')
-        ui.wait('Authorize this resource?');ui.send('1\r');ui.wait('Resource saved');ui.wait('Revalidate codex');ui.send('5\r');ui.finish()
+        ui.wait('Authorize this resource?');ui.send('1\r');ui.wait('Resource saved');ui.wait('Revalidate codex');ui.send('6\r');ui.finish()
     assert 'provider: openai' in (used/'resources.yml').read_text()
     assert (used/'dispatch.db').read_bytes()==before, 'setup wrote to the database'
     saved=(used/'resources.yml').read_bytes()
@@ -127,11 +128,24 @@ for line in sys.stdin:
         ui.wait('Other model ID');ui.send('2\r');ui.wait('as your provider names it');ui.send('-rf\r');ui.wait('non-option identifier')
         ui.wait('Add Codex');ui.send('2\r');ui.wait('Other model ID');ui.send('2\r');ui.wait('as your provider names it');ui.send('codex-custom-9\r')
         ui.wait('Effort for');ui.send('\r');ui.wait('codex / codex-custom-9 / medium');ui.wait('Authorize this resource?');ui.send('\r')
-        ui.wait('Not authorized');ui.wait('Add Codex');ui.send('5\r');ui.finish()
+        ui.wait('Not authorized');ui.wait('Add Codex');ui.send('6\r');ui.finish()
     # Plain mode numbers the same menus; an empty line chooses the focused row,
     # which for consent is Cancel.
     with used_session('plain',['--plain','setup','codex']) as ui:
         ui.wait('1) fixture-codex-model');ui.send('\r');ui.wait('Effort for');ui.wait('[2] >');ui.send('\r')
-        ui.wait('2) Cancel');ui.wait('[2] >');ui.send('\r');ui.wait('Not authorized');ui.wait('5) Back');ui.send('5\r');ui.finish()
+        ui.wait('2) Cancel');ui.wait('[2] >');ui.send('\r');ui.wait('Not authorized');ui.wait('6) Back');ui.send('6\r');ui.finish()
     assert (used/'resources.yml').read_bytes()==saved
+    # Runtime integrations: Claude Code's observation hooks, installed only on
+    # a deliberate choice. Rows with one profile: 4 Provider login…,
+    # 5 Runtime integrations…, 6 Back. Enter on the consent screen cancels.
+    claude_settings=home/'.claude'/'settings.json'
+    hooks_env=dict(env,CLAUDE_CONFIG_DIR=str(home/'.claude'))
+    with Session([binary,'--state-dir',str(used),'setup'],source,captures,'integrations',env=hooks_env,width=100,height=36) as ui:
+        ui.wait('Runtime integrations');ui.send('5\r');ui.wait('Install Claude Code hooks');ui.send('1\r')
+        ui.wait('hook claude');ui.mark('hooks-consent');ui.send('\r')
+        ui.wait('Revalidate codex');assert not claude_settings.exists(), 'Enter alone installed hooks'
+        ui.send('5\r');ui.wait('Install Claude Code hooks');ui.send('1\r');ui.wait('hook claude');ui.send('1\r')
+        ui.wait('hooks installed');ui.wait('Revalidate codex');ui.send('6\r');ui.finish()
+    installed=claude_settings.read_text()
+    assert 'hook claude' in installed and str(used) in installed and 'SessionStart' in installed, installed
     print('CLI/TUI setup journeys passed; zero model calls; no database or grants created')

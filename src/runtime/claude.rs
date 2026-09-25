@@ -131,3 +131,231 @@ fn notice(reply: Result<Reply>) -> Output {
         code: 0,
     }
 }
+
+/// The hook events Dispatch installs, with the timeout each gets. A
+/// `WorktreeRemove` hook outlasts `REMOVAL_DEADLINE`, so Dispatch always
+/// decides before Claude Code gives up on it.
+const INSTALLED: [(&str, u64); 3] = [
+    ("SessionStart", 60),
+    ("SessionEnd", 5),
+    ("WorktreeRemove", 300),
+];
+
+/// Where Claude Code keeps the user's settings: `$CLAUDE_CONFIG_DIR`, or
+/// `~/.claude`.
+pub fn settings_path() -> Result<std::path::PathBuf> {
+    let directory = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(directory) => std::path::PathBuf::from(directory),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+            .join(".claude"),
+    };
+    Ok(directory.join("settings.json"))
+}
+
+/// The command Claude Code runs: this Dispatch, this state, `hook claude`.
+pub fn hook_command(state: &State) -> Result<String> {
+    let quote =
+        |value: &std::path::Path| format!("'{}'", value.to_string_lossy().replace('\'', r"'\''"));
+    Ok(format!(
+        "{} --state-dir {} hook claude",
+        quote(&std::env::current_exe()?),
+        quote(&state.root)
+    ))
+}
+
+fn ours(entry: &serde_json::Value) -> bool {
+    entry["hooks"].as_array().is_some_and(|hooks| {
+        hooks.iter().any(|hook| {
+            hook["command"]
+                .as_str()
+                .is_some_and(|command| command.ends_with(" hook claude"))
+        })
+    })
+}
+
+/// `settings` without Dispatch's hooks: every other setting and hook as it was.
+pub fn without_hooks(mut settings: serde_json::Value) -> serde_json::Value {
+    if let Some(hooks) = settings["hooks"].as_object_mut() {
+        for (event, _) in INSTALLED {
+            if let Some(entries) = hooks.get_mut(event).and_then(|e| e.as_array_mut()) {
+                entries.retain(|entry| !ours(entry));
+                if entries.is_empty() {
+                    hooks.remove(event);
+                }
+            }
+        }
+        if hooks.is_empty() {
+            settings.as_object_mut().map(|s| s.remove("hooks"));
+        }
+    }
+    settings
+}
+
+/// `settings` with exactly one set of Dispatch's hooks, running `command`.
+pub fn with_hooks(settings: serde_json::Value, command: &str) -> Result<serde_json::Value> {
+    let mut settings = without_hooks(settings);
+    anyhow::ensure!(
+        settings.is_object(),
+        "Claude Code settings are not a JSON object"
+    );
+    if !settings["hooks"].is_object() {
+        settings["hooks"] = serde_json::json!({});
+    }
+    for (event, timeout) in INSTALLED {
+        let entry = serde_json::json!({
+            "hooks": [{"type": "command", "command": command, "timeout": timeout}]
+        });
+        match settings["hooks"][event].as_array_mut() {
+            Some(entries) => entries.push(entry),
+            None => settings["hooks"][event] = serde_json::json!([entry]),
+        }
+    }
+    Ok(settings)
+}
+
+/// Whether Dispatch's hooks are in the settings at `path`.
+pub fn hooks_installed(path: &std::path::Path) -> Result<bool> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(false);
+    };
+    let settings: serde_json::Value =
+        serde_json::from_slice(&bytes).context("Claude Code settings are not valid JSON")?;
+    Ok(INSTALLED.iter().any(|(event, _)| {
+        settings["hooks"][event]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(ours))
+    }))
+}
+
+/// Rewrite the settings at `path` with `change`, after keeping a backup
+/// beside them. Settings that are not valid JSON are left untouched.
+fn rewrite(
+    path: &std::path::Path,
+    change: impl FnOnce(serde_json::Value) -> Result<serde_json::Value>,
+) -> Result<Option<std::path::PathBuf>> {
+    let existing = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let settings = match &existing {
+        Some(bytes) => serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "{} is not valid JSON; it was left untouched",
+                path.display()
+            )
+        })?,
+        None => serde_json::json!({}),
+    };
+    let changed = change(settings)?;
+    let backup = match &existing {
+        Some(bytes) => {
+            let backup = path.with_extension(format!(
+                "json.dispatch-backup-{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            std::fs::write(&backup, bytes)
+                .with_context(|| format!("failed to keep a backup at {}", backup.display()))?;
+            Some(backup)
+        }
+        None => None,
+    };
+    let mut text = serde_json::to_vec_pretty(&changed)?;
+    text.push(b'\n');
+    crate::state::write_durably(path, &text)?;
+    Ok(backup)
+}
+
+/// Add Dispatch's hooks to Claude Code's settings at `path`. Returns the
+/// backup of the previous settings, if there were any.
+pub fn install_hooks(path: &std::path::Path, command: &str) -> Result<Option<std::path::PathBuf>> {
+    rewrite(path, |settings| with_hooks(settings, command))
+}
+
+/// Remove Dispatch's hooks, and nothing else, from the settings at `path`.
+pub fn uninstall_hooks(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    rewrite(path, |settings| Ok(without_hooks(settings)))
+}
+
+/// What installing adds, as the person approving it sees it.
+pub fn hooks_preview(command: &str) -> String {
+    let added = with_hooks(serde_json::json!({}), command).expect("an empty object takes hooks");
+    serde_json::to_string_pretty(&added).expect("settings serialize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMAND: &str = "'/bin/dispatch' --state-dir '/s' hook claude";
+
+    #[test]
+    fn installing_adds_one_set_of_hooks_and_keeps_everything_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let theirs = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "direnv export"}]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "x"}]}],
+            },
+        });
+        std::fs::write(&path, theirs.to_string()).unwrap();
+
+        let backup = install_hooks(&path, COMMAND).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            theirs.to_string()
+        );
+        install_hooks(&path, "'/moved/dispatch' --state-dir '/s' hook claude").unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["model"], "claude-sonnet-5");
+        assert_eq!(
+            settings["hooks"]["PreToolUse"],
+            theirs["hooks"]["PreToolUse"]
+        );
+        let starts = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            starts.len(),
+            2,
+            "theirs plus exactly one of ours: {starts:?}"
+        );
+        assert_eq!(starts[0]["hooks"][0]["command"], "direnv export");
+        assert_eq!(
+            starts[1]["hooks"][0]["command"],
+            "'/moved/dispatch' --state-dir '/s' hook claude"
+        );
+        assert_eq!(
+            settings["hooks"]["WorktreeRemove"][0]["hooks"][0]["timeout"],
+            300
+        );
+        assert!(hooks_installed(&path).unwrap());
+
+        uninstall_hooks(&path).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings, theirs);
+        assert!(!hooks_installed(&path).unwrap());
+    }
+
+    #[test]
+    fn settings_that_are_not_json_are_left_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let error = install_hooks(&path, COMMAND).unwrap_err().to_string();
+        assert!(error.contains("left untouched"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn installing_into_no_settings_creates_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        assert!(install_hooks(&path, COMMAND).unwrap().is_none());
+        assert!(hooks_installed(&path).unwrap());
+    }
+}
