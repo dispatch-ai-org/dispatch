@@ -546,6 +546,34 @@ pub struct AttachmentRecord {
     pub attached_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub finish_reason: Option<FinishReason>,
+    /// Who made the workspace. Records before 0.4.6 are the user's.
+    #[serde(default)]
+    pub workspace_owner: WorkspaceOwner,
+    /// A workspace Dispatch made for this Work, and whether it is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedWorkspace>,
+}
+
+/// Who made the workspace the Work happens in.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOwner {
+    /// You made it (`git worktree add`, or any directory you attached).
+    #[default]
+    User,
+    /// An agent runtime made it (a Claude Code `--worktree` session).
+    Runtime,
+    /// Dispatch made it (`dispatch attach -- <agent>` from the checkout).
+    Dispatch,
+}
+
+/// A workspace Dispatch made under `<state>/workspaces/<run-id>`: a linked
+/// worktree on `branch` for a Git checkout, a private copy otherwise. It is
+/// removed only once its Work is applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedWorkspace {
+    pub branch: Option<String>,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -881,6 +909,8 @@ mod tests {
                 .with_timezone(&Utc),
             finished_at: None,
             finish_reason: None,
+            workspace_owner: Default::default(),
+            managed: None,
         }
     }
 

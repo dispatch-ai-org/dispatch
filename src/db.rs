@@ -2714,6 +2714,8 @@ mod tests {
             attached_at: at(1),
             finished_at: None,
             finish_reason: None,
+            workspace_owner: Default::default(),
+            managed: None,
         });
         migrated.sync_run(&attached)?;
         assert_eq!(

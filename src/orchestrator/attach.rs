@@ -29,9 +29,9 @@ use super::{
 use crate::{
     ApplicationState, AttachCapabilities, AttachConfidence, AttachmentRecord, AttemptDetail,
     AttemptRecord, BaselineProvenance, CandidateRecord, CandidateStatus, CheckPhase, Config,
-    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, OwnerState,
-    ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus, VerificationState, WaitingOn,
-    WorkResult,
+    DiffStats, EnvironmentRecord, EventRecord, FinishReason, LifecycleState, ManagedWorkspace,
+    OwnerState, ReviewState, RunMode, RunOutcome, RunPhase, RunRecord, RunStatus,
+    VerificationState, WaitingOn, WorkResult, WorkspaceOwner,
     coherence::watch::{WatchSpec, Watcher},
     db::Database,
     lock::OperationLock,
@@ -72,16 +72,22 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         },
     };
 
+    // Wrapped work started in the checkout itself gets a workspace Dispatch
+    // makes (`make_workspace`); the checkout is never the workspace.
+    let managed = is_wrapped && workspace == root;
+
     // 14.8, in order: same-checkout, different repository, no merge base,
     // plain-directory foreign attach, checks without acknowledgement,
     // already attached.
     anyhow::ensure!(
-        workspace != root,
-        "attach needs a separate worktree; run git worktree add"
+        managed || workspace != root,
+        "attach needs a separate worktree; run git worktree add, or wrap the agent \
+         (dispatch attach -- <agent>) and Dispatch makes one"
     );
 
     let workspace_identity = source::repo_identity(&workspace)?;
     let commit = match &workspace_identity {
+        _ if managed => None,
         Some(workspace_repo) => {
             let root_identity = source::repo_identity(&root)?;
             anyhow::ensure!(
@@ -113,7 +119,7 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     );
     let unsafe_local = request.allow_unsafe_local;
 
-    if let Some(existing_id) = find_active_attachment(state, &workspace)? {
+    if !managed && let Some(existing_id) = find_active_attachment(state, &workspace)? {
         bail!("workspace already attached as {existing_id}");
     }
 
@@ -142,32 +148,48 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         &serde_yaml::to_string(&config).context("failed to serialize effective configuration")?,
     )?;
 
-    let (snapshot, provenance, confidence) = match &commit {
-        Some(commit) => {
-            let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
-                .map_err(|error| {
+    let (snapshot, provenance, confidence, workspace, managed_workspace) = if managed {
+        let (snapshot, provenance, workspace, made) =
+            make_workspace(state, &root, &run_id, &run_dir).map_err(|error| {
+                let _ = fs::remove_dir_all(&run_dir);
+                error.context("could not make a workspace; incomplete run state was removed")
+            })?;
+        (
+            snapshot,
+            provenance,
+            AttachConfidence::Full,
+            workspace,
+            Some(made),
+        )
+    } else {
+        let (snapshot, provenance, confidence) = match &commit {
+            Some(commit) => {
+                let snapshot = source::materialize_baseline_from_commit(&root, commit, &run_dir)
+                    .map_err(|error| {
+                        let _ = fs::remove_dir_all(&run_dir);
+                        error.context("baseline creation failed; incomplete run state was removed")
+                    })?;
+                (
+                    snapshot,
+                    BaselineProvenance::GitMergeBase {
+                        commit: commit.clone(),
+                    },
+                    AttachConfidence::Full,
+                )
+            }
+            None => {
+                let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
                     let _ = fs::remove_dir_all(&run_dir);
                     error.context("baseline creation failed; incomplete run state was removed")
                 })?;
-            (
-                snapshot,
-                BaselineProvenance::GitMergeBase {
-                    commit: commit.clone(),
-                },
-                AttachConfidence::Full,
-            )
-        }
-        None => {
-            let snapshot = source::create_snapshot(&workspace, &run_dir).map_err(|error| {
-                let _ = fs::remove_dir_all(&run_dir);
-                error.context("baseline creation failed; incomplete run state was removed")
-            })?;
-            (
-                snapshot,
-                BaselineProvenance::SnapshotAtAttach,
-                AttachConfidence::Partial,
-            )
-        }
+                (
+                    snapshot,
+                    BaselineProvenance::SnapshotAtAttach,
+                    AttachConfidence::Partial,
+                )
+            }
+        };
+        (snapshot, provenance, confidence, workspace, None)
     };
 
     let (source_kind, source_git_head) = source::inspect_source(&root)?;
@@ -255,6 +277,12 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
         attached_at: now,
         finished_at: None,
         finish_reason: None,
+        workspace_owner: if managed_workspace.is_some() {
+            WorkspaceOwner::Dispatch
+        } else {
+            WorkspaceOwner::User
+        },
+        managed: managed_workspace,
     };
 
     let mut run = RunRecord {
@@ -364,6 +392,112 @@ pub fn create(state: &State, request: AttachRequest) -> Result<RunRecord> {
     Ok(run)
 }
 
+/// The workspace Dispatch makes for wrapped work started in the checkout
+/// itself, under `<state>/workspaces/<run-id>`, never inside the checkout.
+/// S0 is the checkout's exact world now: for Git, `source::world_commit`
+/// checked out as a linked worktree on its own `dispatch/<run-id>` branch;
+/// for a plain directory, a snapshot and a private copy of it.
+fn make_workspace(
+    state: &State,
+    root: &Path,
+    run_id: &str,
+    run_dir: &Path,
+) -> Result<(
+    source::SourceSnapshot,
+    BaselineProvenance,
+    PathBuf,
+    ManagedWorkspace,
+)> {
+    let parent = state.root.join("workspaces");
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = parent.join(run_id);
+    if source::repo_identity(root)?.is_none() {
+        let snapshot = source::create_snapshot(root, run_dir)?;
+        let workspace = source::create_candidate_workspace(&snapshot.baseline_path, &path)?;
+        let provenance = BaselineProvenance::WorkspaceAtStart {
+            commit: snapshot.baseline_commit.clone(),
+        };
+        let made = ManagedWorkspace {
+            branch: None,
+            removed: false,
+        };
+        return Ok((snapshot, provenance, workspace, made));
+    }
+    let commit = source::world_commit(root)?;
+    let branch = format!("dispatch/{}", run_id.to_lowercase());
+    source::create_linked_workspace(root, &commit, &path, &branch)?;
+    let snapshot = match source::materialize_baseline_from_commit(root, &commit, run_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // Nothing has run in it yet, so there is no work to lose.
+            let _ = source::remove_linked_workspace(root, &path, &branch);
+            return Err(error);
+        }
+    };
+    let workspace = source::resolve_source(Some(&path))?;
+    let made = ManagedWorkspace {
+        branch: Some(branch),
+        removed: false,
+    };
+    Ok((
+        snapshot,
+        BaselineProvenance::WorkspaceAtStart { commit },
+        workspace,
+        made,
+    ))
+}
+
+/// Remove the workspace Dispatch made for `run` once its Work is applied: its
+/// Δ is in the checkout now, so nothing is lost. Only a workspace under
+/// `<state>/workspaces/` recorded at creation is ever removed; a failure is
+/// reported and the workspace kept.
+pub(super) fn release_workspace(state: &State, run: &mut RunRecord) -> Result<()> {
+    let Some(attachment) = run.attachment.as_ref() else {
+        return Ok(());
+    };
+    let Some(made) = attachment.managed.as_ref().filter(|made| !made.removed) else {
+        return Ok(());
+    };
+    let workspace = attachment.workspace.clone();
+    let parent = fs::canonicalize(state.root.join("workspaces"))?;
+    anyhow::ensure!(
+        workspace.parent() == Some(parent.as_path()),
+        "refusing to remove {}: not a workspace Dispatch made",
+        workspace.display()
+    );
+    match &made.branch {
+        Some(branch) => {
+            source::remove_linked_workspace(&attachment.integration_root, &workspace, branch)?
+        }
+        None => fs::remove_dir_all(&workspace)
+            .with_context(|| format!("failed to remove {}", workspace.display()))?,
+    }
+    if let Some(made) = run.attachment.as_mut().and_then(|a| a.managed.as_mut()) {
+        made.removed = true;
+    }
+    let db = Database::open(state.db_path())?;
+    persist_event(
+        state,
+        &db,
+        EventRecord {
+            run_id: run.id.clone(),
+            candidate_label: None,
+            event_type: "workspace.released".into(),
+            timestamp: Utc::now(),
+            payload: serde_json::json!({"workspace": workspace}),
+            ..EventRecord::default()
+        },
+        run,
+    )?;
+    Ok(())
+}
+
 /// `dispatch attach -- <command...>`: the wrapped form's owner loop (parts
 /// 6.1 and 6.7). `create`s the Work with `command: Some(argv)`, spawns the
 /// agent under the terminal in the wrapper's own process group, watches the
@@ -388,6 +522,22 @@ pub async fn run_wrapped(state: &State, request: AttachRequest) -> Result<i32> {
     let mut run = create(state, request)?;
     let run_dir = state.run_dir(&run.id);
     let workspace = run.candidates[0].workspace_path.clone();
+    // The one line before the agent starts: where it works, when Dispatch
+    // chose the place.
+    if let Some(branch) = run
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.managed.as_ref())
+        .map(|made| made.branch.clone())
+    {
+        let on = branch
+            .map(|branch| format!(" on branch {branch}"))
+            .unwrap_or_default();
+        eprintln!(
+            "Working in {}{on}; your checkout is not touched.",
+            workspace.display()
+        );
+    }
 
     // Held for the whole wrapped session: this is how `finish` and `serve`
     // know the Work is owned (rule 1).

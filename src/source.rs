@@ -412,6 +412,48 @@ pub fn world_commit(checkout: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&commit).trim().to_owned())
 }
 
+/// A linked worktree of `checkout`'s repository at `path`, on a new `branch`
+/// at `commit`: a workspace whose files are exactly that commit. `path` must
+/// lie outside the checkout.
+pub fn create_linked_workspace(
+    checkout: &Path,
+    commit: &str,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let checkout = resolve_source(Some(checkout))?;
+    let projected = canonicalize_allow_missing(path)?;
+    ensure!(
+        !projected.starts_with(&checkout),
+        "a workspace must be outside the checkout: {}",
+        path.display()
+    );
+    ensure!(
+        fs::symlink_metadata(path).is_err(),
+        "workspace already exists: {}",
+        path.display()
+    );
+    let mut add = git_command(&checkout);
+    add.args(["worktree", "add", "--quiet", "-b", branch, "--"])
+        .arg(path)
+        .arg(commit);
+    checked_output(add, "failed to create the workspace")?;
+    Ok(())
+}
+
+/// Remove a linked worktree `create_linked_workspace` made, and its branch.
+pub fn remove_linked_workspace(checkout: &Path, path: &Path, branch: &str) -> Result<()> {
+    let mut remove = git_command(checkout);
+    remove
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(path);
+    checked_output(remove, "failed to remove the workspace")?;
+    let mut delete = git_command(checkout);
+    delete.args(["branch", "-D", "--", branch]);
+    checked_output(delete, "failed to delete the workspace's branch")?;
+    Ok(())
+}
+
 /// Create a complete, independent workspace at the frozen baseline commit.
 pub fn create_candidate_workspace(baseline_path: &Path, candidate_dir: &Path) -> Result<PathBuf> {
     let baseline_path = resolve_source(Some(baseline_path))?;

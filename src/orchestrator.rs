@@ -2448,6 +2448,18 @@ fn review_locked(
     )?;
     if !quiet {
         println!("Review recorded (revision {}).", feedback.revision);
+        if let Some(attachment) = run.attachment.as_ref().filter(|attachment| {
+            attachment
+                .managed
+                .as_ref()
+                .is_some_and(|made| !made.removed)
+        }) && run.outcome.review == ReviewState::Rejected
+        {
+            println!(
+                "The workspace Dispatch made for it is kept at {}.",
+                attachment.workspace.display()
+            );
+        }
     }
     Ok(())
 }

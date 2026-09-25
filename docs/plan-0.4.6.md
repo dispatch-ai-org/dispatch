@@ -389,3 +389,25 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
   - Test: `world_commit_records_exactly_the_world_and_leaves_the_checkout_alone`,
     covering dirty, deleted, untracked, ignored and nested files, and a repository
     with no commit yet.
+- Stage 3. Managed isolation in wrapped attach.
+  - `dispatch attach -- <cmd>` run from the checkout itself now makes the
+    workspace under `<state>/workspaces/<run-id>`.
+    - For Git: `world_commit(root)` checked out by `source::create_linked_workspace`
+      on branch `dispatch/<run-id>`, with S0 materialized from the same commit.
+    - For a plain directory: `create_snapshot` plus `create_candidate_workspace`.
+    - Either way the provenance is `WorkspaceAtStart` and confidence is Full.
+  - The attachment records `workspace_owner: dispatch` and `managed { branch,
+    removed }`.
+  - `persist_applied` releases the workspace (`workspace.released`) once the Work
+    is applied, and only a path directly under `<state>/workspaces/`. A failed
+    release is reported and the workspace kept.
+  - A reject keeps the workspace and prints its path. The wrapper prints one line
+    before the agent starts, saying where the agent works.
+  - The foreign-attach refusal now mentions the wrapped form.
+  - Tests:
+    - `wrapped_attach_from_the_checkout_works_in_a_workspace_dispatch_makes`:
+      S0 includes uncommitted checkout files, the checkout is untouched, accept
+      applies and releases;
+    - `a_rejected_workspace_dispatch_made_is_kept`;
+    - `wrapped_attach_from_a_plain_directory_works_in_a_private_copy`.
+  - Full suite (stages 2-3): 467 passed.
