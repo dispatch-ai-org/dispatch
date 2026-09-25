@@ -359,3 +359,22 @@ These use Claude and Cursor only, with `caffeinate -i`, in the trial project.
   an observation, not a completion; recovery metadata stays on the run; invariant
   7 (durable exact Δ before `WorktreeRemove` returns). Repository links point at
   `rundispatch/dispatch`.
+- Stage 1. Workspace-scale finish.
+  - Reproduced: an attached worktree whose ignored `build/` held a file over
+    512 MiB was marked **failed** by `dispatch finish`, leaving nothing to
+    review. The same happens for a symlink out of the tree, such as a
+    `node_modules` link, or for more than 200,000 ignored files.
+  - `validate_candidate_tree` now applies its unchanged limits and symlink rules
+    only to paths that can enter Δ: the baseline's tracked paths plus the
+    workspace's untracked, non-ignored paths, as the trusted baseline repository
+    lists them for `git add -A`.
+  - A tracked directory replaced by a symlink is validated as that symlink.
+  - The obsolete ignored whole-tree timing test is removed.
+  - Tests:
+    - `ignored_build_output_never_limits_or_refuses_the_delta` (unit): tracked
+      paths are still refused for an oversized file, an absolute link, or a
+      symlinked parent;
+    - `finish_succeeds_after_a_build_left_ignored_output` (end to end).
+
+    Both fail on the old code.
+  - Full suite: 463 passed.

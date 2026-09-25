@@ -405,7 +405,7 @@ pub fn collect_diff(baseline_path: &Path, workspace: &Path, diff_path: &Path) ->
         !projected_diff_path.starts_with(&workspace),
         "diff artifact must be stored outside the candidate workspace"
     );
-    validate_candidate_tree(&workspace)?;
+    validate_candidate_tree(&baseline_path, &workspace)?;
 
     let untracked_files = list_untracked_files(&baseline_path, &workspace)?;
     let index_directory = Builder::new()
@@ -808,6 +808,25 @@ pub(crate) fn create_scratch_tree(source: &Path, kind: &SourceKind, dest: &Path)
     Ok(())
 }
 
+/// The first parent of `relative` under `root` that is a symlink, if any.
+fn symlinked_parent(root: &Path, relative: &Path) -> Result<Option<PathBuf>> {
+    let mut current = root.to_path_buf();
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    for component in parent.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(Some(current)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// True when every parent directory of `relative` under `root` is a real
 /// directory (not a symlink); verified parents are remembered in `known`.
 pub(crate) fn parents_are_directories(
@@ -953,25 +972,59 @@ fn ensure_symlink_stays_within(root: &Path, link: &Path, target: &Path) -> Resul
     Ok(())
 }
 
-fn validate_candidate_tree(root: &Path) -> Result<()> {
+/// Refuse a candidate whose Δ would be unsafe or too large: at most
+/// `MAX_CANDIDATE_FILES` files of at most `MAX_CANDIDATE_FILE_BYTES` each and
+/// `MAX_CANDIDATE_TREE_BYTES` in all, no special files, no symlink that leaves
+/// the tree. Only paths that can enter Δ count: the baseline's tracked paths
+/// and the workspace's untracked paths its ignore rules do not exclude, as the
+/// trusted baseline repository lists them for `git add -A`. Ignored build
+/// output (`target/`, `node_modules/`) can never enter Δ, so it is neither
+/// counted nor refused.
+fn validate_candidate_tree(baseline_path: &Path, root: &Path) -> Result<()> {
+    let mut list = comparison_git_command(baseline_path, root);
+    list.args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+    ])
+    .args(dispatch_exclusion_pathspecs());
+    let listing = checked_output(list, "failed to enumerate the candidate's changes")?;
     let mut files = 0_u64;
     let mut logical_bytes = 0_u64;
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(include_entry)
-    {
-        let entry =
-            entry.with_context(|| format!("failed to walk candidate {}", root.display()))?;
-        if entry.depth() == 0 {
+    let mut real_directories = HashSet::new();
+    let mut checked_links = HashSet::new();
+    for raw in listing.stdout.split(|byte| *byte == 0) {
+        // An untracked nested repository is listed as `dir/`, not as files.
+        if raw.is_empty() || raw.ends_with(b"/") {
             continue;
         }
-        let metadata = fs::symlink_metadata(entry.path()).with_context(|| {
-            format!(
-                "failed to inspect candidate path {}",
-                entry.path().display()
-            )
-        })?;
+        let relative = bytes_to_path(raw);
+        // Under a parent that became a symlink, the link is what Git records.
+        if !parents_are_directories(root, &relative, &mut real_directories) {
+            if let Some(link) = symlinked_parent(root, &relative)?
+                && checked_links.insert(link.clone())
+            {
+                let target = fs::read_link(&link)
+                    .with_context(|| format!("failed to read symlink {}", link.display()))?;
+                ensure_symlink_stays_within(root, &link, &target)?;
+            }
+            continue;
+        }
+        let path = root.join(&relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            // Deleted since the baseline: part of Δ, but nothing to inspect.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect candidate path {}", path.display())
+                });
+            }
+        };
         if metadata.is_dir() {
             continue;
         }
@@ -981,14 +1034,14 @@ fn validate_candidate_tree(root: &Path) -> Result<()> {
             "candidate contains more than {MAX_CANDIDATE_FILES} files; diff collection was refused"
         );
         if metadata.file_type().is_symlink() {
-            let target = fs::read_link(entry.path())
-                .with_context(|| format!("failed to read symlink {}", entry.path().display()))?;
-            ensure_symlink_stays_within(root, entry.path(), &target)?;
+            let target = fs::read_link(&path)
+                .with_context(|| format!("failed to read symlink {}", path.display()))?;
+            ensure_symlink_stays_within(root, &path, &target)?;
         } else if metadata.is_file() {
             ensure!(
                 metadata.len() <= MAX_CANDIDATE_FILE_BYTES,
                 "candidate file {} is larger than the {} MiB safety limit",
-                entry.path().display(),
+                path.display(),
                 MAX_CANDIDATE_FILE_BYTES / (1024 * 1024)
             );
             logical_bytes = logical_bytes.saturating_add(metadata.len());
@@ -1000,7 +1053,7 @@ fn validate_candidate_tree(root: &Path) -> Result<()> {
         } else {
             bail!(
                 "candidate contains unsupported special file: {}",
-                entry.path().display()
+                path.display()
             );
         }
     }
@@ -2159,6 +2212,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ignored_build_output_never_limits_or_refuses_the_delta() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        write(&source.join(".gitignore"), "target/\nnode_modules/\n");
+        write(&source.join("src/lib.rs"), "pub fn f() {}\n");
+        initialize_user_repository(&source);
+        let snapshot = create_snapshot(&source, &temp.path().join("run")).unwrap();
+        let workspace = temp.path().join("candidate");
+        create_candidate_workspace(&snapshot.baseline_path, &workspace).unwrap();
+        let diff = temp.path().join("delta.patch");
+        let collect = || collect_diff(&snapshot.baseline_path, &workspace, &diff);
+
+        // What a build and an install leave behind: a file over the per-file
+        // limit (sparse, so it costs nothing) and links out of the tree.
+        fs::create_dir_all(workspace.join("target")).unwrap();
+        fs::File::create(workspace.join("target/huge.bin"))
+            .unwrap()
+            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+            .unwrap();
+        fs::create_dir_all(workspace.join("node_modules/.bin")).unwrap();
+        symlink("/usr/bin/env", workspace.join("node_modules/.bin/env")).unwrap();
+        write(&workspace.join("src/lib.rs"), "pub fn f() { 1 }\n");
+        assert_eq!(collect().unwrap().changed_files, vec!["src/lib.rs"]);
+
+        // Whatever can enter the delta is still held to the same limits.
+        symlink("/usr/bin/env", workspace.join("src/escape")).unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("absolute symlink"), "{error}");
+        fs::remove_file(workspace.join("src/escape")).unwrap();
+
+        fs::File::create(workspace.join("src/huge.bin"))
+            .unwrap()
+            .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+            .unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("safety limit"), "{error}");
+        fs::remove_file(workspace.join("src/huge.bin")).unwrap();
+
+        // A tracked directory replaced by a link out of the tree.
+        fs::remove_dir_all(workspace.join("src")).unwrap();
+        symlink("/tmp", workspace.join("src")).unwrap();
+        let error = collect().unwrap_err().to_string();
+        assert!(error.contains("absolute symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn scratch_tree_copies_listed_files_only_and_never_follows_symlinks() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -2607,33 +2710,5 @@ mod tests {
         let finish_text = fs::read_to_string(&diff_path).unwrap();
         assert!(!finish_text.contains("out.bin"));
         assert!(!finish_text.contains(".git"));
-    }
-
-    // Performance report (run with `cargo test --lib source:: -- --ignored --nocapture`).
-    #[test]
-    #[ignore = "perf report; prints timing only"]
-    fn validate_candidate_tree_timing_report() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = 0_u64;
-        for entry in WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(include_entry)
-        {
-            let entry = entry.unwrap();
-            if entry.depth() > 0 && !entry.path().is_dir() {
-                files += 1;
-            }
-        }
-
-        let started = Instant::now();
-        validate_candidate_tree(root).unwrap();
-        let elapsed = started.elapsed();
-
-        println!(
-            "validate_candidate_tree on {}: {:.1} ms wall time, {files} files walked",
-            root.display(),
-            elapsed.as_secs_f64() * 1000.0
-        );
     }
 }
